@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/release-capsule.schema.json",
+  "title": "SEAF ReleaseCapsule",
+  "type": "object",
+  "required": [
+    "release_id",
+    "app_id",
+    "version",
+    "source_commit",
+    "goal_id",
+    "artifact_digest",
+    "eval_report_digest",
+    "rollback_plan",
+    "rollout_policy"
+  ],
+  "properties": {
+    "release_id": { "type": "string", "minLength": 1 },
+    "app_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "source_commit": { "type": "string", "minLength": 1 },
+    "agent_task_id": { "type": "string" },
+    "goal_id": { "type": "string", "minLength": 1 },
+    "build_recipe_hash": { "type": "string" },
+    "artifact_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "eval_report_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "migration_plan": { "type": "string" },
+    "rollback_plan": { "type": "string", "minLength": 1 },
+    "signatures": { "type": "array", "items": { "type": "string" } },
+    "rollout_policy": {
+      "type": "object",
+      "required": ["channel", "initial_percentage"],
+      "properties": {
+        "channel": { "enum": ["dev", "canary", "beta", "stable"] },
+        "initial_percentage": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

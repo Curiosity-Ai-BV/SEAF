@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/goal.schema.json",
+  "title": "SEAF GoalSpec",
+  "type": "object",
+  "required": [
+    "goal_id",
+    "name",
+    "status",
+    "objective",
+    "guardrails",
+    "allowed_change_types"
+  ],
+  "properties": {
+    "goal_id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "owner": { "type": "string" },
+    "status": { "enum": ["draft", "active", "paused", "retired"] },
+    "objective": {
+      "type": "object",
+      "required": ["metric", "direction", "minimum_effect_size"],
+      "properties": {
+        "metric": { "type": "string", "minLength": 1 },
+        "direction": { "enum": ["increase", "decrease"] },
+        "minimum_effect_size": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "guardrails": { "type": "object" },
+    "anti_goals": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "allowed_change_types": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "auto_pr",
+          "require_review",
+          "forbidden",
+          "forbidden_without_owner_approval"
+        ]
+      }
+    },
+    "rollout": { "type": "object" }
+  },
+  "additionalProperties": false
+}

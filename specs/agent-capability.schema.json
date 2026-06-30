@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/agent-capability.schema.json",
+  "title": "SEAF Agent Capability Manifest",
+  "type": "object",
+  "required": [
+    "agent",
+    "can_read",
+    "can_write",
+    "cannot_read",
+    "cannot_write",
+    "network",
+    "requires_review_for"
+  ],
+  "properties": {
+    "agent": { "type": "string", "minLength": 1 },
+    "can_read": { "type": "array", "items": { "type": "string" } },
+    "can_write": { "type": "array", "items": { "type": "string" } },
+    "cannot_read": { "type": "array", "items": { "type": "string" } },
+    "cannot_write": { "type": "array", "items": { "type": "string" } },
+    "network": { "enum": ["none", "restricted", "allowed"] },
+    "requires_review_for": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

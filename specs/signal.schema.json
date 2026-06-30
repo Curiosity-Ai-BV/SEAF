@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/signal.schema.json",
+  "title": "SEAF Signal",
+  "type": "object",
+  "required": [
+    "signal_id",
+    "source",
+    "type",
+    "summary",
+    "severity",
+    "privacy_level",
+    "evidence"
+  ],
+  "properties": {
+    "signal_id": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "minLength": 1 },
+    "related_goal_id": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "severity": { "enum": ["low", "medium", "high"] },
+    "privacy_level": {
+      "enum": ["public", "aggregated", "private", "sensitive"]
+    },
+    "evidence": { "type": "object" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+  "policy_id": "default-agent-policy",
+  "default_autonomy_level": 1,
+  "forbidden_paths": [
+    "crates/seaf-update/**",
+    "infra/signing/**",
+    "secrets/**",
+    ".github/workflows/release.yml"
+  ],
+  "requires_human_review": [
+    "dependency_changes",
+    "database_migrations",
+    "auth_code",
+    "payment_code",
+    "privacy_sensitive_code",
+    "network_permission_changes"
+  ],
+  "allowed_without_review": [
+    "tests",
+    "documentation",
+    "non_sensitive_copy_changes"
+  ]
+}

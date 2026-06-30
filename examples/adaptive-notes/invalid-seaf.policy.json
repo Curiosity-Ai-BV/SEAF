@@ -1,0 +1,7 @@
+{
+  "policy_id": "",
+  "default_autonomy_level": 9,
+  "forbidden_paths": [],
+  "requires_human_review": [""],
+  "allowed_without_review": []
+}

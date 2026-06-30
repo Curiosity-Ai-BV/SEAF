@@ -1,0 +1,17 @@
+{
+  "name": "seaf",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "format:check": "prettier --check \"**/*.{md,json,yaml,yml,ts}\"",
+    "lint": "cargo clippy --all-targets --all-features -- -D warnings && pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}

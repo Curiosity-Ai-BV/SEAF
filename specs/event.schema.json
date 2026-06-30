@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/event.schema.json",
+  "title": "SEAF Event",
+  "type": "object",
+  "required": [
+    "event_id",
+    "name",
+    "timestamp",
+    "source",
+    "privacy_level",
+    "payload"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "privacy_level": {
+      "enum": ["public", "aggregated", "private", "sensitive"]
+    },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

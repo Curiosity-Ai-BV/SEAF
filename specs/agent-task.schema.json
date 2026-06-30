@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/agent-task.schema.json",
+  "title": "SEAF AgentTaskBrief",
+  "type": "object",
+  "required": [
+    "task_id",
+    "goal_id",
+    "objective",
+    "constraints",
+    "relevant_files",
+    "acceptance_criteria",
+    "generated_at"
+  ],
+  "properties": {
+    "task_id": { "type": "string", "minLength": 1 },
+    "goal_id": { "type": "string", "minLength": 1 },
+    "objective": { "type": "string", "minLength": 1 },
+    "signal": { "$ref": "signal.schema.json" },
+    "constraints": {
+      "type": "object",
+      "required": [
+        "default_autonomy_level",
+        "forbidden_paths",
+        "requires_human_review",
+        "allowed_without_review"
+      ],
+      "properties": {
+        "default_autonomy_level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "forbidden_paths": { "type": "array", "items": { "type": "string" } },
+        "requires_human_review": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "allowed_without_review": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "relevant_files": { "type": "array", "items": { "type": "string" } },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "generated_at": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

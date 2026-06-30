@@ -1,0 +1,17 @@
+{
+  "release_id": "rel_0.1.0",
+  "app_id": "dev.seaf.adaptive-notes",
+  "version": "0.1.0",
+  "source_commit": "abc123",
+  "agent_task_id": "task_reduce_time_to_first_note_001",
+  "goal_id": "reduce_time_to_first_note",
+  "build_recipe_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "eval_report_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "rollback_plan": "rollback/0.0.9",
+  "signatures": ["dev-placeholder-signature"],
+  "rollout_policy": {
+    "channel": "canary",
+    "initial_percentage": 5
+  }
+}
