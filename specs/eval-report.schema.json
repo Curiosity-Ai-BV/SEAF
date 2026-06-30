@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/eval-report.schema.json",
+  "title": "SEAF EvalReport",
+  "type": "object",
+  "required": [
+    "eval_report_id",
+    "patch_id",
+    "goal_id",
+    "passed",
+    "summary",
+    "checks",
+    "risk_level",
+    "decision"
+  ],
+  "properties": {
+    "eval_report_id": { "type": "string", "minLength": 1 },
+    "patch_id": { "type": "string", "minLength": 1 },
+    "goal_id": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "enum": ["passed", "failed", "skipped"] },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "stdout_path": { "type": "string" },
+          "stderr_path": { "type": "string" },
+          "summary": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "score_delta_estimate": { "type": "number" },
+    "risk_level": { "enum": ["low", "medium", "high"] },
+    "decision": {
+      "enum": ["reject", "approve_for_human_review", "approve_for_release"]
+    }
+  },
+  "additionalProperties": false
+}

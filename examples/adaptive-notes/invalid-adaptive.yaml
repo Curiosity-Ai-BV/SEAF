@@ -1,0 +1,10 @@
+goal_id: ""
+name: Missing objective details
+status: active
+objective:
+  metric: ""
+  direction: sideways
+  minimum_effect_size: 0
+guardrails: {}
+allowed_change_types:
+  updater_code: auto_pr

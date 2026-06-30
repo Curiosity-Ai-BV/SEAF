@@ -1,0 +1,9 @@
+evals:
+  required:
+    - name: rust_tests
+      command: cargo test
+    - name: typecheck
+      command: pnpm typecheck
+thresholds:
+  max_bundle_size_delta_percent: 5
+  max_startup_time_delta_percent: 10

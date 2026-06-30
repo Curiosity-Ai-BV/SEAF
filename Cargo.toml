@@ -1,0 +1,24 @@
+[workspace]
+members = [
+  "crates/seaf-core",
+  "crates/seaf-cli",
+  "crates/seaf-local-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Curiosity-Ai-BV/SEAF"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
