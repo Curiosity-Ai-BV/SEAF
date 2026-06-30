@@ -20,3 +20,5 @@ SEAF assumes agents can make mistakes and that telemetry, logs, dependencies, an
 - Release capsules must verify artifact and eval report digests.
 - Raw private events must not be uploaded by default.
 - Signing keys and update root policy must remain outside agent-readable contexts.
+
+See `docs/security/forbidden-shortcuts.md` for the current shortcut ban list.

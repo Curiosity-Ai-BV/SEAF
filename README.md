@@ -51,7 +51,20 @@ pnpm typecheck
 cargo run -p seaf-cli -- init --path /tmp/seaf-demo
 cargo run -p seaf-cli -- goal validate examples/adaptive-notes/adaptive.yaml
 cargo run -p seaf-cli -- policy validate examples/adaptive-notes/seaf.policy.json
-cargo run -p seaf-cli -- eval run examples/adaptive-notes/seaf.evals.yaml --json
+cargo run -p seaf-cli -- task brief \
+  --goal examples/adaptive-notes/adaptive.yaml \
+  --policy examples/adaptive-notes/seaf.policy.json
+cargo run -p seaf-cli -- eval run examples/adaptive-notes/seaf.evals.yaml \
+  --goal-id reduce_time_to_first_note \
+  --patch-id patch_local \
+  --json
+cargo run -p seaf-cli -- release prepare \
+  --app-id dev.seaf.adaptive-notes \
+  --version 0.1.0 \
+  --source-commit abc123 \
+  --artifact examples/adaptive-notes/events/note-created.json \
+  --eval-report .seaf/evals/eval-report.json \
+  --rollback-plan rollback/0.0.9
 cargo run -p seaf-cli -- release verify examples/adaptive-notes/release-capsule.json
 ```
 

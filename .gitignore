@@ -23,6 +23,9 @@ coverage
 .seaf/runs/
 .seaf/events/
 .seaf/traces/
+.seaf/evals/
+.seaf/tasks/
+.seaf/releases/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

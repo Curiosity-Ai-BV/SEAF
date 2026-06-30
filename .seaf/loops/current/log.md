@@ -27,3 +27,11 @@ Started event/signal contracts, TypeScript SDK event emission, and SQLite-backed
 ## 2026-06-30 verify | slice 3 quality review
 
 Quality review found feedback privacy could be downgraded while carrying raw message text, and SDK runtime validation did not reject invalid privacy enum values. Enforced private-or-sensitive feedback privacy and added runtime privacy enum validation.
+
+## 2026-06-30 act | slice 4 artifact chain
+
+Replaced the fail-closed eval placeholder with a local eval runner, task brief generator, release capsule preparation command, and digest-aware release verification. This keeps the MVP agent loop manual but produces durable JSON/Markdown artifacts.
+
+## 2026-06-30 verify | slice 4 spec review
+
+Spec review found initialized eval templates could not be parsed because `thresholds` was not accepted, and release preparation accepted contradictory rejected/high-risk EvalReports. Accepted optional thresholds metadata and tightened EvalReport/release validation.

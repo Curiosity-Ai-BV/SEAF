@@ -1,8 +1,9 @@
-use std::{fmt::Display, fs, path::Path};
+use std::{fmt::Display, fs, io::Read, path::Path};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::{GoalSpec, Policy, ReleaseCapsule, SeafEvent};
+use crate::{CheckStatus, EvalReport, GoalSpec, Policy, ReleaseCapsule, SeafEvent};
 
 pub type ValidationResult<T> = Result<T, ValidationReport>;
 
@@ -13,7 +14,7 @@ pub struct FieldError {
 }
 
 impl FieldError {
-    fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             message: message.into(),
@@ -81,6 +82,16 @@ pub fn load_release_capsule_file(path: &Path) -> ValidationResult<ReleaseCapsule
             Some(path),
             errors,
         ))
+    }
+}
+
+pub fn load_eval_report_file(path: &Path) -> ValidationResult<EvalReport> {
+    let report = load_struct::<EvalReport>("eval_report", path)?;
+    let errors = validate_eval_report(&report);
+    if errors.is_empty() {
+        Ok(report)
+    } else {
+        Err(ValidationReport::invalid("eval_report", Some(path), errors))
     }
 }
 
@@ -187,6 +198,56 @@ pub fn validate_release_capsule(capsule: &ReleaseCapsule) -> Vec<FieldError> {
     errors
 }
 
+pub fn validate_eval_report(report: &EvalReport) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    require_non_empty(&mut errors, "eval_report_id", &report.eval_report_id);
+    require_non_empty(&mut errors, "patch_id", &report.patch_id);
+    require_non_empty(&mut errors, "goal_id", &report.goal_id);
+    require_non_empty(&mut errors, "summary", &report.summary);
+
+    if report.checks.is_empty() {
+        errors.push(FieldError::new(
+            "checks",
+            "must include at least one executed check",
+        ));
+    }
+
+    if report.passed
+        && report
+            .checks
+            .iter()
+            .any(|check| check.status != CheckStatus::Passed)
+    {
+        errors.push(FieldError::new(
+            "passed",
+            "cannot be true unless every check passed",
+        ));
+    }
+
+    if report.decision == crate::EvalDecision::Reject && report.passed {
+        errors.push(FieldError::new(
+            "decision",
+            "cannot reject an EvalReport that is marked passed",
+        ));
+    }
+
+    if !report.passed && report.decision != crate::EvalDecision::Reject {
+        errors.push(FieldError::new(
+            "decision",
+            "must reject an EvalReport that is marked failed",
+        ));
+    }
+
+    if report.risk_level == crate::RiskLevel::High && report.passed {
+        errors.push(FieldError::new(
+            "risk_level",
+            "cannot be high when an EvalReport is marked passed",
+        ));
+    }
+
+    errors
+}
+
 pub fn validate_seaf_event(event: &SeafEvent) -> Vec<FieldError> {
     let mut errors = Vec::new();
     require_non_empty(&mut errors, "event_id", &event.event_id);
@@ -199,6 +260,22 @@ pub fn validate_seaf_event(event: &SeafEvent) -> Vec<FieldError> {
     }
 
     errors
+}
+
+pub fn sha256_digest_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn load_struct<T>(kind: &str, path: &Path) -> ValidationResult<T>
@@ -479,6 +556,29 @@ allowed_change_types:
         .unwrap_err();
 
         assert!(error.to_string().contains("checks"));
+    }
+
+    #[test]
+    fn failed_eval_report_must_reject() {
+        let report: EvalReport = serde_json::from_str(
+            r#"{
+  "eval_report_id": "eval_01",
+  "patch_id": "patch_01",
+  "goal_id": "reduce_time_to_first_note",
+  "passed": false,
+  "summary": "Failed report should not be approved.",
+  "checks": [
+    { "name": "unit_tests", "status": "failed" }
+  ],
+  "risk_level": "high",
+  "decision": "approve_for_release"
+}"#,
+        )
+        .expect("report should parse");
+
+        let errors = validate_eval_report(&report);
+
+        assert!(errors.iter().any(|error| error.field == "decision"));
     }
 
     #[test]

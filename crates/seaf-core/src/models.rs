@@ -222,3 +222,26 @@ pub struct Signal {
     pub privacy_level: PrivacyLevel,
     pub evidence: Value,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskBrief {
+    pub task_id: String,
+    pub goal_id: String,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<Signal>,
+    pub constraints: AgentTaskConstraints,
+    pub relevant_files: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskConstraints {
+    pub default_autonomy_level: u8,
+    pub forbidden_paths: Vec<String>,
+    pub requires_human_review: Vec<String>,
+    pub allowed_without_review: Vec<String>,
+}

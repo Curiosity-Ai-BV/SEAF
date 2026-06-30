@@ -27,3 +27,11 @@ gather -> reason -> act -> verify -> commit/merge -> repeat
 ```
 
 If the harness becomes heavier than the work, delete or simplify the harness first.
+
+## Current Command Chain
+
+```text
+seaf task brief -> agent patch -> seaf eval run -> seaf release prepare -> seaf release verify -> commit/merge role
+```
+
+The commit/merge role must verify the working tree, staged files, eval report, and release capsule before staging or committing.
