@@ -4,5 +4,5 @@
 - [x] Created feature branch.
 - [x] Slice 1: monorepo foundation.
 - [x] Slice 2: schemas and Rust/CLI validation.
-- [ ] Slice 3: SDK and runtime MVP.
+- [x] Slice 3: SDK and runtime MVP.
 - [ ] Slice 4: eval, release capsule, and agent task loop.

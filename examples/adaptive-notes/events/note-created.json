@@ -1,0 +1,10 @@
+{
+  "event_id": "evt_note_created_001",
+  "name": "note.created",
+  "timestamp": "2026-06-30T00:00:00.000Z",
+  "source": "adaptive-notes",
+  "privacy_level": "aggregated",
+  "payload": {
+    "source": "empty_state_button"
+  }
+}

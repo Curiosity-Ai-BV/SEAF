@@ -6,4 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rusqlite.workspace = true
 seaf-core = { path = "../seaf-core" }
+serde_json.workspace = true

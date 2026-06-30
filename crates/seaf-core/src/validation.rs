@@ -2,7 +2,7 @@ use std::{fmt::Display, fs, path::Path};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{GoalSpec, Policy, ReleaseCapsule};
+use crate::{GoalSpec, Policy, ReleaseCapsule, SeafEvent};
 
 pub type ValidationResult<T> = Result<T, ValidationReport>;
 
@@ -182,6 +182,20 @@ pub fn validate_release_capsule(capsule: &ReleaseCapsule) -> Vec<FieldError> {
             "rollout_policy.initial_percentage",
             "must be between 0 and 100",
         ));
+    }
+
+    errors
+}
+
+pub fn validate_seaf_event(event: &SeafEvent) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    require_non_empty(&mut errors, "event_id", &event.event_id);
+    require_non_empty(&mut errors, "name", &event.name);
+    require_non_empty(&mut errors, "timestamp", &event.timestamp);
+    require_non_empty(&mut errors, "source", &event.source);
+
+    if !event.payload.is_object() {
+        errors.push(FieldError::new("payload", "must be an object"));
     }
 
     errors
@@ -465,6 +479,22 @@ allowed_change_types:
         .unwrap_err();
 
         assert!(error.to_string().contains("checks"));
+    }
+
+    #[test]
+    fn event_requires_object_payload() {
+        let event = SeafEvent {
+            event_id: "evt_1".to_string(),
+            name: "note.created".to_string(),
+            timestamp: "2026-06-30T00:00:00.000Z".to_string(),
+            source: "adaptive-notes".to_string(),
+            privacy_level: crate::PrivacyLevel::Aggregated,
+            payload: serde_json::json!("raw text"),
+        };
+
+        let errors = validate_seaf_event(&event);
+
+        assert!(errors.iter().any(|error| error.field == "payload"));
     }
 
     #[test]

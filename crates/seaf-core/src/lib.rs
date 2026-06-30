@@ -5,7 +5,8 @@ mod validation;
 pub use models::*;
 pub use validation::{
     load_goal_file, load_policy_file, load_release_capsule_file, validate_goal_spec,
-    validate_policy, validate_release_capsule, FieldError, ValidationReport, ValidationResult,
+    validate_policy, validate_release_capsule, validate_seaf_event, FieldError, ValidationReport,
+    ValidationResult,
 };
 
 pub fn framework_name() -> &'static str {

@@ -179,3 +179,46 @@ pub struct ReleaseCapsule {
     pub signatures: Vec<String>,
     pub rollout_policy: RolloutPolicy,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyLevel {
+    Public,
+    Aggregated,
+    Private,
+    Sensitive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeafEvent {
+    pub event_id: String,
+    pub name: String,
+    pub timestamp: String,
+    pub source: String,
+    pub privacy_level: PrivacyLevel,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signal {
+    pub signal_id: String,
+    pub source: String,
+    #[serde(rename = "type")]
+    pub signal_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_goal_id: Option<String>,
+    pub summary: String,
+    pub severity: SignalSeverity,
+    pub privacy_level: PrivacyLevel,
+    pub evidence: Value,
+}

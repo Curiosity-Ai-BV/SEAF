@@ -55,6 +55,24 @@ cargo run -p seaf-cli -- eval run examples/adaptive-notes/seaf.evals.yaml --json
 cargo run -p seaf-cli -- release verify examples/adaptive-notes/release-capsule.json
 ```
 
+## SDK MVP
+
+```ts
+import { createSeafClient } from "@seaf/sdk";
+
+const seaf = createSeafClient({ source: "adaptive-notes" });
+
+await seaf.event("note.created", { source: "empty_state_button" });
+await seaf.metric("startup.p95_ms", 842);
+await seaf.feedback({
+  surface: "empty_state",
+  sentiment: "confused",
+  message: "I did not realize I could start typing.",
+});
+```
+
+The local runtime accepts the same event envelope through its Rust ingestion API and persists it in SQLite before producing aggregated signals.
+
 ## Agent Loop
 
 This repository uses a disk-backed implementation loop:

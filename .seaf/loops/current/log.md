@@ -19,3 +19,11 @@ Started Rust-owned models and CLI validation. Scope is limited to deterministic 
 ## 2026-06-30 verify | slice 2 quality review
 
 Quality review found four fail-open/package issues: crate templates referenced workspace examples, unknown fields were accepted despite schema closure, eval placeholder exited 0, and NaN effect sizes passed validation. Moved templates into `seaf-core`, denied unknown serde fields, made placeholder eval return nonzero, and required finite positive effect sizes.
+
+## 2026-06-30 act | slice 3 SDK and runtime
+
+Started event/signal contracts, TypeScript SDK event emission, and SQLite-backed local runtime ingestion. Scope is local-only: no daemon lifecycle, no cloud upload, and signal summaries use aggregated counts only.
+
+## 2026-06-30 verify | slice 3 quality review
+
+Quality review found feedback privacy could be downgraded while carrying raw message text, and SDK runtime validation did not reject invalid privacy enum values. Enforced private-or-sensitive feedback privacy and added runtime privacy enum validation.
