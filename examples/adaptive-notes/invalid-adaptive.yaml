@@ -3,7 +3,7 @@ name: Missing objective details
 status: active
 objective:
   metric: ""
-  direction: sideways
+  direction: increase
   minimum_effect_size: 0
 guardrails: {}
 allowed_change_types:

@@ -45,6 +45,16 @@ pnpm build
 pnpm typecheck
 ```
 
+## CLI MVP
+
+```bash
+cargo run -p seaf-cli -- init --path /tmp/seaf-demo
+cargo run -p seaf-cli -- goal validate examples/adaptive-notes/adaptive.yaml
+cargo run -p seaf-cli -- policy validate examples/adaptive-notes/seaf.policy.json
+cargo run -p seaf-cli -- eval run examples/adaptive-notes/seaf.evals.yaml --json
+cargo run -p seaf-cli -- release verify examples/adaptive-notes/release-capsule.json
+```
+
 ## Agent Loop
 
 This repository uses a disk-backed implementation loop:

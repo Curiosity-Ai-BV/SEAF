@@ -1,0 +1,24 @@
+goal_id: reduce_time_to_first_note
+name: Reduce time to first note
+owner: product
+status: active
+objective:
+  metric: median_time_between.app_opened_and.note_created
+  direction: decrease
+  minimum_effect_size: 0.15
+guardrails:
+  max_p95_startup_ms: 1000
+  no_new_permissions: true
+  no_new_personal_data_collection: true
+  preserve_accessibility_score: true
+anti_goals:
+  - do_not_add_dark_patterns
+  - do_not_collect_new_personal_data
+allowed_change_types:
+  copy_changes: auto_pr
+  layout_changes: require_review
+  dependency_changes: require_review
+  filesystem_permissions: forbidden
+rollout:
+  channel: canary
+  max_initial_rollout_percent: 5
