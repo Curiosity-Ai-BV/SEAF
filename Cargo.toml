@@ -3,6 +3,7 @@ members = [
   "crates/seaf-core",
   "crates/seaf-cli",
   "crates/seaf-local-runtime",
+  "crates/seaf-models",
 ]
 resolver = "2"
 
