@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/loop-run.schema.json",
+  "title": "SEAF LoopRun",
+  "type": "object",
+  "required": [
+    "run_id",
+    "ticket_id",
+    "goal_id",
+    "provider",
+    "model",
+    "status",
+    "current_step",
+    "started_at",
+    "updated_at",
+    "steps",
+    "policy_decisions"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "ticket_id": { "type": "string", "minLength": 1 },
+    "goal_id": { "type": "string", "minLength": 1 },
+    "provider": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["pending", "running", "blocked", "failed", "passed", "completed"]
+    },
+    "current_step": {
+      "enum": [
+        "research",
+        "analysis",
+        "spec_creation",
+        "spec_review",
+        "development",
+        "output_review",
+        "testing",
+        "eval_report"
+      ]
+    },
+    "started_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": {
+            "enum": [
+              "research",
+              "analysis",
+              "spec_creation",
+              "spec_review",
+              "development",
+              "output_review",
+              "testing",
+              "eval_report"
+            ]
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "blocked",
+              "failed",
+              "passed",
+              "completed"
+            ]
+          },
+          "artifact_path": {
+            "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "policy_decisions": {
+      "type": "array",
+      "items": { "type": "object", "minProperties": 1 }
+    },
+    "eval_report_path": {
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    }
+  },
+  "additionalProperties": false
+}
