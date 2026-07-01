@@ -14,9 +14,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Rust Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Cargo tests
+        run: cargo test --workspace
+      - name: P2-012 schema fixture checks
+        run: cargo test -p seaf-core fixture_loads
+      - name: P2-012 fake loop smoke test without Ollama
+        run: cargo test -p seaf-cli loop_smoke_produces_json_artifacts_without_ollama
+      - name: P2-012 AgentBench-lite fake provider test
+        run: cargo test -p seaf-cli loop_bench_fake_json_reports_agent_bench_summary
+      - name: P2-012 forbidden patch fixture test
+        run: cargo test -p seaf-loop policy_gate_rejects_forbidden_paths_and_never_invokes_apply
+      - name: P2-012 generated example validation
+        run: cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
+      - name: P2-012 AgentBench-lite fake provider CLI
+        run: cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 
   typescript:
     runs-on: ubuntu-latest
