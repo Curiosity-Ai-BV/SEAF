@@ -213,7 +213,10 @@ Allowed files:
 
 - `crates/seaf-models/src/ollama.rs`
 - `crates/seaf-models/src/lib.rs`
+- `crates/seaf-cli/Cargo.toml` when changed mechanically by adding the local
+  `seaf-models` dependency.
 - `crates/seaf-cli/src/main.rs`
+- `Cargo.lock` when changed mechanically by adding the local CLI dependency.
 - Focused tests or HTTP request-builder fixtures for Ollama behavior.
 
 Dependencies: P2-002.
