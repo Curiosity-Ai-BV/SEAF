@@ -63,3 +63,11 @@ Added the `seaf-models` crate with provider-neutral request/response/error DTOs,
 ## 2026-07-01 verify | P2-002 model provider
 
 Spec review accepted the mechanical `Cargo.lock` update for the new local workspace crate. Code-quality review required finite-temperature serde guards, atomic fake-provider state, and fail-closed DTO tests. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `946aa4d`.
+
+## 2026-07-01 act | P2-004 context packer
+
+Added the `seaf-loop` crate with local context packing, default safety excludes, ticket/policy forbidden-path filtering, UTF-8-safe byte limits, SHA-256 digests, warnings, and `context-manifest.json` writing. The manifest records metadata and excludes file content; the bundle carries the prompt content and untrusted-context marker.
+
+## 2026-07-01 verify | P2-004 context packer
+
+Spec review approved the crate scope and acceptance criteria. Code-quality review approved path normalization, symlink escape blocking, manifest/content separation, and byte-limit behavior, with a non-blocking follow-up for direct path-safety regression tests. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `5f36eba`.

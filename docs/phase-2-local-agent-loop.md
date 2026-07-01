@@ -94,17 +94,17 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001` and `P2-002` are complete. `P2-004` is the next implementation slice
-because the local context packer depends on the ticket contracts and unblocks
-safe prompt construction.
+`P2-001`, `P2-002`, and `P2-004` are complete. `P2-005` is the next
+implementation slice because the workspace/state machine depends on the core
+contracts, fake model provider, and context packer.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
 | P2-001 | Add TicketSpec and LoopRun contracts             | complete | done        |
 | P2-002 | Add model provider abstraction and fake provider | complete | done        |
 | P2-003 | Add Ollama provider                              | pending  | no          |
-| P2-004 | Add local context packer                         | pending  | next        |
-| P2-005 | Add loop workspace and state machine             | pending  | no          |
+| P2-004 | Add local context packer                         | complete | done        |
+| P2-005 | Add loop workspace and state machine             | pending  | next        |
 | P2-006 | Add role prompts and structured response schemas | pending  | no          |
 | P2-007 | Add patch parser and deterministic policy gate   | pending  | no          |
 | P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
@@ -239,7 +239,7 @@ cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx
 
 ### P2-004 - Add local context packer
 
-Status: pending
+Status: complete in `5f36eba`
 
 Objective: Gather safe, bounded repository context for model prompts.
 
@@ -271,6 +271,9 @@ Verification commands:
 ```bash
 cargo test -p seaf-loop context
 ```
+
+Review follow-up for future context hardening: add direct regression tests for
+absolute/traversal path rejection and symlink escape blocking.
 
 ### P2-005 - Add loop workspace and state machine
 
