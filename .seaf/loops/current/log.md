@@ -111,3 +111,21 @@ command diagnostics. After fixes, spec and quality re-reviews approved. Final
 checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --all-features -- -D warnings`,
 `pnpm format:check`, and `git diff --check`. Committed as `0e5f9e5`.
+
+## 2026-07-01 act | P2-003 Ollama provider
+
+Added a dependency-free Ollama provider behind `ModelProvider`, request-builder
+tests, an injectable HTTP client, a `seaf model check --provider ollama`
+command, and a mechanical CLI dependency on `seaf-models`.
+
+## 2026-07-01 verify | P2-003 Ollama provider
+
+Spec review approved the provider and CLI scope. Code-quality review required
+trying all resolved localhost addresses before failing and avoiding missing-model
+pull hints for generic HTTP 404 API-root errors. After fixes, spec and quality
+re-reviews approved. Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Manual smoke reached local Ollama
+but reported missing `gemma4:e4b-mlx` with an `ollama pull` hint. Committed as
+`3fe0744`.

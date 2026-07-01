@@ -94,20 +94,21 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-004`, `P2-005`, `P2-006`, and `P2-007` are complete.
-`P2-003` is the next implementation slice so the model-provider abstraction can
-talk to a local Ollama server before CLI loop wiring in `P2-008`.
+`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, and `P2-007` are
+complete. `P2-008` is the next implementation slice so the reviewed contracts,
+providers, context packer, state machine, role responses, and patch policy gate
+can be exposed through `seaf-cli`.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
 | P2-001 | Add TicketSpec and LoopRun contracts             | complete | done        |
 | P2-002 | Add model provider abstraction and fake provider | complete | done        |
-| P2-003 | Add Ollama provider                              | pending  | next        |
+| P2-003 | Add Ollama provider                              | complete | done        |
 | P2-004 | Add local context packer                         | complete | done        |
 | P2-005 | Add loop workspace and state machine             | complete | done        |
 | P2-006 | Add role prompts and structured response schemas | complete | done        |
 | P2-007 | Add patch parser and deterministic policy gate   | complete | done        |
-| P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
+| P2-008 | Add CLI commands for model, ticket, and loop     | pending  | next        |
 | P2-009 | Build AgentBench-lite                            | pending  | no          |
 | P2-010 | Integrate evals with existing EvalReport         | pending  | no          |
 | P2-011 | Documentation and Mac setup guide                | pending  | no          |
@@ -204,7 +205,7 @@ once the artifact shape is known.
 
 ### P2-003 - Add Ollama provider
 
-Status: pending
+Status: complete in `3fe0744`
 
 Objective: Implement local Ollama API support behind the model-provider
 abstraction.
@@ -239,6 +240,15 @@ Verification commands:
 cargo test -p seaf-models
 cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx
 ```
+
+Manual smoke note: the smoke command compiled and reached local Ollama during
+review, but `gemma4:e4b-mlx` was not installed in the test environment. The CLI
+returned an actionable `ollama pull gemma4:e4b-mlx` hint.
+
+Review follow-ups for future provider work: the std HTTP client intentionally
+tries all resolved localhost addresses before failing, and generic HTTP 404
+responses are reported as base URL/API-root issues unless the provider message
+actually indicates a missing model.
 
 ### P2-004 - Add local context packer
 
