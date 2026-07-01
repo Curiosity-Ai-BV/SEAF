@@ -94,24 +94,24 @@ Safety boundary:
 
 ## Current Status
 
-All Phase 2 implementation tickets are pending. `P2-001` is selected as the
-first implementation slice because the ticket and loop-run contracts unblock
-context packing, loop state, CLI validation, and eval integration.
+`P2-001` is complete. `P2-002` is the next implementation slice because the
+model-provider abstraction and fake provider unblock deterministic loop tests
+without requiring Ollama.
 
-| Ticket | Title                                            | Status  | First Slice |
-| ------ | ------------------------------------------------ | ------- | ----------- |
-| P2-001 | Add TicketSpec and LoopRun contracts             | pending | yes         |
-| P2-002 | Add model provider abstraction and fake provider | pending | no          |
-| P2-003 | Add Ollama provider                              | pending | no          |
-| P2-004 | Add local context packer                         | pending | no          |
-| P2-005 | Add loop workspace and state machine             | pending | no          |
-| P2-006 | Add role prompts and structured response schemas | pending | no          |
-| P2-007 | Add patch parser and deterministic policy gate   | pending | no          |
-| P2-008 | Add CLI commands for model, ticket, and loop     | pending | no          |
-| P2-009 | Build AgentBench-lite                            | pending | no          |
-| P2-010 | Integrate evals with existing EvalReport         | pending | no          |
-| P2-011 | Documentation and Mac setup guide                | pending | no          |
-| P2-012 | CI hardening                                     | pending | no          |
+| Ticket | Title                                            | Status   | First Slice |
+| ------ | ------------------------------------------------ | -------- | ----------- |
+| P2-001 | Add TicketSpec and LoopRun contracts             | complete | done        |
+| P2-002 | Add model provider abstraction and fake provider | pending  | next        |
+| P2-003 | Add Ollama provider                              | pending  | no          |
+| P2-004 | Add local context packer                         | pending  | no          |
+| P2-005 | Add loop workspace and state machine             | pending  | no          |
+| P2-006 | Add role prompts and structured response schemas | pending  | no          |
+| P2-007 | Add patch parser and deterministic policy gate   | pending  | no          |
+| P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
+| P2-009 | Build AgentBench-lite                            | pending  | no          |
+| P2-010 | Integrate evals with existing EvalReport         | pending  | no          |
+| P2-011 | Documentation and Mac setup guide                | pending  | no          |
+| P2-012 | CI hardening                                     | pending  | no          |
 
 Recommended order from the plan:
 
@@ -126,7 +126,7 @@ Sprint 4: P2-009, P2-011, P2-012
 
 ### P2-001 - Add TicketSpec and LoopRun contracts
 
-Status: pending
+Status: complete in `65fc489`
 
 Objective: Add typed contracts for local-loop tickets and loop runs.
 

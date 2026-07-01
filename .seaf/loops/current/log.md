@@ -47,3 +47,11 @@ Created `docs/phase-2-local-agent-loop.md` with overview, scope boundary, review
 ## 2026-07-01 verify | phase 2 spec authoring
 
 Ran `pnpm format:check` and `git diff --check`; both passed after formatting the new Phase 2 spec with Prettier.
+
+## 2026-07-01 act | P2-001 contracts
+
+Added `TicketSpec` and `LoopRun` contracts, JSON schemas, and local-loop fixtures. The implementation stayed in `seaf-core`, `specs/`, and `examples/local-loop/`.
+
+## 2026-07-01 verify | P2-001 contracts
+
+Spec review initially required durable invalid/valid fixtures and alignment with the plan's section 7.1 ticket example. Code-quality review then required tightening `policy_decisions` from arbitrary JSON to non-empty object entries. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `65fc489`.
