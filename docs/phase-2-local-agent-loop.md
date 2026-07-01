@@ -412,7 +412,9 @@ Allowed files:
 
 - `crates/seaf-cli/src/main.rs`
 - `crates/seaf-cli/tests/cli.rs`
-- CLI wiring in workspace manifests only if needed for P2 crates.
+- `crates/seaf-cli/Cargo.toml` when changed mechanically by adding the local
+  `seaf-loop` dependency.
+- `Cargo.lock` when changed mechanically by adding that local dependency.
 - No core loop behavior changes except through already reviewed public APIs.
 
 Dependencies: P2-001, P2-002, P2-004, P2-005, P2-006, P2-007.
