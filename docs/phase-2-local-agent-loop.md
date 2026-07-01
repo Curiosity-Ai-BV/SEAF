@@ -245,6 +245,10 @@ Objective: Gather safe, bounded repository context for model prompts.
 
 Allowed files:
 
+- `Cargo.toml` when changed mechanically by adding the local workspace crate.
+- `Cargo.lock` when changed mechanically by adding the local workspace crate.
+- `crates/seaf-loop/Cargo.toml`
+- `crates/seaf-loop/src/lib.rs`
 - `crates/seaf-loop/src/context.rs`
 - `crates/seaf-loop/src/policy.rs`
 - `crates/seaf-loop/src/workspace.rs`
