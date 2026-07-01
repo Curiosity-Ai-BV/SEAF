@@ -146,3 +146,23 @@ matching. After fixes, spec and quality re-reviews approved. Final checks
 passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --all-features -- -D warnings`,
 `pnpm format:check`, and `git diff --check`. Committed as `e7f04a2`.
+
+## 2026-07-01 act | P2-010 EvalReport integration
+
+Added loop-to-`EvalReport` integration in `seaf-loop`, optional
+`seaf eval run --loop-run --ticket` CLI mode, a deterministic local-loop eval
+config, and tests for loop identity binding, required loop checks, rejected
+policy gates, command-mode backward compatibility, and product-path loop eval.
+
+## 2026-07-01 verify | P2-010 EvalReport integration
+
+Spec review approved the scope and acceptance coverage. Code-quality review
+required loop artifact validation before command execution, product-path policy
+evidence, policy decision `patch_id` binding to `run_id`, and no-op synthetic
+policy evidence with `apply_requested = false`. After fixes, spec and quality
+re-reviews approved. Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, `git diff --check`, and
+`cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --goal-id local_agent_loop_mvp --patch-id test --json`.
+Committed as `1e86622`.

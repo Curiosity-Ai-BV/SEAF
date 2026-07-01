@@ -25,7 +25,7 @@
 - [x] P2-007: Add patch parser and deterministic policy gate.
 - [x] P2-003: Add Ollama provider.
 - [x] P2-008: Add CLI commands for model, ticket, and loop.
-- [ ] P2-010: Integrate evals with existing EvalReport.
+- [x] P2-010: Integrate evals with existing EvalReport.
 - [ ] P2-009: Build AgentBench-lite.
 - [ ] P2-011: Documentation and Mac setup guide.
 - [ ] P2-012: CI hardening.

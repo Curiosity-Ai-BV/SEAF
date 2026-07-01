@@ -94,9 +94,9 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`, and
-`P2-008` are complete. `P2-010` is the next implementation slice so local-loop
-results can be represented through the existing `EvalReport` system.
+`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`,
+`P2-008`, and `P2-010` are complete. `P2-009` is the next implementation slice
+so local model behavior can be evaluated with AgentBench-lite.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -108,8 +108,8 @@ results can be represented through the existing `EvalReport` system.
 | P2-006 | Add role prompts and structured response schemas | complete | done        |
 | P2-007 | Add patch parser and deterministic policy gate   | complete | done        |
 | P2-008 | Add CLI commands for model, ticket, and loop     | complete | done        |
-| P2-009 | Build AgentBench-lite                            | pending  | no          |
-| P2-010 | Integrate evals with existing EvalReport         | pending  | next        |
+| P2-009 | Build AgentBench-lite                            | pending  | next        |
+| P2-010 | Integrate evals with existing EvalReport         | complete | done        |
 | P2-011 | Documentation and Mac setup guide                | pending  | no          |
 | P2-012 | CI hardening                                     | pending  | no          |
 
@@ -477,7 +477,7 @@ cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --f
 
 ### P2-010 - Integrate evals with existing EvalReport
 
-Status: pending
+Status: complete in `1e86622`
 
 Objective: Keep the local loop compatible with SEAF's existing eval report
 system.
@@ -509,6 +509,13 @@ Verification commands:
 cargo test -p seaf-loop eval_report
 cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --goal-id local_agent_loop_mvp --patch-id test --json
 ```
+
+Review notes for future eval work: loop eval mode validates the loop run and
+ticket before creating logs, output files, or running configured shell checks.
+Policy evidence is bound to the loop `run_id`; missing, malformed, mismatched,
+or rejected policy decisions fail closed. Deterministic CLI loop runs record an
+empty-patch no-op policy decision with `apply_requested = false` and
+`applied = false`.
 
 ### P2-011 - Documentation and Mac setup guide
 
