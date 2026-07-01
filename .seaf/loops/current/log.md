@@ -216,3 +216,22 @@ docs were clarified before commit. Final checks passed: `pnpm format:check`,
 `git diff --check`, `cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml`,
 and `cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json`.
 Committed as `a070c4f`.
+
+## 2026-07-01 act | P2-012 CI hardening
+
+Updated `.github/workflows/ci.yml` to keep the Rust job on formatting, Clippy,
+and `cargo test --workspace`, then added named guardrail steps for schema
+fixtures, fake loop smoke without Ollama, AgentBench-lite fake provider output,
+forbidden patch policy coverage, ticket validation, and AgentBench-lite CLI
+execution. The TypeScript job remains on frozen pnpm install, format, lint,
+typecheck, test, and build.
+
+## 2026-07-01 verify | P2-012 CI hardening
+
+Spec and CI-quality reviews approved. Review confirmed that focused test filters
+run real tests, CI does not require Ollama, and TypeScript checks remain intact.
+Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm install --frozen-lockfile`, `pnpm format:check`, `pnpm lint`,
+`pnpm typecheck`, `pnpm test`, `pnpm build`, `git diff --check`, and all focused
+P2-012 commands now listed in CI. Committed as `084688c`.

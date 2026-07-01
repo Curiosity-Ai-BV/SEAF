@@ -94,9 +94,10 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`,
-`P2-008`, `P2-009`, `P2-010`, and `P2-011` are complete. `P2-012` is the final
-Phase 2 implementation slice so CI covers the local agent-loop guardrails.
+`P2-001` through `P2-012` are complete for the Phase 2 local agent-loop plan.
+The branch now contains the local contracts, providers, loop state machine,
+role schemas, policy gate, CLI, EvalReport integration, AgentBench-lite,
+developer docs, and CI guardrails described below.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -111,7 +112,7 @@ Phase 2 implementation slice so CI covers the local agent-loop guardrails.
 | P2-009 | Build AgentBench-lite                            | complete | done        |
 | P2-010 | Integrate evals with existing EvalReport         | complete | done        |
 | P2-011 | Documentation and Mac setup guide                | complete | done        |
-| P2-012 | CI hardening                                     | pending  | next        |
+| P2-012 | CI hardening                                     | complete | done        |
 
 Recommended order from the plan:
 
@@ -573,7 +574,7 @@ evaluates policy evidence while building the final EvalReport.
 
 ### P2-012 - CI hardening
 
-Status: pending
+Status: complete in `084688c`
 
 Objective: Keep the repo trustworthy as local agents start editing code.
 
@@ -611,6 +612,12 @@ pnpm typecheck
 pnpm test
 pnpm build
 ```
+
+Review notes for future CI work: CI intentionally uses fake-provider and
+fixture-backed local-loop commands, not Ollama. The Rust job now runs
+`cargo test --workspace` plus named guardrail steps for schema fixtures, fake
+loop smoke, AgentBench-lite fake provider output, forbidden patch policy
+coverage, ticket validation, and AgentBench-lite CLI execution.
 
 ## Context For Future Agents
 

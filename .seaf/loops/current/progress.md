@@ -28,4 +28,4 @@
 - [x] P2-010: Integrate evals with existing EvalReport.
 - [x] P2-009: Build AgentBench-lite.
 - [x] P2-011: Documentation and Mac setup guide.
-- [ ] P2-012: CI hardening.
+- [x] P2-012: CI hardening.
