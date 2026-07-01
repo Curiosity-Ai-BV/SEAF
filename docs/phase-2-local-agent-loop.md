@@ -284,6 +284,7 @@ Objective: Make loop runs restartable and auditable.
 Allowed files:
 
 - `crates/seaf-loop/src/runner.rs`
+- `crates/seaf-loop/src/lib.rs`
 - `crates/seaf-loop/src/state.rs`
 - `crates/seaf-loop/src/workspace.rs`
 - `crates/seaf-loop/src/artifacts.rs`
