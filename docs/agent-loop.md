@@ -20,6 +20,12 @@ Implementers do not self-approve their own work. The commit/merge agent does not
 
 The loop should be recoverable by reading those three files plus the git diff.
 
+## Phase 2 Specs
+
+The next local-agent-loop implementation phase is tracked in
+[Phase 2 Local Agent Loop](phase-2-local-agent-loop.md). Development slices
+should not start until the ticket spec has been independently reviewed.
+
 ## Loop
 
 ```text

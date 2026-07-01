@@ -35,3 +35,15 @@ Replaced the fail-closed eval placeholder with a local eval runner, task brief g
 ## 2026-06-30 verify | slice 4 spec review
 
 Spec review found initialized eval templates could not be parsed because `thresholds` was not accepted, and release preparation accepted contradictory rejected/high-risk EvalReports. Accepted optional thresholds metadata and tightened EvalReport/release validation.
+
+## 2026-07-01 gather | phase 2 spec authoring
+
+Read the Phase 2 local-agent-loop plan, existing architecture/agent-loop docs, and current loop tracking files. Confirmed the active branch is `codex/seaf-foundation-agent-loop` and the next work should remain documentation-only.
+
+## 2026-07-01 act | phase 2 ticket specs
+
+Created `docs/phase-2-local-agent-loop.md` with overview, scope boundary, review protocol, current pending status, P2-001 selection, and ticket specs for P2-001 through P2-012.
+
+## 2026-07-01 verify | phase 2 spec authoring
+
+Ran `pnpm format:check` and `git diff --check`; both passed after formatting the new Phase 2 spec with Prettier.
