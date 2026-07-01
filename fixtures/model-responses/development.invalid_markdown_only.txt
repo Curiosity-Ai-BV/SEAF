@@ -1,0 +1,7 @@
+```diff
+diff --git a/crates/seaf-loop/src/role_response.rs b/crates/seaf-loop/src/role_response.rs
+--- a/crates/seaf-loop/src/role_response.rs
++++ b/crates/seaf-loop/src/role_response.rs
+@@ -1,0 +1,1 @@
++pub enum Role {}
+```

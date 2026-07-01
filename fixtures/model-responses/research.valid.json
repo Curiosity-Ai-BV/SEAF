@@ -1,0 +1,13 @@
+{
+  "role": "researcher",
+  "status": "passed",
+  "summary": "Relevant CLI code is concentrated in crates/seaf-cli/src/main.rs.",
+  "findings": [
+    {
+      "claim": "The CLI currently has command groups for info, init, goals, policy, tasks, evals, and releases.",
+      "evidence": "crates/seaf-cli/src/main.rs"
+    }
+  ],
+  "risks": [],
+  "next_step_recommendation": "Proceed to analysis."
+}

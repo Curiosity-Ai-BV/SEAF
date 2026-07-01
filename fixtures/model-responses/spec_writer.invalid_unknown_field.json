@@ -1,0 +1,9 @@
+{
+  "role": "spec_writer",
+  "status": "passed",
+  "summary": "Unknown fields must fail closed.",
+  "findings": [],
+  "risks": [],
+  "next_step_recommendation": "Do not continue.",
+  "extra_markdown": "```diff\n+not allowed\n```"
+}

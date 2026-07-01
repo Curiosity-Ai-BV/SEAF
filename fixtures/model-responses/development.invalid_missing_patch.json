@@ -1,0 +1,7 @@
+{
+  "role": "developer",
+  "status": "patch_proposed",
+  "summary": "Developer responses without a patch field must fail closed.",
+  "changed_files": ["crates/seaf-loop/src/role_response.rs"],
+  "requires_human_review": false
+}

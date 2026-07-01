@@ -1,0 +1,8 @@
+{
+  "role": "analyzer",
+  "status": "looks_good",
+  "summary": "Free-form status strings must be rejected.",
+  "findings": [],
+  "risks": [],
+  "next_step_recommendation": "Do not continue."
+}

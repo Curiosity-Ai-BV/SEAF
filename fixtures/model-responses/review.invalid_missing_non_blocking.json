@@ -1,0 +1,11 @@
+{
+  "role": "output_reviewer",
+  "decision": "reject",
+  "summary": "Reviewer responses must include non_blocking_issues even when none exist.",
+  "blocking_issues": [
+    {
+      "summary": "Missing explicit non-blocking issue list.",
+      "evidence": "docs/phase-2-local-agent-loop.md#P2-006"
+    }
+  ]
+}

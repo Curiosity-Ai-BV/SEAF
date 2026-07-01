@@ -1,0 +1,7 @@
+{
+  "role": "spec_reviewer",
+  "decision": "approve_spec",
+  "summary": "The spec matches the ticket and keeps runner integration out of scope.",
+  "blocking_issues": [],
+  "non_blocking_issues": []
+}
