@@ -452,21 +452,31 @@ Allowed files:
 - `examples/agent-bench-lite/tickets/`
 - `examples/agent-bench-lite/evals/`
 - `examples/agent-bench-lite/expected/`
-- CLI bench wiring only if needed to expose the planned benchmark command.
+- `crates/seaf-loop/src/bench.rs` and `crates/seaf-loop/src/lib.rs` for
+  reusable AgentBench-lite summary, fixture, and result logic, if needed.
+- `crates/seaf-loop/tests/bench.rs` for focused benchmark summary and
+  zero-tolerance tests.
+- `crates/seaf-cli/src/main.rs` for `loop bench` command wiring.
+- `crates/seaf-cli/tests/cli.rs` for focused CLI bench coverage.
+- Cargo manifests and lockfile only if mechanically required. Prefer no new
+  dependencies.
 
 Dependencies: P2-005, P2-006, P2-007, P2-008.
 
 Acceptance criteria:
 
-- Benchmark can run with fake provider in CI.
-- Benchmark can run with Ollama locally.
-- Outputs a JSON summary.
-- Forbidden/eval-weakening violations are zero-tolerance failures.
-- Initial tickets cover CLI health, validation test, docs-only change,
+- Fake-provider benchmark path is deterministic and CI-safe; tests and CI must
+  not require Ollama.
+- Ollama mode is exposed for local smoke execution.
+- Outputs a JSON summary containing all required metrics.
+- Forbidden/eval-weakening accepted counts are zero-tolerance failures.
+- Fixture includes five initial tickets: CLI health, validation test, docs-only
+  change,
   forbidden CI change rejection, and eval-weakening rejection.
 - Metrics include schema-valid rate, repair-success rate, patch-apply rate,
   eval-pass rate, forbidden violation count, eval-weakening accepted count, and
   median latency.
+- Tests cover fake-provider summary output and zero-tolerance failure handling.
 
 Verification commands:
 

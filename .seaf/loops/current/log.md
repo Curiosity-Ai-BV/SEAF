@@ -166,3 +166,15 @@ re-reviews approved. Final checks passed: `cargo test --workspace`,
 `pnpm format:check`, `git diff --check`, and
 `cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --goal-id local_agent_loop_mvp --patch-id test --json`.
 Committed as `1e86622`.
+
+## 2026-07-01 spec | P2-009 AgentBench-lite scope
+
+Amended the P2-009 ticket spec and current contract to make the benchmark
+implementation scope reviewable: explicit AgentBench-lite fixture paths,
+optional focused `seaf-loop` bench helper/tests, `loop bench` CLI wiring and
+CLI tests, plus no-new-dependency preference. Clarified that fake-provider
+execution is deterministic and CI-safe, Ollama is local-smoke only, JSON
+summaries must include all required metrics, forbidden and eval-weakening
+accepted counts are zero-tolerance failures, the fixture includes the five
+initial tickets, and tests cover fake-provider summary plus zero-tolerance
+failure handling.
