@@ -94,20 +94,19 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-004`, `P2-005`, and `P2-006` are complete. `P2-007` is
-the next implementation slice because deterministic patch parsing and policy
-gating depend on the context, state-machine, and role-response seams now being
-in place.
+`P2-001`, `P2-002`, `P2-004`, `P2-005`, `P2-006`, and `P2-007` are complete.
+`P2-003` is the next implementation slice so the model-provider abstraction can
+talk to a local Ollama server before CLI loop wiring in `P2-008`.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
 | P2-001 | Add TicketSpec and LoopRun contracts             | complete | done        |
 | P2-002 | Add model provider abstraction and fake provider | complete | done        |
-| P2-003 | Add Ollama provider                              | pending  | no          |
+| P2-003 | Add Ollama provider                              | pending  | next        |
 | P2-004 | Add local context packer                         | complete | done        |
 | P2-005 | Add loop workspace and state machine             | complete | done        |
 | P2-006 | Add role prompts and structured response schemas | complete | done        |
-| P2-007 | Add patch parser and deterministic policy gate   | pending  | next        |
+| P2-007 | Add patch parser and deterministic policy gate   | complete | done        |
 | P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
 | P2-009 | Build AgentBench-lite                            | pending  | no          |
 | P2-010 | Integrate evals with existing EvalReport         | pending  | no          |
@@ -350,7 +349,7 @@ is restricted to `patch`.
 
 ### P2-007 - Add patch parser and deterministic policy gate
 
-Status: pending
+Status: complete in `0e5f9e5`
 
 Objective: Ensure model-generated code changes are safe to apply.
 
@@ -383,6 +382,12 @@ Verification commands:
 cargo test -p seaf-loop patch
 cargo test -p seaf-loop policy_gate
 ```
+
+Review notes for future integration: category-style `requires_human_review`
+entries are treated as canonical policy keys, while path-like entries are
+matched as review patterns. Git command diagnostics are serialized in
+`PolicyDecisionReason.details`; `pattern` is reserved for matched policy keys or
+path patterns.
 
 ### P2-008 - Add CLI commands for model, ticket, and loop
 

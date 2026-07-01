@@ -95,3 +95,19 @@ Final checks passed: `cargo test --workspace`,
 `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --all-features -- -D warnings`,
 `pnpm format:check`, and `git diff --check`. Committed as `bbc5665`.
+
+## 2026-07-01 act | P2-007 patch policy gate
+
+Added unified diff parsing, safe path normalization, binary-patch detection,
+policy/category review gating, explicit apply gating, a testable `git apply`
+runner seam, patch artifacts, and structured `PolicyDecision` artifacts.
+
+## 2026-07-01 verify | P2-007 patch policy gate
+
+Spec review approved the initial implementation. Code-quality review required
+fail-closed malformed `diff --git` headers, clearer category-key versus
+path-pattern review policy semantics, and a separate details field for git
+command diagnostics. After fixes, spec and quality re-reviews approved. Final
+checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `0e5f9e5`.

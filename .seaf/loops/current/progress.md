@@ -22,7 +22,7 @@
 - [x] P2-004: Add local context packer.
 - [x] P2-005: Add loop workspace and state machine.
 - [x] P2-006: Add role prompts and structured response schemas.
-- [ ] P2-007: Add patch parser and deterministic policy gate.
+- [x] P2-007: Add patch parser and deterministic policy gate.
 - [ ] P2-003: Add Ollama provider.
 - [ ] P2-008: Add CLI commands for model, ticket, and loop.
 - [ ] P2-010: Integrate evals with existing EvalReport.
