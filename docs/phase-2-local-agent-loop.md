@@ -95,9 +95,8 @@ Safety boundary:
 ## Current Status
 
 `P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`,
-`P2-008`, `P2-009`, and `P2-010` are complete. `P2-011` is the next
-implementation slice so developers and agents have a complete local setup,
-demo, recovery, eval, and security-boundary guide.
+`P2-008`, `P2-009`, `P2-010`, and `P2-011` are complete. `P2-012` is the final
+Phase 2 implementation slice so CI covers the local agent-loop guardrails.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -111,8 +110,8 @@ demo, recovery, eval, and security-boundary guide.
 | P2-008 | Add CLI commands for model, ticket, and loop     | complete | done        |
 | P2-009 | Build AgentBench-lite                            | complete | done        |
 | P2-010 | Integrate evals with existing EvalReport         | complete | done        |
-| P2-011 | Documentation and Mac setup guide                | pending  | next        |
-| P2-012 | CI hardening                                     | pending  | no          |
+| P2-011 | Documentation and Mac setup guide                | complete | done        |
+| P2-012 | CI hardening                                     | pending  | next        |
 
 Recommended order from the plan:
 
@@ -537,7 +536,7 @@ empty-patch no-op policy decision with `apply_requested = false` and
 
 ### P2-011 - Documentation and Mac setup guide
 
-Status: pending
+Status: complete in `a070c4f`
 
 Objective: Make the local loop easy to run by a developer and easy to dispatch
 to agents.
@@ -566,6 +565,11 @@ Verification commands:
 ```bash
 pnpm format:check
 ```
+
+Review notes for future docs work: the demo commands use fixed run IDs for
+readability, so reruns should choose a fresh ID or inspect/resume the existing
+run. Loop eval validates the loop run and ticket before command checks, then
+evaluates policy evidence while building the final EvalReport.
 
 ### P2-012 - CI hardening
 

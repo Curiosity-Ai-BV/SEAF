@@ -199,3 +199,20 @@ checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
 Manual Ollama smoke reached local Ollama and failed actionably because
 `gemma4:e4b-mlx` is not installed, with an `ollama pull` hint. Committed as
 `c711e04`.
+
+## 2026-07-01 act | P2-011 local loop docs
+
+Added the local agent-loop guide, Gemma/Ollama Mac setup guide, loop eval guide,
+local security-boundary guide, and local-loop example README. The docs cover the
+full demo path, local-only boundaries, untrusted model output, deterministic
+gates, recovery with `loop status`/`loop resume`, artifact locations, CI-safe
+fake commands, Ollama smoke behavior, and pending P2-012 CI hardening.
+
+## 2026-07-01 verify | P2-011 local loop docs
+
+Spec and docs-quality reviews approved. Quality review noted non-blocking
+wording risks around fixed demo run IDs and eval policy-evidence timing; the
+docs were clarified before commit. Final checks passed: `pnpm format:check`,
+`git diff --check`, `cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml`,
+and `cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json`.
+Committed as `a070c4f`.
