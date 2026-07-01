@@ -1,8 +1,9 @@
 # Local Loop Example
 
-This fixture supports P2-011 on branch `codex/seaf-foundation-agent-loop`.
-It is intentionally small so future agents can validate the local-loop command
-chain without relying on a live model.
+This fixture supports the completed Phase 2 local loop on branch
+`codex/seaf-foundation-agent-loop`. It is intentionally small so future agents
+can validate the local-loop command chain without relying on a live model for
+loop execution.
 
 ## Files
 
@@ -56,5 +57,6 @@ smoke path is:
 cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --fixture examples/agent-bench-lite
 ```
 
-Use fake-provider commands for CI-safe checks. P2-012 CI hardening is still
-pending.
+Use fake-provider commands for CI-safe checks. The Ollama benchmark command is a
+local live smoke check; full live model-backed `loop run` execution remains
+future work.

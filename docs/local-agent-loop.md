@@ -1,9 +1,9 @@
 # Local Agent Loop
 
-Current slice context: P2-011 on branch `codex/seaf-foundation-agent-loop`.
-This page documents the Phase 2 local loop as it exists now. P2-012 CI
-hardening is still pending, so use the fake-provider paths for repeatable
-automation and treat Ollama commands as local smoke checks.
+Current slice context: Phase 2 complete on branch
+`codex/seaf-foundation-agent-loop`. This page documents the Phase 2 local loop
+as implemented. CI uses fake-provider paths for repeatable automation; Ollama
+commands are local live smoke checks.
 
 The local loop is disk-backed and review-first. Model output is untrusted
 working material. Schema validation, the deterministic policy gate, configured
@@ -102,7 +102,21 @@ The Ollama smoke loads the AgentBench-lite fixture, sends one structured local
 request, and requires response content with `ok == true`. If the model is not
 installed, the provider error includes an `ollama pull` hint.
 
+Verified locally on 2026-07-01 with `gemma4:e4b-mlx` installed:
+
+```bash
+cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx --json
+cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --fixture examples/agent-bench-lite --json
+```
+
+The model check passed through the local Ollama API, and the AgentBench-lite
+Ollama smoke returned `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
+`forbidden_violation_count = 0`, and `eval_weakening_accepted_count = 0`.
+
 ## Pending Work
 
-P2-012 still needs CI hardening. Until then, use fake-provider commands for
-automation and keep live Ollama checks as local developer smoke only.
+Phase 2 CI hardening is complete. Future work is to wire `seaf loop run` to
+live provider-backed role execution and policy-gated patch proposals. Until
+that exists, `loop bench --provider ollama` is the live model smoke path, while
+`loop run --provider ollama` records provider/model metadata and still executes
+the deterministic local runner.

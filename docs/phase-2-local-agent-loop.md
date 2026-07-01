@@ -380,8 +380,9 @@ Acceptance criteria:
 
 - Forbidden patches never apply.
 - Bad patches leave the working tree unchanged.
-- Allowed patch applies with `--apply-patch`.
-- Without `--apply-patch`, patch is only written to disk.
+- Allowed patch decisions are represented by policy-gate artifacts.
+- Current Phase 2 CLI loop execution persists deterministic artifacts only; live
+  policy-gated patch application remains future integration work.
 - Unified diff paths are parsed.
 - `git apply --check` runs before applying.
 - Forbidden path, eval/CI/policy/dependency/updater/signing/auth/billing,
@@ -645,20 +646,33 @@ Target Phase 2 demo commands:
 
 ```bash
 ollama pull gemma4:e4b-mlx
-cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx
+cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx --json
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
 cargo run -p seaf-cli -- loop run \
   --ticket examples/local-loop/tickets/add-health-command.yaml \
+  --run-id p2-local-demo \
+  --allow-dirty \
+  --json
+cargo run -p seaf-cli -- loop status --run-id p2-local-demo --json
+cargo run -p seaf-cli -- loop bench \
   --provider ollama \
   --model gemma4:e4b-mlx \
-  --apply-patch \
-  --max-iterations 1
-cargo run -p seaf-cli -- loop status .seaf/loops/runs/<run_id>
+  --fixture examples/agent-bench-lite \
+  --json
 cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml \
-  --goal-id local_agent_loop_mvp \
-  --patch-id <run_id> \
+  --loop-run .seaf/loops/runs/p2-local-demo/run.json \
+  --ticket examples/local-loop/tickets/add-health-command.yaml \
+  --output .seaf/evals/p2-local-demo-eval-report.json \
   --json
 ```
+
+Verified locally on 2026-07-01 after installing `gemma4:e4b-mlx`: the Ollama
+model check passed, and the full Ollama benchmark command above returned
+`ticket_count = 5`, `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
+`forbidden_violation_count = 0`, and `eval_weakening_accepted_count = 0`.
+`seaf loop run` remains deterministic in Phase 2; `--provider` and `--model`
+are run metadata there until a future live role-execution slice wires the
+provider through the full loop.
 
 Existing docs to read before implementation:
 
