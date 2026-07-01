@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 seaf-core = { path = "../seaf-core" }
+seaf-loop = { path = "../seaf-loop" }
 seaf-models = { path = "../seaf-models" }
 serde.workspace = true
 serde_json.workspace = true

@@ -8,8 +8,12 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seaf_core::{
     sha256_digest_file, templates, AgentTaskBrief, AgentTaskConstraints, CheckStatus, EvalCheck,
-    EvalDecision, EvalReport, FieldError, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy,
-    ValidationReport,
+    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, ReleaseCapsule,
+    RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext, TicketPriority,
+    TicketSpec, TicketStatus, ValidationReport,
+};
+use seaf_loop::{
+    ArtifactContent, LoopRunner, LoopRunnerConfig, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
@@ -55,6 +59,16 @@ enum Command {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    /// Work with local-loop tickets.
+    Ticket {
+        #[command(subcommand)]
+        command: TicketCommand,
+    },
+    /// Run and inspect deterministic local-loop executions.
+    Loop {
+        #[command(subcommand)]
+        command: LoopCommand,
     },
     /// Work with release capsules.
     Release {
@@ -107,6 +121,24 @@ enum EvalCommand {
 enum ModelCommand {
     /// Check that a local model provider can answer a structured request.
     Check(ModelCheckArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum TicketCommand {
+    /// Validate a local-loop ticket YAML or JSON file.
+    Validate(ValidateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopCommand {
+    /// Start a deterministic local-loop run for a ticket.
+    Run(LoopRunArgs),
+    /// Print persisted loop run status.
+    Status(LoopStatusArgs),
+    /// Resume a deterministic local-loop run.
+    Resume(LoopStatusArgs),
+    /// Run a deterministic smoke loop without contacting a model provider.
+    Smoke(LoopSmokeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -181,6 +213,54 @@ struct ModelCheckArgs {
     /// Request timeout in milliseconds.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopRunArgs {
+    /// Ticket file to validate and run.
+    #[arg(long)]
+    ticket: PathBuf,
+    /// Directory where loop run workspaces are written.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Stable run ID. Generated when omitted.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Provider metadata recorded in run.json. Execution remains deterministic.
+    #[arg(long, default_value = "fake")]
+    provider: String,
+    /// Model metadata recorded in run.json. Execution remains deterministic.
+    #[arg(long, default_value = "fake-local")]
+    model: String,
+    /// Allow starting a loop when the git working tree is dirty.
+    #[arg(long)]
+    allow_dirty: bool,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopStatusArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopSmokeArgs {
+    /// Directory where loop run workspaces are written.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -269,6 +349,21 @@ struct ModelCheckReport {
     error_kind: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct LoopCommandReport {
+    command: String,
+    run_id: String,
+    ticket_id: String,
+    goal_id: String,
+    provider: String,
+    model: String,
+    status: LoopStatus,
+    current_step: LoopStepName,
+    run_directory: String,
+    run_file: String,
+    next_action: String,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -301,6 +396,21 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Model {
             command: ModelCommand::Check(args),
         } => check_model(args),
+        Command::Ticket {
+            command: TicketCommand::Validate(args),
+        } => validate_file(args, "ticket", seaf_core::load_ticket_file),
+        Command::Loop {
+            command: LoopCommand::Run(args),
+        } => run_loop(args),
+        Command::Loop {
+            command: LoopCommand::Status(args),
+        } => loop_status(args),
+        Command::Loop {
+            command: LoopCommand::Resume(args),
+        } => resume_loop(args),
+        Command::Loop {
+            command: LoopCommand::Smoke(args),
+        } => smoke_loop(args),
         Command::Release {
             command: ReleaseCommand::Prepare(args),
         } => prepare_release(args),
@@ -548,6 +658,295 @@ fn model_check_request(model: &str, timeout_ms: u64) -> ModelRequest {
         temperature: 0.0,
         timeout_ms,
     }
+}
+
+fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
+    let ticket = seaf_core::load_ticket_file(&args.ticket)
+        .map_err(|report| CliFailure::validation(report, args.json))?;
+    ensure_clean_git_worktree(args.allow_dirty)?;
+    let run_id = match args.run_id {
+        Some(run_id) => {
+            validate_run_id(&run_id)?;
+            run_id
+        }
+        None => generated_run_id("run"),
+    };
+    let run = start_loop_to_completion(
+        &args.runs_root,
+        &run_id,
+        &ticket,
+        &args.provider,
+        &args.model,
+    )?;
+    finish_loop_command("run", &args.runs_root, &run, args.json)
+}
+
+fn loop_status(args: LoopStatusArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let run = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    finish_loop_command("status", &args.runs_root, &run, args.json)
+}
+
+fn resume_loop(args: LoopStatusArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    let mut step_runner = DeterministicStepRunner;
+    let mut runner = LoopRunner::resume(args.runs_root.clone(), &args.run_id, &mut step_runner)
+        .map_err(loop_runner_failure)?;
+    let run = runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)?
+        .clone();
+    finish_loop_command("resume", &args.runs_root, &run, args.json)
+}
+
+fn smoke_loop(args: LoopSmokeArgs) -> Result<(), CliFailure> {
+    let ticket = smoke_ticket();
+    let run_id = generated_run_id("smoke");
+    let run = start_loop_to_completion(
+        &args.runs_root,
+        &run_id,
+        &ticket,
+        "fake",
+        "deterministic-smoke",
+    )?;
+    finish_loop_command("smoke", &args.runs_root, &run, args.json)
+}
+
+fn start_loop_to_completion(
+    runs_root: &Path,
+    run_id: &str,
+    ticket: &TicketSpec,
+    provider: &str,
+    model: &str,
+) -> Result<LoopRun, CliFailure> {
+    let mut step_runner = DeterministicStepRunner;
+    let config = LoopRunnerConfig::for_ticket(
+        runs_root,
+        run_id,
+        ticket,
+        provider.to_string(),
+        model.to_string(),
+    );
+    let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    let run = runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)?
+        .clone();
+    Ok(run)
+}
+
+fn load_persisted_loop_run(
+    runs_root: &Path,
+    run_id: &str,
+    as_json: bool,
+) -> Result<LoopRun, CliFailure> {
+    let run_file = runs_root.join(run_id).join("run.json");
+    let run = seaf_core::load_loop_run_file(&run_file)
+        .map_err(|report| CliFailure::validation(report, as_json))?;
+
+    if !is_valid_run_id(&run.run_id) {
+        return Err(loop_run_validation_failure(
+            &run_file,
+            "run_id",
+            "must use only ASCII letters, numbers, '-' or '_'",
+            as_json,
+        ));
+    }
+
+    if run.run_id != run_id {
+        return Err(loop_run_validation_failure(
+            &run_file,
+            "run_id",
+            "must match requested --run-id",
+            as_json,
+        ));
+    }
+
+    Ok(run)
+}
+
+fn validate_run_id(run_id: &str) -> Result<(), CliFailure> {
+    if is_valid_run_id(run_id) {
+        Ok(())
+    } else {
+        Err(CliFailure::message(
+            "invalid run ID; use only ASCII letters, numbers, '-' or '_'".to_string(),
+        ))
+    }
+}
+
+fn is_valid_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.trim() == run_id
+        && run_id != "."
+        && run_id != ".."
+        && !Path::new(run_id).is_absolute()
+        && !run_id.contains('/')
+        && !run_id.contains('\\')
+        && run_id
+            .chars()
+            .all(|item| item.is_ascii_alphanumeric() || item == '-' || item == '_')
+}
+
+fn loop_run_validation_failure(
+    path: &Path,
+    field: &str,
+    message: &str,
+    as_json: bool,
+) -> CliFailure {
+    CliFailure::validation(
+        ValidationReport::invalid(
+            "loop_run",
+            Some(path),
+            vec![FieldError::new(field, message)],
+        ),
+        as_json,
+    )
+}
+
+fn finish_loop_command(
+    command: &str,
+    runs_root: &Path,
+    run: &LoopRun,
+    as_json: bool,
+) -> Result<(), CliFailure> {
+    let report = loop_command_report(command, runs_root, run);
+    if as_json {
+        print_json(&report)?;
+    } else {
+        println!(
+            "loop {} {}: status {:?}, current step {:?}",
+            report.command, report.run_id, report.status, report.current_step
+        );
+        println!("next action: {}", report.next_action);
+        println!("run file: {}", report.run_file);
+    }
+    Ok(())
+}
+
+fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCommandReport {
+    let run_directory = runs_root.join(&run.run_id);
+    LoopCommandReport {
+        command: command.to_string(),
+        run_id: run.run_id.clone(),
+        ticket_id: run.ticket_id.clone(),
+        goal_id: run.goal_id.clone(),
+        provider: run.provider.clone(),
+        model: run.model.clone(),
+        status: run.status,
+        current_step: run.current_step,
+        run_file: run_directory.join("run.json").display().to_string(),
+        run_directory: run_directory.display().to_string(),
+        next_action: next_loop_action(run),
+    }
+}
+
+fn next_loop_action(run: &LoopRun) -> String {
+    match run.status {
+        LoopStatus::Pending | LoopStatus::Running => {
+            "resume the run to continue pending loop steps".to_string()
+        }
+        LoopStatus::Blocked => {
+            "inspect the blocked step artifact, resolve the blocker, then resume".to_string()
+        }
+        LoopStatus::Failed => {
+            "inspect log.md and the failed step response before retrying".to_string()
+        }
+        LoopStatus::Passed | LoopStatus::Completed => {
+            "review run artifacts before applying or committing any changes".to_string()
+        }
+    }
+}
+
+fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<(), CliFailure> {
+    if allow_dirty {
+        return Ok(());
+    }
+
+    let output = ProcessCommand::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|err| {
+            CliFailure::message(format!(
+                "could not inspect git working tree: {err}; rerun with --allow-dirty to skip this guard"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        return Err(CliFailure::message(format!(
+            "could not inspect git working tree{suffix}; rerun from a git repository or pass --allow-dirty"
+        )));
+    }
+
+    if !output.stdout.is_empty() {
+        return Err(CliFailure::message(
+            "refusing to start loop with a dirty git working tree; commit or stash changes, or rerun with --allow-dirty"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn smoke_ticket() -> TicketSpec {
+    TicketSpec {
+        ticket_id: "T-SMOKE-LOCAL".to_string(),
+        goal_id: "local_agent_loop_smoke".to_string(),
+        title: "Deterministic local loop smoke".to_string(),
+        status: TicketStatus::Ready,
+        priority: TicketPriority::P2,
+        problem: "Verify the loop workspace and state machine without contacting a model provider."
+            .to_string(),
+        research_questions: vec!["Can the deterministic runner write all loop artifacts?".to_string()],
+        context: TicketContext {
+            relevant_files: vec!["crates/seaf-cli/src/main.rs".to_string()],
+            forbidden_files: vec!["secrets/**".to_string()],
+        },
+        autonomy: TicketAutonomy {
+            level: 1,
+            apply_patch: false,
+            allow_shell_commands: vec!["cargo test -p seaf-cli".to_string()],
+        },
+        acceptance_criteria: vec![
+            "Loop run infrastructure writes run.json, prompts, responses, artifacts, and log output."
+                .to_string(),
+        ],
+        eval: None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeterministicStepRunner;
+
+impl StepRunner for DeterministicStepRunner {
+    fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
+        Ok(format!(
+            "# {:?}\n\nDeterministic local-loop request for CI smoke execution.\n",
+            step
+        ))
+    }
+
+    fn run_step(&mut self, step: LoopStepName, _request: &str) -> Result<StepOutput, RunnerError> {
+        Ok(
+            StepOutput::completed(format!("deterministic local-loop response for {:?}", step))
+                .with_artifact(ArtifactContent::markdown(format!(
+                    "# {:?}\n\nDeterministic artifact generated by seaf-cli fake runner.\n",
+                    step
+                ))),
+        )
+    }
+}
+
+fn loop_runner_failure(error: RunnerError) -> CliFailure {
+    CliFailure::message(format!("loop runner failed: {error}"))
 }
 
 fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
@@ -868,6 +1267,14 @@ fn current_timestamp() -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     format!("unix:{seconds}")
+}
+
+fn generated_run_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{}-{nanos}", sanitize_id(prefix), std::process::id())
 }
 
 fn sanitize_id(value: &str) -> String {
