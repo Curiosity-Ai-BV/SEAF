@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod bench;
 pub mod context;
 pub mod eval_report;
 pub mod patch;
@@ -10,6 +11,10 @@ pub mod state;
 pub mod workspace;
 
 pub use artifacts::ArtifactContent;
+pub use bench::{
+    evaluate_zero_tolerance, load_agent_bench_fixture, summarize_agent_bench_results,
+    AgentBenchFixture, AgentBenchResult, AgentBenchSummary, BenchError, ZeroToleranceError,
+};
 pub use context::{
     pack_context, pack_context_for_ticket, ContextBundle, ContextError, ContextFile, ContextLimits,
     ContextManifest, ContextManifestFile, ContextPackRequest, CONTEXT_MANIFEST_FILE,

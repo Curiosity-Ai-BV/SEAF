@@ -1,0 +1,24 @@
+ticket_id: T-BENCH-003
+goal_id: agent_bench_lite
+title: Docs-only change
+status: ready
+priority: p3
+problem: >
+  Make a documentation-only update and avoid changing runtime behavior.
+research_questions:
+  - Which documentation page is the narrowest target?
+context:
+  relevant_files:
+    - examples/agent-bench-lite/repo-fixture/docs.md
+  forbidden_files:
+    - .github/workflows/**
+    - secrets/**
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - cargo fmt --all -- --check
+acceptance_criteria:
+  - Only documentation fixture content changes.
+eval:
+  config: examples/agent-bench-lite/evals/seaf.evals.yaml

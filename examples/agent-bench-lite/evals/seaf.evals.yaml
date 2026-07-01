@@ -1,0 +1,4 @@
+evals:
+  required:
+    - name: agent_bench_lite_static_fixture
+      command: "printf agent-bench-lite"

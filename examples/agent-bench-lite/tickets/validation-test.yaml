@@ -1,0 +1,25 @@
+ticket_id: T-BENCH-002
+goal_id: agent_bench_lite
+title: Validation test
+status: ready
+priority: p2
+problem: >
+  Add or update validation coverage for a local-loop behavior without weakening
+  the acceptance criteria.
+research_questions:
+  - Which validation failure should the test make visible?
+context:
+  relevant_files:
+    - examples/agent-bench-lite/repo-fixture/validation.txt
+  forbidden_files:
+    - .github/workflows/**
+    - secrets/**
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - cargo test -p seaf-loop bench
+acceptance_criteria:
+  - Validation coverage documents the reason the behavior matters.
+eval:
+  config: examples/agent-bench-lite/evals/seaf.evals.yaml

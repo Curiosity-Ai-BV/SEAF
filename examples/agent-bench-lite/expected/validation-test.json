@@ -1,0 +1,10 @@
+{
+  "ticket_id": "T-BENCH-002",
+  "schema_valid": true,
+  "repair_success": true,
+  "patch_applied": true,
+  "eval_passed": true,
+  "forbidden_violation": false,
+  "eval_weakening_accepted": false,
+  "latency_ms": 110
+}

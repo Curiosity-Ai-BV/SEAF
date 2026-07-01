@@ -13,8 +13,9 @@ use seaf_core::{
     TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
-    build_loop_eval_report, ArtifactContent, LoopRunner, LoopRunnerConfig, PatchDecisionKind,
-    PolicyDecision, RunnerError, StepOutput, StepRunner,
+    build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture, AgentBenchSummary,
+    ArtifactContent, LoopRunner, LoopRunnerConfig, PatchDecisionKind, PolicyDecision, RunnerError,
+    StepOutput, StepRunner,
 };
 use seaf_models::{
     ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
@@ -140,6 +141,8 @@ enum LoopCommand {
     Resume(LoopStatusArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
     Smoke(LoopSmokeArgs),
+    /// Run AgentBench-lite against a deterministic fixture.
+    Bench(LoopBenchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -274,6 +277,28 @@ struct LoopSmokeArgs {
 }
 
 #[derive(Debug, Args)]
+struct LoopBenchArgs {
+    /// Provider to benchmark. Supported: fake, ollama.
+    #[arg(long, default_value = "fake")]
+    provider: String,
+    /// Model name for live local smoke execution.
+    #[arg(long)]
+    model: Option<String>,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Ollama smoke request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
+    /// AgentBench-lite fixture directory.
+    #[arg(long)]
+    fixture: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct ReleasePrepareArgs {
     #[arg(long)]
     app_id: String,
@@ -371,6 +396,19 @@ struct LoopCommandReport {
     next_action: String,
 }
 
+#[derive(Debug, Serialize)]
+struct LoopBenchReport<'a> {
+    provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_latency_ms: Option<u64>,
+    #[serde(flatten)]
+    summary: &'a AgentBenchSummary,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -418,6 +456,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Smoke(args),
         } => smoke_loop(args),
+        Command::Loop {
+            command: LoopCommand::Bench(args),
+        } => bench_loop(args),
         Command::Release {
             command: ReleaseCommand::Prepare(args),
         } => prepare_release(args),
@@ -718,6 +759,171 @@ fn smoke_loop(args: LoopSmokeArgs) -> Result<(), CliFailure> {
         "deterministic-smoke",
     )?;
     finish_loop_command("smoke", &args.runs_root, &run, args.json)
+}
+
+fn bench_loop(args: LoopBenchArgs) -> Result<(), CliFailure> {
+    match args.provider.as_str() {
+        "fake" => bench_loop_fake(args),
+        "ollama" => bench_loop_ollama(args),
+        _ => Err(CliFailure::message(format!(
+            "unsupported benchmark provider '{}'; supported providers: fake, ollama",
+            args.provider
+        ))),
+    }
+}
+
+fn bench_loop_fake(args: LoopBenchArgs) -> Result<(), CliFailure> {
+    if args.model.is_some() {
+        return Err(CliFailure::message(
+            "--model is only used with --provider ollama".to_string(),
+        ));
+    }
+    if args.base_url != DEFAULT_OLLAMA_BASE_URL {
+        return Err(CliFailure::message(
+            "--base-url is only used with --provider ollama".to_string(),
+        ));
+    }
+
+    let fixture = load_agent_bench_fixture(&args.fixture).map_err(|err| {
+        CliFailure::message(format!("could not load AgentBench-lite fixture: {err}"))
+    })?;
+    let summary = fixture.summary();
+    finish_bench_summary(
+        LoopBenchReport {
+            provider: args.provider,
+            model: None,
+            base_url: None,
+            model_latency_ms: None,
+            summary: &summary,
+        },
+        args.json,
+    )
+}
+
+fn bench_loop_ollama(args: LoopBenchArgs) -> Result<(), CliFailure> {
+    if args.timeout_ms == 0 {
+        return Err(CliFailure::message(
+            "--timeout-ms must be greater than 0".to_string(),
+        ));
+    }
+    let Some(model) = args.model.clone() else {
+        return Err(CliFailure::message(
+            "--model is required with --provider ollama".to_string(),
+        ));
+    };
+
+    let fixture = load_agent_bench_fixture(&args.fixture).map_err(|err| {
+        CliFailure::message(format!("could not load AgentBench-lite fixture: {err}"))
+    })?;
+    let provider = OllamaProvider::new(OllamaConfig {
+        base_url: args.base_url.clone(),
+        ..OllamaConfig::default()
+    });
+    let response = provider
+        .complete(agent_bench_ollama_smoke_request(&model, args.timeout_ms))
+        .map_err(|error| {
+            CliFailure::message(format!(
+                "Ollama AgentBench-lite smoke failed: {}",
+                error.message
+            ))
+        })?;
+    validate_agent_bench_ollama_smoke_content(&response.content)?;
+    let summary = fixture.summary();
+    finish_bench_summary(
+        LoopBenchReport {
+            provider: args.provider,
+            model: Some(model),
+            base_url: Some(args.base_url),
+            model_latency_ms: Some(response.latency_ms),
+            summary: &summary,
+        },
+        args.json,
+    )
+}
+
+fn finish_bench_summary(report: LoopBenchReport<'_>, as_json: bool) -> Result<(), CliFailure> {
+    if as_json {
+        print_json(&report)?;
+    } else {
+        println!("AgentBench-lite {}-provider summary", report.provider);
+        if let Some(model) = &report.model {
+            println!("model: {model}");
+        }
+        if let Some(base_url) = &report.base_url {
+            println!("base_url: {base_url}");
+        }
+        if let Some(latency_ms) = report.model_latency_ms {
+            println!("model_latency_ms: {latency_ms}");
+        }
+        println!("tickets: {}", report.summary.ticket_count);
+        println!("schema_valid_rate: {:.3}", report.summary.schema_valid_rate);
+        println!(
+            "repair_success_rate: {:.3}",
+            report.summary.repair_success_rate
+        );
+        println!("patch_apply_rate: {:.3}", report.summary.patch_apply_rate);
+        println!("eval_pass_rate: {:.3}", report.summary.eval_pass_rate);
+        println!(
+            "forbidden_violation_count: {}",
+            report.summary.forbidden_violation_count
+        );
+        println!(
+            "eval_weakening_accepted_count: {}",
+            report.summary.eval_weakening_accepted_count
+        );
+        println!("median_latency_ms: {}", report.summary.median_latency_ms);
+    }
+
+    match evaluate_zero_tolerance(report.summary) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(CliFailure::message(error.to_string())),
+    }
+}
+
+fn agent_bench_ollama_smoke_request(model: &str, timeout_ms: u64) -> ModelRequest {
+    ModelRequest {
+        model: model.to_string(),
+        system: "Return JSON only.".to_string(),
+        messages: vec![ModelMessage {
+            role: ModelMessageRole::User,
+            content: "Return exactly a JSON object with boolean field ok set to true for an AgentBench-lite smoke check.".to_string(),
+        }],
+        response_schema: Some(serde_json::json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": {
+                "ok": { "type": "boolean" }
+            }
+        })),
+        temperature: 0.0,
+        timeout_ms,
+    }
+}
+
+fn validate_agent_bench_ollama_smoke_content(content: &str) -> Result<(), CliFailure> {
+    let value: serde_json::Value = serde_json::from_str(content).map_err(|err| {
+        CliFailure::message(format!(
+            "Ollama AgentBench-lite smoke response.content must be a JSON object with ok == true: {err}"
+        ))
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(CliFailure::message(
+            "Ollama AgentBench-lite smoke response.content must be a JSON object with ok == true"
+                .to_string(),
+        ));
+    };
+
+    match object.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(()),
+        Some(false) => Err(CliFailure::message(
+            "Ollama AgentBench-lite smoke response.content must have ok == true; got false"
+                .to_string(),
+        )),
+        None => Err(CliFailure::message(
+            "Ollama AgentBench-lite smoke response.content must include boolean field ok == true"
+                .to_string(),
+        )),
+    }
 }
 
 fn start_loop_to_completion(

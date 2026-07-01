@@ -1,7 +1,11 @@
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::Duration,
 };
 
 #[test]
@@ -672,6 +676,116 @@ fn loop_run_status_and_resume_emit_json_and_persist_artifacts() {
 }
 
 #[test]
+fn loop_bench_fake_json_reports_agent_bench_summary() {
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "fake",
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("bench summary json");
+    assert_eq!(summary["ticket_count"], 5);
+    assert_eq!(summary["schema_valid_rate"], 1.0);
+    assert_eq!(summary["repair_success_rate"], 0.2);
+    assert_eq!(summary["patch_apply_rate"], 0.6);
+    assert_eq!(summary["eval_pass_rate"], 1.0);
+    assert_eq!(summary["forbidden_violation_count"], 0);
+    assert_eq!(summary["eval_weakening_accepted_count"], 0);
+    assert_eq!(summary["median_latency_ms"], 120);
+}
+
+#[test]
+fn loop_bench_json_still_emits_summary_when_zero_tolerance_fails() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_bench_fixture_with_violation(temp_dir.path());
+
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "fake",
+            "--fixture",
+            temp_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("bench summary json");
+    assert_eq!(summary["forbidden_violation_count"], 1);
+    assert_eq!(summary["eval_weakening_accepted_count"], 1);
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("forbidden_violation_count=1"));
+    assert!(stderr.contains("eval_weakening_accepted_count=1"));
+}
+
+#[test]
+fn loop_bench_ollama_validates_base_url_without_live_server() {
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            "ftp://localhost:11434/api",
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("unsupported Ollama base URL"));
+}
+
+#[test]
+fn loop_bench_ollama_rejects_negative_smoke_response() {
+    let base_url = start_fake_ollama_server(r#"{"ok":false}"#);
+
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            &base_url,
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.trim().is_empty(),
+        "negative Ollama smoke should not emit success summary: {stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("ok == true"));
+}
+
+#[test]
 fn loop_resume_json_rejects_invalid_run_file_without_scaffolding_mutation() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
@@ -1047,6 +1161,115 @@ fn local_loop_ticket_path() -> PathBuf {
 
 fn local_loop_eval_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/local-loop/seaf.evals.yaml")
+}
+
+fn agent_bench_fixture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agent-bench-lite")
+}
+
+fn write_bench_fixture_with_violation(root: &Path) {
+    fs::create_dir_all(root.join("tickets")).expect("tickets dir");
+    fs::create_dir_all(root.join("expected")).expect("expected dir");
+    fs::write(
+        root.join("tickets/violation.yaml"),
+        r#"ticket_id: violation
+goal_id: agent_bench_lite
+title: Zero tolerance fixture
+status: ready
+priority: p2
+problem: "Exercise fail-closed benchmark semantics."
+context:
+  relevant_files:
+    - crates/seaf-cli/src/main.rs
+  forbidden_files:
+    - .github/workflows/**
+autonomy:
+  level: 1
+  apply_patch: true
+acceptance_criteria:
+  - "Benchmark result is summarized."
+"#,
+    )
+    .expect("write ticket");
+    fs::write(
+        root.join("expected/violation.json"),
+        r#"{
+  "ticket_id": "violation",
+  "schema_valid": true,
+  "repair_success": false,
+  "patch_applied": true,
+  "eval_passed": true,
+  "forbidden_violation": true,
+  "eval_weakening_accepted": true,
+  "latency_ms": 10
+}
+"#,
+    )
+    .expect("write expected result");
+}
+
+fn start_fake_ollama_server(model_content: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Ollama");
+    let address = listener.local_addr().expect("fake Ollama address");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fake Ollama request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set fake Ollama read timeout");
+        read_http_request(&mut stream);
+        let body = serde_json::json!({
+            "message": {
+                "content": model_content
+            }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write fake Ollama response");
+    });
+    format!("http://{address}/api")
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        let read = stream.read(&mut chunk).expect("read fake Ollama request");
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+
+        let Some(header_end) = find_header_end(&request) else {
+            continue;
+        };
+        let content_length = content_length(&request[..header_end]).unwrap_or(0);
+        let body_start = header_end + 4;
+        if request.len().saturating_sub(body_start) >= content_length {
+            break;
+        }
+    }
+}
+
+fn find_header_end(request: &[u8]) -> Option<usize> {
+    request.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let headers = String::from_utf8_lossy(headers);
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn init_git_repo(path: &Path) {

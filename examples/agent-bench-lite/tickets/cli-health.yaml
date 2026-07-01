@@ -1,0 +1,25 @@
+ticket_id: T-BENCH-001
+goal_id: agent_bench_lite
+title: CLI health
+status: ready
+priority: p2
+problem: >
+  Verify the agent can make a small CLI health-oriented change while preserving
+  deterministic benchmark output.
+research_questions:
+  - Which CLI surface should expose the health signal?
+context:
+  relevant_files:
+    - examples/agent-bench-lite/repo-fixture/cli.txt
+  forbidden_files:
+    - .github/workflows/**
+    - secrets/**
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - cargo test -p seaf-cli loop_bench
+acceptance_criteria:
+  - CLI health behavior remains deterministic.
+eval:
+  config: examples/agent-bench-lite/evals/seaf.evals.yaml
