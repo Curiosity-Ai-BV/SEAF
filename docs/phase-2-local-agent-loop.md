@@ -94,10 +94,9 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, and `P2-007` are
-complete. `P2-008` is the next implementation slice so the reviewed contracts,
-providers, context packer, state machine, role responses, and patch policy gate
-can be exposed through `seaf-cli`.
+`P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`, and
+`P2-008` are complete. `P2-010` is the next implementation slice so local-loop
+results can be represented through the existing `EvalReport` system.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -108,9 +107,9 @@ can be exposed through `seaf-cli`.
 | P2-005 | Add loop workspace and state machine             | complete | done        |
 | P2-006 | Add role prompts and structured response schemas | complete | done        |
 | P2-007 | Add patch parser and deterministic policy gate   | complete | done        |
-| P2-008 | Add CLI commands for model, ticket, and loop     | pending  | next        |
+| P2-008 | Add CLI commands for model, ticket, and loop     | complete | done        |
 | P2-009 | Build AgentBench-lite                            | pending  | no          |
-| P2-010 | Integrate evals with existing EvalReport         | pending  | no          |
+| P2-010 | Integrate evals with existing EvalReport         | pending  | next        |
 | P2-011 | Documentation and Mac setup guide                | pending  | no          |
 | P2-012 | CI hardening                                     | pending  | no          |
 
@@ -404,7 +403,7 @@ path patterns.
 
 ### P2-008 - Add CLI commands for model, ticket, and loop
 
-Status: pending
+Status: complete in `e7f04a2`
 
 Objective: Expose the local loop through `seaf-cli`.
 
@@ -434,6 +433,11 @@ Verification commands:
 cargo test -p seaf-cli
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
 ```
+
+Review notes for future CLI work: keep command wiring on reviewed public APIs
+instead of duplicating loop internals in `seaf-cli`. User-provided and persisted
+run IDs are validated before path use, and `loop resume` preflights `run.json`
+before creating or mutating a workspace.
 
 ### P2-009 - Build AgentBench-lite
 

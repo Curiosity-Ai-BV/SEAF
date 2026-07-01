@@ -129,3 +129,20 @@ re-reviews approved. Final checks passed: `cargo test --workspace`,
 `pnpm format:check`, and `git diff --check`. Manual smoke reached local Ollama
 but reported missing `gemma4:e4b-mlx` with an `ollama pull` hint. Committed as
 `3fe0744`.
+
+## 2026-07-01 act | P2-008 local loop CLI
+
+Added `ticket validate`, `loop run`, `loop status`, `loop resume`, and
+`loop smoke` commands, a local `seaf-loop` CLI dependency, dirty-tree refusal
+for loop runs, deterministic fake-provider loop execution, JSON outputs for
+automation, and human-readable next-action summaries.
+
+## 2026-07-01 verify | P2-008 local loop CLI
+
+Spec review approved the CLI surface and public-API scope. Code-quality review
+required safe user run ID validation, resume preflight before workspace
+scaffolding, persisted run ID validation, and persisted/requested run ID
+matching. After fixes, spec and quality re-reviews approved. Final checks
+passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `e7f04a2`.
