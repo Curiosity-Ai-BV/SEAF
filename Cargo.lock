@@ -393,6 +393,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "seaf-core",
+ "seaf-loop",
+ "seaf-models",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -417,6 +419,26 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "seaf-core",
+ "serde_json",
+]
+
+[[package]]
+name = "seaf-loop"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "seaf-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "seaf-models"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 

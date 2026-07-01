@@ -1,0 +1,21 @@
+ticket_id: ""
+goal_id: ""
+title: ""
+status: ready
+priority: p1
+problem: ""
+research_questions:
+  - ""
+context:
+  relevant_files:
+    - ""
+  forbidden_files:
+    - ""
+autonomy:
+  level: 9
+  apply_patch: true
+  allow_shell_commands:
+    - ""
+acceptance_criteria: []
+eval:
+  config: ""

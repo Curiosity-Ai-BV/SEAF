@@ -35,3 +35,203 @@ Replaced the fail-closed eval placeholder with a local eval runner, task brief g
 ## 2026-06-30 verify | slice 4 spec review
 
 Spec review found initialized eval templates could not be parsed because `thresholds` was not accepted, and release preparation accepted contradictory rejected/high-risk EvalReports. Accepted optional thresholds metadata and tightened EvalReport/release validation.
+
+## 2026-07-01 gather | phase 2 spec authoring
+
+Read the Phase 2 local-agent-loop plan, existing architecture/agent-loop docs, and current loop tracking files. Confirmed the active branch is `codex/seaf-foundation-agent-loop` and the next work should remain documentation-only.
+
+## 2026-07-01 act | phase 2 ticket specs
+
+Created `docs/phase-2-local-agent-loop.md` with overview, scope boundary, review protocol, current pending status, P2-001 selection, and ticket specs for P2-001 through P2-012.
+
+## 2026-07-01 verify | phase 2 spec authoring
+
+Ran `pnpm format:check` and `git diff --check`; both passed after formatting the new Phase 2 spec with Prettier.
+
+## 2026-07-01 act | P2-001 contracts
+
+Added `TicketSpec` and `LoopRun` contracts, JSON schemas, and local-loop fixtures. The implementation stayed in `seaf-core`, `specs/`, and `examples/local-loop/`.
+
+## 2026-07-01 verify | P2-001 contracts
+
+Spec review initially required durable invalid/valid fixtures and alignment with the plan's section 7.1 ticket example. Code-quality review then required tightening `policy_decisions` from arbitrary JSON to non-empty object entries. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `65fc489`.
+
+## 2026-07-01 act | P2-002 model provider
+
+Added the `seaf-models` crate with provider-neutral request/response/error DTOs, a synchronous `ModelProvider` trait, and a deterministic fake provider. The fake provider records requests and replays scripted responses without network access.
+
+## 2026-07-01 verify | P2-002 model provider
+
+Spec review accepted the mechanical `Cargo.lock` update for the new local workspace crate. Code-quality review required finite-temperature serde guards, atomic fake-provider state, and fail-closed DTO tests. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `946aa4d`.
+
+## 2026-07-01 act | P2-004 context packer
+
+Added the `seaf-loop` crate with local context packing, default safety excludes, ticket/policy forbidden-path filtering, UTF-8-safe byte limits, SHA-256 digests, warnings, and `context-manifest.json` writing. The manifest records metadata and excludes file content; the bundle carries the prompt content and untrusted-context marker.
+
+## 2026-07-01 verify | P2-004 context packer
+
+Spec review approved the crate scope and acceptance criteria. Code-quality review approved path normalization, symlink escape blocking, manifest/content separation, and byte-limit behavior, with a non-blocking follow-up for direct path-safety regression tests. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `5f36eba`.
+
+## 2026-07-01 act | P2-005 state machine
+
+Added durable loop workspace/state infrastructure in `seaf-loop`: run creation/resume, `run.json` persistence, prompt/response/artifact/log writing, attempt-indexed prompt/response artifacts, rerun-from reset, and a small step-runner test seam.
+
+## 2026-07-01 verify | P2-005 state machine
+
+Spec review required request persistence before step execution, attempt-indexed prompt/response artifacts, and a parseable empty context manifest. Code-quality review required duplicate-run protection, terminal `passed` semantics, persisted-running resume tests, blocked/failed output tests, and safe artifact extension handling. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `af7a2fa`.
+
+## 2026-07-01 act | P2-006 role responses
+
+Added local agent role prompts, response DTOs, handcrafted response schemas,
+fail-closed parsing, one-shot invalid-JSON repair, developer patch-field
+enforcement, reviewer issue arrays, and valid/invalid model-response fixtures.
+
+## 2026-07-01 verify | P2-006 role responses
+
+Spec review approved the P2-006 scope and acceptance criteria. Code-quality
+review required status-aware developer patch validation and explicit role
+mismatch regression coverage. After fixes, spec and quality re-reviews approved.
+Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `bbc5665`.
+
+## 2026-07-01 act | P2-007 patch policy gate
+
+Added unified diff parsing, safe path normalization, binary-patch detection,
+policy/category review gating, explicit apply gating, a testable `git apply`
+runner seam, patch artifacts, and structured `PolicyDecision` artifacts.
+
+## 2026-07-01 verify | P2-007 patch policy gate
+
+Spec review approved the initial implementation. Code-quality review required
+fail-closed malformed `diff --git` headers, clearer category-key versus
+path-pattern review policy semantics, and a separate details field for git
+command diagnostics. After fixes, spec and quality re-reviews approved. Final
+checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `0e5f9e5`.
+
+## 2026-07-01 act | P2-003 Ollama provider
+
+Added a dependency-free Ollama provider behind `ModelProvider`, request-builder
+tests, an injectable HTTP client, a `seaf model check --provider ollama`
+command, and a mechanical CLI dependency on `seaf-models`.
+
+## 2026-07-01 verify | P2-003 Ollama provider
+
+Spec review approved the provider and CLI scope. Code-quality review required
+trying all resolved localhost addresses before failing and avoiding missing-model
+pull hints for generic HTTP 404 API-root errors. After fixes, spec and quality
+re-reviews approved. Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Manual smoke reached local Ollama
+but reported missing `gemma4:e4b-mlx` with an `ollama pull` hint. Committed as
+`3fe0744`.
+
+## 2026-07-01 act | P2-008 local loop CLI
+
+Added `ticket validate`, `loop run`, `loop status`, `loop resume`, and
+`loop smoke` commands, a local `seaf-loop` CLI dependency, dirty-tree refusal
+for loop runs, deterministic fake-provider loop execution, JSON outputs for
+automation, and human-readable next-action summaries.
+
+## 2026-07-01 verify | P2-008 local loop CLI
+
+Spec review approved the CLI surface and public-API scope. Code-quality review
+required safe user run ID validation, resume preflight before workspace
+scaffolding, persisted run ID validation, and persisted/requested run ID
+matching. After fixes, spec and quality re-reviews approved. Final checks
+passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `e7f04a2`.
+
+## 2026-07-01 act | P2-010 EvalReport integration
+
+Added loop-to-`EvalReport` integration in `seaf-loop`, optional
+`seaf eval run --loop-run --ticket` CLI mode, a deterministic local-loop eval
+config, and tests for loop identity binding, required loop checks, rejected
+policy gates, command-mode backward compatibility, and product-path loop eval.
+
+## 2026-07-01 verify | P2-010 EvalReport integration
+
+Spec review approved the scope and acceptance coverage. Code-quality review
+required loop artifact validation before command execution, product-path policy
+evidence, policy decision `patch_id` binding to `run_id`, and no-op synthetic
+policy evidence with `apply_requested = false`. After fixes, spec and quality
+re-reviews approved. Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, `git diff --check`, and
+`cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --goal-id local_agent_loop_mvp --patch-id test --json`.
+Committed as `1e86622`.
+
+## 2026-07-01 spec | P2-009 AgentBench-lite scope
+
+Amended the P2-009 ticket spec and current contract to make the benchmark
+implementation scope reviewable: explicit AgentBench-lite fixture paths,
+optional focused `seaf-loop` bench helper/tests, `loop bench` CLI wiring and
+CLI tests, plus no-new-dependency preference. Clarified that fake-provider
+execution is deterministic and CI-safe, Ollama is local-smoke only, JSON
+summaries must include all required metrics, forbidden and eval-weakening
+accepted counts are zero-tolerance failures, the fixture includes the five
+initial tickets, and tests cover fake-provider summary plus zero-tolerance
+failure handling.
+
+## 2026-07-01 act | P2-009 AgentBench-lite
+
+Added deterministic AgentBench-lite fixture loading and summary logic in
+`seaf-loop`, `seaf loop bench` CLI wiring, a five-ticket fixture under
+`examples/agent-bench-lite`, zero-tolerance failure handling, local Ollama smoke
+execution, and focused benchmark/CLI tests.
+
+## 2026-07-01 verify | P2-009 AgentBench-lite
+
+Spec review required the Ollama path to perform real local smoke execution
+rather than a placeholder. Code-quality review required fail-closed fixture file
+loading, overflow-safe median calculation, Ollama smoke response validation, and
+README alignment. After fixes, spec and quality re-reviews approved. Final
+checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, `git diff --check`, and
+`cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json`.
+Manual Ollama smoke reached local Ollama and failed actionably because
+`gemma4:e4b-mlx` is not installed, with an `ollama pull` hint. Committed as
+`c711e04`.
+
+## 2026-07-01 act | P2-011 local loop docs
+
+Added the local agent-loop guide, Gemma/Ollama Mac setup guide, loop eval guide,
+local security-boundary guide, and local-loop example README. The docs cover the
+full demo path, local-only boundaries, untrusted model output, deterministic
+gates, recovery with `loop status`/`loop resume`, artifact locations, CI-safe
+fake commands, Ollama smoke behavior, and pending P2-012 CI hardening.
+
+## 2026-07-01 verify | P2-011 local loop docs
+
+Spec and docs-quality reviews approved. Quality review noted non-blocking
+wording risks around fixed demo run IDs and eval policy-evidence timing; the
+docs were clarified before commit. Final checks passed: `pnpm format:check`,
+`git diff --check`, `cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml`,
+and `cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json`.
+Committed as `a070c4f`.
+
+## 2026-07-01 act | P2-012 CI hardening
+
+Updated `.github/workflows/ci.yml` to keep the Rust job on formatting, Clippy,
+and `cargo test --workspace`, then added named guardrail steps for schema
+fixtures, fake loop smoke without Ollama, AgentBench-lite fake provider output,
+forbidden patch policy coverage, ticket validation, and AgentBench-lite CLI
+execution. The TypeScript job remains on frozen pnpm install, format, lint,
+typecheck, test, and build.
+
+## 2026-07-01 verify | P2-012 CI hardening
+
+Spec and CI-quality reviews approved. Review confirmed that focused test filters
+run real tests, CI does not require Ollama, and TypeScript checks remain intact.
+Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm install --frozen-lockfile`, `pnpm format:check`, `pnpm lint`,
+`pnpm typecheck`, `pnpm test`, `pnpm build`, `git diff --check`, and all focused
+P2-012 commands now listed in CI. Committed as `084688c`.

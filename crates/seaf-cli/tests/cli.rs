@@ -1,7 +1,11 @@
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::Duration,
 };
 
 #[test]
@@ -204,8 +208,7 @@ fn eval_run_accepts_initialized_template_thresholds() {
         .output()
         .expect("run eval");
 
-    assert!(!output.status.success());
-    assert!(report_path.exists());
+    assert!(report_path.exists(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"eval_report_id\""));
 }
@@ -242,6 +245,844 @@ fn eval_run_fails_closed_when_required_check_fails() {
     assert!(stdout.contains("\"passed\": false"));
     assert!(stdout.contains("\"decision\": \"reject\""));
     assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_accepts_local_loop_config_with_explicit_ids() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let report_path = temp_dir.path().join("eval-report.json");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--goal-id",
+            "local_agent_loop_mvp",
+            "--patch-id",
+            "test",
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"patch_id\": \"test\""));
+    assert!(stdout.contains("\"goal_id\": \"local_agent_loop_mvp\""));
+    assert!(stdout.contains("\"passed\": true"));
+    assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_loop_mode_uses_run_and_ticket_identity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let run_path = temp_dir.path().join("run.json");
+    let report_path = temp_dir.path().join("eval-report.json");
+    write_passing_loop_run_file(&run_path, "loop_cli_001");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], "loop_cli_001");
+    assert_eq!(report["goal_id"], "local_agent_loop_mvp");
+    assert_eq!(report["decision"], "approve_for_human_review");
+    let check_names: Vec<&str> = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|check| check["name"].as_str().expect("check name"))
+        .collect();
+    for expected in [
+        "schema_validation",
+        "patch_policy_gate",
+        "spec_review",
+        "output_review",
+        "local_loop_smoke",
+    ] {
+        assert!(
+            check_names.contains(&expected),
+            "report should include {expected:?}; got {check_names:?}"
+        );
+    }
+    assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_loop_mode_requires_ticket_with_loop_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let run_path = temp_dir.path().join("run.json");
+    write_passing_loop_run_file(&run_path, "loop_cli_001");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("--loop-run and --ticket must be provided together"));
+}
+
+#[test]
+fn eval_run_loop_mode_validates_artifacts_before_running_checks() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config_path = temp_dir.path().join("seaf.evals.yaml");
+    let marker_path = temp_dir.path().join("marker");
+    let report_path = temp_dir.path().join("eval-report.json");
+    let run_path = temp_dir.path().join("invalid-run.json");
+    fs::write(
+        &config_path,
+        format!(
+            r#"evals:
+  required:
+    - name: side_effect
+      command: "printf touched > {}"
+"#,
+            marker_path.display()
+        ),
+    )
+    .expect("write eval config");
+    fs::write(&run_path, "{").expect("write invalid run");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            config_path.to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(!output.status.success());
+    assert!(!marker_path.exists(), "eval command should not run");
+    assert!(!report_path.exists(), "EvalReport should not be written");
+    assert!(
+        !temp_dir.path().join("logs").exists(),
+        "logs should not be created before artifact validation"
+    );
+}
+
+#[test]
+fn model_check_json_reports_invalid_ollama_base_url_without_live_server() {
+    let output = seaf()
+        .args([
+            "model",
+            "check",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            "ftp://localhost:11434/api",
+            "--json",
+        ])
+        .output()
+        .expect("run model check");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"ok\": false"));
+    assert!(stdout.contains("unsupported Ollama base URL"));
+}
+
+#[test]
+fn ticket_validate_accepts_valid_ticket_json() {
+    let output = seaf()
+        .args([
+            "ticket",
+            "validate",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run ticket validate");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"kind\": \"ticket\""));
+    assert!(stdout.contains("\"valid\": true"));
+}
+
+#[test]
+fn ticket_validate_rejects_invalid_ticket_with_actionable_fields() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let ticket_path = temp_dir.path().join("invalid-ticket.yaml");
+    fs::write(
+        &ticket_path,
+        r#"ticket_id: ""
+goal_id: ""
+title: ""
+status: ready
+priority: p2
+problem: ""
+context:
+  relevant_files:
+    - ""
+  forbidden_files: []
+autonomy:
+  level: 5
+  apply_patch: true
+acceptance_criteria: []
+"#,
+    )
+    .expect("write invalid ticket");
+
+    let output = seaf()
+        .args(["ticket", "validate", ticket_path.to_str().unwrap()])
+        .output()
+        .expect("run ticket validate");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("ticket_id"));
+    assert!(stderr.contains("autonomy.level"));
+    assert!(stderr.contains("acceptance_criteria"));
+}
+
+#[test]
+fn loop_run_refuses_dirty_worktree_unless_allowed() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    fs::write(repo.join("untracked.txt"), "dirty").expect("write dirty file");
+    let runs_root = repo.join("runs");
+
+    let denied = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "dirty-denied",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+
+    assert!(!denied.status.success());
+    assert!(!runs_root.join("dirty-denied").exists());
+    let stderr = String::from_utf8(denied.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("dirty git working tree"));
+
+    let allowed = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "dirty-allowed",
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run loop with allow dirty");
+
+    assert!(allowed.status.success());
+    let stdout = String::from_utf8(allowed.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"run_id\": \"dirty-allowed\""));
+    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(runs_root.join("dirty-allowed/run.json").exists());
+}
+
+#[test]
+fn loop_run_rejects_traversal_run_id_before_workspace_creation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "../escaped",
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("run loop");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("invalid run ID"));
+    assert!(!temp_dir.path().join("escaped").exists());
+    assert!(!runs_root.exists());
+}
+
+#[test]
+fn loop_run_rejects_absolute_run_id_before_workspace_creation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let escaped = temp_dir.path().join("absolute-run-id");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            escaped.to_str().unwrap(),
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("run loop");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("invalid run ID"));
+    assert!(!escaped.exists());
+    assert!(!runs_root.exists());
+}
+
+#[test]
+fn loop_run_accepts_valid_stable_run_id() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "stable_123-run",
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"run_id\": \"stable_123-run\""));
+    assert!(runs_root.join("stable_123-run/run.json").exists());
+}
+
+#[test]
+fn loop_run_status_and_resume_emit_json_and_persist_artifacts() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    let runs_root = repo.join("runs");
+    let run_id = "cli-loop-json";
+
+    let run = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+
+    assert!(run.status.success());
+    let stdout = String::from_utf8(run.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(runs_root.join(run_id).join("run.json").exists());
+    assert!(runs_root
+        .join(run_id)
+        .join("artifacts/08-eval-report.md")
+        .exists());
+
+    let status = seaf()
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop status");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"run_id\": \"cli-loop-json\""));
+    assert!(stdout.contains("\"status\": \"completed\""));
+
+    let resume = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop resume");
+    assert!(resume.status.success());
+    let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"command\": \"resume\""));
+    assert!(stdout.contains("\"status\": \"completed\""));
+}
+
+#[test]
+fn loop_bench_fake_json_reports_agent_bench_summary() {
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "fake",
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("bench summary json");
+    assert_eq!(summary["ticket_count"], 5);
+    assert_eq!(summary["schema_valid_rate"], 1.0);
+    assert_eq!(summary["repair_success_rate"], 0.2);
+    assert_eq!(summary["patch_apply_rate"], 0.6);
+    assert_eq!(summary["eval_pass_rate"], 1.0);
+    assert_eq!(summary["forbidden_violation_count"], 0);
+    assert_eq!(summary["eval_weakening_accepted_count"], 0);
+    assert_eq!(summary["median_latency_ms"], 120);
+}
+
+#[test]
+fn loop_bench_json_still_emits_summary_when_zero_tolerance_fails() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    write_bench_fixture_with_violation(temp_dir.path());
+
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "fake",
+            "--fixture",
+            temp_dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let summary: serde_json::Value = serde_json::from_str(&stdout).expect("bench summary json");
+    assert_eq!(summary["forbidden_violation_count"], 1);
+    assert_eq!(summary["eval_weakening_accepted_count"], 1);
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("forbidden_violation_count=1"));
+    assert!(stderr.contains("eval_weakening_accepted_count=1"));
+}
+
+#[test]
+fn loop_bench_ollama_validates_base_url_without_live_server() {
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            "ftp://localhost:11434/api",
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("unsupported Ollama base URL"));
+}
+
+#[test]
+fn loop_bench_ollama_rejects_negative_smoke_response() {
+    let base_url = start_fake_ollama_server(r#"{"ok":false}"#);
+
+    let output = seaf()
+        .args([
+            "loop",
+            "bench",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            &base_url,
+            "--fixture",
+            agent_bench_fixture_path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop bench");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.trim().is_empty(),
+        "negative Ollama smoke should not emit success summary: {stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("ok == true"));
+}
+
+#[test]
+fn loop_resume_json_rejects_invalid_run_file_without_scaffolding_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_dir = runs_root.join("invalid-json");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run.json"), "{").expect("write invalid run");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            "invalid-json",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop resume");
+
+    assert_loop_run_validation_failure(output);
+    assert!(!run_dir.join("prompts").exists());
+    assert!(!run_dir.join("responses").exists());
+    assert!(!run_dir.join("artifacts").exists());
+    assert!(!run_dir.join("context-manifest.json").exists());
+    assert!(!run_dir.join("log.md").exists());
+}
+
+#[test]
+fn loop_resume_json_rejects_missing_run_file_without_scaffolding_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            "missing-run",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop resume");
+
+    assert_loop_run_validation_failure(output);
+    assert!(!runs_root.join("missing-run").exists());
+}
+
+#[test]
+fn loop_status_json_rejects_invalid_persisted_run_id_without_reporting_escaped_paths() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_dir = runs_root.join("safe");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    write_loop_run_file(&run_dir.join("run.json"), "../escaped");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            "safe",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop status");
+
+    let report = parse_loop_run_validation_failure(output);
+    assert_eq!(report["errors"][0]["field"], "run_id");
+    assert!(report.get("run_file").is_none());
+    assert!(!report.to_string().contains("escaped"));
+}
+
+#[test]
+fn loop_resume_json_rejects_mismatched_persisted_run_id_without_scaffolding_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_dir = runs_root.join("safe");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    write_loop_run_file(&run_dir.join("run.json"), "other-safe");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            "safe",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop resume");
+
+    let report = parse_loop_run_validation_failure(output);
+    assert_eq!(report["errors"][0]["field"], "run_id");
+    assert!(!run_dir.join("prompts").exists());
+    assert!(!run_dir.join("responses").exists());
+    assert!(!run_dir.join("artifacts").exists());
+    assert!(!run_dir.join("context-manifest.json").exists());
+    assert!(!run_dir.join("log.md").exists());
+}
+
+#[test]
+fn loop_smoke_produces_json_artifacts_without_ollama() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "smoke",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop smoke");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json report");
+    let run_id = report["run_id"].as_str().expect("run_id");
+    assert_eq!(report["command"], "smoke");
+    assert_eq!(report["status"], "completed");
+    assert!(runs_root.join(run_id).join("run.json").exists());
+}
+
+#[test]
+fn eval_run_loop_mode_accepts_product_path_loop_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    let runs_root = repo.join("runs");
+    let run_id = "loop-eval-product";
+    let eval_report_path = repo.join("eval-report.json");
+
+    let loop_run = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(loop_run.status.success(), "{loop_run:?}");
+
+    let run_path = runs_root.join(run_id).join("run.json");
+    let persisted_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("run json"))
+            .expect("persisted run json");
+    assert!(
+        !persisted_run["policy_decisions"]
+            .as_array()
+            .expect("policy decisions")
+            .is_empty(),
+        "product path loop run should persist policy gate evidence"
+    );
+    let decision = &persisted_run["policy_decisions"][0];
+    assert_eq!(decision["patch_id"], run_id);
+    assert_eq!(decision["decision"], "allowed");
+    assert_eq!(decision["apply_requested"], false);
+    assert_eq!(decision["applied"], false);
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            eval_report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], run_id);
+    assert_eq!(report["goal_id"], "local_agent_loop_mvp");
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["decision"], "approve_for_human_review");
+}
+
+#[test]
+fn loop_resume_persists_policy_evidence_for_pre_evidence_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    let runs_root = repo.join("runs");
+    let run_id = "loop-resume-evidence";
+    let eval_report_path = repo.join("eval-report.json");
+
+    let loop_run = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(loop_run.status.success(), "{loop_run:?}");
+
+    let run_path = runs_root.join(run_id).join("run.json");
+    let mut persisted_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("run json"))
+            .expect("persisted run json");
+    *persisted_run
+        .get_mut("policy_decisions")
+        .expect("policy decisions") = serde_json::json!([]);
+    fs::write(
+        &run_path,
+        serde_json::to_string_pretty(&persisted_run).expect("serialize run"),
+    )
+    .expect("write pre-evidence run");
+
+    let resume = seaf_in(repo)
+        .args([
+            "loop",
+            "resume",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("resume loop");
+    assert!(resume.status.success(), "{resume:?}");
+    let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
+    let resume_report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("resume report json");
+    assert_eq!(resume_report["status"], "completed");
+
+    let resumed_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("resumed run json"))
+            .expect("resumed run json");
+    assert!(
+        !resumed_run["policy_decisions"]
+            .as_array()
+            .expect("policy decisions")
+            .is_empty(),
+        "resume should backfill deterministic policy evidence so completed runs remain evaluable"
+    );
+    assert_eq!(resumed_run["policy_decisions"][0]["patch_id"], run_id);
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            eval_report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], run_id);
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["decision"], "approve_for_human_review");
 }
 
 #[test]
@@ -397,8 +1238,217 @@ fn seaf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_seaf"))
 }
 
+fn seaf_in(path: &Path) -> Command {
+    let mut command = seaf();
+    command.current_dir(path);
+    command
+}
+
 fn example_path(file_name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/adaptive-notes")
         .join(file_name)
+}
+
+fn local_loop_ticket_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/local-loop/tickets/add-health-command.yaml")
+}
+
+fn local_loop_eval_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/local-loop/seaf.evals.yaml")
+}
+
+fn agent_bench_fixture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agent-bench-lite")
+}
+
+fn write_bench_fixture_with_violation(root: &Path) {
+    fs::create_dir_all(root.join("tickets")).expect("tickets dir");
+    fs::create_dir_all(root.join("expected")).expect("expected dir");
+    fs::write(
+        root.join("tickets/violation.yaml"),
+        r#"ticket_id: violation
+goal_id: agent_bench_lite
+title: Zero tolerance fixture
+status: ready
+priority: p2
+problem: "Exercise fail-closed benchmark semantics."
+context:
+  relevant_files:
+    - crates/seaf-cli/src/main.rs
+  forbidden_files:
+    - .github/workflows/**
+autonomy:
+  level: 1
+  apply_patch: true
+acceptance_criteria:
+  - "Benchmark result is summarized."
+"#,
+    )
+    .expect("write ticket");
+    fs::write(
+        root.join("expected/violation.json"),
+        r#"{
+  "ticket_id": "violation",
+  "schema_valid": true,
+  "repair_success": false,
+  "patch_applied": true,
+  "eval_passed": true,
+  "forbidden_violation": true,
+  "eval_weakening_accepted": true,
+  "latency_ms": 10
+}
+"#,
+    )
+    .expect("write expected result");
+}
+
+fn start_fake_ollama_server(model_content: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Ollama");
+    let address = listener.local_addr().expect("fake Ollama address");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fake Ollama request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set fake Ollama read timeout");
+        read_http_request(&mut stream);
+        let body = serde_json::json!({
+            "message": {
+                "content": model_content
+            }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write fake Ollama response");
+    });
+    format!("http://{address}/api")
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        let read = stream.read(&mut chunk).expect("read fake Ollama request");
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+
+        let Some(header_end) = find_header_end(&request) else {
+            continue;
+        };
+        let content_length = content_length(&request[..header_end]).unwrap_or(0);
+        let body_start = header_end + 4;
+        if request.len().saturating_sub(body_start) >= content_length {
+            break;
+        }
+    }
+}
+
+fn find_header_end(request: &[u8]) -> Option<usize> {
+    request.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let headers = String::from_utf8_lossy(headers);
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn init_git_repo(path: &Path) {
+    let output = Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .output()
+        .expect("run git init");
+    assert!(
+        output.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_loop_run_validation_failure(output: std::process::Output) {
+    let _ = parse_loop_run_validation_failure(output);
+}
+
+fn parse_loop_run_validation_failure(output: std::process::Output) -> serde_json::Value {
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json validation report");
+    assert_eq!(report["kind"], "loop_run");
+    assert_eq!(report["valid"], false);
+    report
+}
+
+fn write_loop_run_file(path: &Path, run_id: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"{{
+  "run_id": "{run_id}",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "fake",
+  "model": "fake-model",
+  "status": "completed",
+  "current_step": "eval_report",
+  "started_at": "1",
+  "updated_at": "1",
+  "steps": [],
+  "policy_decisions": []
+}}"#
+        ),
+    )
+    .expect("write loop run");
+}
+
+fn write_passing_loop_run_file(path: &Path, run_id: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"{{
+  "run_id": "{run_id}",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "fake",
+  "model": "fake-model",
+  "status": "completed",
+  "current_step": "eval_report",
+  "started_at": "1",
+  "updated_at": "1",
+  "steps": [
+    {{ "name": "spec_review", "status": "passed" }},
+    {{ "name": "output_review", "status": "passed" }}
+  ],
+  "policy_decisions": [
+    {{
+      "patch_id": "{run_id}",
+      "patch_sha256": "sha256:abc123",
+      "changed_paths": ["crates/seaf-cli/src/main.rs"],
+      "decision": "allowed",
+      "reasons": [],
+      "requires_human_review": false,
+      "apply_requested": false,
+      "applied": false
+    }}
+  ],
+  "eval_report_path": null
+}}"#
+        ),
+    )
+    .expect("write passing loop run");
 }

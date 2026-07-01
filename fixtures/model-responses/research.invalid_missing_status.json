@@ -1,0 +1,7 @@
+{
+  "role": "researcher",
+  "summary": "The response omits status and must fail closed.",
+  "findings": [],
+  "risks": [],
+  "next_step_recommendation": "Do not continue."
+}

@@ -1,0 +1,13 @@
+{
+  "role": "analyzer",
+  "status": "passed",
+  "summary": "The ticket is scoped to local response validation and prompt/schema definitions.",
+  "findings": [
+    {
+      "claim": "Provider execution and runner orchestration are forbidden for this slice.",
+      "evidence": "docs/phase-2-local-agent-loop.md#P2-006"
+    }
+  ],
+  "risks": ["A parser that accepts prose would bypass structured gates."],
+  "next_step_recommendation": "Draft the implementation spec."
+}

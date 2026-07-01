@@ -1,0 +1,20 @@
+{
+  "run_id": "loop_20260701_001",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "ollama",
+  "model": "gemma4:e4b-mlx",
+  "status": "running",
+  "current_step": "development",
+  "started_at": "2026-07-01T12:00:00Z",
+  "updated_at": "2026-07-01T12:12:00Z",
+  "steps": [
+    {
+      "name": "research",
+      "status": "passed",
+      "artifact_path": "01-research.md"
+    }
+  ],
+  "policy_decisions": [],
+  "eval_report_path": null
+}

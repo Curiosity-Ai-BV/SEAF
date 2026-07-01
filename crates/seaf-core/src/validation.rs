@@ -3,7 +3,9 @@ use std::{fmt::Display, fs, io::Read, path::Path};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{CheckStatus, EvalReport, GoalSpec, Policy, ReleaseCapsule, SeafEvent};
+use crate::{
+    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ReleaseCapsule, SeafEvent, TicketSpec,
+};
 
 pub type ValidationResult<T> = Result<T, ValidationReport>;
 
@@ -92,6 +94,26 @@ pub fn load_eval_report_file(path: &Path) -> ValidationResult<EvalReport> {
         Ok(report)
     } else {
         Err(ValidationReport::invalid("eval_report", Some(path), errors))
+    }
+}
+
+pub fn load_ticket_file(path: &Path) -> ValidationResult<TicketSpec> {
+    let ticket = load_struct::<TicketSpec>("ticket", path)?;
+    let errors = validate_ticket_spec(&ticket);
+    if errors.is_empty() {
+        Ok(ticket)
+    } else {
+        Err(ValidationReport::invalid("ticket", Some(path), errors))
+    }
+}
+
+pub fn load_loop_run_file(path: &Path) -> ValidationResult<LoopRun> {
+    let run = load_struct::<LoopRun>("loop_run", path)?;
+    let errors = validate_loop_run(&run);
+    if errors.is_empty() {
+        Ok(run)
+    } else {
+        Err(ValidationReport::invalid("loop_run", Some(path), errors))
     }
 }
 
@@ -262,6 +284,88 @@ pub fn validate_seaf_event(event: &SeafEvent) -> Vec<FieldError> {
     errors
 }
 
+pub fn validate_ticket_spec(ticket: &TicketSpec) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    require_non_empty(&mut errors, "ticket_id", &ticket.ticket_id);
+    require_non_empty(&mut errors, "goal_id", &ticket.goal_id);
+    require_non_empty(&mut errors, "title", &ticket.title);
+    require_non_empty(&mut errors, "problem", &ticket.problem);
+
+    validate_list_entries(
+        &mut errors,
+        "research_questions",
+        &ticket.research_questions,
+    );
+    validate_list_entries(
+        &mut errors,
+        "context.relevant_files",
+        &ticket.context.relevant_files,
+    );
+    validate_list_entries(
+        &mut errors,
+        "context.forbidden_files",
+        &ticket.context.forbidden_files,
+    );
+
+    if ticket.autonomy.level > 4 {
+        errors.push(FieldError::new("autonomy.level", "must be between 0 and 4"));
+    }
+    validate_list_entries(
+        &mut errors,
+        "autonomy.allow_shell_commands",
+        &ticket.autonomy.allow_shell_commands,
+    );
+
+    validate_non_empty_list(
+        &mut errors,
+        "acceptance_criteria",
+        &ticket.acceptance_criteria,
+        "must include at least one acceptance criterion",
+    );
+
+    if let Some(eval) = &ticket.eval {
+        require_non_empty(&mut errors, "eval.config", &eval.config);
+    }
+
+    errors
+}
+
+pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    require_non_empty(&mut errors, "run_id", &run.run_id);
+    require_non_empty(&mut errors, "ticket_id", &run.ticket_id);
+    require_non_empty(&mut errors, "goal_id", &run.goal_id);
+    require_non_empty(&mut errors, "provider", &run.provider);
+    require_non_empty(&mut errors, "model", &run.model);
+    require_non_empty(&mut errors, "started_at", &run.started_at);
+    require_non_empty(&mut errors, "updated_at", &run.updated_at);
+
+    for (index, step) in run.steps.iter().enumerate() {
+        if let Some(artifact_path) = &step.artifact_path {
+            require_non_empty(
+                &mut errors,
+                format!("steps[{index}].artifact_path"),
+                artifact_path,
+            );
+        }
+    }
+
+    for (index, decision) in run.policy_decisions.iter().enumerate() {
+        if decision.is_empty() {
+            errors.push(FieldError::new(
+                format!("policy_decisions[{index}]"),
+                "must include at least one policy decision field",
+            ));
+        }
+    }
+
+    if let Some(eval_report_path) = &run.eval_report_path {
+        require_non_empty(&mut errors, "eval_report_path", eval_report_path);
+    }
+
+    errors
+}
+
 pub fn sha256_digest_file(path: &Path) -> Result<String, std::io::Error> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -333,6 +437,12 @@ fn validate_non_empty_list(
         return;
     }
 
+    for (index, value) in values.iter().enumerate() {
+        require_non_empty(errors, format!("{field}[{index}]"), value);
+    }
+}
+
+fn validate_list_entries(errors: &mut Vec<FieldError>, field: &str, values: &[String]) {
     for (index, value) in values.iter().enumerate() {
         require_non_empty(errors, format!("{field}[{index}]"), value);
     }
@@ -622,5 +732,181 @@ rollout: canary
         let report = load_goal_file(&goal_path).unwrap_err();
 
         assert!(report.errors.iter().any(|error| error.field == "rollout"));
+    }
+
+    #[test]
+    fn valid_ticket_fixture_loads() {
+        let ticket_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-loop/tickets/add-health-command.yaml");
+        let ticket = load_ticket_file(&ticket_path).expect("demo ticket fixture should load");
+
+        assert_eq!(ticket.ticket_id, "T-LOCAL-001");
+        assert!(validate_ticket_spec(&ticket).is_empty());
+    }
+
+    #[test]
+    fn invalid_ticket_reports_contract_fields() {
+        let ticket_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-loop/tickets/invalid-empty-ticket.yaml");
+        let report = load_ticket_file(&ticket_path).unwrap_err();
+        let errors = report.errors;
+        let fields: Vec<&str> = errors.iter().map(|error| error.field.as_str()).collect();
+
+        assert!(fields.contains(&"ticket_id"));
+        assert!(fields.contains(&"goal_id"));
+        assert!(fields.contains(&"title"));
+        assert!(fields.contains(&"problem"));
+        assert!(fields.contains(&"context.relevant_files[0]"));
+        assert!(fields.contains(&"context.forbidden_files[0]"));
+        assert!(fields.contains(&"autonomy.level"));
+        assert!(fields.contains(&"autonomy.allow_shell_commands[0]"));
+        assert!(fields.contains(&"acceptance_criteria"));
+        assert!(fields.contains(&"eval.config"));
+    }
+
+    #[test]
+    fn ticket_unknown_fields_fail_closed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ticket_path = temp_dir.path().join("ticket.yaml");
+        std::fs::write(
+            &ticket_path,
+            r#"ticket_id: T-LOCAL-001
+goal_id: local_agent_loop_mvp
+title: Add a local health check command
+status: ready
+priority: p1
+problem: Keep the local loop safe.
+context:
+  relevant_files:
+    - crates/seaf-core/src/models.rs
+  forbidden_files: []
+autonomy:
+  level: 1
+  apply_patch: true
+acceptance_criteria:
+  - Unknown fields must not be accepted.
+unexpected_escape: true
+"#,
+        )
+        .expect("write ticket");
+
+        let report = load_ticket_file(&ticket_path).unwrap_err();
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.field == "file" && error.message.contains("unexpected_escape")));
+    }
+
+    #[test]
+    fn valid_loop_run_fixture_loads() {
+        let run_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-loop/runs/valid-loop-run.json");
+        let run = load_loop_run_file(&run_path).expect("loop run fixture should load");
+
+        assert_eq!(run.run_id, "loop_20260701_001");
+        assert!(validate_loop_run(&run).is_empty());
+    }
+
+    #[test]
+    fn invalid_loop_run_reports_contract_fields() {
+        let run: LoopRun = serde_json::from_str(
+            r#"{
+  "run_id": "",
+  "ticket_id": "",
+  "goal_id": "",
+  "provider": "",
+  "model": "",
+  "status": "running",
+  "current_step": "development",
+  "started_at": "",
+  "updated_at": "",
+  "steps": [
+    {
+      "name": "research",
+      "status": "passed",
+      "artifact_path": ""
+    }
+  ],
+  "policy_decisions": [],
+  "eval_report_path": ""
+}"#,
+        )
+        .expect("loop run should parse");
+        let errors = validate_loop_run(&run);
+        let fields: Vec<&str> = errors.iter().map(|error| error.field.as_str()).collect();
+
+        assert!(fields.contains(&"run_id"));
+        assert!(fields.contains(&"ticket_id"));
+        assert!(fields.contains(&"goal_id"));
+        assert!(fields.contains(&"provider"));
+        assert!(fields.contains(&"model"));
+        assert!(fields.contains(&"started_at"));
+        assert!(fields.contains(&"updated_at"));
+        assert!(fields.contains(&"steps[0].artifact_path"));
+        assert!(fields.contains(&"eval_report_path"));
+    }
+
+    #[test]
+    fn loop_run_rejects_empty_policy_decision_objects() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let run_path = temp_dir.path().join("loop-run.json");
+        std::fs::write(
+            &run_path,
+            r#"{
+  "run_id": "loop_20260701_001",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "ollama",
+  "model": "gemma4:e4b-mlx",
+  "status": "running",
+  "current_step": "development",
+  "started_at": "2026-07-01T12:00:00Z",
+  "updated_at": "2026-07-01T12:12:00Z",
+  "steps": [],
+  "policy_decisions": [{}],
+  "eval_report_path": null
+}"#,
+        )
+        .expect("write loop run");
+
+        let report = load_loop_run_file(&run_path).unwrap_err();
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.field == "policy_decisions[0]"));
+    }
+
+    #[test]
+    fn loop_run_unknown_fields_fail_closed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let run_path = temp_dir.path().join("loop-run.json");
+        std::fs::write(
+            &run_path,
+            r#"{
+  "run_id": "loop_20260701_001",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "ollama",
+  "model": "gemma4:e4b-mlx",
+  "status": "running",
+  "current_step": "development",
+  "started_at": "2026-07-01T12:00:00Z",
+  "updated_at": "2026-07-01T12:12:00Z",
+  "steps": [],
+  "policy_decisions": [],
+  "eval_report_path": null,
+  "unexpected_escape": true
+}"#,
+        )
+        .expect("write loop run");
+
+        let report = load_loop_run_file(&run_path).unwrap_err();
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.field == "file" && error.message.contains("unexpected_escape")));
     }
 }

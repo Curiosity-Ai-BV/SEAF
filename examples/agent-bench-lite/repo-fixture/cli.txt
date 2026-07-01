@@ -1,0 +1,2 @@
+SEAF CLI health fixture.
+

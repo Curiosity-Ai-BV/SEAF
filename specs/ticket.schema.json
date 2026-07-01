@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/ticket.schema.json",
+  "title": "SEAF TicketSpec",
+  "type": "object",
+  "required": [
+    "ticket_id",
+    "goal_id",
+    "title",
+    "status",
+    "priority",
+    "problem",
+    "context",
+    "autonomy",
+    "acceptance_criteria"
+  ],
+  "properties": {
+    "ticket_id": { "type": "string", "minLength": 1 },
+    "goal_id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["draft", "ready", "running", "blocked", "completed", "cancelled"]
+    },
+    "priority": { "enum": ["p0", "p1", "p2", "p3"] },
+    "problem": { "type": "string", "minLength": 1 },
+    "research_questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "context": {
+      "type": "object",
+      "required": ["relevant_files", "forbidden_files"],
+      "properties": {
+        "relevant_files": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "forbidden_files": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "autonomy": {
+      "type": "object",
+      "required": ["level", "apply_patch"],
+      "properties": {
+        "level": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "apply_patch": { "type": "boolean" },
+        "allow_shell_commands": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "eval": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["config"],
+          "properties": {
+            "config": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
+    }
+  },
+  "additionalProperties": false
+}

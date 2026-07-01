@@ -1,0 +1,8 @@
+{
+  "role": "developer",
+  "status": "patch_proposed",
+  "summary": "diff --git a/crates/seaf-loop/src/role_response.rs b/crates/seaf-loop/src/role_response.rs",
+  "changed_files": ["crates/seaf-loop/src/role_response.rs"],
+  "requires_human_review": false,
+  "patch": "diff --git a/crates/seaf-loop/src/role_response.rs b/crates/seaf-loop/src/role_response.rs\n--- a/crates/seaf-loop/src/role_response.rs\n+++ b/crates/seaf-loop/src/role_response.rs\n@@ -1,0 +1,1 @@\n+pub enum Role {}\n"
+}

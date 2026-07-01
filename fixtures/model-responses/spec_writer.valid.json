@@ -1,0 +1,13 @@
+{
+  "role": "spec_writer",
+  "status": "passed",
+  "summary": "Implement a local role-response module with typed parsing and one repair seam.",
+  "findings": [
+    {
+      "claim": "The parser must reject markdown-only responses.",
+      "evidence": "docs/phase-2-local-agent-loop.md#P2-006"
+    }
+  ],
+  "risks": [],
+  "next_step_recommendation": "Send the spec for review."
+}

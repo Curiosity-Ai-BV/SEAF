@@ -1,0 +1,12 @@
+{
+  "role": "output_reviewer",
+  "decision": "reject",
+  "summary": "The response includes a blocking issue and must not be approved for tests.",
+  "blocking_issues": [
+    {
+      "summary": "Developer response placed diff content outside the patch field.",
+      "evidence": "fixtures/model-responses/development.invalid_patch_outside_field.json"
+    }
+  ],
+  "non_blocking_issues": []
+}

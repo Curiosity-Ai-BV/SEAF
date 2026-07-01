@@ -245,3 +245,125 @@ pub struct AgentTaskConstraints {
     pub requires_human_review: Vec<String>,
     pub allowed_without_review: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketStatus {
+    Draft,
+    Ready,
+    Running,
+    Blocked,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketPriority {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketSpec {
+    pub ticket_id: String,
+    pub goal_id: String,
+    pub title: String,
+    pub status: TicketStatus,
+    pub priority: TicketPriority,
+    pub problem: String,
+    #[serde(default)]
+    pub research_questions: Vec<String>,
+    pub context: TicketContext,
+    pub autonomy: TicketAutonomy,
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval: Option<TicketEval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketContext {
+    pub relevant_files: Vec<String>,
+    pub forbidden_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAutonomy {
+    pub level: u8,
+    pub apply_patch: bool,
+    #[serde(default)]
+    pub allow_shell_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketEval {
+    pub config: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopStatus {
+    Pending,
+    Running,
+    Blocked,
+    Failed,
+    Passed,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopStepStatus {
+    Pending,
+    Running,
+    Blocked,
+    Failed,
+    Passed,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopStepName {
+    Research,
+    Analysis,
+    SpecCreation,
+    SpecReview,
+    Development,
+    OutputReview,
+    Testing,
+    EvalReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopRun {
+    pub run_id: String,
+    pub ticket_id: String,
+    pub goal_id: String,
+    pub provider: String,
+    pub model: String,
+    pub status: LoopStatus,
+    pub current_step: LoopStepName,
+    pub started_at: String,
+    pub updated_at: String,
+    pub steps: Vec<LoopStepRecord>,
+    pub policy_decisions: Vec<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_report_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopStepRecord {
+    pub name: LoopStepName,
+    pub status: LoopStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+}

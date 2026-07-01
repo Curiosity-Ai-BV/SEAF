@@ -1,0 +1,43 @@
+ticket_id: T-LOCAL-001
+goal_id: local_agent_loop_mvp
+title: Add a health check command to the CLI
+status: ready
+priority: p1
+problem: >
+  Developers need a quick way to verify that the SEAF CLI, eval config,
+  and local model provider are usable before starting a local loop.
+
+research_questions:
+  - Which CLI command modules need to change?
+  - Which checks can be deterministic without requiring Ollama?
+  - What output should be human-readable and JSON-readable?
+
+context:
+  relevant_files:
+    - crates/seaf-cli/src/main.rs
+    - crates/seaf-core/src/models.rs
+    - examples/adaptive-notes/seaf.evals.yaml
+  forbidden_files:
+    - .github/workflows/release.yml
+    - infra/signing/**
+    - secrets/**
+    - specs/eval-report.schema.json
+
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - cargo test
+    - cargo fmt --all -- --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - pnpm typecheck
+
+acceptance_criteria:
+  - Adds a `seaf health` or equivalent command.
+  - Command has human-readable and JSON output.
+  - Does not require Ollama unless explicitly checking a model provider.
+  - Existing tests pass.
+  - Adds or updates tests for the new behavior.
+
+eval:
+  config: examples/local-loop/seaf.evals.yaml

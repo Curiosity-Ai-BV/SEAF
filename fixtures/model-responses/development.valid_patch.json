@@ -1,0 +1,8 @@
+{
+  "role": "developer",
+  "status": "patch_proposed",
+  "summary": "Adds the role response parser and tests.",
+  "changed_files": ["crates/seaf-loop/src/role_response.rs"],
+  "requires_human_review": false,
+  "patch": "diff --git a/crates/seaf-loop/src/role_response.rs b/crates/seaf-loop/src/role_response.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/crates/seaf-loop/src/role_response.rs\n@@ -0,0 +1,3 @@\n+pub enum Role {\n+    Researcher,\n+}\n"
+}
