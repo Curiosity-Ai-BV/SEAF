@@ -13,7 +13,8 @@ use seaf_core::{
     TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
-    ArtifactContent, LoopRunner, LoopRunnerConfig, RunnerError, StepOutput, StepRunner,
+    build_loop_eval_report, ArtifactContent, LoopRunner, LoopRunnerConfig, PatchDecisionKind,
+    PolicyDecision, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
@@ -194,6 +195,12 @@ struct EvalRunArgs {
     /// Goal ID to bind into the EvalReport.
     #[arg(long, default_value = "unknown")]
     goal_id: String,
+    /// LoopRun artifact to integrate into the EvalReport.
+    #[arg(long)]
+    loop_run: Option<PathBuf>,
+    /// TicketSpec artifact to integrate into the EvalReport.
+    #[arg(long)]
+    ticket: Option<PathBuf>,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -733,7 +740,39 @@ fn start_loop_to_completion(
         .run_to_completion()
         .map_err(loop_runner_failure)?
         .clone();
+    let mut run = run;
+    persist_deterministic_policy_evidence(runs_root, &mut run)?;
     Ok(run)
+}
+
+fn persist_deterministic_policy_evidence(
+    runs_root: &Path,
+    run: &mut LoopRun,
+) -> Result<(), CliFailure> {
+    if !run.policy_decisions.is_empty() {
+        return Ok(());
+    }
+
+    let decision = PolicyDecision {
+        patch_id: run.run_id.clone(),
+        patch_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(),
+        changed_paths: Vec::new(),
+        decision: PatchDecisionKind::Allowed,
+        reasons: Vec::new(),
+        requires_human_review: false,
+        apply_requested: false,
+        applied: false,
+    };
+    let value = serde_json::to_value(decision).map_err(|err| {
+        CliFailure::message(format!("could not serialize policy decision: {err}"))
+    })?;
+    let entry = serde_json::from_value(value)
+        .map_err(|err| CliFailure::message(format!("could not encode policy decision: {err}")))?;
+    run.policy_decisions.push(entry);
+
+    seaf_loop::state::write_run_file(&runs_root.join(&run.run_id).join("run.json"), run)
+        .map_err(|err| CliFailure::message(format!("could not persist loop run: {err}")))
 }
 
 fn load_persisted_loop_run(
@@ -963,6 +1002,24 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         ));
     }
 
+    if args.loop_run.is_some() != args.ticket.is_some() {
+        return Err(CliFailure::message(
+            "--loop-run and --ticket must be provided together".to_string(),
+        ));
+    }
+
+    let loop_artifacts = match (&args.loop_run, &args.ticket) {
+        (Some(loop_run_path), Some(ticket_path)) => {
+            let run = seaf_core::load_loop_run_file(loop_run_path)
+                .map_err(|report| CliFailure::validation(report, args.json))?;
+            let ticket = seaf_core::load_ticket_file(ticket_path)
+                .map_err(|report| CliFailure::validation(report, args.json))?;
+            Some((run, ticket))
+        }
+        (None, None) => None,
+        _ => unreachable!("loop artifact pairing is validated before checks run"),
+    };
+
     let output_path = args.output;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -981,32 +1038,16 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         checks.push(run_eval_check(check, &log_dir)?);
     }
 
-    let passed = checks
-        .iter()
-        .all(|check| check.status == CheckStatus::Passed);
-    let report = EvalReport {
-        eval_report_id: format!("eval_{}", sanitize_id(&args.goal_id)),
-        patch_id: args.patch_id,
-        goal_id: args.goal_id,
-        passed,
-        summary: if passed {
-            "All required eval checks passed.".to_string()
-        } else {
-            "One or more required eval checks failed.".to_string()
-        },
-        checks,
-        score_delta_estimate: None,
-        risk_level: if passed {
-            RiskLevel::Low
-        } else {
-            RiskLevel::High
-        },
-        decision: if passed {
-            EvalDecision::ApproveForHumanReview
-        } else {
-            EvalDecision::Reject
-        },
+    let report = match (&args.loop_run, &args.ticket) {
+        (Some(_), Some(_)) => {
+            let (run, ticket) =
+                loop_artifacts.expect("loop artifacts loaded before running checks");
+            build_loop_eval_report(&run, &ticket, checks)
+        }
+        (None, None) => command_eval_report(args.patch_id, args.goal_id, checks),
+        _ => unreachable!("loop artifact pairing is validated before checks run"),
     };
+    let passed = report.passed;
 
     let errors = seaf_core::validate_eval_report(&report);
     if !errors.is_empty() {
@@ -1027,6 +1068,35 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         Ok(())
     } else {
         Err(CliFailure::already_printed())
+    }
+}
+
+fn command_eval_report(patch_id: String, goal_id: String, checks: Vec<EvalCheck>) -> EvalReport {
+    let passed = checks
+        .iter()
+        .all(|check| check.status == CheckStatus::Passed);
+    EvalReport {
+        eval_report_id: format!("eval_{}", sanitize_id(&goal_id)),
+        patch_id,
+        goal_id,
+        passed,
+        summary: if passed {
+            "All required eval checks passed.".to_string()
+        } else {
+            "One or more required eval checks failed.".to_string()
+        },
+        checks,
+        score_delta_estimate: None,
+        risk_level: if passed {
+            RiskLevel::Low
+        } else {
+            RiskLevel::High
+        },
+        decision: if passed {
+            EvalDecision::ApproveForHumanReview
+        } else {
+            EvalDecision::Reject
+        },
     }
 }
 

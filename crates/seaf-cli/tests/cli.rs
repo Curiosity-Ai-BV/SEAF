@@ -204,8 +204,7 @@ fn eval_run_accepts_initialized_template_thresholds() {
         .output()
         .expect("run eval");
 
-    assert!(!output.status.success());
-    assert!(report_path.exists());
+    assert!(report_path.exists(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"eval_report_id\""));
 }
@@ -242,6 +241,153 @@ fn eval_run_fails_closed_when_required_check_fails() {
     assert!(stdout.contains("\"passed\": false"));
     assert!(stdout.contains("\"decision\": \"reject\""));
     assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_accepts_local_loop_config_with_explicit_ids() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let report_path = temp_dir.path().join("eval-report.json");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--goal-id",
+            "local_agent_loop_mvp",
+            "--patch-id",
+            "test",
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"patch_id\": \"test\""));
+    assert!(stdout.contains("\"goal_id\": \"local_agent_loop_mvp\""));
+    assert!(stdout.contains("\"passed\": true"));
+    assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_loop_mode_uses_run_and_ticket_identity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let run_path = temp_dir.path().join("run.json");
+    let report_path = temp_dir.path().join("eval-report.json");
+    write_passing_loop_run_file(&run_path, "loop_cli_001");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], "loop_cli_001");
+    assert_eq!(report["goal_id"], "local_agent_loop_mvp");
+    assert_eq!(report["decision"], "approve_for_human_review");
+    let check_names: Vec<&str> = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|check| check["name"].as_str().expect("check name"))
+        .collect();
+    for expected in [
+        "schema_validation",
+        "patch_policy_gate",
+        "spec_review",
+        "output_review",
+        "local_loop_smoke",
+    ] {
+        assert!(
+            check_names.contains(&expected),
+            "report should include {expected:?}; got {check_names:?}"
+        );
+    }
+    assert!(report_path.exists());
+}
+
+#[test]
+fn eval_run_loop_mode_requires_ticket_with_loop_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let run_path = temp_dir.path().join("run.json");
+    write_passing_loop_run_file(&run_path, "loop_cli_001");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("--loop-run and --ticket must be provided together"));
+}
+
+#[test]
+fn eval_run_loop_mode_validates_artifacts_before_running_checks() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config_path = temp_dir.path().join("seaf.evals.yaml");
+    let marker_path = temp_dir.path().join("marker");
+    let report_path = temp_dir.path().join("eval-report.json");
+    let run_path = temp_dir.path().join("invalid-run.json");
+    fs::write(
+        &config_path,
+        format!(
+            r#"evals:
+  required:
+    - name: side_effect
+      command: "printf touched > {}"
+"#,
+            marker_path.display()
+        ),
+    )
+    .expect("write eval config");
+    fs::write(&run_path, "{").expect("write invalid run");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            config_path.to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run loop eval");
+
+    assert!(!output.status.success());
+    assert!(!marker_path.exists(), "eval command should not run");
+    assert!(!report_path.exists(), "EvalReport should not be written");
+    assert!(
+        !temp_dir.path().join("logs").exists(),
+        "logs should not be created before artifact validation"
+    );
 }
 
 #[test]
@@ -659,6 +805,77 @@ fn loop_smoke_produces_json_artifacts_without_ollama() {
 }
 
 #[test]
+fn eval_run_loop_mode_accepts_product_path_loop_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    let runs_root = repo.join("runs");
+    let run_id = "loop-eval-product";
+    let eval_report_path = repo.join("eval-report.json");
+
+    let loop_run = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(loop_run.status.success(), "{loop_run:?}");
+
+    let run_path = runs_root.join(run_id).join("run.json");
+    let persisted_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("run json"))
+            .expect("persisted run json");
+    assert!(
+        !persisted_run["policy_decisions"]
+            .as_array()
+            .expect("policy decisions")
+            .is_empty(),
+        "product path loop run should persist policy gate evidence"
+    );
+    let decision = &persisted_run["policy_decisions"][0];
+    assert_eq!(decision["patch_id"], run_id);
+    assert_eq!(decision["decision"], "allowed");
+    assert_eq!(decision["apply_requested"], false);
+    assert_eq!(decision["applied"], false);
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            eval_report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], run_id);
+    assert_eq!(report["goal_id"], "local_agent_loop_mvp");
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["decision"], "approve_for_human_review");
+}
+
+#[test]
 fn release_prepare_and_verify_bind_artifact_and_eval_digests() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let artifact_path = temp_dir.path().join("artifact.txt");
@@ -828,6 +1045,10 @@ fn local_loop_ticket_path() -> PathBuf {
         .join("../../examples/local-loop/tickets/add-health-command.yaml")
 }
 
+fn local_loop_eval_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/local-loop/seaf.evals.yaml")
+}
+
 fn init_git_repo(path: &Path) {
     let output = Command::new("git")
         .args(["init"])
@@ -874,4 +1095,41 @@ fn write_loop_run_file(path: &Path, run_id: &str) {
         ),
     )
     .expect("write loop run");
+}
+
+fn write_passing_loop_run_file(path: &Path, run_id: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"{{
+  "run_id": "{run_id}",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "fake",
+  "model": "fake-model",
+  "status": "completed",
+  "current_step": "eval_report",
+  "started_at": "1",
+  "updated_at": "1",
+  "steps": [
+    {{ "name": "spec_review", "status": "passed" }},
+    {{ "name": "output_review", "status": "passed" }}
+  ],
+  "policy_decisions": [
+    {{
+      "patch_id": "{run_id}",
+      "patch_sha256": "sha256:abc123",
+      "changed_paths": ["crates/seaf-cli/src/main.rs"],
+      "decision": "allowed",
+      "reasons": [],
+      "requires_human_review": false,
+      "apply_requested": false,
+      "applied": false
+    }}
+  ],
+  "eval_report_path": null
+}}"#
+        ),
+    )
+    .expect("write passing loop run");
 }

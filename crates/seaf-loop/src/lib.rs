@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod context;
+pub mod eval_report;
 pub mod patch;
 pub mod policy;
 pub mod policy_gate;
@@ -14,6 +15,7 @@ pub use context::{
     ContextManifest, ContextManifestFile, ContextPackRequest, CONTEXT_MANIFEST_FILE,
     UNTRUSTED_CONTEXT_MARKER,
 };
+pub use eval_report::build_loop_eval_report;
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
 pub use policy_gate::{
     gate_patch, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
