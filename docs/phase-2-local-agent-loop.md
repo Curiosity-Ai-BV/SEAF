@@ -95,8 +95,9 @@ Safety boundary:
 ## Current Status
 
 `P2-001`, `P2-002`, `P2-003`, `P2-004`, `P2-005`, `P2-006`, `P2-007`,
-`P2-008`, and `P2-010` are complete. `P2-009` is the next implementation slice
-so local model behavior can be evaluated with AgentBench-lite.
+`P2-008`, `P2-009`, and `P2-010` are complete. `P2-011` is the next
+implementation slice so developers and agents have a complete local setup,
+demo, recovery, eval, and security-boundary guide.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -108,9 +109,9 @@ so local model behavior can be evaluated with AgentBench-lite.
 | P2-006 | Add role prompts and structured response schemas | complete | done        |
 | P2-007 | Add patch parser and deterministic policy gate   | complete | done        |
 | P2-008 | Add CLI commands for model, ticket, and loop     | complete | done        |
-| P2-009 | Build AgentBench-lite                            | pending  | next        |
+| P2-009 | Build AgentBench-lite                            | complete | done        |
 | P2-010 | Integrate evals with existing EvalReport         | complete | done        |
-| P2-011 | Documentation and Mac setup guide                | pending  | no          |
+| P2-011 | Documentation and Mac setup guide                | pending  | next        |
 | P2-012 | CI hardening                                     | pending  | no          |
 
 Recommended order from the plan:
@@ -441,7 +442,7 @@ before creating or mutating a workspace.
 
 ### P2-009 - Build AgentBench-lite
 
-Status: pending
+Status: complete in `c711e04`
 
 Objective: Create a repeatable local model eval for the loop.
 
@@ -484,6 +485,13 @@ Verification commands:
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite
 cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --fixture examples/agent-bench-lite
 ```
+
+Review notes for future benchmark work: fake-provider execution is deterministic
+and fixture-backed. Fixture directories fail closed on unexpected regular files,
+ticket/result mismatches, duplicates, and malformed expected results. Ollama
+mode performs a live local structured smoke request and requires response
+content with `ok == true` before emitting a success summary; missing local models
+return the provider's actionable `ollama pull` hint.
 
 ### P2-010 - Integrate evals with existing EvalReport
 

@@ -2,21 +2,18 @@
 
 ## Goal
 
-Implement P2-009, AgentBench-lite for repeatable local model loop evaluation.
+Implement P2-011, documentation and Mac setup guide for the local agent loop.
 
 ## Success Criteria
 
-- Add AgentBench-lite fixtures for deterministic fake-provider execution and
-  local Ollama smoke execution. Tests and CI must not require Ollama.
-- Produce a JSON summary with schema-valid rate, repair-success rate,
-  patch-apply rate, eval-pass rate, forbidden violation count,
-  eval-weakening accepted count, and median latency.
-- Treat forbidden and eval-weakening accepted violations as zero-tolerance
-  failures.
-- Cover initial tickets for CLI health, validation tests, docs-only changes,
-  forbidden CI change rejection, and eval-weakening rejection.
-- Keep the slice scoped to the P2-009 allowed files in
-  `docs/phase-2-local-agent-loop.md`, including AgentBench-lite fixtures,
-  focused `seaf-loop` bench helper/tests if needed, and `loop bench` CLI wiring
-  plus focused CLI coverage.
+- Create or update the local agent loop docs listed in the P2-011 allowed files.
+- Include one complete demo path from ticket validation through loop run,
+  benchmark/eval report generation, and artifact review.
+- Explain what remains local-only and why model output is untrusted.
+- Explain failed-run recovery, including `loop status`, `loop resume`, and
+  artifact inspection.
+- Include Mac setup commands for `brew install ollama`, pulling
+  `gemma4:e2b-mlx` and `gemma4:e4b-mlx`, `ollama serve`, and model checks.
+- Keep the slice scoped to the P2-011 allowed files in
+  `docs/phase-2-local-agent-loop.md`.
 - Run spec-compliance and code-quality review before commit.

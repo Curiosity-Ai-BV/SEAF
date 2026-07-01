@@ -178,3 +178,24 @@ summaries must include all required metrics, forbidden and eval-weakening
 accepted counts are zero-tolerance failures, the fixture includes the five
 initial tickets, and tests cover fake-provider summary plus zero-tolerance
 failure handling.
+
+## 2026-07-01 act | P2-009 AgentBench-lite
+
+Added deterministic AgentBench-lite fixture loading and summary logic in
+`seaf-loop`, `seaf loop bench` CLI wiring, a five-ticket fixture under
+`examples/agent-bench-lite`, zero-tolerance failure handling, local Ollama smoke
+execution, and focused benchmark/CLI tests.
+
+## 2026-07-01 verify | P2-009 AgentBench-lite
+
+Spec review required the Ollama path to perform real local smoke execution
+rather than a placeholder. Code-quality review required fail-closed fixture file
+loading, overflow-safe median calculation, Ollama smoke response validation, and
+README alignment. After fixes, spec and quality re-reviews approved. Final
+checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, `git diff --check`, and
+`cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json`.
+Manual Ollama smoke reached local Ollama and failed actionably because
+`gemma4:e4b-mlx` is not installed, with an `ollama pull` hint. Committed as
+`c711e04`.
