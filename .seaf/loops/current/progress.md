@@ -18,7 +18,7 @@
 ## Phase 2 Implementation
 
 - [x] P2-001: Add TicketSpec and LoopRun contracts.
-- [ ] P2-002: Add model provider abstraction and fake provider.
+- [x] P2-002: Add model provider abstraction and fake provider.
 - [ ] P2-004: Add local context packer.
 - [ ] P2-005: Add loop workspace and state machine.
 - [ ] P2-006: Add role prompts and structured response schemas.

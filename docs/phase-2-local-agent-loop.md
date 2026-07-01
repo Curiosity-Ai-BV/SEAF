@@ -94,16 +94,16 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001` is complete. `P2-002` is the next implementation slice because the
-model-provider abstraction and fake provider unblock deterministic loop tests
-without requiring Ollama.
+`P2-001` and `P2-002` are complete. `P2-004` is the next implementation slice
+because the local context packer depends on the ticket contracts and unblocks
+safe prompt construction.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
 | P2-001 | Add TicketSpec and LoopRun contracts             | complete | done        |
-| P2-002 | Add model provider abstraction and fake provider | pending  | next        |
+| P2-002 | Add model provider abstraction and fake provider | complete | done        |
 | P2-003 | Add Ollama provider                              | pending  | no          |
-| P2-004 | Add local context packer                         | pending  | no          |
+| P2-004 | Add local context packer                         | pending  | next        |
 | P2-005 | Add loop workspace and state machine             | pending  | no          |
 | P2-006 | Add role prompts and structured response schemas | pending  | no          |
 | P2-007 | Add patch parser and deterministic policy gate   | pending  | no          |
@@ -165,7 +165,7 @@ pnpm format:check
 
 ### P2-002 - Add model provider abstraction and fake provider
 
-Status: pending
+Status: complete in `946aa4d`
 
 Objective: Create a provider-neutral interface for model calls and deterministic
 tests.
@@ -173,6 +173,7 @@ tests.
 Allowed files:
 
 - `Cargo.toml`
+- `Cargo.lock` when changed mechanically by adding the local workspace crate.
 - `crates/seaf-models/Cargo.toml`
 - `crates/seaf-models/src/lib.rs`
 - `crates/seaf-models/src/provider.rs`
@@ -195,6 +196,11 @@ Verification commands:
 cargo test -p seaf-models
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+Completed in `946aa4d`. Review follow-ups for future slices: add nested
+`ModelMessage` unknown-field coverage if the DTO tests are expanded, and
+replace `BTreeMap<String, Value>` policy decisions with a typed model in P2-007
+once the artifact shape is known.
 
 ### P2-003 - Add Ollama provider
 

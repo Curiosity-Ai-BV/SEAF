@@ -2,15 +2,17 @@
 
 ## Goal
 
-Implement P2-002, the model-provider abstraction and deterministic fake
-provider for the Phase 2 local agent loop.
+Implement P2-004, the safe local context packer for Phase 2 local agent-loop
+prompts.
 
 ## Success Criteria
 
-- Add a provider-neutral model request/response API.
-- Add a deterministic fake provider that can script a sequence of responses.
-- Provider errors can be serialized into loop artifacts.
-- Tests can exercise the provider abstraction without network access.
-- Keep the slice scoped to the P2-002 allowed files in
+- Gather bounded context from ticket relevant files.
+- Exclude secrets, signing material, generated folders, dependency folders, and
+  forbidden paths.
+- Enforce max bytes per file and total context bytes.
+- Include file digests and warnings for traceability.
+- Write `context-manifest.json` to a run directory.
+- Keep the slice scoped to the P2-004 allowed files in
   `docs/phase-2-local-agent-loop.md`.
 - Run spec-compliance and code-quality review before commit.
