@@ -79,3 +79,19 @@ Added durable loop workspace/state infrastructure in `seaf-loop`: run creation/r
 ## 2026-07-01 verify | P2-005 state machine
 
 Spec review required request persistence before step execution, attempt-indexed prompt/response artifacts, and a parseable empty context manifest. Code-quality review required duplicate-run protection, terminal `passed` semantics, persisted-running resume tests, blocked/failed output tests, and safe artifact extension handling. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `af7a2fa`.
+
+## 2026-07-01 act | P2-006 role responses
+
+Added local agent role prompts, response DTOs, handcrafted response schemas,
+fail-closed parsing, one-shot invalid-JSON repair, developer patch-field
+enforcement, reviewer issue arrays, and valid/invalid model-response fixtures.
+
+## 2026-07-01 verify | P2-006 role responses
+
+Spec review approved the P2-006 scope and acceptance criteria. Code-quality
+review required status-aware developer patch validation and explicit role
+mismatch regression coverage. After fixes, spec and quality re-reviews approved.
+Final checks passed: `cargo test --workspace`,
+`cargo fmt --all -- --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`,
+`pnpm format:check`, and `git diff --check`. Committed as `bbc5665`.

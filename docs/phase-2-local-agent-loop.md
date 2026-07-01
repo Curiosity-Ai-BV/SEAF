@@ -94,9 +94,10 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, `P2-004`, and `P2-005` are complete. `P2-006` is the next
-implementation slice because role prompts and structured responses depend on
-the persisted loop workspace/state-machine seams.
+`P2-001`, `P2-002`, `P2-004`, `P2-005`, and `P2-006` are complete. `P2-007` is
+the next implementation slice because deterministic patch parsing and policy
+gating depend on the context, state-machine, and role-response seams now being
+in place.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -105,8 +106,8 @@ the persisted loop workspace/state-machine seams.
 | P2-003 | Add Ollama provider                              | pending  | no          |
 | P2-004 | Add local context packer                         | complete | done        |
 | P2-005 | Add loop workspace and state machine             | complete | done        |
-| P2-006 | Add role prompts and structured response schemas | pending  | next        |
-| P2-007 | Add patch parser and deterministic policy gate   | pending  | no          |
+| P2-006 | Add role prompts and structured response schemas | complete | done        |
+| P2-007 | Add patch parser and deterministic policy gate   | pending  | next        |
 | P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
 | P2-009 | Build AgentBench-lite                            | pending  | no          |
 | P2-010 | Integrate evals with existing EvalReport         | pending  | no          |
@@ -313,7 +314,7 @@ prompt exists without a response.
 
 ### P2-006 - Add role prompts and structured response schemas
 
-Status: pending
+Status: complete in `bbc5665`
 
 Objective: Implement local agent roles and schema-validated structured outputs.
 
@@ -341,6 +342,11 @@ Verification commands:
 ```bash
 cargo test -p seaf-loop role_response
 ```
+
+Review follow-up before policy-gate integration: consider rejecting unified diff
+content in the developer `patch` field when the developer status is `blocked`
+or `needs_context`. Current behavior still satisfies P2-006 because diff content
+is restricted to `patch`.
 
 ### P2-007 - Add patch parser and deterministic policy gate
 

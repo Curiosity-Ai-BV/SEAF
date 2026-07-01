@@ -21,7 +21,7 @@
 - [x] P2-002: Add model provider abstraction and fake provider.
 - [x] P2-004: Add local context packer.
 - [x] P2-005: Add loop workspace and state machine.
-- [ ] P2-006: Add role prompts and structured response schemas.
+- [x] P2-006: Add role prompts and structured response schemas.
 - [ ] P2-007: Add patch parser and deterministic policy gate.
 - [ ] P2-003: Add Ollama provider.
 - [ ] P2-008: Add CLI commands for model, ticket, and loop.
