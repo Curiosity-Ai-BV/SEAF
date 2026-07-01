@@ -356,6 +356,7 @@ Objective: Ensure model-generated code changes are safe to apply.
 
 Allowed files:
 
+- `crates/seaf-loop/src/lib.rs`
 - `crates/seaf-loop/src/patch.rs`
 - `crates/seaf-loop/src/policy_gate.rs`
 - `fixtures/patches/*`
