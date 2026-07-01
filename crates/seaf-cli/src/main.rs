@@ -11,6 +11,10 @@ use seaf_core::{
     EvalDecision, EvalReport, FieldError, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy,
     ValidationReport,
 };
+use seaf_models::{
+    ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
+    DEFAULT_OLLAMA_BASE_URL,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
@@ -46,6 +50,11 @@ enum Command {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    /// Work with local model providers.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
     },
     /// Work with release capsules.
     Release {
@@ -92,6 +101,12 @@ enum TaskCommand {
 enum EvalCommand {
     /// Run configured eval commands and emit an EvalReport.
     Run(EvalRunArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Check that a local model provider can answer a structured request.
+    Check(ModelCheckArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +162,25 @@ struct EvalRunArgs {
     /// Goal ID to bind into the EvalReport.
     #[arg(long, default_value = "unknown")]
     goal_id: String,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ModelCheckArgs {
+    /// Provider to check. Supported: ollama.
+    #[arg(long)]
+    provider: String,
+    /// Model name to check.
+    #[arg(long)]
+    model: String,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -223,6 +257,18 @@ struct EvalCommandConfig {
     command: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ModelCheckReport {
+    provider: String,
+    model: String,
+    base_url: String,
+    ok: bool,
+    status: String,
+    message: String,
+    latency_ms: Option<u64>,
+    error_kind: Option<String>,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -252,6 +298,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Eval {
             command: EvalCommand::Run(args),
         } => run_eval(args),
+        Command::Model {
+            command: ModelCommand::Check(args),
+        } => check_model(args),
         Command::Release {
             command: ReleaseCommand::Prepare(args),
         } => prepare_release(args),
@@ -392,6 +441,113 @@ fn generate_task_brief(args: TaskBriefArgs) -> Result<(), CliFailure> {
     }
 
     Ok(())
+}
+
+fn check_model(args: ModelCheckArgs) -> Result<(), CliFailure> {
+    if args.provider != "ollama" {
+        return finish_model_check(
+            ModelCheckReport {
+                provider: args.provider,
+                model: args.model,
+                base_url: args.base_url,
+                ok: false,
+                status: "failed".to_string(),
+                message: "unsupported model provider; supported providers: ollama".to_string(),
+                latency_ms: None,
+                error_kind: Some("unsupported_provider".to_string()),
+            },
+            args.json,
+        );
+    }
+
+    if args.timeout_ms == 0 {
+        return finish_model_check(
+            ModelCheckReport {
+                provider: args.provider,
+                model: args.model,
+                base_url: args.base_url,
+                ok: false,
+                status: "failed".to_string(),
+                message: "--timeout-ms must be greater than 0".to_string(),
+                latency_ms: None,
+                error_kind: Some("invalid_timeout".to_string()),
+            },
+            args.json,
+        );
+    }
+
+    let provider = OllamaProvider::new(OllamaConfig {
+        base_url: args.base_url.clone(),
+        ..OllamaConfig::default()
+    });
+    let request = model_check_request(&args.model, args.timeout_ms);
+    let report = match provider.complete(request) {
+        Ok(response) => ModelCheckReport {
+            provider: args.provider,
+            model: args.model,
+            base_url: args.base_url,
+            ok: true,
+            status: "passed".to_string(),
+            message: "Ollama model check passed".to_string(),
+            latency_ms: Some(response.latency_ms),
+            error_kind: None,
+        },
+        Err(error) => ModelCheckReport {
+            provider: args.provider,
+            model: args.model,
+            base_url: args.base_url,
+            ok: false,
+            status: "failed".to_string(),
+            message: error.message,
+            latency_ms: None,
+            error_kind: Some(error.kind.to_string()),
+        },
+    };
+
+    finish_model_check(report, args.json)
+}
+
+fn finish_model_check(report: ModelCheckReport, as_json: bool) -> Result<(), CliFailure> {
+    let ok = report.ok;
+    if as_json {
+        print_json(&report)?;
+    } else if ok {
+        println!(
+            "model check passed for {} model {}",
+            report.provider, report.model
+        );
+    } else {
+        eprintln!(
+            "model check failed for {} model {}: {}",
+            report.provider, report.model, report.message
+        );
+    }
+
+    if ok {
+        Ok(())
+    } else {
+        Err(CliFailure::already_printed())
+    }
+}
+
+fn model_check_request(model: &str, timeout_ms: u64) -> ModelRequest {
+    ModelRequest {
+        model: model.to_string(),
+        system: "Return JSON only.".to_string(),
+        messages: vec![ModelMessage {
+            role: ModelMessageRole::User,
+            content: "Return exactly a JSON object with boolean field ok set to true.".to_string(),
+        }],
+        response_schema: Some(serde_json::json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": {
+                "ok": { "type": "boolean" }
+            }
+        })),
+        temperature: 0.0,
+        timeout_ms,
+    }
 }
 
 fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {

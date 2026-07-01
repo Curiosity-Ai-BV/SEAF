@@ -1,7 +1,12 @@
 pub mod fake;
+pub mod ollama;
 pub mod provider;
 
 pub use fake::FakeProvider;
+pub use ollama::{
+    OllamaConfig, OllamaHttpClient, OllamaHttpError, OllamaHttpRequest, OllamaHttpResponse,
+    OllamaProvider, DEFAULT_OLLAMA_BASE_URL,
+};
 pub use provider::{
     ModelError, ModelErrorKind, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest,
     ModelResponse,

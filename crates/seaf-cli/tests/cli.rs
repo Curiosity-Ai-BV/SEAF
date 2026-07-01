@@ -245,6 +245,29 @@ fn eval_run_fails_closed_when_required_check_fails() {
 }
 
 #[test]
+fn model_check_json_reports_invalid_ollama_base_url_without_live_server() {
+    let output = seaf()
+        .args([
+            "model",
+            "check",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            "ftp://localhost:11434/api",
+            "--json",
+        ])
+        .output()
+        .expect("run model check");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"ok\": false"));
+    assert!(stdout.contains("unsupported Ollama base URL"));
+}
+
+#[test]
 fn release_prepare_and_verify_bind_artifact_and_eval_digests() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let artifact_path = temp_dir.path().join("artifact.txt");
