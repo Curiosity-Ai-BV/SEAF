@@ -71,3 +71,11 @@ Added the `seaf-loop` crate with local context packing, default safety excludes,
 ## 2026-07-01 verify | P2-004 context packer
 
 Spec review approved the crate scope and acceptance criteria. Code-quality review approved path normalization, symlink escape blocking, manifest/content separation, and byte-limit behavior, with a non-blocking follow-up for direct path-safety regression tests. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `5f36eba`.
+
+## 2026-07-01 act | P2-005 state machine
+
+Added durable loop workspace/state infrastructure in `seaf-loop`: run creation/resume, `run.json` persistence, prompt/response/artifact/log writing, attempt-indexed prompt/response artifacts, rerun-from reset, and a small step-runner test seam.
+
+## 2026-07-01 verify | P2-005 state machine
+
+Spec review required request persistence before step execution, attempt-indexed prompt/response artifacts, and a parseable empty context manifest. Code-quality review required duplicate-run protection, terminal `passed` semantics, persisted-running resume tests, blocked/failed output tests, and safe artifact extension handling. After fixes, spec and quality re-reviews approved. Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `pnpm format:check`, and `git diff --check`. Committed as `af7a2fa`.

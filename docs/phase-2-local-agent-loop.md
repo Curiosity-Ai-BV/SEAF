@@ -94,9 +94,9 @@ Safety boundary:
 
 ## Current Status
 
-`P2-001`, `P2-002`, and `P2-004` are complete. `P2-005` is the next
-implementation slice because the workspace/state machine depends on the core
-contracts, fake model provider, and context packer.
+`P2-001`, `P2-002`, `P2-004`, and `P2-005` are complete. `P2-006` is the next
+implementation slice because role prompts and structured responses depend on
+the persisted loop workspace/state-machine seams.
 
 | Ticket | Title                                            | Status   | First Slice |
 | ------ | ------------------------------------------------ | -------- | ----------- |
@@ -104,8 +104,8 @@ contracts, fake model provider, and context packer.
 | P2-002 | Add model provider abstraction and fake provider | complete | done        |
 | P2-003 | Add Ollama provider                              | pending  | no          |
 | P2-004 | Add local context packer                         | complete | done        |
-| P2-005 | Add loop workspace and state machine             | pending  | next        |
-| P2-006 | Add role prompts and structured response schemas | pending  | no          |
+| P2-005 | Add loop workspace and state machine             | complete | done        |
+| P2-006 | Add role prompts and structured response schemas | pending  | next        |
 | P2-007 | Add patch parser and deterministic policy gate   | pending  | no          |
 | P2-008 | Add CLI commands for model, ticket, and loop     | pending  | no          |
 | P2-009 | Build AgentBench-lite                            | pending  | no          |
@@ -277,7 +277,7 @@ absolute/traversal path rejection and symlink escape blocking.
 
 ### P2-005 - Add loop workspace and state machine
 
-Status: pending
+Status: complete in `af7a2fa`
 
 Objective: Make loop runs restartable and auditable.
 
@@ -306,6 +306,10 @@ Verification commands:
 ```bash
 cargo test -p seaf-loop state
 ```
+
+Review follow-ups before CLI wiring: validate user-facing `run_id` values before
+joining them into workspace paths, and consider a focused retry test where a
+prompt exists without a response.
 
 ### P2-006 - Add role prompts and structured response schemas
 
