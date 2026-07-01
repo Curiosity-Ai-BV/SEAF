@@ -745,6 +745,8 @@ fn resume_loop(args: LoopStatusArgs) -> Result<(), CliFailure> {
         .run_to_completion()
         .map_err(loop_runner_failure)?
         .clone();
+    let mut run = run;
+    persist_deterministic_policy_evidence(&args.runs_root, &mut run)?;
     finish_loop_command("resume", &args.runs_root, &run, args.json)
 }
 

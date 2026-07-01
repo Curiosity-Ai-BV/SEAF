@@ -990,6 +990,102 @@ fn eval_run_loop_mode_accepts_product_path_loop_run() {
 }
 
 #[test]
+fn loop_resume_persists_policy_evidence_for_pre_evidence_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path();
+    init_git_repo(repo);
+    let runs_root = repo.join("runs");
+    let run_id = "loop-resume-evidence";
+    let eval_report_path = repo.join("eval-report.json");
+
+    let loop_run = seaf_in(repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(loop_run.status.success(), "{loop_run:?}");
+
+    let run_path = runs_root.join(run_id).join("run.json");
+    let mut persisted_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("run json"))
+            .expect("persisted run json");
+    *persisted_run
+        .get_mut("policy_decisions")
+        .expect("policy decisions") = serde_json::json!([]);
+    fs::write(
+        &run_path,
+        serde_json::to_string_pretty(&persisted_run).expect("serialize run"),
+    )
+    .expect("write pre-evidence run");
+
+    let resume = seaf_in(repo)
+        .args([
+            "loop",
+            "resume",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("resume loop");
+    assert!(resume.status.success(), "{resume:?}");
+    let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
+    let resume_report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("resume report json");
+    assert_eq!(resume_report["status"], "completed");
+
+    let resumed_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("resumed run json"))
+            .expect("resumed run json");
+    assert!(
+        !resumed_run["policy_decisions"]
+            .as_array()
+            .expect("policy decisions")
+            .is_empty(),
+        "resume should backfill deterministic policy evidence so completed runs remain evaluable"
+    );
+    assert_eq!(resumed_run["policy_decisions"][0]["patch_id"], run_id);
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            local_loop_eval_path().to_str().unwrap(),
+            "--loop-run",
+            run_path.to_str().unwrap(),
+            "--ticket",
+            local_loop_ticket_path().to_str().unwrap(),
+            "--output",
+            eval_report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("eval report json");
+    assert_eq!(report["patch_id"], run_id);
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["decision"], "approve_for_human_review");
+}
+
+#[test]
 fn release_prepare_and_verify_bind_artifact_and_eval_digests() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let artifact_path = temp_dir.path().join("artifact.txt");
