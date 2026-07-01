@@ -1,6 +1,8 @@
 pub mod artifacts;
 pub mod context;
+pub mod patch;
 pub mod policy;
+pub mod policy_gate;
 pub mod role_response;
 pub mod runner;
 pub mod state;
@@ -11,6 +13,11 @@ pub use context::{
     pack_context, pack_context_for_ticket, ContextBundle, ContextError, ContextFile, ContextLimits,
     ContextManifest, ContextManifestFile, ContextPackRequest, CONTEXT_MANIFEST_FILE,
     UNTRUSTED_CONTEXT_MARKER,
+};
+pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
+pub use policy_gate::{
+    gate_patch, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
+    PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision, PolicyDecisionReason,
 };
 pub use role_response::{
     parse_role_response, parse_role_response_with_repair, AgentResponse, AgentStatus,
