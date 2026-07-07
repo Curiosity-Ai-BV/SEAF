@@ -13,7 +13,12 @@
     "auth_code",
     "payment_code",
     "privacy_sensitive_code",
-    "network_permission_changes"
+    "network_permission_changes",
+    "ci_changes",
+    "eval_changes",
+    "policy_changes",
+    "updater_changes",
+    "signing_changes"
   ],
   "allowed_without_review": [
     "tests",

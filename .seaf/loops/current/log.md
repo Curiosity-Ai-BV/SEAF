@@ -259,3 +259,10 @@ post-Phase-2 live integration work. Marked P3-002 complete in current progress;
 P3-003 through P3-005 remain open. Final checks passed: `pnpm exec prettier
 --check docs/mvp-backlog.md .seaf/loops/current/progress.md
 .seaf/loops/current/log.md` and `git diff --check`.
+
+## 2026-07-07 act | P3-003 default policy drift
+
+Added a core regression that requires the default policy template and
+adaptive-notes example policy to list every policy-gate human-review category.
+Updated both policies to include CI, eval, policy, updater, and signing change
+categories, then marked only P3-003 complete in current progress.

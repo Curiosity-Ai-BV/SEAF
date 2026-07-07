@@ -10,7 +10,7 @@
 - [x] P3-001: Create post-Phase-2 loop contract and current tracker.
 - [x] P3-002: Reconcile stale docs so implemented primitives are separated from
       missing live integration.
-- [ ] P3-003: Fix default policy drift for CI, eval, policy, updater, and
+- [x] P3-003: Fix default policy drift for CI, eval, policy, updater, and
       signing change categories.
 - [ ] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
       context exclusions.
