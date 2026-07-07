@@ -1,9 +1,14 @@
 use std::path::Path;
 
-use seaf_core::{LoopStepName, LoopStepStatus, TicketContext, TicketSpec, TicketStatus};
+use seaf_core::{
+    LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, TicketContext, TicketSpec,
+    TicketStatus,
+};
 use seaf_loop::{
-    ContextLimits, ContextManifest, ContextPackRequest, LoopRunner, LoopRunnerConfig,
-    ProviderStepRunner, Role, StepRunner, UNTRUSTED_CONTEXT_MARKER,
+    CommandOutput, ContextLimits, ContextManifest, ContextPackRequest, LoopRunner,
+    LoopRunnerConfig, PatchCommand, PatchCommandRunner, PatchDecisionKind, PatchGateError,
+    PolicyDecision, ProviderPatchGateConfig, ProviderStepRunner, Role, StepRunner,
+    UNTRUSTED_CONTEXT_MARKER,
 };
 use seaf_models::{FakeProvider, ModelError, ModelResponse};
 use serde_json::json;
@@ -27,6 +32,12 @@ fn fixture(name: &str) -> &'static str {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../fixtures/model-responses/analyzer.valid.json"
+            ))
+        }
+        "allowed-doc.diff" => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/patches/allowed-doc.diff"
             ))
         }
         _ => panic!("unknown fixture: {name}"),
@@ -404,6 +415,353 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
 }
 
 #[test]
+fn provider_step_runner_persists_allowed_patch_policy_decision_without_apply() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+
+    let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "allowed-patch-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+    finish_steps_before_development(&mut loop_runner);
+
+    loop_runner
+        .run_next_step()
+        .expect("run development step with patch gate");
+    drop(loop_runner);
+    drop(step_runner);
+
+    let run_dir = runs_root.join("allowed-patch-run");
+    let persisted = read_run(&run_dir);
+    let decision = single_policy_decision(&persisted);
+    assert_eq!(decision.patch_id, "allowed-patch-run");
+    assert_eq!(
+        decision.patch_sha256,
+        sha256(fixture("allowed-doc.diff").as_bytes())
+    );
+    assert_eq!(decision.changed_paths, vec!["docs/example.md"]);
+    assert_eq!(decision.decision, PatchDecisionKind::Allowed);
+    assert!(!decision.requires_human_review);
+    assert!(!decision.apply_requested);
+    assert!(!decision.applied);
+    assert!(
+        patch_runner.commands.is_empty(),
+        "apply-disabled gates must not invoke git apply checks"
+    );
+    assert_file_contains(
+        &run_dir.join("artifacts/allowed-patch-run.diff"),
+        fixture("allowed-doc.diff"),
+    );
+    assert!(run_dir
+        .join("artifacts/allowed-patch-run.policy-decision.json")
+        .is_file());
+}
+
+#[test]
+fn provider_step_runner_rejected_patch_fails_development_and_never_applies() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let patch = forbidden_patch();
+
+    let provider = provider_for_development_patch(&patch);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "rejected-patch-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+    finish_steps_before_development(&mut loop_runner);
+
+    loop_runner
+        .run_next_step()
+        .expect("policy rejection is persisted as a failed step");
+    drop(loop_runner);
+    drop(step_runner);
+
+    let persisted = read_run(&runs_root.join("rejected-patch-run"));
+    assert_eq!(persisted.status, LoopStatus::Failed);
+    assert_eq!(
+        step_status(&persisted, LoopStepName::Development),
+        LoopStepStatus::Failed
+    );
+    let decision = single_policy_decision(&persisted);
+    assert_eq!(decision.decision, PatchDecisionKind::Rejected);
+    assert!(decision.apply_requested);
+    assert!(!decision.applied);
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.code == "forbidden_path"));
+    assert!(
+        patch_runner.commands.is_empty(),
+        "forbidden patches must not reach git apply --check"
+    );
+}
+
+#[test]
+fn provider_step_runner_replaces_stale_policy_decision_when_development_is_rerun() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let rejected_patch = forbidden_patch();
+
+    let provider = FakeProvider::new(vec![
+        Ok(model_response(fixture("research.valid.json"))),
+        Ok(model_response(fixture("analyzer.valid.json"))),
+        Ok(model_response(&spec_writer_response())),
+        Ok(model_response(&spec_review_approved_response())),
+        Ok(model_response(&developer_response(&rejected_patch))),
+        Ok(model_response(&developer_response(fixture(
+            "allowed-doc.diff",
+        )))),
+    ]);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "rerun-policy-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+    finish_steps_before_development(&mut loop_runner);
+    loop_runner
+        .run_next_step()
+        .expect("first development attempt records rejection");
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
+
+    let mut loop_runner = loop_runner
+        .rerun_from(LoopStepName::Development)
+        .expect("rerun development");
+    loop_runner
+        .run_next_step()
+        .expect("second development attempt records replacement decision");
+    drop(loop_runner);
+    drop(step_runner);
+
+    let persisted = read_run(&runs_root.join("rerun-policy-run"));
+    let decision = single_policy_decision(&persisted);
+    assert_eq!(decision.patch_id, "rerun-policy-run");
+    assert_eq!(decision.decision, PatchDecisionKind::Allowed);
+    assert_eq!(decision.changed_paths, vec!["docs/example.md"]);
+}
+
+#[test]
+fn provider_step_runner_human_review_patch_persists_without_failing_or_applying() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let patch = human_review_patch();
+
+    let provider = provider_for_development_patch(&patch);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "review-patch-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+    finish_steps_before_development(&mut loop_runner);
+
+    loop_runner
+        .run_next_step()
+        .expect("human review decision should not fail development");
+    drop(loop_runner);
+    drop(step_runner);
+
+    let persisted = read_run(&runs_root.join("review-patch-run"));
+    assert_eq!(
+        step_status(&persisted, LoopStepName::Development),
+        LoopStepStatus::Completed
+    );
+    let decision = single_policy_decision(&persisted);
+    assert_eq!(decision.decision, PatchDecisionKind::RequiresHumanReview);
+    assert!(decision.requires_human_review);
+    assert!(decision.apply_requested);
+    assert!(!decision.applied);
+    assert!(
+        patch_runner.commands.is_empty(),
+        "human-review patches must not be applied automatically"
+    );
+}
+
+#[test]
+fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+
+    let setup_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
+    let mut setup_patch_runner = RecordingPatchRunner::default();
+    let mut setup_step_runner = ProviderStepRunner::new(&setup_provider, "fake-model", 30_000)
+        .with_patch_gate(
+            patch_gate_config(&repo, false, true),
+            &mut setup_patch_runner,
+        );
+    let setup_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "workspace-directory",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut setup_step_runner,
+    )
+    .expect("start loop");
+    drop(setup_runner);
+    drop(setup_step_runner);
+
+    let run_dir = runs_root.join("workspace-directory");
+    let mut run = read_run(&run_dir);
+    run.run_id = "authoritative-run-id".to_string();
+    write_run(&run_dir, &run);
+
+    let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
+    let mut loop_runner =
+        LoopRunner::resume(&runs_root, "workspace-directory", &mut step_runner).expect("resume");
+    finish_steps_before_development(&mut loop_runner);
+    loop_runner
+        .run_next_step()
+        .expect("development records policy evidence");
+    drop(loop_runner);
+    drop(step_runner);
+
+    let persisted = read_run(&run_dir);
+    let decision = single_policy_decision(&persisted);
+    assert_eq!(decision.patch_id, "authoritative-run-id");
+    assert!(run_dir
+        .join("artifacts/authoritative-run-id.policy-decision.json")
+        .is_file());
+}
+
+#[test]
+fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let clean_runs_root = temp_dir.path().join("clean-runs");
+    let dirty_runs_root = temp_dir.path().join("dirty-runs");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+
+    let clean_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
+    let mut clean_patch_runner = RecordingPatchRunner::default();
+    let mut clean_step_runner = ProviderStepRunner::new(&clean_provider, "fake-model", 30_000)
+        .with_patch_gate(
+            patch_gate_config(&repo, true, true),
+            &mut clean_patch_runner,
+        );
+    let mut clean_loop = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &clean_runs_root,
+            "clean-apply-run",
+            &ticket_with_apply(true),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut clean_step_runner,
+    )
+    .expect("start clean loop");
+    finish_steps_before_development(&mut clean_loop);
+    clean_loop.run_next_step().expect("run clean apply step");
+    drop(clean_loop);
+    drop(clean_step_runner);
+
+    assert_eq!(
+        clean_patch_runner.commands,
+        vec![PatchCommand::GitApplyCheck, PatchCommand::GitApply],
+        "clean apply-enabled patches should run check before apply"
+    );
+    let clean_decision =
+        single_policy_decision(&read_run(&clean_runs_root.join("clean-apply-run")));
+    assert!(clean_decision.apply_requested);
+    assert!(clean_decision.applied);
+
+    let dirty_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
+    let mut dirty_patch_runner = RecordingPatchRunner::default();
+    let mut dirty_step_runner = ProviderStepRunner::new(&dirty_provider, "fake-model", 30_000)
+        .with_patch_gate(
+            patch_gate_config(&repo, true, false),
+            &mut dirty_patch_runner,
+        );
+    let mut dirty_loop = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &dirty_runs_root,
+            "dirty-apply-run",
+            &ticket_with_apply(true),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut dirty_step_runner,
+    )
+    .expect("start dirty loop");
+    finish_steps_before_development(&mut dirty_loop);
+    dirty_loop.run_next_step().expect("run dirty apply step");
+    drop(dirty_loop);
+    drop(dirty_step_runner);
+
+    let dirty_decision =
+        single_policy_decision(&read_run(&dirty_runs_root.join("dirty-apply-run")));
+    assert_eq!(dirty_decision.decision, PatchDecisionKind::Rejected);
+    assert!(dirty_decision.apply_requested);
+    assert!(!dirty_decision.applied);
+    let dirty_reason = dirty_decision
+        .reasons
+        .iter()
+        .find(|reason| reason.code == "git_apply_check_failed")
+        .expect("dirty guard should be recorded as apply-check failure");
+    assert!(dirty_reason
+        .details
+        .as_deref()
+        .unwrap_or_default()
+        .contains("worktree is not clean"));
+    assert!(
+        dirty_patch_runner.commands.is_empty(),
+        "dirty worktree guard must not invoke the patch runner"
+    );
+}
+
+#[test]
 fn provider_step_runner_maps_developer_blocked_and_reviewer_failed_statuses() {
     let developer_blocked = r#"{
         "role": "developer",
@@ -487,6 +845,39 @@ fn model_response(content: &str) -> ModelResponse {
     }
 }
 
+fn provider_for_development_patch(patch: &str) -> FakeProvider {
+    FakeProvider::new(vec![
+        Ok(model_response(fixture("research.valid.json"))),
+        Ok(model_response(fixture("analyzer.valid.json"))),
+        Ok(model_response(&spec_writer_response())),
+        Ok(model_response(&spec_review_approved_response())),
+        Ok(model_response(&developer_response(patch))),
+    ])
+}
+
+fn spec_writer_response() -> String {
+    json!({
+        "role": "spec_writer",
+        "status": "passed",
+        "summary": "Implement the requested patch.",
+        "findings": [],
+        "risks": [],
+        "next_step_recommendation": "Review the implementation plan."
+    })
+    .to_string()
+}
+
+fn spec_review_approved_response() -> String {
+    json!({
+        "role": "spec_reviewer",
+        "decision": "approve_spec",
+        "summary": "The spec is narrow enough to implement.",
+        "blocking_issues": [],
+        "non_blocking_issues": []
+    })
+    .to_string()
+}
+
 fn ticket() -> TicketSpec {
     TicketSpec {
         ticket_id: "P3-006".to_string(),
@@ -510,6 +901,12 @@ fn ticket() -> TicketSpec {
     }
 }
 
+fn ticket_with_apply(apply_patch: bool) -> TicketSpec {
+    let mut ticket = ticket();
+    ticket.autonomy.apply_patch = apply_patch;
+    ticket
+}
+
 fn ticket_with_context(relevant_files: Vec<&str>, forbidden_files: Vec<&str>) -> TicketSpec {
     TicketSpec {
         context: TicketContext {
@@ -518,6 +915,107 @@ fn ticket_with_context(relevant_files: Vec<&str>, forbidden_files: Vec<&str>) ->
         },
         ..ticket()
     }
+}
+
+fn patch_gate_config(
+    repository_root: &Path,
+    apply_patch: bool,
+    worktree_clean: bool,
+) -> ProviderPatchGateConfig {
+    ProviderPatchGateConfig::for_ticket(
+        repository_root,
+        &ticket_with_apply(apply_patch),
+        policy(),
+        worktree_clean,
+    )
+}
+
+fn policy() -> Policy {
+    Policy {
+        policy_id: "test-policy".to_string(),
+        default_autonomy_level: 1,
+        forbidden_paths: vec!["secrets/**".to_string()],
+        requires_human_review: vec!["dependency_changes".to_string()],
+        allowed_without_review: Vec::new(),
+    }
+}
+
+fn developer_response(patch: &str) -> String {
+    json!({
+        "role": "developer",
+        "status": "patch_proposed",
+        "summary": "Proposed a focused patch.",
+        "changed_files": ["docs/example.md"],
+        "requires_human_review": false,
+        "patch": patch
+    })
+    .to_string()
+}
+
+fn forbidden_patch() -> String {
+    r#"diff --git a/secrets/token.txt b/secrets/token.txt
+index 1111111..2222222 100644
+--- a/secrets/token.txt
++++ b/secrets/token.txt
+@@ -1 +1 @@
+-old
++new
+"#
+    .to_string()
+}
+
+fn human_review_patch() -> String {
+    r#"diff --git a/Cargo.lock b/Cargo.lock
+index 1111111..2222222 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1 +1 @@
+-old
++new
+"#
+    .to_string()
+}
+
+fn finish_steps_before_development<R: StepRunner + ?Sized>(loop_runner: &mut LoopRunner<'_, R>) {
+    for step in [
+        LoopStepName::Research,
+        LoopStepName::Analysis,
+        LoopStepName::SpecCreation,
+        LoopStepName::SpecReview,
+    ] {
+        assert!(loop_runner
+            .run_next_step()
+            .unwrap_or_else(|error| panic!("run {step:?}: {error}")));
+    }
+}
+
+fn read_run(run_dir: &Path) -> LoopRun {
+    let run_json = std::fs::read_to_string(run_dir.join("run.json")).expect("run json");
+    serde_json::from_str(&run_json).expect("run json")
+}
+
+fn write_run(run_dir: &Path, run: &LoopRun) {
+    let mut run_json = serde_json::to_vec_pretty(run).expect("run json");
+    run_json.push(b'\n');
+    std::fs::write(run_dir.join("run.json"), run_json).expect("write run json");
+}
+
+fn single_policy_decision(run: &LoopRun) -> PolicyDecision {
+    assert_eq!(
+        run.policy_decisions.len(),
+        1,
+        "expected exactly one persisted policy decision"
+    );
+    serde_json::from_value(serde_json::to_value(&run.policy_decisions[0]).expect("decision value"))
+        .expect("typed policy decision")
+}
+
+fn step_status(run: &LoopRun, step: LoopStepName) -> LoopStepStatus {
+    run.steps
+        .iter()
+        .find(|record| record.name == step)
+        .expect("step record")
+        .status
 }
 
 fn context_request(
@@ -549,4 +1047,21 @@ fn assert_file_contains(path: &Path, expected: &str) {
         content.contains(expected),
         "{path:?} should contain {expected:?}; got {content:?}"
     );
+}
+
+#[derive(Default)]
+struct RecordingPatchRunner {
+    commands: Vec<PatchCommand>,
+}
+
+impl PatchCommandRunner for RecordingPatchRunner {
+    fn run(
+        &mut self,
+        _repo_root: &Path,
+        command: PatchCommand,
+        _patch: &str,
+    ) -> Result<CommandOutput, PatchGateError> {
+        self.commands.push(command);
+        Ok(CommandOutput::success())
+    }
 }

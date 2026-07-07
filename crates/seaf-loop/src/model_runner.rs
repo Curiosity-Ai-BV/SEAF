@@ -1,12 +1,19 @@
-use seaf_core::{LoopStepName, LoopStepStatus};
+use std::path::{Path, PathBuf};
+
+use seaf_core::{LoopStepName, LoopStepStatus, Policy, TicketSpec};
 use seaf_models::{ModelMessage, ModelMessageRole, ModelProvider, ModelRequest};
 
 use crate::{
     context::{pack_live_context, ContextBundle, ContextPackRequest},
     parse_role_response_with_repair,
+    policy_gate::{
+        gate_patch, CommandOutput, PatchCommand, PatchCommandRunner, PatchDecisionKind,
+        PatchGateError, PatchGateRequest, PolicyDecision,
+    },
     runner::{RunnerError, StepRunner},
-    workspace::LoopWorkspace,
-    AgentStatus, DeveloperStatus, ReviewDecision, Role, RoleResponse, StepOutput,
+    workspace::{LoopWorkspace, ARTIFACTS_DIR},
+    AgentStatus, DeveloperResponse, DeveloperStatus, ReviewDecision, Role, RoleResponse,
+    StepOutput,
 };
 
 pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
@@ -15,7 +22,40 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     timeout_ms: u64,
     context_pack_request: Option<ContextPackRequest>,
     context_bundle: Option<ContextBundle>,
+    run_directory: Option<PathBuf>,
+    run_id: Option<String>,
+    patch_gate: Option<ProviderPatchGate<'a>>,
+    pending_policy_decisions: Vec<PolicyDecision>,
     last_error_response: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderPatchGateConfig {
+    pub repository_root: PathBuf,
+    pub policy: Policy,
+    pub apply_patch: bool,
+    pub worktree_clean: bool,
+}
+
+impl ProviderPatchGateConfig {
+    pub fn for_ticket(
+        repository_root: impl Into<PathBuf>,
+        ticket: &TicketSpec,
+        policy: Policy,
+        worktree_clean: bool,
+    ) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            policy,
+            apply_patch: ticket.autonomy.apply_patch,
+            worktree_clean,
+        }
+    }
+}
+
+struct ProviderPatchGate<'a> {
+    config: ProviderPatchGateConfig,
+    runner: &'a mut dyn PatchCommandRunner,
 }
 
 impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
@@ -26,12 +66,25 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             timeout_ms,
             context_pack_request: None,
             context_bundle: None,
+            run_directory: None,
+            run_id: None,
+            patch_gate: None,
+            pending_policy_decisions: Vec::new(),
             last_error_response: None,
         }
     }
 
     pub fn with_context_pack_request(mut self, request: ContextPackRequest) -> Self {
         self.context_pack_request = Some(request);
+        self
+    }
+
+    pub fn with_patch_gate(
+        mut self,
+        config: ProviderPatchGateConfig,
+        runner: &'a mut dyn PatchCommandRunner,
+    ) -> Self {
+        self.patch_gate = Some(ProviderPatchGate { config, runner });
         self
     }
 
@@ -48,20 +101,68 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             timeout_ms: self.timeout_ms,
         }
     }
+
+    fn gate_developer_patch(
+        &mut self,
+        response: &DeveloperResponse,
+    ) -> Result<Option<LoopStepStatus>, RunnerError> {
+        if response.status != DeveloperStatus::PatchProposed {
+            return Ok(None);
+        }
+
+        let Some(patch_gate) = self.patch_gate.as_mut() else {
+            return Ok(None);
+        };
+        let patch = response.patch.as_deref().ok_or_else(|| {
+            RunnerError::Step("developer patch response was missing patch content".to_string())
+        })?;
+        let run_directory = self.run_directory.as_ref().ok_or_else(|| {
+            RunnerError::Step(
+                "patch gate requires a prepared loop workspace before development".to_string(),
+            )
+        })?;
+        let run_id = self.run_id.as_ref().ok_or_else(|| {
+            RunnerError::Step(
+                "patch gate requires an authoritative loop run id before development".to_string(),
+            )
+        })?;
+        let config = patch_gate.config.clone();
+        let artifact_dir = run_directory.join(ARTIFACTS_DIR);
+        let request = PatchGateRequest {
+            repo_root: &config.repository_root,
+            artifact_dir: &artifact_dir,
+            patch_id: run_id,
+            patch,
+            policy: &config.policy,
+            apply_patch: config.apply_patch,
+        };
+
+        let decision = if config.apply_patch && !config.worktree_clean {
+            let mut guard = DirtyWorktreePatchRunner;
+            gate_patch(request, &mut guard)
+        } else {
+            gate_patch(request, &mut *patch_gate.runner)
+        }
+        .map_err(|error| RunnerError::Step(format!("patch gate failed: {error}")))?;
+
+        let status = match decision.decision {
+            PatchDecisionKind::Rejected => LoopStepStatus::Failed,
+            PatchDecisionKind::Allowed | PatchDecisionKind::RequiresHumanReview => {
+                LoopStepStatus::Completed
+            }
+        };
+        self.pending_policy_decisions.push(decision);
+        Ok(Some(status))
+    }
 }
 
 impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     fn prepare_workspace(&mut self, workspace: &LoopWorkspace) -> Result<(), RunnerError> {
-        self.context_bundle = None;
-        let Some(request) = &self.context_pack_request else {
-            return Ok(());
-        };
-        let mut request = request.clone();
-        request.run_directory = workspace.run_directory().to_path_buf();
-        let bundle = pack_live_context(&request)
-            .map_err(|error| RunnerError::Step(format!("failed to pack live context: {error}")))?;
-        self.context_bundle = Some(bundle);
-        Ok(())
+        self.prepare_provider_workspace(workspace, None)
+    }
+
+    fn prepare_run(&mut self, workspace: &LoopWorkspace, run_id: &str) -> Result<(), RunnerError> {
+        self.prepare_provider_workspace(workspace, Some(run_id))
     }
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
@@ -82,6 +183,7 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError> {
         self.last_error_response = None;
+        self.pending_policy_decisions.clear();
 
         let Some(role) = role_for_step(step) else {
             return Ok(StepOutput::completed(no_model_response(step)));
@@ -151,16 +253,60 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             }
             _ => initial_response.content,
         };
+        let gated_status = match &parsed {
+            RoleResponse::Developer(response) => self.gate_developer_patch(response)?,
+            RoleResponse::Agent(_) | RoleResponse::Reviewer(_) => None,
+        };
 
         Ok(StepOutput {
             response,
             artifact: None,
-            status,
+            status: gated_status.unwrap_or(status),
         })
+    }
+
+    fn drain_policy_decisions(&mut self) -> Result<Vec<PolicyDecision>, RunnerError> {
+        Ok(std::mem::take(&mut self.pending_policy_decisions))
     }
 
     fn error_response(&self) -> Option<&str> {
         self.last_error_response.as_deref()
+    }
+}
+
+impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
+    fn prepare_provider_workspace(
+        &mut self,
+        workspace: &LoopWorkspace,
+        run_id: Option<&str>,
+    ) -> Result<(), RunnerError> {
+        self.context_bundle = None;
+        self.run_directory = Some(workspace.run_directory().to_path_buf());
+        self.run_id = run_id.map(str::to_string);
+        let Some(request) = &self.context_pack_request else {
+            return Ok(());
+        };
+        let mut request = request.clone();
+        request.run_directory = workspace.run_directory().to_path_buf();
+        let bundle = pack_live_context(&request)
+            .map_err(|error| RunnerError::Step(format!("failed to pack live context: {error}")))?;
+        self.context_bundle = Some(bundle);
+        Ok(())
+    }
+}
+
+struct DirtyWorktreePatchRunner;
+
+impl PatchCommandRunner for DirtyWorktreePatchRunner {
+    fn run(
+        &mut self,
+        _repo_root: &Path,
+        _command: PatchCommand,
+        _patch: &str,
+    ) -> Result<CommandOutput, PatchGateError> {
+        Ok(CommandOutput::failure(
+            "worktree is not clean; refusing to run git apply for an automatic patch",
+        ))
     }
 }
 
