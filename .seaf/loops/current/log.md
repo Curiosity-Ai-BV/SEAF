@@ -235,3 +235,18 @@ Final checks passed: `cargo test --workspace`, `cargo fmt --all -- --check`,
 `pnpm install --frozen-lockfile`, `pnpm format:check`, `pnpm lint`,
 `pnpm typecheck`, `pnpm test`, `pnpm build`, `git diff --check`, and all focused
 P2-012 commands now listed in CI. Committed as `084688c`.
+
+## 2026-07-07 act | P3-001 Phase 0 contract
+
+Replaced the completed Phase 2 current contract with a post-Phase-2 Phase 0
+production-readiness contract. Reset current progress to the Phase 0 P3-001
+through P3-005 tracker, marking only P3-001 complete and leaving P3-002 through
+P3-005 open. Preserved the production-readiness roadmap and made no code
+changes.
+
+## 2026-07-07 verify | P3-001 Phase 0 contract
+
+Final documentation checks passed: `pnpm exec prettier --check
+docs/production-readiness-roadmap.md .seaf/loops/current/contract.md
+.seaf/loops/current/progress.md .seaf/loops/current/log.md` and
+`git diff --check`.
