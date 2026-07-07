@@ -87,10 +87,10 @@ enabling live model-driven changes.
   timeouts and concurrency, and split Rust clippy from TypeScript package lint
   so the TypeScript job does not depend on an unconfigured Rust environment.
 
-Exit gate: `cargo fmt --all -- --check`, `cargo clippy --all-targets
---all-features -- -D warnings`, `cargo test --workspace`, `pnpm
-format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build`, and
-`git diff --check` pass on a clean tree.
+Exit gate: `cargo fmt --all -- --check`, `cargo clippy --locked
+--all-targets --all-features -- -D warnings`, `cargo test --locked
+--workspace`, `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`,
+`pnpm build`, and `git diff --check` pass on a clean tree.
 
 ### Phase 1 - Wire The Live Local Agent Loop
 
