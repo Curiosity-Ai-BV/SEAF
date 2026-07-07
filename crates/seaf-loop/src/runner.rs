@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, path::PathBuf};
+use std::{error::Error, fmt, fs, path::PathBuf};
 
 use seaf_core::{LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketSpec};
 
@@ -41,6 +41,10 @@ impl LoopRunnerConfig {
 }
 
 pub trait StepRunner {
+    fn prepare_workspace(&mut self, _workspace: &LoopWorkspace) -> Result<(), RunnerError> {
+        Ok(())
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
@@ -81,6 +85,9 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
 impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     pub fn start(config: LoopRunnerConfig, step_runner: &'a mut R) -> Result<Self, RunnerError> {
         let workspace = LoopWorkspace::create(&config.runs_root, &config.run_id)?;
+        if let Err(error) = step_runner.prepare_workspace(&workspace) {
+            return Err(cleanup_failed_start_workspace(&workspace, error));
+        }
         let run = state::create_run(NewLoopRun {
             run_id: config.run_id,
             ticket_id: config.ticket_id,
@@ -106,6 +113,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let runs_root = runs_root.into();
         let workspace = LoopWorkspace::open(&runs_root, run_id)?;
         let run = state::load_run(&workspace)?;
+        step_runner.prepare_workspace(&workspace)?;
         workspace.append_log("resumed run")?;
 
         Ok(Self {
@@ -185,6 +193,20 @@ impl<R: StepRunner + ?Sized> fmt::Debug for LoopRunner<'_, R> {
             .field("workspace", &self.workspace)
             .field("run", &self.run)
             .finish_non_exhaustive()
+    }
+}
+
+fn cleanup_failed_start_workspace(workspace: &LoopWorkspace, error: RunnerError) -> RunnerError {
+    if workspace.run_file().exists() {
+        return error;
+    }
+
+    match fs::remove_dir_all(workspace.run_directory()) {
+        Ok(()) => error,
+        Err(cleanup_error) => RunnerError::Step(format!(
+            "{error}; failed to clean partial run workspace {}: {cleanup_error}",
+            workspace.run_directory().display()
+        )),
     }
 }
 

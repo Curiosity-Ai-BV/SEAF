@@ -1,9 +1,13 @@
 use std::path::Path;
 
 use seaf_core::{LoopStepName, LoopStepStatus, TicketContext, TicketSpec, TicketStatus};
-use seaf_loop::{LoopRunner, LoopRunnerConfig, ProviderStepRunner, Role, StepRunner};
+use seaf_loop::{
+    ContextLimits, ContextManifest, ContextPackRequest, LoopRunner, LoopRunnerConfig,
+    ProviderStepRunner, Role, StepRunner, UNTRUSTED_CONTEXT_MARKER,
+};
 use seaf_models::{FakeProvider, ModelError, ModelResponse};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 fn fixture(name: &str) -> &'static str {
     match name {
@@ -17,6 +21,12 @@ fn fixture(name: &str) -> &'static str {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../fixtures/model-responses/research.invalid_missing_status.json"
+            ))
+        }
+        "analyzer.valid.json" => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/model-responses/analyzer.valid.json"
             ))
         }
         _ => panic!("unknown fixture: {name}"),
@@ -186,6 +196,214 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
 }
 
 #[test]
+fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    let source_path = repo.join("src/lib.rs");
+    let source_content = "pub fn live_context() -> &'static str { \"packed\" }\n";
+    std::fs::create_dir_all(source_path.parent().expect("source parent")).expect("src dir");
+    std::fs::write(&source_path, source_content).expect("source file");
+
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "live-context-run",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    loop_runner.run_next_step().expect("run research step");
+
+    let digest = sha256(source_content.as_bytes());
+    let requests = provider.requests().expect("provider requests");
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[0].content;
+    assert!(user_prompt.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(user_prompt.contains("path: src/lib.rs"));
+    assert!(user_prompt.contains(&format!("sha256: {digest}")));
+    assert!(user_prompt.contains(source_content));
+
+    let prompt_audit =
+        std::fs::read_to_string(runs_root.join("live-context-run/prompts/01-research.prompt.md"))
+            .expect("prompt audit");
+    assert!(prompt_audit.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(prompt_audit.contains(&digest));
+
+    let manifest_json =
+        std::fs::read_to_string(runs_root.join("live-context-run/context-manifest.json"))
+            .expect("manifest");
+    let manifest: ContextManifest = serde_json::from_str(&manifest_json).expect("manifest json");
+    assert_eq!(manifest.untrusted_context_marker, UNTRUSTED_CONTEXT_MARKER);
+    assert_eq!(manifest.files.len(), 1);
+    assert_eq!(manifest.files[0].path, "src/lib.rs");
+    assert_eq!(manifest.files[0].sha256, digest);
+    assert_eq!(manifest.files[0].source_bytes, source_content.len());
+    assert_eq!(manifest.files[0].included_bytes, source_content.len());
+    assert!(!manifest_json.contains(source_content));
+}
+
+#[test]
+fn provider_step_runner_rejects_forbidden_live_context_before_provider_call() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn forbidden() {}\n").expect("source file");
+
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
+
+    let error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "forbidden-context-run",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect_err("forbidden live context should fail before loop starts");
+
+    assert!(
+        error.to_string().contains("forbidden live context path"),
+        "error should name forbidden context, got {error}"
+    );
+    assert!(provider.requests().expect("provider requests").is_empty());
+    assert!(!runs_root
+        .join("forbidden-context-run/prompts/01-research.prompt.md")
+        .exists());
+    assert!(!runs_root
+        .join("forbidden-context-run/responses/01-research.raw.txt")
+        .exists());
+}
+
+#[test]
+fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn retryable() {}\n").expect("source file");
+
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut forbidden_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
+
+    let first_error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "retryable-context-run",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut forbidden_runner,
+    )
+    .expect_err("forbidden context should fail before start completes");
+
+    assert!(
+        first_error
+            .to_string()
+            .contains("forbidden live context path"),
+        "first error should name forbidden context, got {first_error}"
+    );
+    assert!(
+        !runs_root.join("retryable-context-run").exists(),
+        "failed prepare should not leave a partial run directory that blocks retry"
+    );
+
+    let mut allowed_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
+
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "retryable-context-run",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut allowed_runner,
+    )
+    .expect("same run id should be reusable after fixing context");
+
+    loop_runner.run_next_step().expect("run research step");
+    assert_eq!(provider.requests().expect("provider requests").len(), 1);
+    assert!(runs_root
+        .join("retryable-context-run/context-manifest.json")
+        .exists());
+}
+
+#[test]
+fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_prompt() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    let source_path = repo.join("src/lib.rs");
+    let source_content = "pub fn resumed_context() -> &'static str { \"fresh\" }\n";
+    std::fs::create_dir_all(source_path.parent().expect("source parent")).expect("src dir");
+    std::fs::write(&source_path, source_content).expect("source file");
+
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let start_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut start_runner = ProviderStepRunner::new(&start_provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "resume-context-run",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut start_runner,
+    )
+    .expect("start loop");
+    loop_runner.run_next_step().expect("run research step");
+    drop(loop_runner);
+
+    let resume_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("analyzer.valid.json")))]);
+    let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
+    let mut resumed =
+        LoopRunner::resume(&runs_root, "resume-context-run", &mut resume_runner).expect("resume");
+
+    resumed.run_next_step().expect("run analysis step");
+
+    let digest = sha256(source_content.as_bytes());
+    let requests = resume_provider
+        .requests()
+        .expect("resume provider requests");
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[0].content;
+    assert!(user_prompt.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(user_prompt.contains("path: src/lib.rs"));
+    assert!(user_prompt.contains(&format!("sha256: {digest}")));
+    assert!(user_prompt.contains(source_content));
+
+    let prompt_audit =
+        std::fs::read_to_string(runs_root.join("resume-context-run/prompts/02-analysis.prompt.md"))
+            .expect("analysis prompt audit");
+    assert!(prompt_audit.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(prompt_audit.contains(&digest));
+}
+
+#[test]
 fn provider_step_runner_maps_developer_blocked_and_reviewer_failed_statuses() {
     let developer_blocked = r#"{
         "role": "developer",
@@ -290,6 +508,39 @@ fn ticket() -> TicketSpec {
         acceptance_criteria: vec!["Every provider request and response is persisted.".to_string()],
         eval: None,
     }
+}
+
+fn ticket_with_context(relevant_files: Vec<&str>, forbidden_files: Vec<&str>) -> TicketSpec {
+    TicketSpec {
+        context: TicketContext {
+            relevant_files: relevant_files.into_iter().map(str::to_string).collect(),
+            forbidden_files: forbidden_files.into_iter().map(str::to_string).collect(),
+        },
+        ..ticket()
+    }
+}
+
+fn context_request(
+    repository_root: &Path,
+    ticket: &TicketSpec,
+    policy_forbidden_paths: Vec<String>,
+) -> ContextPackRequest {
+    ContextPackRequest::for_ticket(
+        repository_root,
+        Path::new("prepare-workspace-must-choose-run-directory"),
+        ticket,
+        &policy_forbidden_paths,
+        ContextLimits {
+            max_bytes_per_file: 1_024,
+            max_total_bytes: 8_192,
+        },
+    )
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn assert_file_contains(path: &Path, expected: &str) {

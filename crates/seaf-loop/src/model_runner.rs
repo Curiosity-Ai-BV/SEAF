@@ -2,8 +2,10 @@ use seaf_core::{LoopStepName, LoopStepStatus};
 use seaf_models::{ModelMessage, ModelMessageRole, ModelProvider, ModelRequest};
 
 use crate::{
+    context::{pack_live_context, ContextBundle, ContextPackRequest},
     parse_role_response_with_repair,
     runner::{RunnerError, StepRunner},
+    workspace::LoopWorkspace,
     AgentStatus, DeveloperStatus, ReviewDecision, Role, RoleResponse, StepOutput,
 };
 
@@ -11,6 +13,8 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     provider: &'a P,
     model: String,
     timeout_ms: u64,
+    context_pack_request: Option<ContextPackRequest>,
+    context_bundle: Option<ContextBundle>,
     last_error_response: Option<String>,
 }
 
@@ -20,8 +24,15 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             provider,
             model: model.into(),
             timeout_ms,
+            context_pack_request: None,
+            context_bundle: None,
             last_error_response: None,
         }
+    }
+
+    pub fn with_context_pack_request(mut self, request: ContextPackRequest) -> Self {
+        self.context_pack_request = Some(request);
+        self
     }
 
     fn model_request(&self, role: Role, user_prompt: String) -> ModelRequest {
@@ -40,12 +51,28 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
 }
 
 impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
+    fn prepare_workspace(&mut self, workspace: &LoopWorkspace) -> Result<(), RunnerError> {
+        self.context_bundle = None;
+        let Some(request) = &self.context_pack_request else {
+            return Ok(());
+        };
+        let mut request = request.clone();
+        request.run_directory = workspace.run_directory().to_path_buf();
+        let bundle = pack_live_context(&request)
+            .map_err(|error| RunnerError::Step(format!("failed to pack live context: {error}")))?;
+        self.context_bundle = Some(bundle);
+        Ok(())
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
         let Some(role) = role_for_step(step) else {
             return Ok(no_model_request(step));
         };
 
-        let request = self.model_request(role, role_step_prompt(step, role));
+        let request = self.model_request(
+            role,
+            role_step_prompt(step, role, self.context_bundle.as_ref()),
+        );
         serde_json::to_string_pretty(&request).map_err(|error| {
             RunnerError::Step(format!(
                 "failed to serialize {step:?} model request: {error}"
@@ -149,11 +176,44 @@ fn role_for_step(step: LoopStepName) -> Option<Role> {
     }
 }
 
-fn role_step_prompt(step: LoopStepName, role: Role) -> String {
-    format!(
+fn role_step_prompt(step: LoopStepName, role: Role, context: Option<&ContextBundle>) -> String {
+    let mut prompt = format!(
         "Run the {step:?} loop step as the {}. Return only JSON matching the response schema.",
         role.as_str()
-    )
+    );
+
+    if let Some(context) = context {
+        append_context_to_prompt(&mut prompt, context);
+    }
+
+    prompt
+}
+
+fn append_context_to_prompt(prompt: &mut String, context: &ContextBundle) {
+    prompt.push_str("\n\nRepository context:\n");
+    prompt.push_str(&context.untrusted_context_marker);
+    prompt.push('\n');
+
+    for file in &context.files {
+        prompt.push_str("\ncontext file\npath: ");
+        prompt.push_str(&file.path);
+        prompt.push_str("\nsha256: ");
+        prompt.push_str(&file.sha256);
+        prompt.push_str("\ncontent:\n");
+        prompt.push_str(&file.content);
+        if !file.content.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+
+    if !context.warnings.is_empty() {
+        prompt.push_str("\ncontext warnings:\n");
+        for warning in &context.warnings {
+            prompt.push_str("- ");
+            prompt.push_str(warning);
+            prompt.push('\n');
+        }
+    }
 }
 
 fn status_for_response(response: &RoleResponse) -> LoopStepStatus {

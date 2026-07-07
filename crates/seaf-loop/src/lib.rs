@@ -17,9 +17,9 @@ pub use bench::{
     AgentBenchFixture, AgentBenchResult, AgentBenchSummary, BenchError, ZeroToleranceError,
 };
 pub use context::{
-    pack_context, pack_context_for_ticket, ContextBundle, ContextError, ContextFile, ContextLimits,
-    ContextManifest, ContextManifestFile, ContextPackRequest, CONTEXT_MANIFEST_FILE,
-    UNTRUSTED_CONTEXT_MARKER,
+    pack_context, pack_context_for_ticket, pack_live_context, ContextBundle, ContextError,
+    ContextFile, ContextLimits, ContextManifest, ContextManifestFile, ContextPackRequest,
+    CONTEXT_MANIFEST_FILE, UNTRUSTED_CONTEXT_MARKER,
 };
 pub use eval_report::build_loop_eval_report;
 pub use model_runner::ProviderStepRunner;

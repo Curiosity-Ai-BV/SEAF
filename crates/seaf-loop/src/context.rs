@@ -118,6 +118,11 @@ pub fn pack_context_for_ticket(
     pack_context(&request)
 }
 
+pub fn pack_live_context(request: &ContextPackRequest) -> Result<ContextBundle, ContextError> {
+    validate_live_context_paths(request)?;
+    pack_context(request)
+}
+
 pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, ContextError> {
     let repository_root = request.repository_root.canonicalize()?;
     let default_excludes = effective_default_exclude_globs(&request.default_exclude_globs);
@@ -285,6 +290,7 @@ pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, Conte
 pub enum ContextError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Safety(String),
 }
 
 impl fmt::Display for ContextError {
@@ -292,6 +298,7 @@ impl fmt::Display for ContextError {
         match self {
             Self::Io(error) => write!(formatter, "context I/O error: {error}"),
             Self::Json(error) => write!(formatter, "context JSON error: {error}"),
+            Self::Safety(message) => write!(formatter, "context safety error: {message}"),
         }
     }
 }
@@ -314,6 +321,56 @@ fn sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn validate_live_context_paths(request: &ContextPackRequest) -> Result<(), ContextError> {
+    let repository_root = request.repository_root.canonicalize()?;
+    let default_excludes = effective_default_exclude_globs(&request.default_exclude_globs);
+    let mut seen_paths = BTreeSet::new();
+
+    for requested_path in &request.relevant_files {
+        let Some(repo_path) = normalize_repo_path(requested_path) else {
+            return Err(ContextError::Safety(format!(
+                "unsafe live context path: {requested_path}"
+            )));
+        };
+
+        if !seen_paths.insert(repo_path.clone()) {
+            continue;
+        }
+
+        if let Some(pattern) = matching_pattern(&repo_path, &default_excludes) {
+            return Err(ContextError::Safety(format!(
+                "forbidden live context path {repo_path} matches default exclude {pattern}"
+            )));
+        }
+
+        if let Some(pattern) = matching_pattern(&repo_path, &request.ticket_forbidden_files) {
+            return Err(ContextError::Safety(format!(
+                "forbidden live context path {repo_path} matches ticket forbidden file {pattern}"
+            )));
+        }
+
+        if let Some(pattern) = matching_pattern(&repo_path, &request.policy_forbidden_paths) {
+            return Err(ContextError::Safety(format!(
+                "forbidden live context path {repo_path} matches policy forbidden path {pattern}"
+            )));
+        }
+
+        let source_path = repository_root.join(&repo_path);
+        match source_path.canonicalize() {
+            Ok(canonical_source) if canonical_source.starts_with(&repository_root) => {}
+            Ok(_) => {
+                return Err(ContextError::Safety(format!(
+                    "unsafe live context path resolves outside repository: {repo_path}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(())
 }
 
 fn effective_default_exclude_globs(requested_globs: &[String]) -> Vec<String> {
