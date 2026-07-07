@@ -272,3 +272,10 @@ categories, then marked only P3-003 complete in current progress.
 Added a context regression for ticket-requested `.seaf/loops/runs` artifacts,
 then added `.seaf/**` to default context excludes and `.seaf/loops/runs/` to
 `.gitignore`. Marked P3-004 complete; P3-005 remains open.
+
+## 2026-07-07 act | P3-005 CI determinism
+
+Hardened CI with read-only contents permissions, per-ref concurrency cancellation,
+job timeouts, locked Cargo checks, and a documented stable Rust toolchain policy.
+Split root lint into `lint:rust` and `lint:packages`, then pointed the TypeScript
+CI job at package-only lint so it does not invoke Rust setup.

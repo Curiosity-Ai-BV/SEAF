@@ -14,7 +14,7 @@
       signing change categories.
 - [x] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
       context exclusions.
-- [ ] P3-005: Harden CI determinism with locked commands, toolchain policy,
+- [x] P3-005: Harden CI determinism with locked commands, toolchain policy,
       workflow permissions, timeouts, concurrency, and split lint environments.
 
 ## Next Acceptance Criteria

@@ -5,7 +5,9 @@
   "scripts": {
     "build": "pnpm -r build",
     "format:check": "prettier --check \"**/*.{md,json,yaml,yml,ts}\"",
-    "lint": "cargo clippy --all-targets --all-features -- -D warnings && pnpm -r lint",
+    "lint": "pnpm lint:rust && pnpm lint:packages",
+    "lint:packages": "pnpm -r lint",
+    "lint:rust": "cargo clippy --locked --all-targets --all-features -- -D warnings",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test"
   },
