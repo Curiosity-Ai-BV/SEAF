@@ -12,26 +12,35 @@ GoalSpec -> Local Signal -> Agent Task Brief -> Patch -> EvalReport -> ReleaseCa
 2. Goal, policy, eval report, release capsule, event, and signal contracts.
 3. CLI validation, project initialization, task brief generation, eval execution, and release capsule preparation/verification.
 4. TypeScript SDK event emission and Rust local runtime event ingestion.
+5. Phase 2 local-loop primitives: ticket/run contracts, provider abstraction,
+   context packing, role response schemas, patch parser, deterministic policy
+   gate, loop CLI, AgentBench-lite, EvalReport integration, docs, and CI
+   guardrails.
 
-## Next Slices
+## Remaining Integration
 
-1. Patch artifact interface.
-   - Accept a unified diff or patch directory.
-   - Validate with `git apply --check`.
-   - Record patch digest before application.
-2. Patch risk classifier.
-   - Detect forbidden paths, dependency files, migrations, auth/payment/update paths, and eval/CI edits.
-   - Require human review when policy demands it.
-3. Controlled patch application.
-   - Apply patches only in an explicit branch or worktree mode.
-   - Refuse dirty unrelated baselines.
-4. Integration/commit command.
-   - Commit only after evals pass, capsule digests verify, patch digest matches, and no unrelated files are dirty.
-   - Merge only with an explicit target branch.
-5. Adaptive Notes demo shell.
-   - Emit SDK events.
-   - Create a first-note workflow.
-   - Demonstrate local signal generation and eval/report/release flow.
+Phase 2 implemented the parser, risk classification, `git apply --check`,
+policy-decision artifact, and gated apply primitives. The remaining work is to
+wire those primitives into live, provider-backed loop execution.
+
+1. Live role execution integration.
+   - Run loop steps through `ModelProvider` and structured role outputs instead
+     of the deterministic runner for non-smoke paths.
+   - Feed bounded context manifests into prompts and persist provider
+     requests/responses.
+2. Real patch evidence integration.
+   - Route developer patch output through the implemented parser and policy gate.
+   - Persist real patch digests, changed paths, decisions, review requirements,
+     and apply status.
+   - Limit synthetic empty-patch policy evidence to explicit smoke paths.
+3. Controlled application and command checks.
+   - Enforce ticket autonomy, clean-worktree requirements, and opt-in patch application.
+   - Sandbox eval commands by allowlist, working directory, environment,
+     timeout, output limits, and redaction.
+4. Demo and product integration.
+   - Promote Adaptive Notes from example data to a runnable local demo after the
+     live loop path exists.
+   - Keep commit, merge, signing, and release actions under explicit human review.
 
 ## Commit/Merge Role
 

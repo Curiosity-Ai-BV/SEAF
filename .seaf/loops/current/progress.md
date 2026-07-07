@@ -8,7 +8,7 @@
 ## Phase 0 Production-Readiness Baseline
 
 - [x] P3-001: Create post-Phase-2 loop contract and current tracker.
-- [ ] P3-002: Reconcile stale docs so implemented primitives are separated from
+- [x] P3-002: Reconcile stale docs so implemented primitives are separated from
       missing live integration.
 - [ ] P3-003: Fix default policy drift for CI, eval, policy, updater, and
       signing change categories.

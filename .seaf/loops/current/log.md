@@ -250,3 +250,12 @@ Final documentation checks passed: `pnpm exec prettier --check
 docs/production-readiness-roadmap.md .seaf/loops/current/contract.md
 .seaf/loops/current/progress.md .seaf/loops/current/log.md` and
 `git diff --check`.
+
+## 2026-07-07 act | P3-002 stale docs
+
+Updated `docs/mvp-backlog.md` to treat Phase 2 as the source of truth for
+implemented local-loop primitives and to describe only the remaining
+post-Phase-2 live integration work. Marked P3-002 complete in current progress;
+P3-003 through P3-005 remain open. Final checks passed: `pnpm exec prettier
+--check docs/mvp-backlog.md .seaf/loops/current/progress.md
+.seaf/loops/current/log.md` and `git diff --check`.
