@@ -428,6 +428,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "seaf-core",
+ "seaf-models",
  "serde",
  "serde_json",
  "sha2",

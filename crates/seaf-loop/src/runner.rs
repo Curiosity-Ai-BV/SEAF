@@ -44,6 +44,10 @@ pub trait StepRunner {
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
+
+    fn error_response(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +148,15 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let request = self.step_runner.step_request(step)?;
         write_step_request(&self.workspace, step, attempt, &request)?;
 
-        let output = self.step_runner.run_step(step, &request)?;
+        let output = match self.step_runner.run_step(step, &request) {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(response) = self.step_runner.error_response() {
+                    write_step_response(&self.workspace, step, attempt, response)?;
+                }
+                return Err(error);
+            }
+        };
         write_step_response(&self.workspace, step, attempt, &output.response)?;
         validate_step_output(&output)?;
         let artifact_path = match &output.artifact {
