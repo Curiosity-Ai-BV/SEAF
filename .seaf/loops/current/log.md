@@ -266,3 +266,9 @@ Added a core regression that requires the default policy template and
 adaptive-notes example policy to list every policy-gate human-review category.
 Updated both policies to include CI, eval, policy, updater, and signing change
 categories, then marked only P3-003 complete in current progress.
+
+## 2026-07-07 act | P3-004 generated artifact hygiene
+
+Added a context regression for ticket-requested `.seaf/loops/runs` artifacts,
+then added `.seaf/**` to default context excludes and `.seaf/loops/runs/` to
+`.gitignore`. Marked P3-004 complete; P3-005 remains open.

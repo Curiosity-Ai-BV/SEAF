@@ -405,6 +405,50 @@ mod tests {
     }
 
     #[test]
+    fn context_pack_excludes_generated_seaf_run_artifacts_even_when_ticket_requests_them() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        let run_dir = temp_dir.path().join("run");
+        let generated_artifact = ".seaf/loops/runs/run-001/context.md";
+        let generated_content = "generated loop context must not be repacked\n";
+        std::fs::create_dir_all(repo.join(".seaf/loops/runs/run-001")).expect("generated run dir");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(repo.join(generated_artifact), generated_content)
+            .expect("generated context artifact");
+
+        let ticket = ticket_with_relevant_files(vec![generated_artifact]);
+
+        let bundle = pack_context_for_ticket(
+            &repo,
+            &run_dir,
+            &ticket,
+            &[],
+            ContextLimits {
+                max_bytes_per_file: 1_024,
+                max_total_bytes: 8_192,
+            },
+        )
+        .expect("pack context");
+
+        assert!(bundle.files.is_empty());
+        assert!(bundle
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(".seaf/**")));
+
+        let manifest_json =
+            std::fs::read_to_string(run_dir.join(CONTEXT_MANIFEST_FILE)).expect("manifest");
+        let manifest: ContextManifest =
+            serde_json::from_str(&manifest_json).expect("manifest json");
+        assert!(manifest
+            .default_exclude_globs
+            .iter()
+            .any(|pattern| pattern == ".seaf/**"));
+        assert!(manifest.files.is_empty());
+        assert!(!manifest_json.contains(generated_content));
+    }
+
+    #[test]
     fn context_pack_records_digests_and_enforces_file_and_total_byte_limits() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let repo = temp_dir.path().join("repo");

@@ -12,7 +12,7 @@
       missing live integration.
 - [x] P3-003: Fix default policy drift for CI, eval, policy, updater, and
       signing change categories.
-- [ ] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
+- [x] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
       context exclusions.
 - [ ] P3-005: Harden CI determinism with locked commands, toolchain policy,
       workflow permissions, timeouts, concurrency, and split lint environments.
