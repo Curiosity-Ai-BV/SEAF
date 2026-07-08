@@ -11,18 +11,19 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seaf_core::{
     sha256_digest_file, templates, AgentTaskBrief, AgentTaskConstraints, CheckStatus, EvalCheck,
-    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, ReleaseCapsule,
-    RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext, TicketPriority,
-    TicketSpec, TicketStatus, ValidationReport,
+    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
+    Policy, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy,
+    TicketContext, TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
     build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture, AgentBenchSummary,
-    ArtifactContent, LoopRunner, LoopRunnerConfig, PatchDecisionKind, PolicyDecision, RunnerError,
-    StepOutput, StepRunner,
+    ArtifactContent, ContextLimits, ContextPackRequest, GitCommandRunner, LoopRunner,
+    LoopRunnerConfig, PatchDecisionKind, PolicyDecision, ProviderPatchGateConfig,
+    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
-    ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
-    DEFAULT_OLLAMA_BASE_URL,
+    FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
+    OllamaConfig, OllamaProvider, DEFAULT_OLLAMA_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,7 +71,7 @@ enum Command {
         #[command(subcommand)]
         command: TicketCommand,
     },
-    /// Run and inspect deterministic local-loop executions.
+    /// Run and inspect local-loop executions.
     Loop {
         #[command(subcommand)]
         command: LoopCommand,
@@ -136,12 +137,12 @@ enum TicketCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoopCommand {
-    /// Start a deterministic local-loop run for a ticket.
+    /// Start a provider-backed local-loop run for a ticket.
     Run(LoopRunArgs),
     /// Print persisted loop run status.
     Status(LoopStatusArgs),
-    /// Resume a deterministic local-loop run.
-    Resume(LoopStatusArgs),
+    /// Resume a local-loop run.
+    Resume(LoopResumeArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
     Smoke(LoopSmokeArgs),
     /// Run AgentBench-lite against a deterministic fixture.
@@ -242,12 +243,18 @@ struct LoopRunArgs {
     /// Stable run ID. Generated when omitted.
     #[arg(long)]
     run_id: Option<String>,
-    /// Provider metadata recorded in run.json. Execution remains deterministic.
+    /// Provider to execute. Supported: fake, ollama.
     #[arg(long, default_value = "fake")]
     provider: String,
-    /// Model metadata recorded in run.json. Execution remains deterministic.
-    #[arg(long, default_value = "fake-local")]
-    model: String,
+    /// Model name for provider-backed execution. Defaults to fake-local for --provider fake.
+    #[arg(long)]
+    model: Option<String>,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Provider request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     /// Allow starting a loop when the git working tree is dirty.
     #[arg(long)]
     allow_dirty: bool,
@@ -264,6 +271,28 @@ struct LoopStatusArgs {
     /// Directory containing loop run workspaces.
     #[arg(long, default_value = ".seaf/loops/runs")]
     runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopResumeArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Ticket file required when resuming incomplete provider-backed runs.
+    #[arg(long)]
+    ticket: Option<PathBuf>,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Provider request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -724,7 +753,9 @@ fn model_check_request(model: &str, timeout_ms: u64) -> ModelRequest {
 fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
     let ticket = seaf_core::load_ticket_file(&args.ticket)
         .map_err(|report| CliFailure::validation(report, args.json))?;
-    ensure_clean_git_worktree(args.allow_dirty)?;
+    validate_provider_timeout(args.timeout_ms)?;
+    let worktree_clean = ensure_clean_git_worktree(args.allow_dirty)?;
+    let model = loop_model(&args.provider, args.model)?;
     let run_id = match args.run_id {
         Some(run_id) => {
             validate_run_id(&run_id)?;
@@ -732,13 +763,55 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
         }
         None => generated_run_id("run"),
     };
-    let run = start_loop_to_completion(
-        &args.runs_root,
-        &run_id,
-        &ticket,
-        &args.provider,
-        &args.model,
-    )?;
+    let repository_root = current_repository_root()?;
+    let run = match args.provider.as_str() {
+        "fake" => {
+            if args.base_url != DEFAULT_OLLAMA_BASE_URL {
+                return Err(CliFailure::message(
+                    "--base-url is only used with --provider ollama".to_string(),
+                ));
+            }
+            let provider = FakeProvider::new(fake_provider_script_from(LoopStepName::Research));
+            start_provider_loop_to_completion(
+                ProviderLoopConfig {
+                    runs_root: &args.runs_root,
+                    run_id: &run_id,
+                    ticket: &ticket,
+                    model: &model,
+                    timeout_ms: args.timeout_ms,
+                    repository_root: &repository_root,
+                    worktree_clean,
+                },
+                &args.provider,
+                &provider,
+            )?
+        }
+        "ollama" => {
+            let provider = OllamaProvider::new(OllamaConfig {
+                base_url: args.base_url,
+                ..OllamaConfig::default()
+            });
+            start_provider_loop_to_completion(
+                ProviderLoopConfig {
+                    runs_root: &args.runs_root,
+                    run_id: &run_id,
+                    ticket: &ticket,
+                    model: &model,
+                    timeout_ms: args.timeout_ms,
+                    repository_root: &repository_root,
+                    worktree_clean,
+                },
+                &args.provider,
+                &provider,
+            )?
+        }
+        _ => {
+            return Err(CliFailure::message(format!(
+                "unsupported loop provider '{}'; supported providers: fake, ollama",
+                args.provider
+            )));
+        }
+    };
     finish_loop_command("run", &args.runs_root, &run, args.json)
 }
 
@@ -748,25 +821,79 @@ fn loop_status(args: LoopStatusArgs) -> Result<(), CliFailure> {
     finish_loop_command("status", &args.runs_root, &run, args.json)
 }
 
-fn resume_loop(args: LoopStatusArgs) -> Result<(), CliFailure> {
+fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
-    load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
-    let mut step_runner = DeterministicStepRunner;
-    let mut runner = LoopRunner::resume(args.runs_root.clone(), &args.run_id, &mut step_runner)
-        .map_err(loop_runner_failure)?;
-    let run = runner
-        .run_to_completion()
-        .map_err(loop_runner_failure)?
-        .clone();
-    let mut run = run;
-    persist_deterministic_policy_evidence(&args.runs_root, &mut run)?;
+    validate_provider_timeout(args.timeout_ms)?;
+    let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    let run = if loop_run_needs_provider_resume(&existing) {
+        let Some(ticket_path) = args.ticket.as_ref() else {
+            return Err(CliFailure::message(
+                "--ticket is required to resume an incomplete provider-backed run".to_string(),
+            ));
+        };
+        let ticket = seaf_core::load_ticket_file(ticket_path)
+            .map_err(|report| CliFailure::validation(report, args.json))?;
+        let ticket = resume_provider_ticket(&existing, &ticket)?;
+        let repository_root = current_repository_root()?;
+        match existing.provider.as_str() {
+            "fake" => {
+                if args.base_url != DEFAULT_OLLAMA_BASE_URL {
+                    return Err(CliFailure::message(
+                        "--base-url is only used with --provider ollama".to_string(),
+                    ));
+                }
+                let next_step =
+                    next_pending_model_step(&existing).unwrap_or(LoopStepName::Research);
+                let provider = FakeProvider::new(fake_provider_script_from(next_step));
+                let worktree_clean = ensure_clean_git_worktree(true)?;
+                resume_provider_loop_to_completion(
+                    ProviderLoopConfig {
+                        runs_root: &args.runs_root,
+                        run_id: &args.run_id,
+                        ticket: &ticket,
+                        model: &existing.model,
+                        timeout_ms: args.timeout_ms,
+                        repository_root: &repository_root,
+                        worktree_clean,
+                    },
+                    &provider,
+                )?
+            }
+            "ollama" => {
+                let provider = OllamaProvider::new(OllamaConfig {
+                    base_url: args.base_url,
+                    ..OllamaConfig::default()
+                });
+                let worktree_clean = ensure_clean_git_worktree(true)?;
+                resume_provider_loop_to_completion(
+                    ProviderLoopConfig {
+                        runs_root: &args.runs_root,
+                        run_id: &args.run_id,
+                        ticket: &ticket,
+                        model: &existing.model,
+                        timeout_ms: args.timeout_ms,
+                        repository_root: &repository_root,
+                        worktree_clean,
+                    },
+                    &provider,
+                )?
+            }
+            provider => {
+                return Err(CliFailure::message(format!(
+                    "unsupported loop provider '{provider}'; supported providers: fake, ollama"
+                )));
+            }
+        }
+    } else {
+        existing
+    };
     finish_loop_command("resume", &args.runs_root, &run, args.json)
 }
 
 fn smoke_loop(args: LoopSmokeArgs) -> Result<(), CliFailure> {
     let ticket = smoke_ticket();
     let run_id = generated_run_id("smoke");
-    let run = start_loop_to_completion(
+    let run = start_deterministic_loop_to_completion(
         &args.runs_root,
         &run_id,
         &ticket,
@@ -941,7 +1068,338 @@ fn validate_agent_bench_ollama_smoke_content(content: &str) -> Result<(), CliFai
     }
 }
 
-fn start_loop_to_completion(
+struct ProviderLoopConfig<'a> {
+    runs_root: &'a Path,
+    run_id: &'a str,
+    ticket: &'a TicketSpec,
+    model: &'a str,
+    timeout_ms: u64,
+    repository_root: &'a Path,
+    worktree_clean: bool,
+}
+
+fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
+    config: ProviderLoopConfig<'_>,
+    provider_name: &str,
+    provider: &P,
+) -> Result<LoopRun, CliFailure> {
+    let policy = default_policy()?;
+    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let patch_gate_config = ProviderPatchGateConfig::for_ticket(
+        config.repository_root,
+        config.ticket,
+        policy,
+        config.worktree_clean,
+    );
+    let mut patch_runner = GitCommandRunner;
+    let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_context_pack_request(context_request)
+        .with_patch_gate(patch_gate_config, &mut patch_runner);
+    let config = LoopRunnerConfig::for_ticket(
+        config.runs_root,
+        config.run_id,
+        config.ticket,
+        provider_name.to_string(),
+        config.model.to_string(),
+    );
+    let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)
+        .cloned()
+}
+
+fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
+    config: ProviderLoopConfig<'_>,
+    provider: &P,
+) -> Result<LoopRun, CliFailure> {
+    let policy = default_policy()?;
+    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let patch_gate_config = ProviderPatchGateConfig::for_ticket(
+        config.repository_root,
+        config.ticket,
+        policy,
+        config.worktree_clean,
+    );
+    let mut patch_runner = GitCommandRunner;
+    let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_context_pack_request(context_request)
+        .with_patch_gate(patch_gate_config, &mut patch_runner);
+    let mut runner = LoopRunner::resume(
+        config.runs_root.to_path_buf(),
+        config.run_id,
+        &mut step_runner,
+    )
+    .map_err(loop_runner_failure)?;
+    runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)
+        .cloned()
+}
+
+fn provider_context_request(
+    repository_root: &Path,
+    ticket: &TicketSpec,
+    policy: &Policy,
+) -> ContextPackRequest {
+    ContextPackRequest::for_ticket(
+        repository_root,
+        Path::new("provider-runner-will-set-run-directory"),
+        ticket,
+        &policy.forbidden_paths,
+        ContextLimits {
+            max_bytes_per_file: 32 * 1024,
+            max_total_bytes: 128 * 1024,
+        },
+    )
+}
+
+fn default_policy() -> Result<Policy, CliFailure> {
+    serde_json::from_str(templates::DEFAULT_POLICY_JSON)
+        .map_err(|err| CliFailure::message(format!("could not parse default policy: {err}")))
+}
+
+fn loop_model(provider: &str, model: Option<String>) -> Result<String, CliFailure> {
+    match (provider, model) {
+        ("fake", Some(model)) => Ok(model),
+        ("fake", None) => Ok("fake-local".to_string()),
+        ("ollama", Some(model)) => Ok(model),
+        ("ollama", None) => Err(CliFailure::message(
+            "--model is required with --provider ollama".to_string(),
+        )),
+        (_, Some(model)) => Ok(model),
+        (_, None) => Ok("fake-local".to_string()),
+    }
+}
+
+fn validate_provider_timeout(timeout_ms: u64) -> Result<(), CliFailure> {
+    if timeout_ms == 0 {
+        return Err(CliFailure::message(
+            "--timeout-ms must be greater than 0".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_repository_root() -> Result<PathBuf, CliFailure> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| {
+            CliFailure::message(format!("could not inspect git repository root: {err}"))
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        return Err(CliFailure::message(format!(
+            "could not inspect git repository root{suffix}; rerun from a git repository"
+        )));
+    }
+
+    let root = String::from_utf8(output.stdout)
+        .map_err(|err| CliFailure::message(format!("git repository root was not UTF-8: {err}")))?;
+    let root = PathBuf::from(root.trim());
+    root.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "could not canonicalize git repository root {}: {err}",
+            root.display()
+        ))
+    })
+}
+
+fn loop_run_needs_provider_resume(run: &LoopRun) -> bool {
+    matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
+}
+
+fn resume_provider_ticket(run: &LoopRun, ticket: &TicketSpec) -> Result<TicketSpec, CliFailure> {
+    let mut mismatches = Vec::new();
+    if run.ticket_id != ticket.ticket_id {
+        mismatches.push(format!(
+            "ticket_id mismatch (run has {}, ticket has {})",
+            run.ticket_id, ticket.ticket_id
+        ));
+    }
+    if run.goal_id != ticket.goal_id {
+        mismatches.push(format!(
+            "goal_id mismatch (run has {}, ticket has {})",
+            run.goal_id, ticket.goal_id
+        ));
+    }
+    if !mismatches.is_empty() {
+        return Err(CliFailure::message(format!(
+            "resume ticket does not match persisted run: {}",
+            mismatches.join("; ")
+        )));
+    }
+
+    let has_apply_authority = persisted_apply_authority(run);
+    let mut ticket = ticket.clone();
+    if !has_apply_authority {
+        ticket.autonomy.apply_patch = false;
+    }
+    Ok(ticket)
+}
+
+fn persisted_apply_authority(run: &LoopRun) -> bool {
+    run.policy_decisions.iter().any(|entry| {
+        serde_json::to_value(entry)
+            .ok()
+            .and_then(|value| serde_json::from_value::<PolicyDecision>(value).ok())
+            .is_some_and(|decision| decision.patch_id == run.run_id && decision.apply_requested)
+    })
+}
+
+fn next_pending_model_step(run: &LoopRun) -> Option<LoopStepName> {
+    run.steps
+        .iter()
+        .find(|step| {
+            matches!(
+                step.status,
+                LoopStepStatus::Pending | LoopStepStatus::Running
+            ) && is_model_step(step.name)
+        })
+        .map(|step| step.name)
+}
+
+fn is_model_step(step: LoopStepName) -> bool {
+    matches!(
+        step,
+        LoopStepName::Research
+            | LoopStepName::Analysis
+            | LoopStepName::SpecCreation
+            | LoopStepName::SpecReview
+            | LoopStepName::Development
+            | LoopStepName::OutputReview
+    )
+}
+
+fn fake_provider_script_from(
+    start_step: LoopStepName,
+) -> Vec<Result<ModelResponse, seaf_models::ModelError>> {
+    fake_provider_script()
+        .into_iter()
+        .filter(|(step, _)| step_index(*step) >= step_index(start_step))
+        .map(|(_, response)| Ok(fake_model_response(response)))
+        .collect()
+}
+
+fn fake_provider_script() -> Vec<(LoopStepName, String)> {
+    vec![
+        (
+            LoopStepName::Research,
+            fake_agent_response(
+                "researcher",
+                "Relevant CLI wiring is concentrated in the loop command.",
+                "Proceed to analysis.",
+            ),
+        ),
+        (
+            LoopStepName::Analysis,
+            fake_agent_response(
+                "analyzer",
+                "The provider path must preserve context and gate artifacts.",
+                "Write a narrow implementation spec.",
+            ),
+        ),
+        (
+            LoopStepName::SpecCreation,
+            fake_agent_response(
+                "spec_writer",
+                "Use the same ProviderStepRunner path as live providers.",
+                "Send the spec for review.",
+            ),
+        ),
+        (
+            LoopStepName::SpecReview,
+            fake_reviewer_response(
+                "spec_reviewer",
+                "approve_spec",
+                "The spec is narrow and testable.",
+            ),
+        ),
+        (LoopStepName::Development, fake_developer_response()),
+        (
+            LoopStepName::OutputReview,
+            fake_reviewer_response(
+                "output_reviewer",
+                "approve_for_tests",
+                "The patch is acceptable for test verification.",
+            ),
+        ),
+    ]
+}
+
+fn fake_agent_response(role: &str, summary: &str, next_step_recommendation: &str) -> String {
+    serde_json::json!({
+        "role": role,
+        "status": "passed",
+        "summary": summary,
+        "findings": [
+            {
+                "claim": "Provider-backed loop execution is auditable.",
+                "evidence": "prompts and responses are persisted per step"
+            }
+        ],
+        "risks": [],
+        "next_step_recommendation": next_step_recommendation
+    })
+    .to_string()
+}
+
+fn fake_reviewer_response(role: &str, decision: &str, summary: &str) -> String {
+    serde_json::json!({
+        "role": role,
+        "decision": decision,
+        "summary": summary,
+        "blocking_issues": [],
+        "non_blocking_issues": []
+    })
+    .to_string()
+}
+
+fn fake_developer_response() -> String {
+    serde_json::json!({
+        "role": "developer",
+        "status": "patch_proposed",
+        "summary": "Propose a small eval-scoped smoke artifact so policy evidence is real and human-reviewed.",
+        "changed_files": ["examples/local-loop/evals/fake-provider-smoke.txt"],
+        "requires_human_review": true,
+        "patch": fake_provider_review_patch()
+    })
+    .to_string()
+}
+
+fn fake_provider_review_patch() -> &'static str {
+    "diff --git a/examples/local-loop/evals/fake-provider-smoke.txt b/examples/local-loop/evals/fake-provider-smoke.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/examples/local-loop/evals/fake-provider-smoke.txt\n@@ -0,0 +1 @@\n+provider-backed smoke\n"
+}
+
+fn fake_model_response(content: String) -> ModelResponse {
+    ModelResponse {
+        content,
+        latency_ms: 0,
+        raw_provider_metadata: serde_json::json!({ "provider": "fake" }),
+    }
+}
+
+fn step_index(step: LoopStepName) -> usize {
+    match step {
+        LoopStepName::Research => 0,
+        LoopStepName::Analysis => 1,
+        LoopStepName::SpecCreation => 2,
+        LoopStepName::SpecReview => 3,
+        LoopStepName::Development => 4,
+        LoopStepName::OutputReview => 5,
+        LoopStepName::Testing => 6,
+        LoopStepName::EvalReport => 7,
+    }
+}
+
+fn start_deterministic_loop_to_completion(
     runs_root: &Path,
     run_id: &str,
     ticket: &TicketSpec,
@@ -1119,21 +1577,24 @@ fn next_loop_action(run: &LoopRun) -> String {
     }
 }
 
-fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<(), CliFailure> {
-    if allow_dirty {
-        return Ok(());
-    }
-
-    let output = ProcessCommand::new("git")
+fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<bool, CliFailure> {
+    let output = match ProcessCommand::new("git")
         .args(["status", "--porcelain"])
         .output()
-        .map_err(|err| {
-            CliFailure::message(format!(
+    {
+        Ok(output) => output,
+        Err(_) if allow_dirty => return Ok(false),
+        Err(err) => {
+            return Err(CliFailure::message(format!(
                 "could not inspect git working tree: {err}; rerun with --allow-dirty to skip this guard"
-            ))
-        })?;
+            )));
+        }
+    };
 
     if !output.status.success() {
+        if allow_dirty {
+            return Ok(false);
+        }
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
         let suffix = if detail.is_empty() {
@@ -1147,13 +1608,16 @@ fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<(), CliFailure> {
     }
 
     if !output.stdout.is_empty() {
+        if allow_dirty {
+            return Ok(false);
+        }
         return Err(CliFailure::message(
             "refusing to start loop with a dirty git working tree; commit or stash changes, or rerun with --allow-dirty"
                 .to_string(),
         ));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn smoke_ticket() -> TicketSpec {

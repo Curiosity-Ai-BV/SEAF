@@ -207,6 +207,69 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
 }
 
 #[test]
+fn provider_step_runner_surfaces_model_timeout_without_retrying_a_role_step() {
+    let provider = FakeProvider::new(vec![Err(ModelError::timeout(
+        "research model timed out",
+        10,
+        json!({ "provider": "fake" }),
+    ))]);
+    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 10);
+
+    let request_audit = runner
+        .step_request(LoopStepName::Research)
+        .expect("research request");
+    let error = runner
+        .run_step(LoopStepName::Research, &request_audit)
+        .expect_err("timeout should fail the role step");
+
+    assert!(
+        error.to_string().contains("research model timed out"),
+        "timeout should be surfaced in the step error, got {error}"
+    );
+    assert_eq!(
+        provider.requests().expect("provider requests").len(),
+        1,
+        "timeouts must not be repaired as malformed role output"
+    );
+}
+
+#[test]
+fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let provider = FakeProvider::new(vec![Err(ModelError::timeout(
+        "research model timed out",
+        10,
+        json!({ "provider": "fake" }),
+    ))]);
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 10);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "timeout-artifact-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    let error = loop_runner
+        .run_next_step()
+        .expect_err("timeout should stop the live loop step");
+
+    assert!(
+        error.to_string().contains("research model timed out"),
+        "provider timeout should remain visible, got {error}"
+    );
+    let response_path = runs_root.join("timeout-artifact-run/responses/01-research.raw.txt");
+    assert_file_contains(&response_path, "provider request failed for Research");
+    assert_file_contains(&response_path, "\"kind\": \"timeout\"");
+    assert_file_contains(&response_path, "research model timed out");
+}
+
+#[test]
 fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps_run() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
@@ -802,6 +865,68 @@ fn provider_step_runner_maps_developer_blocked_and_reviewer_failed_statuses() {
     }"#;
     let reviewer = run_scripted_step(LoopStepName::SpecReview, reviewer_requested_changes);
     assert_eq!(reviewer.status, LoopStepStatus::Blocked);
+}
+
+#[test]
+fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let reviewer_requested_changes = r#"{
+        "role": "spec_reviewer",
+        "decision": "request_changes",
+        "summary": "The spec needs narrower acceptance criteria.",
+        "blocking_issues": [
+            {
+                "summary": "Acceptance criteria are too broad.",
+                "evidence": "ticket acceptance criteria"
+            }
+        ],
+        "non_blocking_issues": []
+    }"#;
+    let provider = FakeProvider::new(vec![
+        Ok(model_response(fixture("research.valid.json"))),
+        Ok(model_response(fixture("analyzer.valid.json"))),
+        Ok(model_response(&spec_writer_response())),
+        Ok(model_response(reviewer_requested_changes)),
+    ]);
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "blocked-reviewer-run",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    loop_runner
+        .run_to_completion()
+        .expect("blocked reviewer should stop cleanly");
+    drop(loop_runner);
+
+    let run_dir = runs_root.join("blocked-reviewer-run");
+    let persisted = read_run(&run_dir);
+    assert_eq!(persisted.status, LoopStatus::Blocked);
+    assert_eq!(persisted.current_step, LoopStepName::SpecReview);
+    assert_eq!(
+        step_status(&persisted, LoopStepName::SpecReview),
+        LoopStepStatus::Blocked
+    );
+    assert_file_contains(
+        &run_dir.join("responses/04-spec-review.raw.txt"),
+        "request_changes",
+    );
+    assert!(
+        !run_dir.join("prompts/05-development.prompt.md").exists(),
+        "blocked reviewer recovery state must not advance to development"
+    );
+    assert_file_contains(
+        &run_dir.join("log.md"),
+        "finished step SpecReview as Blocked",
+    );
 }
 
 #[test]

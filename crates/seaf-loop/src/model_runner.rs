@@ -194,9 +194,15 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 "failed to parse {step:?} model request audit: {error}"
             ))
         })?;
-        let initial_response = self.provider.complete(model_request).map_err(|error| {
-            RunnerError::Step(format!("provider request failed for {step:?}: {error}"))
-        })?;
+        let initial_response = match self.provider.complete(model_request) {
+            Ok(response) => response,
+            Err(error) => {
+                self.last_error_response = Some(provider_error_transcript(step, &error));
+                return Err(RunnerError::Step(format!(
+                    "provider request failed for {step:?}: {error}"
+                )));
+            }
+        };
 
         let mut repair_request_audit = None;
         let mut repair_response_content = None;
@@ -406,4 +412,9 @@ fn repair_error_transcript(
     format!(
         "initial provider response:\n{initial_response}\n\nrepair provider request:\n{repair_request}\n\nrepair provider error:\n{repair_error}"
     )
+}
+
+fn provider_error_transcript(step: LoopStepName, error: &seaf_models::ModelError) -> String {
+    let error_json = serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string());
+    format!("provider request failed for {step:?}:\n{error_json}")
 }
