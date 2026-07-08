@@ -1,25 +1,30 @@
 use std::{
+    collections::BTreeMap,
     fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio},
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, Parser, Subcommand};
 use seaf_core::{
     sha256_digest_file, templates, AgentTaskBrief, AgentTaskConstraints, CheckStatus, EvalCheck,
-    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, ReleaseCapsule,
-    RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext, TicketPriority,
-    TicketSpec, TicketStatus, ValidationReport,
+    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
+    Policy, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy,
+    TicketContext, TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
     build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture, AgentBenchSummary,
-    ArtifactContent, LoopRunner, LoopRunnerConfig, PatchDecisionKind, PolicyDecision, RunnerError,
-    StepOutput, StepRunner,
+    ArtifactContent, ContextLimits, ContextPackRequest, GitCommandRunner, LoopRunner,
+    LoopRunnerConfig, PatchDecisionKind, PolicyDecision, ProviderPatchGateConfig,
+    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
-    ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, OllamaConfig, OllamaProvider,
-    DEFAULT_OLLAMA_BASE_URL,
+    FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
+    OllamaConfig, OllamaProvider, DEFAULT_OLLAMA_BASE_URL,
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +72,7 @@ enum Command {
         #[command(subcommand)]
         command: TicketCommand,
     },
-    /// Run and inspect deterministic local-loop executions.
+    /// Run and inspect local-loop executions.
     Loop {
         #[command(subcommand)]
         command: LoopCommand,
@@ -133,12 +138,12 @@ enum TicketCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoopCommand {
-    /// Start a deterministic local-loop run for a ticket.
+    /// Start a provider-backed local-loop run for a ticket.
     Run(LoopRunArgs),
     /// Print persisted loop run status.
     Status(LoopStatusArgs),
-    /// Resume a deterministic local-loop run.
-    Resume(LoopStatusArgs),
+    /// Resume a local-loop run.
+    Resume(LoopResumeArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
     Smoke(LoopSmokeArgs),
     /// Run AgentBench-lite against a deterministic fixture.
@@ -239,12 +244,18 @@ struct LoopRunArgs {
     /// Stable run ID. Generated when omitted.
     #[arg(long)]
     run_id: Option<String>,
-    /// Provider metadata recorded in run.json. Execution remains deterministic.
+    /// Provider to execute. Supported: fake, ollama.
     #[arg(long, default_value = "fake")]
     provider: String,
-    /// Model metadata recorded in run.json. Execution remains deterministic.
-    #[arg(long, default_value = "fake-local")]
-    model: String,
+    /// Model name for provider-backed execution. Defaults to fake-local for --provider fake.
+    #[arg(long)]
+    model: Option<String>,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Provider request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     /// Allow starting a loop when the git working tree is dirty.
     #[arg(long)]
     allow_dirty: bool,
@@ -261,6 +272,28 @@ struct LoopStatusArgs {
     /// Directory containing loop run workspaces.
     #[arg(long, default_value = ".seaf/loops/runs")]
     runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopResumeArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Ticket file required when resuming incomplete provider-backed runs.
+    #[arg(long)]
+    ticket: Option<PathBuf>,
+    /// Ollama API base URL.
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    /// Provider request timeout in milliseconds.
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -359,6 +392,8 @@ struct EvalConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvalGroup {
+    #[serde(default)]
+    allow_commands: Vec<String>,
     required: Vec<EvalCommandConfig>,
 }
 
@@ -367,6 +402,14 @@ struct EvalGroup {
 struct EvalCommandConfig {
     name: String,
     command: String,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -711,7 +754,9 @@ fn model_check_request(model: &str, timeout_ms: u64) -> ModelRequest {
 fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
     let ticket = seaf_core::load_ticket_file(&args.ticket)
         .map_err(|report| CliFailure::validation(report, args.json))?;
-    ensure_clean_git_worktree(args.allow_dirty)?;
+    validate_provider_timeout(args.timeout_ms)?;
+    let worktree_clean = ensure_clean_git_worktree(args.allow_dirty)?;
+    let model = loop_model(&args.provider, args.model)?;
     let run_id = match args.run_id {
         Some(run_id) => {
             validate_run_id(&run_id)?;
@@ -719,13 +764,55 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
         }
         None => generated_run_id("run"),
     };
-    let run = start_loop_to_completion(
-        &args.runs_root,
-        &run_id,
-        &ticket,
-        &args.provider,
-        &args.model,
-    )?;
+    let repository_root = current_repository_root()?;
+    let run = match args.provider.as_str() {
+        "fake" => {
+            if args.base_url != DEFAULT_OLLAMA_BASE_URL {
+                return Err(CliFailure::message(
+                    "--base-url is only used with --provider ollama".to_string(),
+                ));
+            }
+            let provider = FakeProvider::new(fake_provider_script_from(LoopStepName::Research));
+            start_provider_loop_to_completion(
+                ProviderLoopConfig {
+                    runs_root: &args.runs_root,
+                    run_id: &run_id,
+                    ticket: &ticket,
+                    model: &model,
+                    timeout_ms: args.timeout_ms,
+                    repository_root: &repository_root,
+                    worktree_clean,
+                },
+                &args.provider,
+                &provider,
+            )?
+        }
+        "ollama" => {
+            let provider = OllamaProvider::new(OllamaConfig {
+                base_url: args.base_url,
+                ..OllamaConfig::default()
+            });
+            start_provider_loop_to_completion(
+                ProviderLoopConfig {
+                    runs_root: &args.runs_root,
+                    run_id: &run_id,
+                    ticket: &ticket,
+                    model: &model,
+                    timeout_ms: args.timeout_ms,
+                    repository_root: &repository_root,
+                    worktree_clean,
+                },
+                &args.provider,
+                &provider,
+            )?
+        }
+        _ => {
+            return Err(CliFailure::message(format!(
+                "unsupported loop provider '{}'; supported providers: fake, ollama",
+                args.provider
+            )));
+        }
+    };
     finish_loop_command("run", &args.runs_root, &run, args.json)
 }
 
@@ -735,25 +822,79 @@ fn loop_status(args: LoopStatusArgs) -> Result<(), CliFailure> {
     finish_loop_command("status", &args.runs_root, &run, args.json)
 }
 
-fn resume_loop(args: LoopStatusArgs) -> Result<(), CliFailure> {
+fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
-    load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
-    let mut step_runner = DeterministicStepRunner;
-    let mut runner = LoopRunner::resume(args.runs_root.clone(), &args.run_id, &mut step_runner)
-        .map_err(loop_runner_failure)?;
-    let run = runner
-        .run_to_completion()
-        .map_err(loop_runner_failure)?
-        .clone();
-    let mut run = run;
-    persist_deterministic_policy_evidence(&args.runs_root, &mut run)?;
+    validate_provider_timeout(args.timeout_ms)?;
+    let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    let run = if loop_run_needs_provider_resume(&existing) {
+        let Some(ticket_path) = args.ticket.as_ref() else {
+            return Err(CliFailure::message(
+                "--ticket is required to resume an incomplete provider-backed run".to_string(),
+            ));
+        };
+        let ticket = seaf_core::load_ticket_file(ticket_path)
+            .map_err(|report| CliFailure::validation(report, args.json))?;
+        let ticket = resume_provider_ticket(&existing, &ticket, &args.runs_root)?;
+        let repository_root = current_repository_root()?;
+        match existing.provider.as_str() {
+            "fake" => {
+                if args.base_url != DEFAULT_OLLAMA_BASE_URL {
+                    return Err(CliFailure::message(
+                        "--base-url is only used with --provider ollama".to_string(),
+                    ));
+                }
+                let next_step =
+                    next_pending_model_step(&existing).unwrap_or(LoopStepName::Research);
+                let provider = FakeProvider::new(fake_provider_script_from(next_step));
+                let worktree_clean = ensure_clean_git_worktree(true)?;
+                resume_provider_loop_to_completion(
+                    ProviderLoopConfig {
+                        runs_root: &args.runs_root,
+                        run_id: &args.run_id,
+                        ticket: &ticket,
+                        model: &existing.model,
+                        timeout_ms: args.timeout_ms,
+                        repository_root: &repository_root,
+                        worktree_clean,
+                    },
+                    &provider,
+                )?
+            }
+            "ollama" => {
+                let provider = OllamaProvider::new(OllamaConfig {
+                    base_url: args.base_url,
+                    ..OllamaConfig::default()
+                });
+                let worktree_clean = ensure_clean_git_worktree(true)?;
+                resume_provider_loop_to_completion(
+                    ProviderLoopConfig {
+                        runs_root: &args.runs_root,
+                        run_id: &args.run_id,
+                        ticket: &ticket,
+                        model: &existing.model,
+                        timeout_ms: args.timeout_ms,
+                        repository_root: &repository_root,
+                        worktree_clean,
+                    },
+                    &provider,
+                )?
+            }
+            provider => {
+                return Err(CliFailure::message(format!(
+                    "unsupported loop provider '{provider}'; supported providers: fake, ollama"
+                )));
+            }
+        }
+    } else {
+        existing
+    };
     finish_loop_command("resume", &args.runs_root, &run, args.json)
 }
 
 fn smoke_loop(args: LoopSmokeArgs) -> Result<(), CliFailure> {
     let ticket = smoke_ticket();
     let run_id = generated_run_id("smoke");
-    let run = start_loop_to_completion(
+    let run = start_deterministic_loop_to_completion(
         &args.runs_root,
         &run_id,
         &ticket,
@@ -928,7 +1069,389 @@ fn validate_agent_bench_ollama_smoke_content(content: &str) -> Result<(), CliFai
     }
 }
 
-fn start_loop_to_completion(
+struct ProviderLoopConfig<'a> {
+    runs_root: &'a Path,
+    run_id: &'a str,
+    ticket: &'a TicketSpec,
+    model: &'a str,
+    timeout_ms: u64,
+    repository_root: &'a Path,
+    worktree_clean: bool,
+}
+
+fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
+    config: ProviderLoopConfig<'_>,
+    provider_name: &str,
+    provider: &P,
+) -> Result<LoopRun, CliFailure> {
+    let policy = default_policy()?;
+    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let patch_gate_config = ProviderPatchGateConfig::for_ticket(
+        config.repository_root,
+        config.ticket,
+        policy,
+        config.worktree_clean,
+    );
+    let mut patch_runner = GitCommandRunner;
+    let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_context_pack_request(context_request)
+        .with_patch_gate(patch_gate_config, &mut patch_runner);
+    let runs_root = config.runs_root;
+    let run_id = config.run_id;
+    let ticket = config.ticket;
+    let config = LoopRunnerConfig::for_ticket(
+        config.runs_root,
+        config.run_id,
+        ticket,
+        provider_name.to_string(),
+        config.model.to_string(),
+    );
+    let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    persist_provider_ticket_snapshot(runs_root, run_id, ticket)?;
+    runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)
+        .cloned()
+}
+
+fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
+    config: ProviderLoopConfig<'_>,
+    provider: &P,
+) -> Result<LoopRun, CliFailure> {
+    let policy = default_policy()?;
+    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let patch_gate_config = ProviderPatchGateConfig::for_ticket(
+        config.repository_root,
+        config.ticket,
+        policy,
+        config.worktree_clean,
+    );
+    let mut patch_runner = GitCommandRunner;
+    let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_context_pack_request(context_request)
+        .with_patch_gate(patch_gate_config, &mut patch_runner);
+    let mut runner = LoopRunner::resume(
+        config.runs_root.to_path_buf(),
+        config.run_id,
+        &mut step_runner,
+    )
+    .map_err(loop_runner_failure)?;
+    runner
+        .run_to_completion()
+        .map_err(loop_runner_failure)
+        .cloned()
+}
+
+fn provider_context_request(
+    repository_root: &Path,
+    ticket: &TicketSpec,
+    policy: &Policy,
+) -> ContextPackRequest {
+    ContextPackRequest::for_ticket(
+        repository_root,
+        Path::new("provider-runner-will-set-run-directory"),
+        ticket,
+        &policy.forbidden_paths,
+        ContextLimits {
+            max_bytes_per_file: 32 * 1024,
+            max_total_bytes: 128 * 1024,
+        },
+    )
+}
+
+fn default_policy() -> Result<Policy, CliFailure> {
+    serde_json::from_str(templates::DEFAULT_POLICY_JSON)
+        .map_err(|err| CliFailure::message(format!("could not parse default policy: {err}")))
+}
+
+fn loop_model(provider: &str, model: Option<String>) -> Result<String, CliFailure> {
+    match (provider, model) {
+        ("fake", Some(model)) => Ok(model),
+        ("fake", None) => Ok("fake-local".to_string()),
+        ("ollama", Some(model)) => Ok(model),
+        ("ollama", None) => Err(CliFailure::message(
+            "--model is required with --provider ollama".to_string(),
+        )),
+        (_, Some(model)) => Ok(model),
+        (_, None) => Ok("fake-local".to_string()),
+    }
+}
+
+fn validate_provider_timeout(timeout_ms: u64) -> Result<(), CliFailure> {
+    if timeout_ms == 0 {
+        return Err(CliFailure::message(
+            "--timeout-ms must be greater than 0".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_repository_root() -> Result<PathBuf, CliFailure> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| {
+            CliFailure::message(format!("could not inspect git repository root: {err}"))
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        return Err(CliFailure::message(format!(
+            "could not inspect git repository root{suffix}; rerun from a git repository"
+        )));
+    }
+
+    let root = String::from_utf8(output.stdout)
+        .map_err(|err| CliFailure::message(format!("git repository root was not UTF-8: {err}")))?;
+    let root = PathBuf::from(root.trim());
+    root.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "could not canonicalize git repository root {}: {err}",
+            root.display()
+        ))
+    })
+}
+
+fn loop_run_needs_provider_resume(run: &LoopRun) -> bool {
+    matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
+}
+
+fn resume_provider_ticket(
+    run: &LoopRun,
+    ticket: &TicketSpec,
+    runs_root: &Path,
+) -> Result<TicketSpec, CliFailure> {
+    let mut mismatches = Vec::new();
+    if run.ticket_id != ticket.ticket_id {
+        mismatches.push(format!(
+            "ticket_id mismatch (run has {}, ticket has {})",
+            run.ticket_id, ticket.ticket_id
+        ));
+    }
+    if run.goal_id != ticket.goal_id {
+        mismatches.push(format!(
+            "goal_id mismatch (run has {}, ticket has {})",
+            run.goal_id, ticket.goal_id
+        ));
+    }
+    if !mismatches.is_empty() {
+        return Err(CliFailure::message(format!(
+            "resume ticket does not match persisted run: {}",
+            mismatches.join("; ")
+        )));
+    }
+
+    compare_provider_ticket_snapshot(runs_root, run, ticket)?;
+    let has_apply_authority = persisted_apply_authority(run);
+    let mut ticket = ticket.clone();
+    if !has_apply_authority {
+        ticket.autonomy.apply_patch = false;
+    }
+    Ok(ticket)
+}
+
+fn persist_provider_ticket_snapshot(
+    runs_root: &Path,
+    run_id: &str,
+    ticket: &TicketSpec,
+) -> Result<(), CliFailure> {
+    let snapshot = canonical_ticket_snapshot(ticket)?;
+    let path = provider_ticket_snapshot_path(runs_root, run_id);
+    fs::write(&path, snapshot)
+        .map_err(|err| CliFailure::message(format!("could not write {}: {err}", path.display())))
+}
+
+fn compare_provider_ticket_snapshot(
+    runs_root: &Path,
+    run: &LoopRun,
+    ticket: &TicketSpec,
+) -> Result<(), CliFailure> {
+    let path = provider_ticket_snapshot_path(runs_root, &run.run_id);
+    let persisted = fs::read(&path).map_err(|err| {
+        CliFailure::message(format!(
+            "could not read original provider ticket snapshot {}: {err}; refusing to resume with unverifiable ticket content",
+            path.display()
+        ))
+    })?;
+    let candidate = canonical_ticket_snapshot(ticket)?;
+    if persisted != candidate {
+        return Err(CliFailure::message(
+            "resume ticket content does not match the original provider run ticket snapshot; refusing to rebuild context or patch gate from changed ticket"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_ticket_snapshot_path(runs_root: &Path, run_id: &str) -> PathBuf {
+    runs_root.join(run_id).join("ticket.snapshot.json")
+}
+
+fn canonical_ticket_snapshot(ticket: &TicketSpec) -> Result<Vec<u8>, CliFailure> {
+    serde_json::to_vec_pretty(ticket)
+        .map_err(|err| CliFailure::message(format!("could not serialize ticket snapshot: {err}")))
+}
+
+fn persisted_apply_authority(run: &LoopRun) -> bool {
+    run.policy_decisions.iter().any(|entry| {
+        serde_json::to_value(entry)
+            .ok()
+            .and_then(|value| serde_json::from_value::<PolicyDecision>(value).ok())
+            .is_some_and(|decision| decision.patch_id == run.run_id && decision.apply_requested)
+    })
+}
+
+fn next_pending_model_step(run: &LoopRun) -> Option<LoopStepName> {
+    run.steps
+        .iter()
+        .find(|step| {
+            matches!(
+                step.status,
+                LoopStepStatus::Pending | LoopStepStatus::Running
+            ) && is_model_step(step.name)
+        })
+        .map(|step| step.name)
+}
+
+fn is_model_step(step: LoopStepName) -> bool {
+    matches!(
+        step,
+        LoopStepName::Research
+            | LoopStepName::Analysis
+            | LoopStepName::SpecCreation
+            | LoopStepName::SpecReview
+            | LoopStepName::Development
+            | LoopStepName::OutputReview
+    )
+}
+
+fn fake_provider_script_from(
+    start_step: LoopStepName,
+) -> Vec<Result<ModelResponse, seaf_models::ModelError>> {
+    fake_provider_script()
+        .into_iter()
+        .filter(|(step, _)| step_index(*step) >= step_index(start_step))
+        .map(|(_, response)| Ok(fake_model_response(response)))
+        .collect()
+}
+
+fn fake_provider_script() -> Vec<(LoopStepName, String)> {
+    vec![
+        (
+            LoopStepName::Research,
+            fake_agent_response(
+                "researcher",
+                "Relevant CLI wiring is concentrated in the loop command.",
+                "Proceed to analysis.",
+            ),
+        ),
+        (
+            LoopStepName::Analysis,
+            fake_agent_response(
+                "analyzer",
+                "The provider path must preserve context and gate artifacts.",
+                "Write a narrow implementation spec.",
+            ),
+        ),
+        (
+            LoopStepName::SpecCreation,
+            fake_agent_response(
+                "spec_writer",
+                "Use the same ProviderStepRunner path as live providers.",
+                "Send the spec for review.",
+            ),
+        ),
+        (
+            LoopStepName::SpecReview,
+            fake_reviewer_response(
+                "spec_reviewer",
+                "approve_spec",
+                "The spec is narrow and testable.",
+            ),
+        ),
+        (LoopStepName::Development, fake_developer_response()),
+        (
+            LoopStepName::OutputReview,
+            fake_reviewer_response(
+                "output_reviewer",
+                "approve_for_tests",
+                "The patch is acceptable for test verification.",
+            ),
+        ),
+    ]
+}
+
+fn fake_agent_response(role: &str, summary: &str, next_step_recommendation: &str) -> String {
+    serde_json::json!({
+        "role": role,
+        "status": "passed",
+        "summary": summary,
+        "findings": [
+            {
+                "claim": "Provider-backed loop execution is auditable.",
+                "evidence": "prompts and responses are persisted per step"
+            }
+        ],
+        "risks": [],
+        "next_step_recommendation": next_step_recommendation
+    })
+    .to_string()
+}
+
+fn fake_reviewer_response(role: &str, decision: &str, summary: &str) -> String {
+    serde_json::json!({
+        "role": role,
+        "decision": decision,
+        "summary": summary,
+        "blocking_issues": [],
+        "non_blocking_issues": []
+    })
+    .to_string()
+}
+
+fn fake_developer_response() -> String {
+    serde_json::json!({
+        "role": "developer",
+        "status": "patch_proposed",
+        "summary": "Propose a small eval-scoped smoke artifact so policy evidence is real and human-reviewed.",
+        "changed_files": ["examples/local-loop/evals/fake-provider-smoke.txt"],
+        "requires_human_review": true,
+        "patch": fake_provider_review_patch()
+    })
+    .to_string()
+}
+
+fn fake_provider_review_patch() -> &'static str {
+    "diff --git a/examples/local-loop/evals/fake-provider-smoke.txt b/examples/local-loop/evals/fake-provider-smoke.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/examples/local-loop/evals/fake-provider-smoke.txt\n@@ -0,0 +1 @@\n+provider-backed smoke\n"
+}
+
+fn fake_model_response(content: String) -> ModelResponse {
+    ModelResponse {
+        content,
+        latency_ms: 0,
+        raw_provider_metadata: serde_json::json!({ "provider": "fake" }),
+    }
+}
+
+fn step_index(step: LoopStepName) -> usize {
+    match step {
+        LoopStepName::Research => 0,
+        LoopStepName::Analysis => 1,
+        LoopStepName::SpecCreation => 2,
+        LoopStepName::SpecReview => 3,
+        LoopStepName::Development => 4,
+        LoopStepName::OutputReview => 5,
+        LoopStepName::Testing => 6,
+        LoopStepName::EvalReport => 7,
+    }
+}
+
+fn start_deterministic_loop_to_completion(
     runs_root: &Path,
     run_id: &str,
     ticket: &TicketSpec,
@@ -1106,21 +1629,24 @@ fn next_loop_action(run: &LoopRun) -> String {
     }
 }
 
-fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<(), CliFailure> {
-    if allow_dirty {
-        return Ok(());
-    }
-
-    let output = ProcessCommand::new("git")
+fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<bool, CliFailure> {
+    let output = match ProcessCommand::new("git")
         .args(["status", "--porcelain"])
         .output()
-        .map_err(|err| {
-            CliFailure::message(format!(
+    {
+        Ok(output) => output,
+        Err(_) if allow_dirty => return Ok(false),
+        Err(err) => {
+            return Err(CliFailure::message(format!(
                 "could not inspect git working tree: {err}; rerun with --allow-dirty to skip this guard"
-            ))
-        })?;
+            )));
+        }
+    };
 
     if !output.status.success() {
+        if allow_dirty {
+            return Ok(false);
+        }
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
         let suffix = if detail.is_empty() {
@@ -1134,13 +1660,16 @@ fn ensure_clean_git_worktree(allow_dirty: bool) -> Result<(), CliFailure> {
     }
 
     if !output.stdout.is_empty() {
+        if allow_dirty {
+            return Ok(false);
+        }
         return Err(CliFailure::message(
             "refusing to start loop with a dirty git working tree; commit or stash changes, or rerun with --allow-dirty"
                 .to_string(),
         ));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn smoke_ticket() -> TicketSpec {
@@ -1228,6 +1757,28 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         _ => unreachable!("loop artifact pairing is validated before checks run"),
     };
 
+    let invocation_root = std::env::current_dir()
+        .map_err(|err| CliFailure::message(format!("could not determine current dir: {err}")))?;
+    let invocation_root = invocation_root.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "could not canonicalize invocation root {}: {err}",
+            invocation_root.display()
+        ))
+    })?;
+
+    let ticket_allow_commands = loop_artifacts
+        .as_ref()
+        .map(|(_, ticket)| ticket.autonomy.allow_shell_commands.as_slice());
+    let mut plans = Vec::new();
+    for check in &config.evals.required {
+        plans.push(plan_eval_check(
+            check,
+            &config.evals.allow_commands,
+            ticket_allow_commands,
+            &invocation_root,
+        )?);
+    }
+
     let output_path = args.output;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -1242,8 +1793,8 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         .map_err(|err| CliFailure::message(format!("could not create logs dir: {err}")))?;
 
     let mut checks = Vec::new();
-    for check in &config.evals.required {
-        checks.push(run_eval_check(check, &log_dir)?);
+    for plan in &plans {
+        checks.push(run_eval_check(plan, &log_dir)?);
     }
 
     let report = match (&args.loop_run, &args.ticket) {
@@ -1308,7 +1859,61 @@ fn command_eval_report(patch_id: String, goal_id: String, checks: Vec<EvalCheck>
     }
 }
 
-fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck, CliFailure> {
+const DEFAULT_EVAL_TIMEOUT_MS: u64 = 120_000;
+const MAX_EVAL_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_EVAL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_EVAL_OUTPUT_BYTES: usize = 1024 * 1024;
+const EVAL_OUTPUT_DRAIN_GRACE_MS: u64 = 250;
+
+#[derive(Debug)]
+struct EvalCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+#[derive(Debug)]
+struct OutputDrain {
+    state: Arc<Mutex<OutputDrainState>>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct OutputDrainState {
+    retained: Vec<u8>,
+    completed: bool,
+    error: Option<OutputDrainError>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputDrainError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl OutputDrainError {
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
+#[derive(Debug)]
+struct EvalCheckPlan {
+    name: String,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+}
+
+fn plan_eval_check(
+    check: &EvalCommandConfig,
+    eval_allow_commands: &[String],
+    ticket_allow_commands: Option<&[String]>,
+    invocation_root: &Path,
+) -> Result<EvalCheckPlan, CliFailure> {
     if check.name.trim().is_empty() {
         return Err(CliFailure::message(
             "eval check name must not be empty".to_string(),
@@ -1321,28 +1926,79 @@ fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck
         )));
     }
 
-    let started = Instant::now();
-    let output = ProcessCommand::new("sh")
-        .arg("-c")
-        .arg(&check.command)
-        .output()
-        .map_err(|err| {
-            CliFailure::message(format!("could not run eval check {}: {err}", check.name))
+    let argv = parse_eval_command(&check.command).map_err(|err| {
+        CliFailure::message(format!("eval check {} command rejected: {err}", check.name))
+    })?;
+    ensure_command_allowed(&argv, eval_allow_commands).map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {} command rejected by eval allow_commands: {err}",
+            check.name
+        ))
+    })?;
+    if let Some(ticket_allow_commands) = ticket_allow_commands {
+        ensure_command_allowed(&argv, ticket_allow_commands).map_err(|err| {
+            CliFailure::message(format!(
+                "eval check {} command rejected by ticket autonomy: {err}",
+                check.name
+            ))
         })?;
+    }
+
+    let cwd = resolve_eval_cwd(check, invocation_root)?;
+    validate_eval_env(check)?;
+    let mut argv = argv;
+    argv[0] = resolve_eval_executable(&argv[0], &cwd, &check.name)?;
+    let timeout_ms = check.timeout_ms.unwrap_or(DEFAULT_EVAL_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_EVAL_TIMEOUT_MS {
+        return Err(CliFailure::message(format!(
+            "eval check {} timeout_ms must be between 1 and {MAX_EVAL_TIMEOUT_MS}",
+            check.name
+        )));
+    }
+    let max_output_bytes = check.max_output_bytes.unwrap_or(DEFAULT_EVAL_OUTPUT_BYTES);
+    if max_output_bytes == 0 || max_output_bytes > MAX_EVAL_OUTPUT_BYTES {
+        return Err(CliFailure::message(format!(
+            "eval check {} max_output_bytes must be between 1 and {MAX_EVAL_OUTPUT_BYTES}",
+            check.name
+        )));
+    }
+
+    Ok(EvalCheckPlan {
+        name: check.name.clone(),
+        argv,
+        cwd,
+        env: check.env.clone(),
+        timeout_ms,
+        max_output_bytes,
+    })
+}
+
+fn run_eval_check(plan: &EvalCheckPlan, log_dir: &Path) -> Result<EvalCheck, CliFailure> {
+    let started = Instant::now();
+    let output = run_controlled_command(
+        &plan.argv,
+        &plan.cwd,
+        &plan.env,
+        plan.timeout_ms,
+        plan.max_output_bytes,
+    )
+    .map_err(|err| CliFailure::message(format!("could not run eval check {}: {err}", plan.name)))?;
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let safe_name = sanitize_id(&check.name);
+    let safe_name = sanitize_id(&plan.name);
     let stdout_path = log_dir.join(format!("{safe_name}.stdout.log"));
     let stderr_path = log_dir.join(format!("{safe_name}.stderr.log"));
-    fs::write(&stdout_path, &output.stdout).map_err(|err| {
+    let stdout = sanitize_eval_log(&output.stdout, &plan.env, plan.max_output_bytes);
+    let stderr = sanitize_eval_log(&output.stderr, &plan.env, plan.max_output_bytes);
+    fs::write(&stdout_path, stdout).map_err(|err| {
         CliFailure::message(format!("could not write {}: {err}", stdout_path.display()))
     })?;
-    fs::write(&stderr_path, &output.stderr).map_err(|err| {
+    fs::write(&stderr_path, stderr).map_err(|err| {
         CliFailure::message(format!("could not write {}: {err}", stderr_path.display()))
     })?;
 
     Ok(EvalCheck {
-        name: check.name.clone(),
-        status: if output.status.success() {
+        name: plan.name.clone(),
+        status: if !output.timed_out && output.status.success() {
             CheckStatus::Passed
         } else {
             CheckStatus::Failed
@@ -1350,11 +2006,697 @@ fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck
         duration_ms: Some(duration_ms),
         stdout_path: Some(stdout_path.display().to_string()),
         stderr_path: Some(stderr_path.display().to_string()),
-        summary: Some(match output.status.code() {
-            Some(code) => format!("command exited with code {code}"),
-            None => "command terminated by signal".to_string(),
+        summary: Some(if output.timed_out {
+            format!("command timed out after {}ms", plan.timeout_ms)
+        } else {
+            match output.status.code() {
+                Some(code) => format!("command exited with code {code}"),
+                None => "command terminated by signal".to_string(),
+            }
         }),
     })
+}
+
+fn parse_eval_command(command: &str) -> Result<Vec<String>, String> {
+    if command.contains('\0') {
+        return Err("command must not contain NUL bytes".to_string());
+    }
+    if command.contains("$(") {
+        return Err("shell metacharacter '$(' is not supported".to_string());
+    }
+    for metacharacter in [';', '&', '|', '<', '>', '`', '\n', '\r'] {
+        if command.contains(metacharacter) {
+            return Err(format!(
+                "shell metacharacter '{metacharacter}' is not supported"
+            ));
+        }
+    }
+    if command.contains('"') || command.contains('\'') {
+        return Err("quoted shell syntax is not supported".to_string());
+    }
+    let argv: Vec<String> = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    if argv.is_empty() {
+        return Err("command must not be empty".to_string());
+    }
+    Ok(argv)
+}
+
+fn ensure_command_allowed(argv: &[String], allow_commands: &[String]) -> Result<(), String> {
+    for allow_command in allow_commands {
+        let allow_argv = parse_eval_command(allow_command)
+            .map_err(|err| format!("invalid allowlist entry {allow_command:?}: {err}"))?;
+        if allow_argv.len() <= argv.len() && argv[..allow_argv.len()] == allow_argv {
+            return Ok(());
+        }
+    }
+    Err(format!("{} is not allowed", argv.join(" ")))
+}
+
+fn resolve_eval_cwd(
+    check: &EvalCommandConfig,
+    invocation_root: &Path,
+) -> Result<PathBuf, CliFailure> {
+    let cwd = match &check.cwd {
+        Some(cwd) if cwd.is_absolute() => cwd.clone(),
+        Some(cwd) => invocation_root.join(cwd),
+        None => invocation_root.to_path_buf(),
+    };
+    let cwd = cwd.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {} cwd {} is invalid: {err}",
+            check.name,
+            cwd.display()
+        ))
+    })?;
+    if !cwd.is_dir() {
+        return Err(CliFailure::message(format!(
+            "eval check {} cwd {} is not a directory",
+            check.name,
+            cwd.display()
+        )));
+    }
+    if !cwd.starts_with(invocation_root) {
+        return Err(CliFailure::message(format!(
+            "eval check {} cwd {} escapes invocation root {}",
+            check.name,
+            cwd.display(),
+            invocation_root.display()
+        )));
+    }
+    Ok(cwd)
+}
+
+fn validate_eval_env(check: &EvalCommandConfig) -> Result<(), CliFailure> {
+    for (name, value) in &check.env {
+        if name.eq_ignore_ascii_case("PATH") {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} is not allowed",
+                check.name
+            )));
+        }
+        if !is_safe_env_name(name) {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} is invalid",
+                check.name
+            )));
+        }
+        if value.contains('\0') {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} value must not contain NUL bytes",
+                check.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn resolve_eval_executable(
+    program: &str,
+    cwd: &Path,
+    check_name: &str,
+) -> Result<String, CliFailure> {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() || program_path.components().count() > 1 {
+        let candidate = if program_path.is_absolute() {
+            program_path.to_path_buf()
+        } else {
+            cwd.join(program_path)
+        };
+        if is_executable_file(&candidate) {
+            validate_eval_executable_shape(&candidate, program, check_name)?;
+            return Ok(candidate.display().to_string());
+        }
+        return Err(CliFailure::message(format!(
+            "eval check {check_name} executable {program:?} was not found or is not executable"
+        )));
+    }
+
+    for dir in trusted_eval_search_paths() {
+        let candidate = dir.join(program);
+        if is_executable_file(&candidate) {
+            validate_eval_executable_shape(&candidate, program, check_name)?;
+            return Ok(candidate.display().to_string());
+        }
+    }
+    Err(CliFailure::message(format!(
+        "eval check {check_name} executable {program:?} was not found on trusted PATH"
+    )))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    is_executable_metadata(&metadata)
+}
+
+fn validate_eval_executable_shape(
+    path: &Path,
+    program: &str,
+    check_name: &str,
+) -> Result<(), CliFailure> {
+    validate_platform_executable_shape(path).map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {check_name} executable {program:?} cannot spawn: {err}"
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn validate_platform_executable_shape(path: &Path) -> Result<(), String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
+    if bytes.starts_with(b"#!") {
+        let shebang_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(bytes.len());
+        let shebang = String::from_utf8_lossy(&bytes[2..shebang_end]);
+        let mut shebang_parts = shebang.split_whitespace();
+        let interpreter = shebang_parts
+            .next()
+            .ok_or_else(|| "shebang is missing an interpreter".to_string())?;
+        let interpreter_path = Path::new(interpreter);
+        if !interpreter_path.is_absolute() {
+            return Err(format!(
+                "shebang interpreter {interpreter:?} is not absolute"
+            ));
+        }
+        if !is_executable_file(interpreter_path) {
+            return Err(format!(
+                "shebang interpreter {} was not found or is not executable",
+                interpreter_path.display()
+            ));
+        }
+        if interpreter_path
+            .file_name()
+            .is_some_and(|name| name == "env")
+        {
+            let env_interpreter = shebang_parts
+                .next()
+                .ok_or_else(|| "env shebang is missing an interpreter".to_string())?;
+            validate_env_shebang_interpreter(env_interpreter)?;
+        }
+        return Ok(());
+    }
+
+    if looks_like_text_without_shebang(&bytes) {
+        return Err("text executable is missing a shebang interpreter".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_env_shebang_interpreter(interpreter: &str) -> Result<(), String> {
+    if interpreter.starts_with('-') {
+        return Err(format!(
+            "env shebang option {interpreter:?} is not supported"
+        ));
+    }
+    let interpreter_path = Path::new(interpreter);
+    if interpreter_path.components().count() > 1 {
+        if interpreter_path.is_absolute() && is_executable_file(interpreter_path) {
+            return Ok(());
+        }
+        return Err(format!(
+            "env shebang interpreter {interpreter:?} was not found or is not executable"
+        ));
+    }
+    for dir in trusted_eval_search_paths() {
+        if is_executable_file(&dir.join(interpreter)) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "env shebang interpreter {interpreter:?} was not found on trusted PATH"
+    ))
+}
+
+#[cfg(not(unix))]
+fn validate_platform_executable_shape(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn looks_like_text_without_shebang(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let sample_len = bytes.len().min(512);
+    std::str::from_utf8(&bytes[..sample_len]).is_ok_and(|text| {
+        text.chars()
+            .all(|ch| ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control())
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_metadata(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_metadata(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn trusted_eval_path() -> String {
+    std::env::join_paths(trusted_eval_search_paths())
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn trusted_eval_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(cargo_home) = option_env!("CARGO_HOME") {
+        paths.push(PathBuf::from(cargo_home).join("bin"));
+    }
+    if let Some(home) = option_env!("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".cargo/bin"));
+        paths.push(home.join("Library/pnpm"));
+        paths.push(home.join(".local/bin"));
+    }
+    for path in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        paths.push(PathBuf::from(path));
+    }
+    paths
+}
+
+fn run_controlled_command(
+    argv: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+) -> std::io::Result<EvalCommandOutput> {
+    let mut command = ProcessCommand::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_eval_child(&mut command);
+    command.env_clear();
+    inherit_safe_eval_env(&mut command);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_capped_output_drain(stdout, max_output_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_capped_output_drain(stderr, max_output_bytes));
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            terminate_eval_child(&mut child)?;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait()?;
+    if !timed_out {
+        terminate_eval_child(&mut child)?;
+    }
+    let drain_deadline = Instant::now() + Duration::from_millis(EVAL_OUTPUT_DRAIN_GRACE_MS);
+    let stdout = match stdout {
+        Some(drain) => finish_output_drain(drain, drain_deadline)?,
+        None => Vec::new(),
+    };
+    let stderr = match stderr {
+        Some(drain) => finish_output_drain(drain, drain_deadline)?,
+        None => Vec::new(),
+    };
+    Ok(EvalCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn inherit_safe_eval_env(command: &mut ProcessCommand) {
+    command.env("PATH", trusted_eval_path());
+    for name in [
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn spawn_capped_output_drain<R>(mut reader: R, max_output_bytes: usize) -> OutputDrain
+where
+    R: Read + Send + 'static,
+{
+    let state = Arc::new(Mutex::new(OutputDrainState {
+        retained: Vec::with_capacity(max_output_bytes.min(8192)),
+        completed: false,
+        error: None,
+    }));
+    let thread_state = Arc::clone(&state);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.completed = true;
+                    }
+                    break;
+                }
+                Ok(read) => {
+                    let Ok(mut state) = thread_state.lock() else {
+                        break;
+                    };
+                    let remaining = max_output_bytes.saturating_sub(state.retained.len());
+                    if remaining > 0 {
+                        state
+                            .retained
+                            .extend_from_slice(&chunk[..read.min(remaining)]);
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.error = Some(OutputDrainError {
+                            kind: err.kind(),
+                            message: err.to_string(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    OutputDrain { state, handle }
+}
+
+#[cfg(unix)]
+fn configure_eval_child(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_eval_child(_command: &mut ProcessCommand) {}
+
+#[cfg(unix)]
+fn terminate_eval_child(child: &mut std::process::Child) -> io::Result<()> {
+    let process_group = format!("-{}", child.id());
+    let kill_group = ProcessCommand::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .status();
+    if let Err(err) = kill_group {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+    if let Err(err) = child.kill() {
+        if err.kind() != io::ErrorKind::InvalidInput {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_eval_child(child: &mut std::process::Child) -> io::Result<()> {
+    if let Err(err) = child.kill() {
+        if err.kind() != io::ErrorKind::InvalidInput {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn finish_output_drain(drain: OutputDrain, deadline: Instant) -> io::Result<Vec<u8>> {
+    loop {
+        let snapshot = output_drain_snapshot(&drain.state)?;
+        if snapshot.completed || snapshot.error.is_some() {
+            drain
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("output drain thread panicked"))?;
+            if let Some(error) = snapshot.error {
+                return Err(error.into_io_error());
+            }
+            return Ok(snapshot.retained);
+        }
+        if drain.handle.is_finished() {
+            drain
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("output drain thread panicked"))?;
+            let snapshot = output_drain_snapshot(&drain.state)?;
+            if let Some(error) = snapshot.error {
+                return Err(error.into_io_error());
+            }
+            return Ok(snapshot.retained);
+        }
+        if Instant::now() >= deadline {
+            return Ok(snapshot.retained);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn output_drain_snapshot(state: &Arc<Mutex<OutputDrainState>>) -> io::Result<OutputDrainState> {
+    let state = state
+        .lock()
+        .map_err(|_| io::Error::other("output drain state lock poisoned"))?;
+    Ok(OutputDrainState {
+        retained: state.retained.clone(),
+        completed: state.completed,
+        error: state.error.clone(),
+    })
+}
+
+fn sanitize_eval_log(
+    output: &[u8],
+    env: &BTreeMap<String, String>,
+    max_output_bytes: usize,
+) -> String {
+    let mut text = String::from_utf8_lossy(output).into_owned();
+    for (name, value) in env {
+        if is_sensitive_name(name) && !value.is_empty() {
+            text = text.replace(value, "[REDACTED]");
+        }
+    }
+    text = redact_configured_secret_prefixes(&text, env);
+    text = redact_sensitive_assignments(&text);
+    text = redact_obvious_standalone_secrets(&text);
+    truncate_to_bytes(&text, max_output_bytes)
+}
+
+fn redact_configured_secret_prefixes(text: &str, env: &BTreeMap<String, String>) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_configured_secret_prefix_token(&token, env));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_configured_secret_prefix_token(&token, env));
+    redacted
+}
+
+fn redact_configured_secret_prefix_token(token: &str, env: &BTreeMap<String, String>) -> String {
+    if is_configured_secret_prefix(token, env) {
+        "[REDACTED]".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_configured_secret_prefix(token: &str, env: &BTreeMap<String, String>) -> bool {
+    let candidate = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if candidate.is_empty() {
+        return false;
+    }
+    env.iter().any(|(name, value)| {
+        is_sensitive_name(name)
+            && ((value.len() > candidate.len() && value.starts_with(candidate))
+                || is_labeled_configured_secret_prefix(candidate, name, value))
+    })
+}
+
+fn is_labeled_configured_secret_prefix(candidate: &str, name: &str, value: &str) -> bool {
+    for separator in [':', '='] {
+        let Some((label, prefix)) = candidate.split_once(separator) else {
+            continue;
+        };
+        if !prefix.is_empty()
+            && (label == name || is_sensitive_name(label))
+            && value.len() > prefix.len()
+            && value.starts_with(prefix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn redact_sensitive_assignments(text: &str) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_sensitive_token(&token));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_sensitive_token(&token));
+    redacted
+}
+
+fn redact_sensitive_token(token: &str) -> String {
+    let Some((name, _value)) = token.split_once('=') else {
+        return token.to_string();
+    };
+    if is_sensitive_name(name) {
+        format!("{name}=[REDACTED]")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn redact_obvious_standalone_secrets(text: &str) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_standalone_secret_token(&token));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_standalone_secret_token(&token));
+    redacted
+}
+
+fn redact_standalone_secret_token(token: &str) -> String {
+    if is_obvious_standalone_secret(token) {
+        "[REDACTED]".to_string()
+    } else if let Some((label, value)) = token.split_once(':') {
+        if !label.is_empty() && is_obvious_standalone_secret(value) {
+            format!("{label}:[REDACTED]")
+        } else {
+            token.to_string()
+        }
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_obvious_standalone_secret(token: &str) -> bool {
+    let candidate = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    for prefix in [
+        "sk-proj-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+    ] {
+        let Some(rest) = candidate.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.len() >= 16
+            && rest
+                .chars()
+                .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn prepare_release(args: ReleasePrepareArgs) -> Result<(), CliFailure> {

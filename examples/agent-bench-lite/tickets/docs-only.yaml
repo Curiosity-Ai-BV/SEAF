@@ -17,6 +17,7 @@ autonomy:
   level: 1
   apply_patch: true
   allow_shell_commands:
+    - cargo test -p seaf-cli loop_bench
     - cargo fmt --all -- --check
 acceptance_criteria:
   - Only documentation fixture content changes.

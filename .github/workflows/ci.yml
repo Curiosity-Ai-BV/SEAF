@@ -6,35 +6,61 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      # Stable is intentional until SEAF declares an MSRV.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Expose pnpm on eval trusted PATH
+        run: |
+          PNPM_BIN="$(command -v pnpm)"
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo tee /usr/local/bin/pnpm > /dev/null <<EOF
+          #!/bin/sh
+          exec "$PNPM_BIN" "\$@"
+          EOF
+          sudo chmod +x /usr/local/bin/pnpm
+          PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" pnpm --version
       - name: Rust format
         run: cargo fmt --all -- --check
       - name: Rust Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Cargo tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: P2-012 schema fixture checks
-        run: cargo test -p seaf-core fixture_loads
+        run: cargo test --locked -p seaf-core fixture_loads
       - name: P2-012 fake loop smoke test without Ollama
-        run: cargo test -p seaf-cli loop_smoke_produces_json_artifacts_without_ollama
+        run: cargo test --locked -p seaf-cli loop_smoke_produces_json_artifacts_without_ollama
       - name: P2-012 AgentBench-lite fake provider test
-        run: cargo test -p seaf-cli loop_bench_fake_json_reports_agent_bench_summary
+        run: cargo test --locked -p seaf-cli loop_bench_fake_json_reports_agent_bench_summary
       - name: P2-012 forbidden patch fixture test
-        run: cargo test -p seaf-loop policy_gate_rejects_forbidden_paths_and_never_invokes_apply
+        run: cargo test --locked -p seaf-loop policy_gate_rejects_forbidden_paths_and_never_invokes_apply
       - name: P2-012 generated example validation
-        run: cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
+        run: cargo run --locked -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
       - name: P2-012 AgentBench-lite fake provider CLI
-        run: cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
+        run: cargo run --locked -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 
   typescript:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
@@ -46,7 +72,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
-      - run: pnpm lint
+      - run: pnpm lint:packages
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build

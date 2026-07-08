@@ -139,7 +139,7 @@ impl PatchCommandRunner for GitCommandRunner {
     }
 }
 
-pub fn gate_patch<R: PatchCommandRunner>(
+pub fn gate_patch<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
 ) -> Result<PolicyDecision, PatchGateError> {

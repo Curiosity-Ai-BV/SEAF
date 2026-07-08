@@ -472,6 +472,20 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    const POLICY_GATE_REVIEW_CATEGORIES: &[&str] = &[
+        "dependency_changes",
+        "database_migrations",
+        "auth_code",
+        "payment_code",
+        "privacy_sensitive_code",
+        "network_permission_changes",
+        "ci_changes",
+        "eval_changes",
+        "policy_changes",
+        "updater_changes",
+        "signing_changes",
+    ];
+
     #[test]
     fn valid_goal_example_loads() {
         let goal: GoalSpec = serde_yaml::from_str(crate::templates::ADAPTIVE_GOAL_YAML)
@@ -561,6 +575,46 @@ allowed_change_types:
 
         assert_eq!(policy.default_autonomy_level, 1);
         assert!(validate_policy(&policy).is_empty());
+    }
+
+    #[test]
+    fn default_and_example_policies_require_review_for_every_policy_gate_category() {
+        let policy_sources = [
+            ("default template", crate::templates::DEFAULT_POLICY_JSON),
+            (
+                "adaptive-notes example",
+                include_str!("../../../examples/adaptive-notes/seaf.policy.json"),
+            ),
+        ];
+
+        for (name, source) in policy_sources {
+            let policy: Policy = serde_json::from_str(source).expect("policy should parse");
+            let expected_categories: std::collections::BTreeSet<&str> =
+                POLICY_GATE_REVIEW_CATEGORIES.iter().copied().collect();
+            let review_categories: std::collections::BTreeSet<&str> = policy
+                .requires_human_review
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let missing_categories: Vec<&str> = expected_categories
+                .difference(&review_categories)
+                .copied()
+                .collect();
+            let unexpected_categories: Vec<&str> = review_categories
+                .difference(&expected_categories)
+                .copied()
+                .collect();
+
+            assert!(
+                missing_categories.is_empty(),
+                "{name} policy must require human review for every policy-gate category; missing: {missing_categories:?}"
+            );
+            assert!(
+                unexpected_categories.is_empty(),
+                "{name} policy must not add review defaults outside policy-gate categories; unexpected: {unexpected_categories:?}"
+            );
+            assert!(validate_policy(&policy).is_empty());
+        }
     }
 
     #[test]

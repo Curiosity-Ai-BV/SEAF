@@ -1,4 +1,6 @@
 evals:
+  allow_commands:
+    - cargo test -p seaf-cli loop_bench
   required:
     - name: agent_bench_lite_static_fixture
-      command: "printf agent-bench-lite"
+      command: "cargo test -p seaf-cli loop_bench --quiet"

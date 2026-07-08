@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, path::PathBuf};
+use std::{error::Error, fmt, fs, path::PathBuf};
 
 use seaf_core::{LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketSpec};
 
@@ -7,6 +7,7 @@ use crate::{
         next_step_attempt, write_step_artifact, write_step_request, write_step_response,
         ArtifactContent,
     },
+    policy_gate::PolicyDecision,
     state::{self, NewLoopRun},
     workspace::{LoopWorkspace, WorkspaceError},
 };
@@ -41,9 +42,25 @@ impl LoopRunnerConfig {
 }
 
 pub trait StepRunner {
+    fn prepare_workspace(&mut self, _workspace: &LoopWorkspace) -> Result<(), RunnerError> {
+        Ok(())
+    }
+
+    fn prepare_run(&mut self, workspace: &LoopWorkspace, _run_id: &str) -> Result<(), RunnerError> {
+        self.prepare_workspace(workspace)
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
+
+    fn drain_policy_decisions(&mut self) -> Result<Vec<PolicyDecision>, RunnerError> {
+        Ok(Vec::new())
+    }
+
+    fn error_response(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +94,9 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
 impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     pub fn start(config: LoopRunnerConfig, step_runner: &'a mut R) -> Result<Self, RunnerError> {
         let workspace = LoopWorkspace::create(&config.runs_root, &config.run_id)?;
+        if let Err(error) = step_runner.prepare_run(&workspace, &config.run_id) {
+            return Err(cleanup_failed_start_workspace(&workspace, error));
+        }
         let run = state::create_run(NewLoopRun {
             run_id: config.run_id,
             ticket_id: config.ticket_id,
@@ -102,6 +122,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let runs_root = runs_root.into();
         let workspace = LoopWorkspace::open(&runs_root, run_id)?;
         let run = state::load_run(&workspace)?;
+        step_runner.prepare_run(&workspace, &run.run_id)?;
         workspace.append_log("resumed run")?;
 
         Ok(Self {
@@ -113,6 +134,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
 
     pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
         state::reset_from_step(&mut self.run, step)?;
+        clear_current_run_policy_decisions_from_step(&mut self.run, step)?;
         state::save_run(&self.workspace, &self.run)?;
         self.workspace
             .append_log(&format!("reset run from {step:?}"))?;
@@ -144,9 +166,18 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let request = self.step_runner.step_request(step)?;
         write_step_request(&self.workspace, step, attempt, &request)?;
 
-        let output = self.step_runner.run_step(step, &request)?;
+        let output = match self.step_runner.run_step(step, &request) {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(response) = self.step_runner.error_response() {
+                    write_step_response(&self.workspace, step, attempt, response)?;
+                }
+                return Err(error);
+            }
+        };
         write_step_response(&self.workspace, step, attempt, &output.response)?;
         validate_step_output(&output)?;
+        append_policy_decisions(&mut self.run, self.step_runner.drain_policy_decisions()?)?;
         let artifact_path = match &output.artifact {
             Some(artifact) => Some(write_step_artifact(&self.workspace, step, artifact)?),
             None => None,
@@ -166,6 +197,43 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     }
 }
 
+fn append_policy_decisions(
+    run: &mut LoopRun,
+    decisions: Vec<PolicyDecision>,
+) -> Result<(), RunnerError> {
+    for decision in decisions {
+        let patch_id = decision.patch_id.clone();
+        let value = serde_json::to_value(decision).map_err(|error| {
+            RunnerError::Step(format!("failed to serialize policy decision: {error}"))
+        })?;
+        let entry = serde_json::from_value(value).map_err(|error| {
+            RunnerError::Step(format!("failed to encode policy decision entry: {error}"))
+        })?;
+        run.policy_decisions
+            .retain(|existing| policy_decision_patch_id(existing) != Some(patch_id.as_str()));
+        run.policy_decisions.push(entry);
+    }
+    Ok(())
+}
+
+fn clear_current_run_policy_decisions_from_step(
+    run: &mut LoopRun,
+    step: LoopStepName,
+) -> Result<(), RunnerError> {
+    if state::step_index(step)? <= state::step_index(LoopStepName::Development)? {
+        let run_id = run.run_id.clone();
+        run.policy_decisions
+            .retain(|decision| policy_decision_patch_id(decision) != Some(run_id.as_str()));
+    }
+    Ok(())
+}
+
+fn policy_decision_patch_id(
+    decision: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<&str> {
+    decision.get("patch_id").and_then(serde_json::Value::as_str)
+}
+
 impl<R: StepRunner + ?Sized> fmt::Debug for LoopRunner<'_, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -173,6 +241,20 @@ impl<R: StepRunner + ?Sized> fmt::Debug for LoopRunner<'_, R> {
             .field("workspace", &self.workspace)
             .field("run", &self.run)
             .finish_non_exhaustive()
+    }
+}
+
+fn cleanup_failed_start_workspace(workspace: &LoopWorkspace, error: RunnerError) -> RunnerError {
+    if workspace.run_file().exists() {
+        return error;
+    }
+
+    match fs::remove_dir_all(workspace.run_directory()) {
+        Ok(()) => error,
+        Err(cleanup_error) => RunnerError::Step(format!(
+            "{error}; failed to clean partial run workspace {}: {cleanup_error}",
+            workspace.run_directory().display()
+        )),
     }
 }
 

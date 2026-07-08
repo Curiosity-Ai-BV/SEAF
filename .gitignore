@@ -21,6 +21,7 @@ coverage
 # SEAF generated runtime state
 .seaf/tmp/
 .seaf/runs/
+.seaf/loops/runs/
 .seaf/events/
 .seaf/traces/
 .seaf/evals/

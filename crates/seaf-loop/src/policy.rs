@@ -12,6 +12,7 @@ pub fn default_exclude_patterns() -> Vec<String> {
         "target/**",
         "dist/**",
         ".git/**",
+        ".seaf/**",
     ]
     .into_iter()
     .map(str::to_string)

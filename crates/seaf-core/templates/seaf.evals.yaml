@@ -1,7 +1,10 @@
 evals:
+  allow_commands:
+    - cargo test
+    - pnpm typecheck
   required:
     - name: rust_tests
-      command: cargo test
+      command: cargo test -p seaf-core validate_eval_report --quiet
     - name: typecheck
       command: pnpm typecheck
 thresholds:

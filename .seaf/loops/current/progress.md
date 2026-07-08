@@ -1,31 +1,29 @@
 # Progress
 
-- [x] Read blueprint, repository state, and Karpathy loop image.
-- [x] Created feature branch.
-- [x] Slice 1: monorepo foundation.
-- [x] Slice 2: schemas and Rust/CLI validation.
-- [x] Slice 3: SDK and runtime MVP.
-- [x] Slice 4: eval, release capsule, and agent task loop.
+## Prior Baseline
 
-## Phase 2 Spec Authoring
+- [x] Phase 2 complete through P2-012; see
+      `docs/phase-2-local-agent-loop.md`.
 
-- [x] Read Phase 2 local agent loop plan from Downloads.
-- [x] Read existing agent-loop docs and current loop tracking files.
-- [x] Author durable Phase 2 ticket specs.
-- [x] Run cheap documentation verification.
-- [x] Report final status and concerns.
+## Phase 0 Production-Readiness Baseline
 
-## Phase 2 Implementation
+- [x] P3-001: Create post-Phase-2 loop contract and current tracker.
+- [x] P3-002: Reconcile stale docs so implemented primitives are separated from
+      missing live integration.
+- [x] P3-003: Fix default policy drift for CI, eval, policy, updater, and
+      signing change categories.
+- [x] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
+      context exclusions.
+- [x] P3-005: Harden CI determinism with locked commands, toolchain policy,
+      workflow permissions, timeouts, concurrency, and split lint environments.
 
-- [x] P2-001: Add TicketSpec and LoopRun contracts.
-- [x] P2-002: Add model provider abstraction and fake provider.
-- [x] P2-004: Add local context packer.
-- [x] P2-005: Add loop workspace and state machine.
-- [x] P2-006: Add role prompts and structured response schemas.
-- [x] P2-007: Add patch parser and deterministic policy gate.
-- [x] P2-003: Add Ollama provider.
-- [x] P2-008: Add CLI commands for model, ticket, and loop.
-- [x] P2-010: Integrate evals with existing EvalReport.
-- [x] P2-009: Build AgentBench-lite.
-- [x] P2-011: Documentation and Mac setup guide.
-- [x] P2-012: CI hardening.
+## Next Acceptance Criteria
+
+- Live provider-backed loop execution replaces deterministic-runner behavior for
+  non-smoke runs.
+- Shell command execution is sandboxed by ticket/eval allowlists, working
+  directory, environment, timeout, output, and redaction controls.
+- Loop evals require real policy evidence and fail closed on missing,
+  placeholder, mismatched, malformed, or rejected decisions.
+- Public Rust, TypeScript, and JSON Schema contracts have drift tests before SDK
+  or production-readiness claims.

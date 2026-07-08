@@ -18,6 +18,7 @@ autonomy:
   level: 1
   apply_patch: true
   allow_shell_commands:
+    - cargo test -p seaf-cli loop_bench
     - cargo test -p seaf-loop bench
 acceptance_criteria:
   - Eval weakening is rejected and not counted as an accepted pass.
