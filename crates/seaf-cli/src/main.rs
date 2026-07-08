@@ -4,6 +4,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1862,6 +1863,7 @@ const DEFAULT_EVAL_TIMEOUT_MS: u64 = 120_000;
 const MAX_EVAL_TIMEOUT_MS: u64 = 3_600_000;
 const DEFAULT_EVAL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_EVAL_OUTPUT_BYTES: usize = 1024 * 1024;
+const EVAL_OUTPUT_DRAIN_GRACE_MS: u64 = 250;
 
 #[derive(Debug)]
 struct EvalCommandOutput {
@@ -1869,6 +1871,31 @@ struct EvalCommandOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+}
+
+#[derive(Debug)]
+struct OutputDrain {
+    state: Arc<Mutex<OutputDrainState>>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct OutputDrainState {
+    retained: Vec<u8>,
+    completed: bool,
+    error: Option<OutputDrainError>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputDrainError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl OutputDrainError {
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
 }
 
 #[derive(Debug)]
@@ -2330,12 +2357,13 @@ fn run_controlled_command(
     if !timed_out {
         terminate_eval_child(&mut child)?;
     }
+    let drain_deadline = Instant::now() + Duration::from_millis(EVAL_OUTPUT_DRAIN_GRACE_MS);
     let stdout = match stdout {
-        Some(handle) => join_output_drain(handle)?,
+        Some(drain) => finish_output_drain(drain, drain_deadline)?,
         None => Vec::new(),
     };
     let stderr = match stderr {
-        Some(handle) => join_output_drain(handle)?,
+        Some(drain) => finish_output_drain(drain, drain_deadline)?,
         None => Vec::new(),
     };
     Ok(EvalCommandOutput {
@@ -2365,28 +2393,50 @@ fn inherit_safe_eval_env(command: &mut ProcessCommand) {
     }
 }
 
-fn spawn_capped_output_drain<R>(
-    mut reader: R,
-    max_output_bytes: usize,
-) -> JoinHandle<io::Result<Vec<u8>>>
+fn spawn_capped_output_drain<R>(mut reader: R, max_output_bytes: usize) -> OutputDrain
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let mut retained = Vec::with_capacity(max_output_bytes.min(8192));
+    let state = Arc::new(Mutex::new(OutputDrainState {
+        retained: Vec::with_capacity(max_output_bytes.min(8192)),
+        completed: false,
+        error: None,
+    }));
+    let thread_state = Arc::clone(&state);
+    let handle = thread::spawn(move || {
         let mut chunk = [0_u8; 8192];
         loop {
-            let read = reader.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            let remaining = max_output_bytes.saturating_sub(retained.len());
-            if remaining > 0 {
-                retained.extend_from_slice(&chunk[..read.min(remaining)]);
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.completed = true;
+                    }
+                    break;
+                }
+                Ok(read) => {
+                    let Ok(mut state) = thread_state.lock() else {
+                        break;
+                    };
+                    let remaining = max_output_bytes.saturating_sub(state.retained.len());
+                    if remaining > 0 {
+                        state
+                            .retained
+                            .extend_from_slice(&chunk[..read.min(remaining)]);
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.error = Some(OutputDrainError {
+                            kind: err.kind(),
+                            message: err.to_string(),
+                        });
+                    }
+                    break;
+                }
             }
         }
-        Ok(retained)
-    })
+    });
+    OutputDrain { state, handle }
 }
 
 #[cfg(unix)]
@@ -2428,10 +2478,46 @@ fn terminate_eval_child(child: &mut std::process::Child) -> io::Result<()> {
     Ok(())
 }
 
-fn join_output_drain(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    handle
-        .join()
-        .map_err(|_| io::Error::other("output drain thread panicked"))?
+fn finish_output_drain(drain: OutputDrain, deadline: Instant) -> io::Result<Vec<u8>> {
+    loop {
+        let snapshot = output_drain_snapshot(&drain.state)?;
+        if snapshot.completed || snapshot.error.is_some() {
+            drain
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("output drain thread panicked"))?;
+            if let Some(error) = snapshot.error {
+                return Err(error.into_io_error());
+            }
+            return Ok(snapshot.retained);
+        }
+        if drain.handle.is_finished() {
+            drain
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("output drain thread panicked"))?;
+            let snapshot = output_drain_snapshot(&drain.state)?;
+            if let Some(error) = snapshot.error {
+                return Err(error.into_io_error());
+            }
+            return Ok(snapshot.retained);
+        }
+        if Instant::now() >= deadline {
+            return Ok(snapshot.retained);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn output_drain_snapshot(state: &Arc<Mutex<OutputDrainState>>) -> io::Result<OutputDrainState> {
+    let state = state
+        .lock()
+        .map_err(|_| io::Error::other("output drain state lock poisoned"))?;
+    Ok(OutputDrainState {
+        retained: state.retained.clone(),
+        completed: state.completed,
+        error: state.error.clone(),
+    })
 }
 
 fn sanitize_eval_log(

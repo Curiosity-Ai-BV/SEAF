@@ -23,6 +23,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Expose pnpm on eval trusted PATH
+        run: |
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo ln -sf "$(command -v pnpm)" /usr/local/bin/pnpm
+          PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" pnpm --version
       - name: Rust format
         run: cargo fmt --all -- --check
       - name: Rust Clippy

@@ -1695,27 +1695,44 @@ fn compile_descendant_pipe_helper(root: &Path) -> PathBuf {
         &source_path,
         r#"
 use std::{
+    fs,
     io::{self, Write},
+    path::Path,
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+extern "C" {
+    fn setsid() -> i32;
+}
 
 fn main() {
     if std::env::args().any(|arg| arg == "--hold-pipes") {
+        unsafe {
+            setsid();
+        }
+        let marker = std::env::args().nth(2).unwrap();
+        fs::write(marker, "ready").unwrap();
         thread::sleep(Duration::from_secs(2));
         return;
     }
 
+    let marker = std::env::args().nth(1).unwrap();
     println!("direct-child-done");
     io::stdout().flush().unwrap();
     Command::new(std::env::current_exe().unwrap())
         .arg("--hold-pipes")
+        .arg(&marker)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !Path::new(&marker).exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 "#,
     )
@@ -2970,6 +2987,7 @@ fn eval_run_cleans_up_descendants_that_keep_pipes_open() {
     let config_path = temp_dir.path().join("seaf.evals.yaml");
     let report_path = temp_dir.path().join("eval-report.json");
     let helper_path = compile_descendant_pipe_helper(temp_dir.path());
+    let marker_path = temp_dir.path().join("descendant-ready");
     fs::write(
         &config_path,
         format!(
@@ -2978,10 +2996,11 @@ fn eval_run_cleans_up_descendants_that_keep_pipes_open() {
     - {command}
   required:
     - name: descendant_pipe
-      command: "{command}"
+      command: "{command} {marker}"
       timeout_ms: 1000
 "#,
-            command = helper_path.display()
+            command = helper_path.display(),
+            marker = marker_path.display()
         ),
     )
     .expect("write eval config");
