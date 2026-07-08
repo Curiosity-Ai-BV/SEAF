@@ -833,7 +833,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         };
         let ticket = seaf_core::load_ticket_file(ticket_path)
             .map_err(|report| CliFailure::validation(report, args.json))?;
-        let ticket = resume_provider_ticket(&existing, &ticket)?;
+        let ticket = resume_provider_ticket(&existing, &ticket, &args.runs_root)?;
         let repository_root = current_repository_root()?;
         match existing.provider.as_str() {
             "fake" => {
@@ -1095,14 +1095,18 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
+    let runs_root = config.runs_root;
+    let run_id = config.run_id;
+    let ticket = config.ticket;
     let config = LoopRunnerConfig::for_ticket(
         config.runs_root,
         config.run_id,
-        config.ticket,
+        ticket,
         provider_name.to_string(),
         config.model.to_string(),
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    persist_provider_ticket_snapshot(runs_root, run_id, ticket)?;
     runner
         .run_to_completion()
         .map_err(loop_runner_failure)
@@ -1216,7 +1220,11 @@ fn loop_run_needs_provider_resume(run: &LoopRun) -> bool {
     matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
 }
 
-fn resume_provider_ticket(run: &LoopRun, ticket: &TicketSpec) -> Result<TicketSpec, CliFailure> {
+fn resume_provider_ticket(
+    run: &LoopRun,
+    ticket: &TicketSpec,
+    runs_root: &Path,
+) -> Result<TicketSpec, CliFailure> {
     let mut mismatches = Vec::new();
     if run.ticket_id != ticket.ticket_id {
         mismatches.push(format!(
@@ -1237,12 +1245,55 @@ fn resume_provider_ticket(run: &LoopRun, ticket: &TicketSpec) -> Result<TicketSp
         )));
     }
 
+    compare_provider_ticket_snapshot(runs_root, run, ticket)?;
     let has_apply_authority = persisted_apply_authority(run);
     let mut ticket = ticket.clone();
     if !has_apply_authority {
         ticket.autonomy.apply_patch = false;
     }
     Ok(ticket)
+}
+
+fn persist_provider_ticket_snapshot(
+    runs_root: &Path,
+    run_id: &str,
+    ticket: &TicketSpec,
+) -> Result<(), CliFailure> {
+    let snapshot = canonical_ticket_snapshot(ticket)?;
+    let path = provider_ticket_snapshot_path(runs_root, run_id);
+    fs::write(&path, snapshot)
+        .map_err(|err| CliFailure::message(format!("could not write {}: {err}", path.display())))
+}
+
+fn compare_provider_ticket_snapshot(
+    runs_root: &Path,
+    run: &LoopRun,
+    ticket: &TicketSpec,
+) -> Result<(), CliFailure> {
+    let path = provider_ticket_snapshot_path(runs_root, &run.run_id);
+    let persisted = fs::read(&path).map_err(|err| {
+        CliFailure::message(format!(
+            "could not read original provider ticket snapshot {}: {err}; refusing to resume with unverifiable ticket content",
+            path.display()
+        ))
+    })?;
+    let candidate = canonical_ticket_snapshot(ticket)?;
+    if persisted != candidate {
+        return Err(CliFailure::message(
+            "resume ticket content does not match the original provider run ticket snapshot; refusing to rebuild context or patch gate from changed ticket"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_ticket_snapshot_path(runs_root: &Path, run_id: &str) -> PathBuf {
+    runs_root.join(run_id).join("ticket.snapshot.json")
+}
+
+fn canonical_ticket_snapshot(ticket: &TicketSpec) -> Result<Vec<u8>, CliFailure> {
+    serde_json::to_vec_pretty(ticket)
+        .map_err(|err| CliFailure::message(format!("could not serialize ticket snapshot: {err}")))
 }
 
 fn persisted_apply_authority(run: &LoopRun) -> bool {

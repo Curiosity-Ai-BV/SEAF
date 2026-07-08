@@ -813,6 +813,10 @@ fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
     assert!(run.status.success(), "{run:?}");
 
     let run_path = runs_root.join(run_id).join("run.json");
+    assert!(
+        runs_root.join(run_id).join("ticket.snapshot.json").exists(),
+        "provider-backed runs must persist the original ticket content used for resume checks"
+    );
     mark_loop_run_pending_from_analysis(&run_path);
 
     let missing_ticket = seaf_in(&repo)
@@ -874,22 +878,22 @@ fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
 }
 
 #[test]
-fn loop_resume_provider_run_downgrades_unproven_apply_authority() {
+fn loop_resume_provider_run_rejects_mutated_same_identity_ticket() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
     init_git_repo(&repo);
     let runs_root = temp_dir.path().join("runs");
-    let run_id = "cli-loop-resume-escalation";
-    let setup_ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
-    let apply_ticket_path = write_provider_loop_allowed_apply_ticket(temp_dir.path());
+    let run_id = "cli-loop-resume-ticket-digest";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let mutated_ticket_path = write_provider_loop_mutated_same_identity_ticket(temp_dir.path());
 
     let run = seaf_in(&repo)
         .args([
             "loop",
             "run",
             "--ticket",
-            setup_ticket_path.to_str().unwrap(),
+            ticket_path.to_str().unwrap(),
             "--runs-root",
             runs_root.to_str().unwrap(),
             "--run-id",
@@ -905,7 +909,7 @@ fn loop_resume_provider_run_downgrades_unproven_apply_authority() {
     assert!(run.status.success(), "{run:?}");
 
     let run_path = runs_root.join(run_id).join("run.json");
-    mark_loop_run_pending_from_development(&run_path);
+    mark_loop_run_pending_from_analysis(&run_path);
 
     let resume = seaf_in(&repo)
         .args([
@@ -916,26 +920,89 @@ fn loop_resume_provider_run_downgrades_unproven_apply_authority() {
             "--run-id",
             run_id,
             "--ticket",
-            apply_ticket_path.to_str().unwrap(),
+            mutated_ticket_path.to_str().unwrap(),
             "--json",
         ])
         .output()
-        .expect("resume loop with stronger ticket");
-    assert!(resume.status.success(), "{resume:?}");
-    let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("\"status\": \"completed\""));
-
-    let resumed_run: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&run_path).expect("resumed run json"))
-            .expect("resumed run json");
-    let decision = &resumed_run["policy_decisions"][0];
-    assert_eq!(decision["decision"], "requires_human_review");
-    assert_eq!(decision["apply_requested"], false);
-    assert_eq!(decision["applied"], false);
+        .expect("resume loop with mutated ticket");
+    assert!(
+        !resume.status.success(),
+        "resume must bind to the original ticket content, not just ids"
+    );
+    let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("does not match the original provider run ticket snapshot"),
+        "content mismatch should explain the snapshot trust-boundary failure, got {stderr}"
+    );
     assert_eq!(
         git_status_porcelain(&repo),
         "",
-        "replacement ticket authority must never mutate the worktree"
+        "mutated ticket content must not let resume mutate the worktree"
+    );
+}
+
+#[test]
+fn loop_resume_provider_run_rejects_unverifiable_ticket_snapshot() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-resume-missing-snapshot";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+
+    let run = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(run.status.success(), "{run:?}");
+
+    let run_path = runs_root.join(run_id).join("run.json");
+    mark_loop_run_pending_from_analysis(&run_path);
+    fs::remove_file(runs_root.join(run_id).join("ticket.snapshot.json"))
+        .expect("remove provider ticket snapshot");
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume loop without ticket snapshot");
+    assert!(
+        !resume.status.success(),
+        "resume must fail closed when the original ticket snapshot is unverifiable"
+    );
+    let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("refusing to resume with unverifiable ticket content"),
+        "missing snapshot should explain the resume trust-boundary failure, got {stderr}"
+    );
+    assert_eq!(
+        git_status_porcelain(&repo),
+        "",
+        "unverifiable ticket content must not let resume mutate the worktree"
     );
 }
 
@@ -3101,22 +3168,22 @@ acceptance_criteria:
     ticket_path
 }
 
-fn write_provider_loop_allowed_apply_ticket(root: &Path) -> PathBuf {
-    let ticket_path = root.join("provider-loop-apply-ticket.yaml");
+fn write_provider_loop_mutated_same_identity_ticket(root: &Path) -> PathBuf {
+    let ticket_path = root.join("provider-loop-mutated-same-identity-ticket.yaml");
     fs::write(
         &ticket_path,
         r#"ticket_id: T-PROVIDER-001
 goal_id: provider_loop_smoke
-title: Exercise provider-backed loop execution with stronger apply authority
+title: Exercise provider-backed loop execution with mutated content
 status: ready
 priority: p2
-problem: "Provider-backed loop resume must not accept stronger apply authority."
+problem: "Provider-backed loop resume must not accept changed ticket content."
 research_questions:
-  - "Does resume reject replacement ticket authority?"
+  - "Does resume bind context and autonomy to the original ticket?"
 context:
-  relevant_files: []
-  forbidden_files:
-    - secrets/**
+  relevant_files:
+    - secrets/changed-context.txt
+  forbidden_files: []
 autonomy:
   level: 1
   apply_patch: true
@@ -3126,7 +3193,7 @@ acceptance_criteria:
   - "Provider-backed loop execution records real policy evidence."
 "#,
     )
-    .expect("write provider loop apply ticket");
+    .expect("write provider loop mutated same-identity ticket");
     ticket_path
 }
 
@@ -3268,10 +3335,6 @@ fn developer_response() -> String {
 
 fn fake_provider_review_patch() -> &'static str {
     "diff --git a/examples/local-loop/evals/fake-provider-smoke.txt b/examples/local-loop/evals/fake-provider-smoke.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/examples/local-loop/evals/fake-provider-smoke.txt\n@@ -0,0 +1 @@\n+provider-backed smoke\n"
-}
-
-fn mark_loop_run_pending_from_development(run_path: &Path) {
-    mark_loop_run_pending_from_step(run_path, "development");
 }
 
 fn mark_loop_run_pending_from_analysis(run_path: &Path) {
