@@ -1,4 +1,6 @@
 evals:
+  allow_commands:
+    - cargo test
   required:
     - name: local_loop_smoke
       command: "cargo test -p seaf-core validate_eval_report --quiet"

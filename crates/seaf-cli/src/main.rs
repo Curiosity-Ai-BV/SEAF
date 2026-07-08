@@ -1,8 +1,11 @@
 use std::{
+    collections::BTreeMap,
     fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -359,6 +362,8 @@ struct EvalConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvalGroup {
+    #[serde(default)]
+    allow_commands: Vec<String>,
     required: Vec<EvalCommandConfig>,
 }
 
@@ -367,6 +372,14 @@ struct EvalGroup {
 struct EvalCommandConfig {
     name: String,
     command: String,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1228,6 +1241,28 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         _ => unreachable!("loop artifact pairing is validated before checks run"),
     };
 
+    let invocation_root = std::env::current_dir()
+        .map_err(|err| CliFailure::message(format!("could not determine current dir: {err}")))?;
+    let invocation_root = invocation_root.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "could not canonicalize invocation root {}: {err}",
+            invocation_root.display()
+        ))
+    })?;
+
+    let ticket_allow_commands = loop_artifacts
+        .as_ref()
+        .map(|(_, ticket)| ticket.autonomy.allow_shell_commands.as_slice());
+    let mut plans = Vec::new();
+    for check in &config.evals.required {
+        plans.push(plan_eval_check(
+            check,
+            &config.evals.allow_commands,
+            ticket_allow_commands,
+            &invocation_root,
+        )?);
+    }
+
     let output_path = args.output;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -1242,8 +1277,8 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         .map_err(|err| CliFailure::message(format!("could not create logs dir: {err}")))?;
 
     let mut checks = Vec::new();
-    for check in &config.evals.required {
-        checks.push(run_eval_check(check, &log_dir)?);
+    for plan in &plans {
+        checks.push(run_eval_check(plan, &log_dir)?);
     }
 
     let report = match (&args.loop_run, &args.ticket) {
@@ -1308,7 +1343,35 @@ fn command_eval_report(patch_id: String, goal_id: String, checks: Vec<EvalCheck>
     }
 }
 
-fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck, CliFailure> {
+const DEFAULT_EVAL_TIMEOUT_MS: u64 = 120_000;
+const MAX_EVAL_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_EVAL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_EVAL_OUTPUT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct EvalCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+#[derive(Debug)]
+struct EvalCheckPlan {
+    name: String,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+}
+
+fn plan_eval_check(
+    check: &EvalCommandConfig,
+    eval_allow_commands: &[String],
+    ticket_allow_commands: Option<&[String]>,
+    invocation_root: &Path,
+) -> Result<EvalCheckPlan, CliFailure> {
     if check.name.trim().is_empty() {
         return Err(CliFailure::message(
             "eval check name must not be empty".to_string(),
@@ -1321,28 +1384,79 @@ fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck
         )));
     }
 
-    let started = Instant::now();
-    let output = ProcessCommand::new("sh")
-        .arg("-c")
-        .arg(&check.command)
-        .output()
-        .map_err(|err| {
-            CliFailure::message(format!("could not run eval check {}: {err}", check.name))
+    let argv = parse_eval_command(&check.command).map_err(|err| {
+        CliFailure::message(format!("eval check {} command rejected: {err}", check.name))
+    })?;
+    ensure_command_allowed(&argv, eval_allow_commands).map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {} command rejected by eval allow_commands: {err}",
+            check.name
+        ))
+    })?;
+    if let Some(ticket_allow_commands) = ticket_allow_commands {
+        ensure_command_allowed(&argv, ticket_allow_commands).map_err(|err| {
+            CliFailure::message(format!(
+                "eval check {} command rejected by ticket autonomy: {err}",
+                check.name
+            ))
         })?;
+    }
+
+    let cwd = resolve_eval_cwd(check, invocation_root)?;
+    validate_eval_env(check)?;
+    let mut argv = argv;
+    argv[0] = resolve_eval_executable(&argv[0], &cwd, &check.name)?;
+    let timeout_ms = check.timeout_ms.unwrap_or(DEFAULT_EVAL_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_EVAL_TIMEOUT_MS {
+        return Err(CliFailure::message(format!(
+            "eval check {} timeout_ms must be between 1 and {MAX_EVAL_TIMEOUT_MS}",
+            check.name
+        )));
+    }
+    let max_output_bytes = check.max_output_bytes.unwrap_or(DEFAULT_EVAL_OUTPUT_BYTES);
+    if max_output_bytes == 0 || max_output_bytes > MAX_EVAL_OUTPUT_BYTES {
+        return Err(CliFailure::message(format!(
+            "eval check {} max_output_bytes must be between 1 and {MAX_EVAL_OUTPUT_BYTES}",
+            check.name
+        )));
+    }
+
+    Ok(EvalCheckPlan {
+        name: check.name.clone(),
+        argv,
+        cwd,
+        env: check.env.clone(),
+        timeout_ms,
+        max_output_bytes,
+    })
+}
+
+fn run_eval_check(plan: &EvalCheckPlan, log_dir: &Path) -> Result<EvalCheck, CliFailure> {
+    let started = Instant::now();
+    let output = run_controlled_command(
+        &plan.argv,
+        &plan.cwd,
+        &plan.env,
+        plan.timeout_ms,
+        plan.max_output_bytes,
+    )
+    .map_err(|err| CliFailure::message(format!("could not run eval check {}: {err}", plan.name)))?;
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let safe_name = sanitize_id(&check.name);
+    let safe_name = sanitize_id(&plan.name);
     let stdout_path = log_dir.join(format!("{safe_name}.stdout.log"));
     let stderr_path = log_dir.join(format!("{safe_name}.stderr.log"));
-    fs::write(&stdout_path, &output.stdout).map_err(|err| {
+    let stdout = sanitize_eval_log(&output.stdout, &plan.env, plan.max_output_bytes);
+    let stderr = sanitize_eval_log(&output.stderr, &plan.env, plan.max_output_bytes);
+    fs::write(&stdout_path, stdout).map_err(|err| {
         CliFailure::message(format!("could not write {}: {err}", stdout_path.display()))
     })?;
-    fs::write(&stderr_path, &output.stderr).map_err(|err| {
+    fs::write(&stderr_path, stderr).map_err(|err| {
         CliFailure::message(format!("could not write {}: {err}", stderr_path.display()))
     })?;
 
     Ok(EvalCheck {
-        name: check.name.clone(),
-        status: if output.status.success() {
+        name: plan.name.clone(),
+        status: if !output.timed_out && output.status.success() {
             CheckStatus::Passed
         } else {
             CheckStatus::Failed
@@ -1350,11 +1464,638 @@ fn run_eval_check(check: &EvalCommandConfig, log_dir: &Path) -> Result<EvalCheck
         duration_ms: Some(duration_ms),
         stdout_path: Some(stdout_path.display().to_string()),
         stderr_path: Some(stderr_path.display().to_string()),
-        summary: Some(match output.status.code() {
-            Some(code) => format!("command exited with code {code}"),
-            None => "command terminated by signal".to_string(),
+        summary: Some(if output.timed_out {
+            format!("command timed out after {}ms", plan.timeout_ms)
+        } else {
+            match output.status.code() {
+                Some(code) => format!("command exited with code {code}"),
+                None => "command terminated by signal".to_string(),
+            }
         }),
     })
+}
+
+fn parse_eval_command(command: &str) -> Result<Vec<String>, String> {
+    if command.contains('\0') {
+        return Err("command must not contain NUL bytes".to_string());
+    }
+    if command.contains("$(") {
+        return Err("shell metacharacter '$(' is not supported".to_string());
+    }
+    for metacharacter in [';', '&', '|', '<', '>', '`', '\n', '\r'] {
+        if command.contains(metacharacter) {
+            return Err(format!(
+                "shell metacharacter '{metacharacter}' is not supported"
+            ));
+        }
+    }
+    if command.contains('"') || command.contains('\'') {
+        return Err("quoted shell syntax is not supported".to_string());
+    }
+    let argv: Vec<String> = command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    if argv.is_empty() {
+        return Err("command must not be empty".to_string());
+    }
+    Ok(argv)
+}
+
+fn ensure_command_allowed(argv: &[String], allow_commands: &[String]) -> Result<(), String> {
+    for allow_command in allow_commands {
+        let allow_argv = parse_eval_command(allow_command)
+            .map_err(|err| format!("invalid allowlist entry {allow_command:?}: {err}"))?;
+        if allow_argv.len() <= argv.len() && argv[..allow_argv.len()] == allow_argv {
+            return Ok(());
+        }
+    }
+    Err(format!("{} is not allowed", argv.join(" ")))
+}
+
+fn resolve_eval_cwd(
+    check: &EvalCommandConfig,
+    invocation_root: &Path,
+) -> Result<PathBuf, CliFailure> {
+    let cwd = match &check.cwd {
+        Some(cwd) if cwd.is_absolute() => cwd.clone(),
+        Some(cwd) => invocation_root.join(cwd),
+        None => invocation_root.to_path_buf(),
+    };
+    let cwd = cwd.canonicalize().map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {} cwd {} is invalid: {err}",
+            check.name,
+            cwd.display()
+        ))
+    })?;
+    if !cwd.is_dir() {
+        return Err(CliFailure::message(format!(
+            "eval check {} cwd {} is not a directory",
+            check.name,
+            cwd.display()
+        )));
+    }
+    if !cwd.starts_with(invocation_root) {
+        return Err(CliFailure::message(format!(
+            "eval check {} cwd {} escapes invocation root {}",
+            check.name,
+            cwd.display(),
+            invocation_root.display()
+        )));
+    }
+    Ok(cwd)
+}
+
+fn validate_eval_env(check: &EvalCommandConfig) -> Result<(), CliFailure> {
+    for (name, value) in &check.env {
+        if name.eq_ignore_ascii_case("PATH") {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} is not allowed",
+                check.name
+            )));
+        }
+        if !is_safe_env_name(name) {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} is invalid",
+                check.name
+            )));
+        }
+        if value.contains('\0') {
+            return Err(CliFailure::message(format!(
+                "eval check {} env var {name:?} value must not contain NUL bytes",
+                check.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn resolve_eval_executable(
+    program: &str,
+    cwd: &Path,
+    check_name: &str,
+) -> Result<String, CliFailure> {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() || program_path.components().count() > 1 {
+        let candidate = if program_path.is_absolute() {
+            program_path.to_path_buf()
+        } else {
+            cwd.join(program_path)
+        };
+        if is_executable_file(&candidate) {
+            validate_eval_executable_shape(&candidate, program, check_name)?;
+            return Ok(candidate.display().to_string());
+        }
+        return Err(CliFailure::message(format!(
+            "eval check {check_name} executable {program:?} was not found or is not executable"
+        )));
+    }
+
+    for dir in trusted_eval_search_paths() {
+        let candidate = dir.join(program);
+        if is_executable_file(&candidate) {
+            validate_eval_executable_shape(&candidate, program, check_name)?;
+            return Ok(candidate.display().to_string());
+        }
+    }
+    Err(CliFailure::message(format!(
+        "eval check {check_name} executable {program:?} was not found on trusted PATH"
+    )))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    is_executable_metadata(&metadata)
+}
+
+fn validate_eval_executable_shape(
+    path: &Path,
+    program: &str,
+    check_name: &str,
+) -> Result<(), CliFailure> {
+    validate_platform_executable_shape(path).map_err(|err| {
+        CliFailure::message(format!(
+            "eval check {check_name} executable {program:?} cannot spawn: {err}"
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn validate_platform_executable_shape(path: &Path) -> Result<(), String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
+    if bytes.starts_with(b"#!") {
+        let shebang_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(bytes.len());
+        let shebang = String::from_utf8_lossy(&bytes[2..shebang_end]);
+        let mut shebang_parts = shebang.split_whitespace();
+        let interpreter = shebang_parts
+            .next()
+            .ok_or_else(|| "shebang is missing an interpreter".to_string())?;
+        let interpreter_path = Path::new(interpreter);
+        if !interpreter_path.is_absolute() {
+            return Err(format!(
+                "shebang interpreter {interpreter:?} is not absolute"
+            ));
+        }
+        if !is_executable_file(interpreter_path) {
+            return Err(format!(
+                "shebang interpreter {} was not found or is not executable",
+                interpreter_path.display()
+            ));
+        }
+        if interpreter_path
+            .file_name()
+            .is_some_and(|name| name == "env")
+        {
+            let env_interpreter = shebang_parts
+                .next()
+                .ok_or_else(|| "env shebang is missing an interpreter".to_string())?;
+            validate_env_shebang_interpreter(env_interpreter)?;
+        }
+        return Ok(());
+    }
+
+    if looks_like_text_without_shebang(&bytes) {
+        return Err("text executable is missing a shebang interpreter".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_env_shebang_interpreter(interpreter: &str) -> Result<(), String> {
+    if interpreter.starts_with('-') {
+        return Err(format!(
+            "env shebang option {interpreter:?} is not supported"
+        ));
+    }
+    let interpreter_path = Path::new(interpreter);
+    if interpreter_path.components().count() > 1 {
+        if interpreter_path.is_absolute() && is_executable_file(interpreter_path) {
+            return Ok(());
+        }
+        return Err(format!(
+            "env shebang interpreter {interpreter:?} was not found or is not executable"
+        ));
+    }
+    for dir in trusted_eval_search_paths() {
+        if is_executable_file(&dir.join(interpreter)) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "env shebang interpreter {interpreter:?} was not found on trusted PATH"
+    ))
+}
+
+#[cfg(not(unix))]
+fn validate_platform_executable_shape(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn looks_like_text_without_shebang(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let sample_len = bytes.len().min(512);
+    std::str::from_utf8(&bytes[..sample_len]).is_ok_and(|text| {
+        text.chars()
+            .all(|ch| ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control())
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_metadata(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_metadata(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn trusted_eval_path() -> String {
+    std::env::join_paths(trusted_eval_search_paths())
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn trusted_eval_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(cargo_home) = option_env!("CARGO_HOME") {
+        paths.push(PathBuf::from(cargo_home).join("bin"));
+    }
+    if let Some(home) = option_env!("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".cargo/bin"));
+        paths.push(home.join("Library/pnpm"));
+        paths.push(home.join(".local/bin"));
+    }
+    for path in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        paths.push(PathBuf::from(path));
+    }
+    paths
+}
+
+fn run_controlled_command(
+    argv: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+) -> std::io::Result<EvalCommandOutput> {
+    let mut command = ProcessCommand::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_eval_child(&mut command);
+    command.env_clear();
+    inherit_safe_eval_env(&mut command);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_capped_output_drain(stdout, max_output_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_capped_output_drain(stderr, max_output_bytes));
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            terminate_eval_child(&mut child)?;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait()?;
+    if !timed_out {
+        terminate_eval_child(&mut child)?;
+    }
+    let stdout = match stdout {
+        Some(handle) => join_output_drain(handle)?,
+        None => Vec::new(),
+    };
+    let stderr = match stderr {
+        Some(handle) => join_output_drain(handle)?,
+        None => Vec::new(),
+    };
+    Ok(EvalCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn inherit_safe_eval_env(command: &mut ProcessCommand) {
+    command.env("PATH", trusted_eval_path());
+    for name in [
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn spawn_capped_output_drain<R>(
+    mut reader: R,
+    max_output_bytes: usize,
+) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(max_output_bytes.min(8192));
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = max_output_bytes.saturating_sub(retained.len());
+            if remaining > 0 {
+                retained.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+        Ok(retained)
+    })
+}
+
+#[cfg(unix)]
+fn configure_eval_child(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_eval_child(_command: &mut ProcessCommand) {}
+
+#[cfg(unix)]
+fn terminate_eval_child(child: &mut std::process::Child) -> io::Result<()> {
+    let process_group = format!("-{}", child.id());
+    let kill_group = ProcessCommand::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .status();
+    if let Err(err) = kill_group {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+    if let Err(err) = child.kill() {
+        if err.kind() != io::ErrorKind::InvalidInput {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_eval_child(child: &mut std::process::Child) -> io::Result<()> {
+    if let Err(err) = child.kill() {
+        if err.kind() != io::ErrorKind::InvalidInput {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn join_output_drain(handle: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("output drain thread panicked"))?
+}
+
+fn sanitize_eval_log(
+    output: &[u8],
+    env: &BTreeMap<String, String>,
+    max_output_bytes: usize,
+) -> String {
+    let mut text = String::from_utf8_lossy(output).into_owned();
+    for (name, value) in env {
+        if is_sensitive_name(name) && !value.is_empty() {
+            text = text.replace(value, "[REDACTED]");
+        }
+    }
+    text = redact_configured_secret_prefixes(&text, env);
+    text = redact_sensitive_assignments(&text);
+    text = redact_obvious_standalone_secrets(&text);
+    truncate_to_bytes(&text, max_output_bytes)
+}
+
+fn redact_configured_secret_prefixes(text: &str, env: &BTreeMap<String, String>) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_configured_secret_prefix_token(&token, env));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_configured_secret_prefix_token(&token, env));
+    redacted
+}
+
+fn redact_configured_secret_prefix_token(token: &str, env: &BTreeMap<String, String>) -> String {
+    if is_configured_secret_prefix(token, env) {
+        "[REDACTED]".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_configured_secret_prefix(token: &str, env: &BTreeMap<String, String>) -> bool {
+    let candidate = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if candidate.is_empty() {
+        return false;
+    }
+    env.iter().any(|(name, value)| {
+        is_sensitive_name(name)
+            && ((value.len() > candidate.len() && value.starts_with(candidate))
+                || is_labeled_configured_secret_prefix(candidate, name, value))
+    })
+}
+
+fn is_labeled_configured_secret_prefix(candidate: &str, name: &str, value: &str) -> bool {
+    for separator in [':', '='] {
+        let Some((label, prefix)) = candidate.split_once(separator) else {
+            continue;
+        };
+        if !prefix.is_empty()
+            && (label == name || is_sensitive_name(label))
+            && value.len() > prefix.len()
+            && value.starts_with(prefix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn redact_sensitive_assignments(text: &str) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_sensitive_token(&token));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_sensitive_token(&token));
+    redacted
+}
+
+fn redact_sensitive_token(token: &str) -> String {
+    let Some((name, _value)) = token.split_once('=') else {
+        return token.to_string();
+    };
+    if is_sensitive_name(name) {
+        format!("{name}=[REDACTED]")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn redact_obvious_standalone_secrets(text: &str) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            redacted.push_str(&redact_standalone_secret_token(&token));
+            token.clear();
+            redacted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    redacted.push_str(&redact_standalone_secret_token(&token));
+    redacted
+}
+
+fn redact_standalone_secret_token(token: &str) -> String {
+    if is_obvious_standalone_secret(token) {
+        "[REDACTED]".to_string()
+    } else if let Some((label, value)) = token.split_once(':') {
+        if !label.is_empty() && is_obvious_standalone_secret(value) {
+            format!("{label}:[REDACTED]")
+        } else {
+            token.to_string()
+        }
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_obvious_standalone_secret(token: &str) -> bool {
+    let candidate = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    for prefix in [
+        "sk-proj-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+    ] {
+        let Some(rest) = candidate.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.len() >= 16
+            && rest
+                .chars()
+                .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn prepare_release(args: ReleasePrepareArgs) -> Result<(), CliFailure> {
