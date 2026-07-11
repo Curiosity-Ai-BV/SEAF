@@ -725,3 +725,26 @@ expansion orchestration is active.
 Final verification passed: `cargo fmt --all -- --check`, locked all-target and
 all-feature Clippy with warnings denied, all 239 locked Rust workspace tests,
 `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 analyze | M1-04b implementation boundary
+
+Source review found that the current LoopRunner persists the outer step request
+before `ProviderStepRunner::run_step`, but persists the response only after that
+method returns. A same-step context retry therefore needs explicit immutable
+exchange ordering and authoritative run-state references; the mutable initial
+`context-manifest.json` and filesystem scanning alone cannot prove round counts
+or resume integrity.
+
+M1-04b is split into four reviewable commits. M1-04b1 defines an additive,
+all-or-nothing expansion primitive and canonical create-only artifact containing
+the exact accepted bytes, without changing provider or LoopRun behavior.
+M1-04b2a adds the durable exchange/state contract, M1-04b2b adds bounded live
+same-role orchestration, and M1-04b2c adds resume/rerun/CLI reconciliation. The
+immutable initial provider-request audit, not the mutable content-free initial
+manifest, is the initial-byte authority. Context denials block; provider or
+audit infrastructure failures fail when writable, while a failed durable write
+must stop further calls and be reconciled later. Both the two-per-logical-step
+and eight-per-run caps span all attempts; legacy calls consume zero expansion
+rounds. Flat names are required because the existing workspace validator
+intentionally accepts only regular child files in its audit directories.
+M1-04b1 is active.

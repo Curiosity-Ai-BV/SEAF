@@ -14,7 +14,10 @@
 - [x] M1-03b: Development and exact output-review evidence.
 - [x] M1-04a: Context request contract.
 - [x] M1-R01: Stabilize descendant pipe cleanup regression.
-- [ ] M1-04b: Bounded context expansion orchestration (active).
+- [ ] M1-04b1: Additive context expansion artifact (active).
+- [ ] M1-04b2a: Durable context exchange contract.
+- [ ] M1-04b2b: Bounded live context orchestration.
+- [ ] M1-04b2c: Context round recovery and CLI integration.
 - [ ] M1-05: Isolated candidate workspace.
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
@@ -45,5 +48,6 @@
 
 ## Current Gate
 
-M1-R01 is complete. M1-04b is the next dependency-ready slice. Milestone 1
-remains active; bounded context expansion orchestration is not yet implemented.
+M1-R01 is complete. M1-04b1 is active; M1-04b2a through M1-04b2c remain
+pending. Milestone 1 remains active; bounded context expansion orchestration is
+not yet implemented.

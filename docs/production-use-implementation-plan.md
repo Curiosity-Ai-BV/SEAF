@@ -339,35 +339,196 @@ production 250ms drain grace and eval behavior remain unchanged.
 
 Roadmap: U2. Dependencies: M1-R01.
 
+Status: active. This work is split into M1-04b1 and M1-04b2a through M1-04b2c
+so context data, durable exchange state, live orchestration, and recovery can be
+reviewed independently.
+
 Objective: satisfy validated ContextRequests through the orchestrator without
 direct model tools or safety-boundary bypass.
 
+#### M1-04b1 - Additive Context Expansion Artifact
+
+Status: active. Dependencies: M1-R01.
+
+Objective: create one safe, canonical, immutable expansion from a validated
+ContextRequest without changing provider retry or LoopRun behavior.
+
 Acceptance criteria:
 
-- The orchestrator reuses existing forbidden/secret/symlink/path and per-file/
-  total-byte limits for every requested path.
-- Safe additional files produce a new canonical, digest-bound context manifest
-  and a separately audited provider request/response round for the same role.
-- Previously loaded files are not duplicated; unsafe, duplicate-only,
-  unavailable, or excessive requests fail or block deterministically.
-- Per-step and per-run round caps prevent loops; resume reconstructs verified
-  context rounds and cannot reset caps or substitute manifests.
-- Every additional provider exchange is persisted before another call, and
-  failure leaves run state/evidence consistent.
+- Reuse the existing normalized-path, default-exclude, ticket-forbidden,
+  policy-forbidden, repository-boundary, symlink, UTF-8, per-file, and
+  total-byte controls.
+- Treat expansion as all-or-nothing for unsafe or unavailable new paths.
+  Mixed already-loaded and safe new paths may succeed with only the new files;
+  duplicate-only, missing, directory, binary, or zero-useful-byte requests fail
+  deterministically without writing an artifact.
+- Enforce the cumulative byte budget across the initial context and all prior
+  expansions. Per-file or remaining-budget truncation stays explicit, but an
+  expansion that would omit a requested new file entirely fails atomically.
+- Persist exact included content plus normalized paths, source/included sizes,
+  truncation flags, and source digests. Canonical bytes bind schema version,
+  run, step, role, step attempt, context round, the validated request/reason,
+  the immutable initial audited provider-request path/digest,
+  previous-expansion digest, limits, excluded loaded paths, and prior/resulting
+  cumulative totals. The mutable content-free initial context manifest is not
+  the byte authority.
+- Canonical path ordering makes semantically equivalent requests deterministic.
+  A flat artifact name includes step, attempt, and round; creation is
+  create-only. Replaying byte-identical canonical content returns the existing
+  identity for idempotent recovery; an existing different file is tampering,
+  never an overwrite. Previously accepted expansion bytes are reconstructed
+  from these artifacts, never reread from a changed live repository.
+- The existing mutable initial `context-manifest.json`, LoopRun schema, provider
+  call count, and single-round blocking behavior remain unchanged in this
+  slice.
 
-Likely seams: context packer, ProviderStepRunner, request/response artifacts,
-run state, and provider/CLI resume tests.
+Likely seams: `context.rs`, a focused canonical expansion artifact/codec,
+workspace create-only writing, exports, and context tests.
 
-RED: safe expansion, forbidden/symlink escape, byte cap, duplicate-only,
-round-cap, audited exchanges, manifest tamper, and resume-cap tests.
+RED: safe single/multi-file expansion; ordering determinism; mixed loaded/new;
+duplicate-only; unsafe, forbidden, symlink escape, missing, directory, binary,
+and atomic mixed failure; UTF-8/per-file/cumulative byte edges; create-only
+collision; digest/content/identity tamper; and live-repository substitution.
+Include byte-identical idempotent replay and different-content collision cases.
 
-Verification: context/provider/state/CLI suites plus Rust workspace and Docs
+Verification: focused context/artifact tests plus Rust workspace and Docs gates.
+
+Docs/tracker: artifact contract and M1-04b1 completion.
+
+Commit boundary: additive expansion primitive and immutable artifact codec only;
+no provider retry, run-state field, CLI change, candidate workspace, approval,
+eval, or promotion.
+
+#### M1-04b2a - Durable Context Exchange Contract
+
+Status: pending. Dependencies: M1-04b1.
+
+Objective: define authoritative, backward-compatible state and immutable audit
+records for ordered provider exchanges without adding retry behavior.
+
+Acceptance criteria:
+
+- Add a versioned canonical exchange record binding run, step, role, step
+  attempt, exchange kind/index, previous-record digest, request path/digest,
+  response path/digest when present, optional expansion path/digest, and parsed
+  outcome. Flat immutable names always include step attempt and exchange index.
+- LoopRun stores authoritative ordered record path/digest references and counts;
+  filesystem scanning alone is not authoritative. Runtime and schema validation
+  reject gaps, reorderings, identity mismatches, invalid pairings, and malformed
+  digests.
+- New LoopRun fields use safe empty defaults so completed legacy runs still
+  load. Existing fixtures and public schema remain in parity; unknown fields
+  still fail closed.
+- Provide create-only, byte-identical-idempotent request, response, expansion,
+  and exchange-record writers. Different existing bytes are tampering. A staged
+  record not yet referenced by LoopRun has an explicit inspectable state for
+  later reconciliation; this slice does not adopt it automatically.
+- Add the smallest persistence protocol needed for a caller to durably append
+  one verified reference before continuing. Do not call the provider or change
+  single-round behavior in this slice.
+
+Likely seams: shared LoopRun models/schema/fixtures, artifact naming/writers,
+state validation and append protocol, exports, and state/artifact tests.
+
+RED: canonical record/digest; every identity/link/pairing mutation; ordered
+append; duplicate index; byte-identical replay; different-content collision;
+staged-but-unreferenced classification; safe legacy defaults; schema/runtime
+parity; and no change to provider call count.
+
+Verification: core contract, state, artifact, and provider-regression suites plus
+Rust workspace and Docs gates.
+
+Docs/tracker: durable exchange contract and M1-04b2a completion.
+
+Commit boundary: exchange/state contract only; no context retry, cap enforcement,
+resume reconciliation, CLI change, or later-milestone behavior.
+
+#### M1-04b2b - Bounded Live Context Orchestration
+
+Status: pending. Dependencies: M1-04b2a.
+
+Objective: execute bounded same-role context retries with every exchange durable
+before the next provider call.
+
+Acceptance criteria:
+
+- A validated `needs_context` response durably records its provider response,
+  canonical expansion artifact, state reference, and next provider request
+  before the next call. Every repair request/response in every round follows the
+  same ordering.
+- Retry the same role with the original audited input and ordered expansion
+  chain. Initial/additional paths appear exactly once; initial bytes come from
+  the verified provider-request audit and expansion bytes from verified
+  artifacts, never a fresh repository read.
+- Permit at most two accepted expansions per logical step across all attempts
+  and eight per run across all steps and attempts. Initial role calls and JSON
+  repairs are audited exchanges but consume zero expansion rounds. Unit tests
+  cover exact, one-over, cross-role, and cross-attempt boundaries.
+- Unsafe, unavailable, duplicate-only, excessive, and cap-exhausted requests
+  become terminal `Blocked` with denial evidence. Provider/audit failures become
+  terminal `Failed` with failure evidence when the run-state store remains
+  writable. If a durable write itself fails, return a clear error, perform no
+  further provider call or mutation, and leave the staged state for M1-04b2c
+  reconciliation; do not claim evidence that could not be written.
+- A terminal valid role response completes the logical step exactly once. No
+  live outcome remains unexplained as `Running` when durable state is writable.
+
+Likely seams: ProviderStepRunner, a small StepRunner/LoopRunner exchange hook,
+context expansion integration, state transitions, and provider/state tests.
+
+RED: fake-provider callbacks inspect on-disk ordering before each call; same-role
+prompt chain; repair plus context; write/provider failure boundaries; denial
+outcomes; exact/over step and run caps including another attempt; and final
+completion once.
+
+Verification: focused context/provider/state suites plus Rust workspace and Docs
 gates.
 
-Docs/tracker: context rounds/limits and M1-04b completion.
+Docs/tracker: live round behavior/caps and M1-04b2b completion.
 
-Commit boundary: bounded expansion orchestration only; no candidate workspace,
-approval, eval, or promotion.
+Commit boundary: fresh-run bounded orchestration only; no resume/rerun/CLI
+recovery, candidate workspace, approval, eval, or promotion.
+
+#### M1-04b2c - Context Round Recovery And CLI Integration
+
+Status: pending. Dependencies: M1-04b2b.
+
+Objective: verify or reconcile interrupted exchange chains and preserve caps
+through resume, rerun, and real CLI entrypoints.
+
+Acceptance criteria:
+
+- Before another provider call, resume verifies authoritative ordered references
+  and reconciles or rejects every crash cut: initial response, expansion
+  artifact, retry request, retry response, repair exchange, staged record, and
+  run-state head update. Only byte-identical, correctly linked staged content may
+  be adopted; missing, orphaned, reordered, substituted, or digest-invalid data
+  fails before provider invocation or mutation.
+- Resume and `rerun_from` preserve both caps: two accepted expansions per logical
+  step across all attempts and eight per run. Earlier attempts are immutable and
+  new attempts never overwrite their names or reset counts.
+- Legacy M1-04a runs already terminal on `needs_context` do not silently enter
+  the protocol. They require an explicit audited rerun; existing calls remain
+  immutable history but consume zero expansion rounds.
+- CLI start/resume/rerun tests prove the same guarantees, including repository
+  changes after the first exchange, exact-byte reconstruction, cap exhaustion,
+  and request/response/expansion/record tampering.
+- Recovery failures use the M1-04b2b outcome rules and never make another
+  provider call from ambiguous durable state.
+
+Likely seams: state/workspace reconciliation, ProviderStepRunner preparation,
+rerun handling, CLI provider flow, and provider/state/CLI integration tests.
+
+RED: each crash cut; every identity/digest/link mutation; repository-byte
+substitution; resume and rerun at both cap boundaries; legacy blocked runs;
+immutable attempt naming; and CLI start/resume/rerun paths.
+
+Verification: provider/state/CLI suites plus Rust workspace and Docs gates.
+
+Docs/tracker: recovery behavior and complete M1-04b status.
+
+Commit boundary: M1-04b recovery/CLI integration only; no candidate workspace,
+approval, eval, promotion, or general M1-09 recovery operations.
 
 ### M1-05 - Isolated Candidate Workspace
 
