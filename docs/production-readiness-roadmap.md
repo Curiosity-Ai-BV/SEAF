@@ -1,211 +1,203 @@
-# Production Readiness Roadmap
+# Production Use Roadmap
 
-Date: 2026-07-07
+Date: 2026-07-11
 
-Branch assessed: `codex/seaf-foundation-agent-loop`
+Assessed branch: `codex/seaf-foundation-agent-loop` at `1013207` (already
+merged into `origin/main` by PR #3)
 
-## Assumptions
+## Product Decision
 
-Production-ready means SEAF can safely run a supervised local agent loop against
-real provider output, produce auditable artifacts, publish dependable SDK/schema
-contracts, and prepare verified release metadata without weakening the existing
-safety boundaries. It does not mean production apps can rewrite, merge, sign, or
-deploy changes without human review.
+The first supported SEAF product should be the **supervised local coding
+loop**: a developer installs the CLI in an existing repository, supplies a
+ticket and project policy, receives an isolated candidate patch, runs bounded
+checks, reviews the evidence, and explicitly promotes the change.
 
-## Current State
+This is narrower than the full vision in `README.md`. Telemetry ingestion, a
+dashboard, signed updates, cloud agents, and autonomous merge/deploy remain
+experimental or deferred until the local loop works reliably in real projects.
+Calling those surfaces production-ready now would spread effort across several
+unfinished products.
 
-Phase 2 is complete. `docs/phase-2-local-agent-loop.md` remains the historical
-source for P2-001 through P2-012, and `.seaf/loops/current/contract.md` now
-tracks the Phase 0 production-readiness baseline. The implemented foundation is
-substantial:
+## Current Verdict
 
-- Rust workspace crates exist for core contracts, CLI, loop orchestration,
-  model providers, and local runtime.
-- `@seaf/sdk` can emit events, metrics, and feedback through HTTP or memory
-  transports.
-- Public schemas exist under `specs/`.
-- The CLI validates goals, policies, tickets, runs deterministic loop
-  executions, runs evals, prepares/verifies release capsules, and checks local
-  Ollama availability.
-- Phase 2 added ticket and loop-run contracts, fake and Ollama providers,
-  context packing, role response schemas, a deterministic policy gate,
-  AgentBench-lite, EvalReport integration, documentation, and CI guardrails.
+SEAF is a production-conscious prototype, not yet a tool that should modify a
+real project unattended.
 
-The repo is production-conscious, but not production-ready. The highest-impact
-gap is that `seaf loop run --provider ollama` still records provider/model
-metadata while executing the deterministic local runner. Live provider-backed
-role execution and policy-gated patch proposals remain future work
-(`docs/local-agent-loop.md`, `docs/phase-2-local-agent-loop.md`). Release
-capsules are digest/provenance metadata only, with no production signing or
-verified updater path (`docs/artifact-chain.md`, `crates/seaf-cli/src/main.rs`).
+The previous roadmap delivered its baseline and provider-loop mechanics:
 
-## Production Readiness Criteria
+- P3-001 through P3-005 are complete: current tracking, policy categories,
+  generated-artifact hygiene, and deterministic CI were hardened.
+- P3-006 through P3-010 are mechanically present: fake and Ollama providers use
+  `ProviderStepRunner`; context and provider exchanges are persisted; developer
+  patches pass through the policy gate; eval commands are bounded; and recovery
+  failures have focused coverage.
+- The latest `main` CI run passed. Local Rust formatting, Clippy, the full
+  180-test Rust suite, and all TypeScript format/lint/typecheck/test/build checks
+  also pass at this assessment baseline.
 
-SEAF should not be called production-ready until these criteria are met:
+The remaining blocker is workflow integrity, not another broad set of platform
+features:
 
-1. A real provider-backed loop can run from ticket to EvalReport through
-   structured role outputs, bounded context, patch extraction, policy gating,
-   command checks, and durable artifacts.
-2. Synthetic empty-patch policy evidence is limited to explicit smoke paths.
-   Real loop evals fail closed on missing, malformed, placeholder, mismatched,
-   or rejected policy decisions.
-3. Ticket autonomy is enforced for patch application and shell commands.
-4. SDK, Rust models, and JSON schemas have one declared source of truth and
-   drift tests.
-5. Local telemetry ingestion has privacy, retention, redaction, migration, and
-   operational controls before ingesting sensitive production data.
-6. Release capsules include signing/provenance controls strong enough for a
-   verified update chain.
-7. CI, dependency, packaging, and governance controls are explicit and
-   repeatable.
+1. Each model role receives a generic instruction and the same initial file
+   context. It does not receive the complete ticket, effective project policy,
+   or validated outputs from earlier roles. The output reviewer therefore does
+   not review the exact proposed patch.
+2. An allowed patch may be applied to the developer's current checkout during
+   Development, before OutputReview and evals. If application is disabled,
+   evals would instead test the unchanged checkout. There is no isolated
+   candidate workspace.
+3. The loop's Testing and EvalReport steps are explicit no-ops. The real eval
+   runner is a separate manual command, `ticket.eval.config` is not consumed by
+   `loop run`, and the report is not attached to the `LoopRun`.
+4. `seaf init` writes a project policy, but `loop run` ignores it and loads the
+   compiled default. Resume binds the ticket snapshot but not an effective
+   project configuration snapshot.
+5. Blocked and failed runs are terminal. `loop resume` cannot revise them even
+   though the docs say it can, and there is no audited CLI rerun-from-step flow.
+6. External adoption is unsupported: no released CLI binary or documented
+   install path, no `--version`, Adaptive Notes-specific initialization, and no
+   end-to-end test in a repository outside SEAF.
+7. The SDK defaults to an HTTP endpoint for which SEAF ships no server. Release
+   capsules are unsigned development metadata. Both surfaces currently
+   overstate their usable lifecycle.
 
-## Roadmap
+## Production-Use Acceptance Scenario
 
-### Phase 0 - Stabilize The Current Baseline
+This scenario is the release gate for the roadmap. A developer must be able to:
 
-Goal: remove stale planning signals and close cheap guardrail gaps before
-enabling live model-driven changes.
+1. Install a versioned `seaf` binary without cloning this repository.
+2. Initialize a generic, clean external Git repository and obtain editable
+   policy, eval, ticket, provider, and ignore templates.
+3. Run a small test-covered ticket with Ollama in an isolated candidate
+   worktree. The original checkout must not be mutated.
+4. Inspect evidence showing that each role received the ticket and preceding
+   validated outputs, and that the reviewer evaluated the exact candidate diff.
+5. Approve the exact candidate diff before executing model-modified code, then
+   run the ticket-configured checks against that candidate and receive a passing
+   or failing EvalReport linked from the LoopRun.
+6. Interrupt and resume once, then revise and rerun a reviewer-blocked step
+   without losing or silently replacing audit history.
+7. Explicitly promote a passing candidate after human review. Any rejected,
+   blocked, timed-out, or failing run must leave the original checkout
+   unchanged.
 
-- P3-001: Create a new post-Phase-2 loop contract in `.seaf/loops/current/`.
-  The contract should make live provider-backed execution, command sandboxing,
-  real policy evidence, and schema drift tests the next acceptance criteria.
-- P3-002: Reconcile stale docs. `docs/mvp-backlog.md` still lists some work as
-  next slices even though the Phase 2 tracker says the primitives are complete.
-  Treat `docs/phase-2-local-agent-loop.md` as authoritative and update backlog
-  wording to distinguish implemented primitives from missing integration.
-- P3-003: Fix default policy drift. The policy gate recognizes `ci_changes`,
-  `eval_changes`, `policy_changes`, `updater_changes`, and `signing_changes`,
-  but the default/example policies only list dependency, database, auth,
-  payment, privacy, and network categories. Add the missing categories to
-  templates/examples and lock them with tests.
-- P3-004: Fix generated artifact hygiene. The CLI writes loop runs under
-  `.seaf/loops/runs`, while `.gitignore` ignores `.seaf/runs`. Align the ignore
-  rules and add `.seaf/**` to default context exclusions so generated run
-  artifacts are not accidentally packed back into model context.
-- P3-005: Harden CI determinism. Use locked Cargo commands, pin the Rust
-  toolchain or document why stable is acceptable, set workflow permissions,
-  timeouts and concurrency, and split Rust clippy from TypeScript package lint
-  so the TypeScript job does not depend on an unconfigured Rust environment.
+All context digests, prompts, responses, patch evidence, policy decisions,
+command logs, and the EvalReport must remain inspectable and redact obvious
+secrets.
 
-Exit gate: `cargo fmt --all -- --check`, `cargo clippy --locked
---all-targets --all-features -- -D warnings`, `cargo test --locked
---workspace`, `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`,
-`pnpm build`, and `git diff --check` pass on a clean tree.
+## Lean Roadmap
 
-### Phase 1 - Wire The Live Local Agent Loop
+### Milestone 1 - Make One Loop Coherent And Safe
 
-Goal: make `seaf loop run` use the loop primitives already built in Phase 2.
+Goal: one command produces a reviewable candidate and trustworthy evidence.
 
-- P3-006: Add a provider-backed `StepRunner` that maps loop steps to role
-  prompts, sends `ModelRequest`s through `ModelProvider`, persists every request
-  and response, parses structured responses, and attempts the existing one-time
-  repair path only for invalid JSON.
-- P3-007: Connect context packing to live role prompts. The run should write
-  `context-manifest.json`, include file digests, preserve the untrusted-context
-  marker, and fail closed on unsafe or forbidden context paths.
-- P3-008: Wire developer patch output to `gate_patch`. Policy decisions must
-  include the real patch digest, changed paths, decision kind, human-review
-  requirement, apply request, and applied status. Patch application must remain
-  opt-in through ticket autonomy and a clean worktree guard.
-- P3-009: Enforce command controls. Replace raw `sh -c` eval execution with a
-  command runner that validates ticket/eval allowlists, working directory, env,
-  timeout, output size, and redaction rules before writing logs.
-- P3-010: Add live-loop recovery tests. Cover malformed role output, repair
-  success/failure, model timeout, blocked reviewer decisions, rejected forbidden
-  patches, resume after interruption, and eval failure from missing policy
-  evidence.
+- **U1 - Make project inputs authoritative.** Add explicit project config and
+  policy discovery with documented precedence. Snapshot the complete ticket,
+  effective policy, config, and their digests into the run. Resume must fail
+  closed if those inputs have changed unless the user starts a new audited
+  attempt.
+- **U2 - Pass validated state between roles.** Research receives the ticket;
+  analysis receives research; spec creation receives both; spec review receives
+  the proposed spec; development receives the approved spec; output review
+  receives the exact normalized patch and policy decision. Persist each
+  structured role artifact separately. Add a bounded request-more-context flow
+  so success does not depend on perfect upfront file enumeration.
+- **U3 - Isolate the candidate lifecycle.** Create a dedicated temporary Git
+  worktree or equivalent candidate workspace. Generate, policy-check, apply,
+  review, and test the same patch there. Do not mutate the user's checkout or
+  commit/merge automatically. Add explicit `awaiting_human_review`,
+  `eval_passed`, and `promoted` states. Human-review decisions must block tests
+  and promotion, not be represented as a passed run. Promotion must verify the
+  candidate patch digest, bound EvalReport, target HEAD and cleanliness, and a
+  fresh human confirmation before applying to the original checkout.
+- **U4 - Integrate Testing and EvalReport.** Replace both no-op steps with the
+  existing controlled command runner and EvalReport builder. Consume
+  `ticket.eval.config`, run both ticket and eval allowlists in the candidate
+  workspace, persist logs, bind real policy evidence, set
+  `LoopRun.eval_report_path`, and fail the loop when checks or evidence fail.
+  Do not execute model-modified code before the exact diff is approved by a
+  human unless a separately reviewed OS-level sandbox blocks access to the
+  source checkout, home directory, shared Git metadata, secrets, and network.
+- **U5 - Make recovery real.** Add audited CLI operations to inspect, revise,
+  and rerun from a named step. Preserve attempt history, bind the candidate and
+  config snapshots, use atomic state replacement and a per-run lock, and cover
+  interruption at patch, review, testing, and report boundaries. Before live
+  Ollama use, enforce private run-directory permissions, provider-response and
+  storage caps, and prompt/response redaction.
 
-Exit gate: `loop run --provider fake` exercises the same provider-backed path
-as live runs, `loop run --provider ollama` can complete a local smoke against an
-installed model, and `eval run --loop-run ... --ticket ...` refuses runs without
-real policy evidence.
+Exit gate: focused tests prove authoritative inputs, role-to-role data flow,
+candidate isolation, human approval, controlled evals, bound reports, promotion
+integrity, and recovery. A failed run leaves the source checkout byte-for-byte
+unchanged. This gate may still run SEAF from its source workspace; packaging and
+external initialization belong to Milestone 2.
 
-### Phase 2 - Make Contracts And SDK Publishable
+### Milestone 2 - Make The Loop Consumable
 
-Goal: make SEAF's public contracts dependable for Rust and TypeScript
-consumers.
+Goal: a developer can adopt SEAF without understanding this monorepo.
 
-- P3-011: Declare one contract source of truth. Either generate Rust/TS from
-  JSON Schema or generate schemas/TS from Rust models. Add drift tests for every
-  public contract.
-- P3-012: Tighten schema parity. Current schemas allow shapes that Rust
-  validation rejects, such as empty goal guardrails, empty policy lists, and
-  empty EvalReport checks. Make schema and Rust behavior agree.
-- P3-013: Move `PolicyDecision` into `seaf-core` or another shared contract
-  surface and make `LoopRun.policy_decisions` typed instead of arbitrary object
-  maps.
-- P3-014: Expand `@seaf/sdk` beyond event emission. Export contract types and
-  validation helpers for Event, Signal, GoalSpec, Policy, TicketSpec, LoopRun,
-  EvalReport, and ReleaseCapsule.
-- P3-015: Make package release checks real. Include schemas intentionally in
-  `@seaf/sdk` or publish `@seaf/schemas`, add license/repository/engines and
-  publish metadata, run `npm pack --dry-run`, and import the packed artifact in
-  CI.
+- **U6 - Ship a generic project bootstrap.** Replace the Adaptive Notes-only
+  default with stack-neutral initialization plus explicit optional examples.
+  Generate a starter ticket, project policy, eval config, provider config, and
+  `.gitignore` entries. Add `seaf doctor` for Git, model, configuration,
+  candidate-workspace, and eval-command readiness.
+- **U7 - Distribute a versioned CLI.** Add `seaf --version`, complete Cargo
+  package metadata and versioned internal dependencies, a license and changelog,
+  and tagged macOS/Linux binary releases with checksums. Test the packaged
+  binary rather than only `cargo run` from the workspace.
+- **U8 - Add an external golden path.** Maintain a small fixture repository
+  outside the SEAF source tree. CI must install the packaged CLI, initialize the
+  fixture, run a real candidate patch through the fake provider, execute its
+  native tests, exercise interrupt/resume and rejection, and validate every
+  referenced artifact. Rewrite the README and loop docs from that tested flow.
 
-Exit gate: SDK package contents are verified from the packed artifact, schema
-fixtures pass in Rust and TypeScript, and a schema drift test fails on any
-contract mismatch.
+Exit gate: a new developer can complete the fake-provider path from the public
+quickstart in under 15 minutes. The full production-use acceptance scenario
+passes with the packaged fake provider in CI and locally with Ollama.
 
-### Phase 3 - Harden Runtime, Telemetry, And Product Surface
+### Milestone 3 - Stabilize Through Real Project Pilots
 
-Goal: turn the local runtime from an MVP event store into a safe operational
-component and expose enough product surface to inspect the loop.
+Goal: turn observed usage failures into a small, supportable `0.x` contract.
 
-- P3-016: Add runtime migrations, retention policy, payload redaction,
-  sensitive/private event handling, log-size caps, and optional encryption for
-  local storage.
-- P3-017: Add a supported ingestion surface. Either expose a local HTTP service
-  matching the SDK default endpoint or change the SDK/runtime contract so the
-  default integration is demonstrably runnable.
-- P3-018: Build the read-only dashboard described in the roadmap: goals,
-  signals, tasks, loop runs, eval reports, policy decisions, release capsules,
-  and generated artifacts. Keep it read-only until policy and release controls
-  mature.
-- P3-019: Promote Adaptive Notes from example data to a complete demo shell that
-  emits SDK events, produces local signals, runs a ticket through the loop, and
-  shows the resulting EvalReport and ReleaseCapsule.
+- **U9 - Version and protect durable artifacts.** Type `PolicyDecision` in the
+  shared contract layer; add schema drift tests for Ticket, Policy, LoopRun,
+  PolicyDecision, and EvalReport; version on-disk formats; and define compatible
+  read/migration behavior. Enforce private state-directory permissions, storage
+  budgets, and retention/purge controls.
+- **U10 - Dogfood two real repositories.** Complete at least five bounded
+  tickets across two different stacks, including an approved patch, a policy
+  rejection, an eval failure, and an interrupted/resumed run. Track setup time,
+  patch applicability, review corrections, eval reliability, recovery success,
+  and manual workarounds. Every safety or data-loss failure becomes a
+  regression before release.
+- **U11 - Cut the first supported preview.** Publish the tested binaries,
+  compatibility notes, security reporting path, support boundary, and release
+  procedure. The release notes must state that promotion remains manual and
+  telemetry, release capsules, and update delivery are experimental.
 
-Exit gate: a new developer can run one documented demo from app event emission
-through signal, ticket, loop run, eval report, and release capsule without
-manual fixture editing.
+Exit gate: both pilot repositories complete the acceptance scenario without
+editing SEAF artifacts by hand, no unresolved safety/data-loss defects remain,
+and upgrade/recovery behavior is documented and tested.
 
-### Phase 4 - Production Release And Governance
+## Explicitly Deferred
 
-Goal: make release artifacts, operational ownership, and supply-chain controls
-credible.
+- Dashboard or multi-user service.
+- Cloud model providers and credential storage.
+- Automatic PR creation, commit, merge, deployment, or rollback.
+- Production signing and verified updater infrastructure.
+- Treating `@seaf/sdk` or `seaf-local-runtime` as supported. If telemetry is
+  required by pilot feedback, give it a separate roadmap covering a loopback
+  service, bounded SDK timeouts/failure semantics, database migrations,
+  retention, privacy handling, and one event-to-signal integration test.
+- Generating every public contract across Rust, TypeScript, and JSON Schema
+  before the smaller loop artifact set has stabilized.
 
-- P3-020: Implement signing and verified-update metadata. Release capsules
-  should require signatures for production channels, include build recipe or
-  provenance hashes, and verify artifact/eval digests before trust.
-- P3-021: Add provenance and commit checks. Verify source commit, dirty tree
-  state, patch digest, eval report digest, and release capsule digest before
-  commit/merge or release preparation.
-- P3-022: Add supply-chain controls: `cargo-deny` or equivalent, npm audit
-  policy, license allowlist, SBOM generation, Dependabot/Renovate, and release
-  artifact attestation.
-- P3-023: Add governance docs and ownership. Include `SECURITY.md`,
-  `CODEOWNERS`, release procedure, incident process, support policy, changelog
-  rules, and coverage expectations.
+## Roadmap Discipline
 
-Exit gate: a release candidate can be built, checked, signed, verified, and
-rolled back through documented commands with CI evidence and human review gates.
-
-## Recommended Order
-
-Start with Phase 0. It is small, removes stale instructions, and closes gaps
-that become dangerous once live agents are allowed to propose patches. Phase 1
-is the core product milestone: until live provider-backed loop execution is
-real, production signing, dashboards, and package publishing are supporting
-work rather than proof that SEAF works end to end. Phase 2 and Phase 3 can run
-partly in parallel after Phase 1 interfaces settle. Phase 4 should wait until
-real loop artifacts and contract surfaces have stopped moving.
-
-## Non-Goals For The Next Phase
-
-- Automatic merge to `main`.
-- Automatic production deployment.
-- Real signing keys stored in the repo, CI general jobs, or agent-readable
-  context.
-- Cloud agent execution.
-- Allowing model output to bypass schema validation, policy gates, evals, or
-  human review.
+- Work in the listed order; U1 through U5 are one product milestone and should
+  not be diluted by dashboard, signing, or telemetry work.
+- Each ticket gets a failing regression or external acceptance test before the
+  implementation when behavior changes.
+- Update the README, local-loop guide, examples, and `.seaf/loops/current/`
+  tracker in the same slice as the behavior they describe.
+- Do not call the loop passed unless the exact reviewed candidate has passing
+  deterministic checks and a bound EvalReport.
