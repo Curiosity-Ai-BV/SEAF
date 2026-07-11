@@ -143,6 +143,21 @@ pub fn gate_patch<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
 ) -> Result<PolicyDecision, PatchGateError> {
+    gate_patch_with_execution(request, runner, true)
+}
+
+pub(crate) fn gate_patch_proposal<R: PatchCommandRunner + ?Sized>(
+    request: PatchGateRequest<'_>,
+    runner: &mut R,
+) -> Result<PolicyDecision, PatchGateError> {
+    gate_patch_with_execution(request, runner, false)
+}
+
+fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
+    request: PatchGateRequest<'_>,
+    runner: &mut R,
+    execute_apply: bool,
+) -> Result<PolicyDecision, PatchGateError> {
     fs::create_dir_all(request.artifact_dir).map_err(PatchGateError::Io)?;
 
     let artifact_stem = safe_artifact_stem(request.patch_id);
@@ -195,7 +210,7 @@ pub fn gate_patch<R: PatchCommandRunner + ?Sized>(
                         Some(trim_stderr(&check.stderr)),
                     ));
                     refresh_decision_kind(&mut decision);
-                } else {
+                } else if execute_apply {
                     let apply =
                         runner.run(request.repo_root, PatchCommand::GitApply, request.patch)?;
                     if apply.success {
@@ -521,7 +536,7 @@ fn push_reason(reasons: &mut Vec<PolicyDecisionReason>, reason: PolicyDecisionRe
     }
 }
 
-fn patch_digest(patch: &str) -> String {
+pub fn patch_digest(patch: &str) -> String {
     let digest = Sha256::digest(patch.as_bytes());
     format!("sha256:{}", hex::encode(digest))
 }

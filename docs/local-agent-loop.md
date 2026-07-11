@@ -81,8 +81,15 @@ root and Git common directory. The effective config snapshot records the
 winning policy path for explicit-policy and root-policy fallback runs as well
 as config-backed runs.
 
-M1-02 resume configuration integrity is complete. M1-03 validated role artifact
-dataflow is the next dependency-ready slice.
+M1-03 validated role dataflow is complete. Development consumes the exact
+approved spec and persists policy-gated DevelopmentEvidence; OutputReview
+consumes only that verified evidence and approved-spec identities. M1-04
+bounded additional context is the next dependency-ready slice.
+
+Provider-backed Development is proposal-only. A ticket may record
+`apply_requested: true`, but the provider gate performs at most an applicability
+check and always records `applied: false`; it does not modify the source
+checkout before the isolated candidate-workspace milestone.
 
 ## Failed-Run Recovery
 
@@ -150,6 +157,7 @@ Ollama smoke returned `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
 
 ## Pending Work
 
-M1-02 resume configuration integrity is complete: incomplete provider resumes
-verify their persisted inputs before rebuilding provider context or patch-gate
-state. M1-03 validated role artifact dataflow is the next production-use slice.
+M1-03 validated role dataflow is complete: incomplete provider resumes verify
+the exact approved spec, DevelopmentEvidence, policy decision, and downstream
+role envelopes before provider or state mutation. M1-04 bounded additional
+context is the next production-use slice.

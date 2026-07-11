@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod bench;
 pub mod context;
+pub mod development_evidence;
 pub mod eval_report;
 pub mod model_runner;
 pub mod patch;
@@ -22,14 +23,15 @@ pub use context::{
     ContextFile, ContextLimits, ContextManifest, ContextManifestFile, ContextPackRequest,
     CONTEXT_MANIFEST_FILE, UNTRUSTED_CONTEXT_MARKER,
 };
+pub use development_evidence::DevelopmentEvidence;
 pub use eval_report::build_loop_eval_report;
 pub use model_runner::{ProviderPatchGateConfig, ProviderStepRunner};
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
 pub use policy_gate::{
-    gate_patch, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
+    gate_patch, patch_digest, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
     PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision, PolicyDecisionReason,
 };
-pub use role_artifact::ValidatedRoleArtifact;
+pub use role_artifact::{RoleArtifactError, ValidatedRoleArtifact};
 pub use role_response::{
     parse_role_response, parse_role_response_with_repair, AgentResponse, AgentStatus,
     DeveloperResponse, DeveloperStatus, Finding, ReviewDecision, ReviewIssue, ReviewerResponse,

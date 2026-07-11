@@ -579,3 +579,87 @@ Final verification passed: focused authority and schema tests, `cargo fmt
 --all -- --check`, locked all-target/all-feature Clippy with warnings denied,
 the complete locked 224-test Rust workspace, `corepack pnpm format:check`, and
 `git diff --check`. M1-03b behavior remains untouched.
+
+## 2026-07-11 implement | M1-03b exact development and output-review evidence
+
+RED began with Development still emitting the legacy generic prose request,
+which could not provide the exact approved spec identity. The next RED found
+that a validated `patch_proposed` response could complete without any patch
+gate or Development artifact. GREEN adds a structured Development request
+bound to run/input digests and the exact canonical SpecCreation and approving
+SpecReview envelopes, paths, and digests. The initially bounded repository
+context is retained only for Development because it needs the named source
+files to construct a patch; unrelated Research and Analysis bodies are absent.
+
+Every validated DeveloperResponse now persists a canonical run-bound artifact.
+Patch proposals require exactly one authoritative gate and produce typed
+DevelopmentEvidence binding the validated response, exact patch, patch digest,
+normalized changed paths, and exact PolicyDecision. Rejected evidence persists
+and stops. Blocked or needs-context responses persist without invented policy
+fields and do not advance. Allowed and human-review evidence may reach
+OutputReview under the existing state semantics; human approval remains M1-06.
+
+OutputReview receives only verified DevelopmentEvidence, approved-spec
+identities, the run ID, and input digests. Its validated response is persisted
+as the canonical OutputReview role envelope. Resume at Development reuses the
+verified approved spec. Resume at OutputReview reuses the exact persisted
+evidence, verifies the run's exact policy decision, and does not rerun the
+patch gate. Missing, tampered, noncanonical, wrong-run, wrong-role, wrong-step,
+wrong-digest, substituted-patch, and policy-mismatch matrices fail before any
+provider, gate, or durable mutation.
+
+Focused provider, role, policy, state, and CLI resume suites passed. M1-03b is
+complete and M1-04 bounded additional context is active. Context-request flow,
+candidate worktrees, human approval, eval/promotion, and commits remain out of
+scope.
+
+Final verification passed: `cargo fmt --all -- --check`, locked all-target and
+all-feature Clippy with warnings denied, all 233 locked Rust workspace tests,
+`corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 verify | M1-03b OutputReview approval binding
+
+Spec review found that OutputReview resume verified the canonical SpecReview
+envelope but did not reassert its `approve_spec` decision. RED canonically
+rewrote the persisted decision to `approve_for_tests`, `request_changes`, and
+`reject`, recomputed the response and outer artifact digests, and updated the
+supplied LoopRun digest binding. All three substitutions resumed successfully
+instead of failing before the resume log.
+
+GREEN makes OutputReview preparation and request construction reuse the same
+`require_approved_spec_review` guard as Development. Downstream resume also
+applies that guard after canonical artifact verification and before any log,
+provider, gate, or state mutation. The matrix snapshots the whole run tree and
+asserts zero provider and patch-runner calls for every changed decision.
+
+Verification passed: all 37 focused provider-runner tests, all four focused CLI
+provider-resume tests, `cargo fmt --all -- --check`, locked all-target and
+all-feature Clippy with warnings denied, all 234 locked Rust workspace tests,
+`corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 verify | M1-03b evidence reparse and proposal-only gating
+
+Quality review found two remaining trust-boundary gaps. First, coordinated
+tampering could replace the patch, developer response, evidence paths, policy
+decision, run policy decision, and every digest together. RED showed resume
+accepted a forbidden-path patch whose substituted evidence still claimed only
+`docs/example.md`. GREEN independently reparses the exact canonical patch and
+requires its normalized paths to equal both DevelopmentEvidence and
+PolicyDecision paths. Malformed and binary patches remain valid rejected
+evidence only when their exact gate rejection kind is preserved.
+
+Second, an apply-enabled provider run could execute `GitApply` against the
+source checkout before Development evidence and run state were durably saved.
+RED forced artifact persistence to fail after gating and observed `applied:
+true` plus source mutation. GREEN adds a proposal-only provider gate path: it
+preserves `apply_requested`, may run `GitApplyCheck`, never runs `GitApply`, and
+always leaves `applied` false. The regression uses a mutation-capable runner,
+forces the later artifact write to fail, and proves the source remains
+byte-for-byte unchanged. Generic `gate_patch` retains explicit apply behavior
+for non-provider callers; OutputReview resume still reuses evidence without
+rerunning the gate.
+
+Verification passed: all 38 focused provider-runner tests, all 13 generic
+policy-gate tests, `cargo fmt --all -- --check`, locked all-target and
+all-feature Clippy with warnings denied, all 235 locked Rust workspace tests,
+`corepack pnpm format:check`, and `git diff --check`.

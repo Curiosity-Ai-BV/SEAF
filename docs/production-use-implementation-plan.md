@@ -168,7 +168,7 @@ Commit boundary: resume integrity only.
 
 Roadmap: U2. Dependencies: M1-02.
 
-Status: complete on 2026-07-11. M1-03b is active.
+Status: complete on 2026-07-11. M1-03b is also complete; M1-04 is active.
 
 Objective: make research, analysis, spec creation, and spec review consume and
 persist their exact validated prerequisites.
@@ -211,6 +211,8 @@ role-specific response schema before context packing or any durable mutation.
 
 Roadmap: U2. Dependencies: M1-03a.
 
+Status: complete on 2026-07-11. M1-04 is active.
+
 Objective: bind development and output review to the approved specification and
 the exact normalized policy-gated patch.
 
@@ -238,6 +240,22 @@ Docs/tracker: exact output-review evidence and M1-03b completion.
 
 Commit boundary: development/output-review dataflow only; no context expansion,
 candidate worktree, approval, or eval execution.
+
+Implemented flow: Development receives the exact canonical SpecCreation and
+approving SpecReview envelopes, paths, and digests plus the bounded initial
+repository context it still needs to construct a patch. It does not receive
+Research or Analysis bodies. Every validated DeveloperResponse is persisted;
+patch proposals additionally produce typed canonical DevelopmentEvidence that
+binds the exact gated patch, digest, normalized changed paths, and exact
+PolicyDecision. OutputReview is built only from verified DevelopmentEvidence,
+approved-spec identities, the run ID, and all input digests. Resume verifies
+both downstream artifact envelopes and the run's exact policy decision before
+mutation or provider calls, and never reruns the patch gate at OutputReview.
+DevelopmentEvidence independently reparses the exact patch and binds its
+normalized paths to both evidence and policy decision fields. Provider-backed
+gating is proposal-only: `apply_requested` preserves ticket intent, while
+`applied` remains false and the source checkout is never modified before the
+M1-05 isolated candidate workspace exists.
 
 ### M1-04 - Bounded Additional Context
 

@@ -11,8 +11,8 @@
 - [x] M1-01b: Authoritative configuration discovery and snapshots.
 - [x] M1-02: Resume configuration integrity.
 - [x] M1-03a: Validated early role artifact chain.
-- [ ] M1-03b: Development and exact output-review evidence (active).
-- [ ] M1-04: Bounded additional context.
+- [x] M1-03b: Development and exact output-review evidence.
+- [ ] M1-04: Bounded additional context (active).
 - [ ] M1-05: Isolated candidate workspace.
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
@@ -43,6 +43,5 @@
 
 ## Current Gate
 
-M1-03a is complete. M1-03b is the next dependency-ready slice. Milestone 1
-remains active; developer and output-review exact patch evidence is not yet
-implemented.
+M1-03b is complete. M1-04 is the next dependency-ready slice. Milestone 1
+remains active; bounded additional context is not yet implemented.

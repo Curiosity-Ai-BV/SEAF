@@ -57,6 +57,15 @@ pub trait StepRunner {
         self.prepare_workspace(workspace)
     }
 
+    fn prepare_step(
+        &mut self,
+        _workspace: &LoopWorkspace,
+        _run: &LoopRun,
+        _step: LoopStepName,
+    ) -> Result<(), RunnerError> {
+        Ok(())
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
@@ -193,6 +202,9 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             Some((cached_step, attempt)) if cached_step == step => attempt,
             Some(_) | None => next_step_attempt(&self.workspace, step)?,
         };
+
+        self.step_runner
+            .prepare_step(&self.workspace, &self.run, step)?;
 
         state::mark_step_running(&mut self.run, step)?;
         state::save_run(&self.workspace, &self.run)?;

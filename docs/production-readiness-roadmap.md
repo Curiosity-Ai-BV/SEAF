@@ -42,10 +42,10 @@ features:
    context. It does not receive the complete ticket, effective project policy,
    or validated outputs from earlier roles. The output reviewer therefore does
    not review the exact proposed patch.
-2. An allowed patch may be applied to the developer's current checkout during
-   Development, before OutputReview and evals. If application is disabled,
-   evals would instead test the unchanged checkout. There is no isolated
-   candidate workspace.
+2. Provider-backed Development is now proposal-only: ticket apply intent is
+   audited, but the policy gate never applies the patch to the developer's
+   checkout. Evals therefore still test the unchanged checkout because there
+   is no isolated candidate workspace yet.
 3. The loop's Testing and EvalReport steps are explicit no-ops. The real eval
    runner is a separate manual command, `ticket.eval.config` is not consumed by
    `loop run`, and the report is not attached to the `LoopRun`.
@@ -63,11 +63,12 @@ explicit or Git-root project authority, persist canonical effective inputs and
 repository identity, and verify them before an incomplete resume can mutate
 run state or contact the provider.
 
-M1-03a resolved the early-role half of workflow-integrity item 1: research,
-analysis, spec creation, and spec review now consume only their exact validated
-prerequisites and persist canonically verified run-bound artifacts. Development
-and output review still need the exact approved-spec and patch-evidence binding
-scheduled for M1-03b.
+M1-03a and M1-03b resolved workflow-integrity item 1: every model role now
+consumes its exact validated prerequisites and persists canonically verified
+run-bound artifacts. Development is bound to the approved spec and the bounded
+source context needed to construct a patch. Output review receives only the
+persisted policy-gated DevelopmentEvidence, approved-spec identities, and run
+input digests. Bounded additional context requests remain scheduled for M1-04.
 
 ## Production-Use Acceptance Scenario
 
