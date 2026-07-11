@@ -382,4 +382,6 @@ pub struct LoopStepRecord {
     pub status: LoopStepStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<String>,
 }

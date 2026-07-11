@@ -520,3 +520,62 @@ seconds. Its exact rerun passed, and the complete locked workspace rerun passed
 all 213 tests. Final formatting, locked Clippy, `corepack pnpm format:check`, and
 `git diff --check` passed. No locking or atomic-write behavior from M1-10 was
 added.
+
+## 2026-07-11 implement | M1-03a validated early role artifact chain
+
+RED began with a focused research-request regression that failed on the missing
+effective-ticket seam. The next RED proved the early chain lacked structured
+canonical artifacts and run-state digests. Focused state REDs then rejected the
+existing acceptance of unpaired and malformed artifact integrity metadata.
+
+GREEN adds canonical validated role envelopes for Research, Analysis,
+SpecCreation, and SpecReview. Each envelope binds run ID, step, role, the parsed
+role response, and its canonical response digest; `run.json` separately binds
+the safe artifact path and canonical artifact digest. Requests carry the exact
+effective TicketSpec, run ID, all four input digests, and only the required
+prior role responses. Raw provider transcripts remain separate response audit
+files. Blocked and failed early responses retain their validated artifacts but
+do not enable downstream steps.
+
+Resume now loads the exact preflight LoopRun, verifies every required early
+artifact before context-manifest writes or log/provider/state mutation, and
+rejects missing, tampered, noncanonical, wrong-run, wrong-role, wrong-step, and
+wrong-digest evidence. The matrix snapshots the whole run tree and asserts zero
+provider requests for every failure. New-run and resumed happy paths both pass.
+M1-03b remains intentionally out of scope and is now active.
+
+Verification passed: focused role/provider/state/core tests, all CLI resume
+tests, `cargo fmt --all -- --check`, locked all-target/all-feature Clippy with
+warnings denied, the full locked 221-test Rust workspace, `corepack pnpm
+format:check`, and `git diff --check`.
+
+## 2026-07-11 verify | M1-03a prepared-ticket and schema-pair fixes
+
+Follow-up review found two contract gaps. First, a directly constructed
+`ProviderStepRunner` could prepare without a TicketSpec and retain the legacy
+generic early-role request/artifact behavior. RED showed the missing-ticket
+run prepared successfully; a second matrix showed substituted ticket ID, goal
+ID, and canonical ticket digest also prepared. GREEN makes every prepared
+provider run require the exact effective TicketSpec and binds all three fields
+to the exact LoopRun before artifact loading or context packing. The tests
+preconfigure live context, snapshot the complete runs tree, and assert no tree
+change or provider request for every failure.
+
+Second, the loop-run JSON Schema allowed a string artifact path paired with a
+null digest, or the reverse, because it checked property presence rather than
+non-null value pairing. RED found no exclusive artifact-pair schema branches.
+GREEN permits exactly three representations: both valid strings, both explicit
+nulls, or both absent. Runtime and schema parity regressions cover both mismatch
+directions.
+
+The first full workspace run exposed one legitimate compatibility conflict:
+resume had cloned and modified the verified ticket to disable renewed apply
+authority, breaking the new canonical ticket digest binding. The fix keeps the
+provider ticket exact and applies the persisted-authority restriction only to
+the separate patch-gate configuration. The exact mocked-Ollama resume
+regression passed afterward.
+
+Final verification passed: focused authority and schema tests, `cargo fmt
+--all -- --check`, locked all-target/all-feature Clippy with warnings denied,
+the complete locked 224-test Rust workspace, `corepack pnpm format:check`, and
+`git diff --check`. M1-03b behavior remains untouched.

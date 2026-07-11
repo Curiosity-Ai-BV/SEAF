@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-03 - Validated role artifact chain.
+M1-03b - Development and exact output-review evidence.

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use seaf_core::{
-    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, TicketContext,
-    TicketSpec, TicketStatus,
+    canonical_json_bytes, canonical_sha256_digest, LoopInputDigests, LoopRun, LoopStatus,
+    LoopStepName, LoopStepStatus, Policy, TicketContext, TicketSpec, TicketStatus,
 };
 use seaf_loop::{
     CommandOutput, ContextLimits, ContextManifest, ContextPackRequest, LoopRunner,
@@ -78,6 +78,247 @@ fn provider_step_runner_sends_role_request_and_maps_common_passed_status() {
 }
 
 #[test]
+fn research_request_contains_exact_ticket_and_all_run_input_digests() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let input_digests = test_input_digests();
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "exact-research-request",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            input_digests.clone(),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    loop_runner.run_next_step().expect("run research");
+
+    let requests = provider.requests().expect("provider requests");
+    let prompt: serde_json::Value =
+        serde_json::from_str(&requests[0].messages[0].content).expect("structured role prompt");
+    assert_eq!(prompt["run_id"], "exact-research-request");
+    assert_eq!(prompt["input_digests"], json!(input_digests));
+    assert_eq!(prompt["ticket"], json!(ticket));
+    assert_eq!(prompt["prerequisites"], json!({}));
+}
+
+#[test]
+fn prepared_provider_run_requires_effective_ticket_before_workspace_or_provider_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let repo = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&runs_root).expect("runs root");
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn missing_ticket() {}\n").expect("source file");
+    let authoritative = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let before = read_tree_bytes(&runs_root);
+    let provider = FakeProvider::new(Vec::new());
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_context_pack_request(context_request(&repo, &authoritative, Vec::new()));
+
+    let error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "missing-prepared-ticket",
+            &authoritative,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&authoritative),
+        ),
+        &mut step_runner,
+    )
+    .expect_err("prepared provider run without ticket must fail closed");
+
+    assert!(error.to_string().contains("effective ticket"), "{error}");
+    assert_eq!(read_tree_bytes(&runs_root), before);
+    assert!(provider.requests().expect("provider requests").is_empty());
+}
+
+#[test]
+fn prepared_provider_run_rejects_substituted_ticket_authority_before_any_mutation() {
+    for mismatch in [
+        PreparedTicketMismatch::TicketId,
+        PreparedTicketMismatch::GoalId,
+        PreparedTicketMismatch::Digest,
+    ] {
+        assert_prepared_ticket_mismatch_fails_closed(mismatch);
+    }
+}
+
+#[test]
+fn early_role_requests_chain_only_exact_validated_prerequisites_and_persist_canonical_artifacts() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let input_digests = test_input_digests();
+    let responses = [
+        fixture("research.valid.json").to_string(),
+        fixture("analyzer.valid.json").to_string(),
+        spec_writer_response(),
+        spec_review_approved_response(),
+    ];
+    let provider = FakeProvider::new(
+        responses
+            .iter()
+            .map(|response| Ok(model_response(response)))
+            .collect(),
+    );
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "exact-early-chain",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            input_digests.clone(),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    for _ in 0..4 {
+        assert!(loop_runner.run_next_step().expect("run early step"));
+    }
+    drop(loop_runner);
+
+    let response_values: Vec<serde_json::Value> = responses
+        .iter()
+        .map(|response| serde_json::from_str(response).expect("response JSON"))
+        .collect();
+    let requests = provider.requests().expect("provider requests");
+    assert_eq!(requests.len(), 4);
+    let prompts: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_str(&request.messages[0].content).expect("role input JSON"))
+        .collect();
+    for prompt in &prompts {
+        assert_eq!(prompt["run_id"], "exact-early-chain");
+        assert_eq!(prompt["input_digests"], json!(input_digests));
+        assert_eq!(prompt["ticket"], json!(ticket));
+    }
+    assert_eq!(prompts[0]["prerequisites"], json!({}));
+    assert_eq!(
+        prompts[1]["prerequisites"],
+        json!({ "research": response_values[0] })
+    );
+    assert_eq!(
+        prompts[2]["prerequisites"],
+        json!({ "research": response_values[0], "analysis": response_values[1] })
+    );
+    assert_eq!(
+        prompts[3]["prerequisites"],
+        json!({ "proposed_spec": response_values[2] })
+    );
+
+    let run_dir = runs_root.join("exact-early-chain");
+    let persisted = read_run(&run_dir);
+    for (index, (step, role)) in [
+        (LoopStepName::Research, Role::Researcher),
+        (LoopStepName::Analysis, Role::Analyzer),
+        (LoopStepName::SpecCreation, Role::SpecWriter),
+        (LoopStepName::SpecReview, Role::SpecReviewer),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record = persisted
+            .steps
+            .iter()
+            .find(|record| record.name == step)
+            .expect("step record");
+        let path = record.artifact_path.as_deref().expect("artifact path");
+        let bytes = std::fs::read(run_dir.join(path)).expect("artifact bytes");
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).expect("artifact JSON");
+        assert_eq!(artifact["run_id"], "exact-early-chain");
+        assert_eq!(artifact["step"], json!(step));
+        assert_eq!(artifact["role"], json!(role));
+        assert_eq!(artifact["response"], response_values[index]);
+        assert_eq!(
+            artifact["response_digest"],
+            canonical_sha256_digest(&response_values[index]).expect("response digest")
+        );
+        assert_eq!(
+            bytes,
+            canonical_json_bytes(&artifact).expect("canonical artifact bytes")
+        );
+        assert_eq!(
+            record.artifact_digest.as_deref(),
+            Some(
+                canonical_sha256_digest(&artifact)
+                    .expect("artifact digest")
+                    .as_str()
+            )
+        );
+    }
+}
+
+#[test]
+fn resumed_analysis_reuses_verified_research_artifact_without_unrelated_prerequisites() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let start_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut start_runner =
+        ProviderStepRunner::new(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "resume-exact-chain",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut start_runner,
+    )
+    .expect("start loop");
+    loop_runner.run_next_step().expect("research");
+    drop(loop_runner);
+
+    let resume_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("analyzer.valid.json")))]);
+    let mut resume_runner =
+        ProviderStepRunner::new(&resume_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+    let mut resumed = LoopRunner::resume(&runs_root, "resume-exact-chain", &mut resume_runner)
+        .expect("resume verified role chain");
+    resumed.run_next_step().expect("analysis");
+
+    let requests = resume_provider.requests().expect("provider requests");
+    let prompt: serde_json::Value =
+        serde_json::from_str(&requests[0].messages[0].content).expect("role input JSON");
+    let research: serde_json::Value =
+        serde_json::from_str(fixture("research.valid.json")).expect("research JSON");
+    assert_eq!(prompt["ticket"], json!(ticket));
+    assert_eq!(prompt["prerequisites"], json!({ "research": research }));
+}
+
+#[test]
+fn resume_rejects_invalid_early_role_artifacts_before_context_log_or_provider_mutation() {
+    for mutation in [
+        ResumeArtifactMutation::Missing,
+        ResumeArtifactMutation::TamperedResponse,
+        ResumeArtifactMutation::NonCanonical,
+        ResumeArtifactMutation::WrongRun,
+        ResumeArtifactMutation::WrongRole,
+        ResumeArtifactMutation::WrongStep,
+        ResumeArtifactMutation::WrongDigest,
+    ] {
+        assert_resume_artifact_rejected_without_mutation(mutation);
+    }
+}
+
+#[test]
 fn provider_step_runner_repairs_invalid_json_once_and_audits_both_responses() {
     let provider = FakeProvider::new(vec![
         Ok(model_response("not json")),
@@ -138,7 +379,8 @@ fn provider_step_runner_persists_provider_response_when_parse_failure_stops_loop
     let provider = FakeProvider::new(vec![Ok(model_response(fixture(
         "research.invalid_missing_status.json",
     )))]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -178,7 +420,8 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
             json!({}),
         )),
     ]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -244,7 +487,8 @@ fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails(
         10,
         json!({ "provider": "fake" }),
     ))]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 10);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 10).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -285,6 +529,7 @@ fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -293,7 +538,7 @@ fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps
             &ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&ticket),
         ),
         &mut step_runner,
     )
@@ -305,10 +550,15 @@ fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps
     let requests = provider.requests().expect("provider requests");
     assert_eq!(requests.len(), 1);
     let user_prompt = &requests[0].messages[0].content;
-    assert!(user_prompt.contains(UNTRUSTED_CONTEXT_MARKER));
-    assert!(user_prompt.contains("path: src/lib.rs"));
-    assert!(user_prompt.contains(&format!("sha256: {digest}")));
-    assert!(user_prompt.contains(source_content));
+    let role_input: serde_json::Value =
+        serde_json::from_str(user_prompt).expect("structured role input");
+    let repository_context = role_input["repository_context"]
+        .as_str()
+        .expect("repository context");
+    assert!(repository_context.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(repository_context.contains("path: src/lib.rs"));
+    assert!(repository_context.contains(&format!("sha256: {digest}")));
+    assert!(repository_context.contains(source_content));
 
     let prompt_audit =
         std::fs::read_to_string(runs_root.join("live-context-run/prompts/01-research.prompt.md"))
@@ -340,6 +590,7 @@ fn provider_step_runner_rejects_forbidden_live_context_before_provider_call() {
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
 
     let error = LoopRunner::start(
@@ -349,7 +600,7 @@ fn provider_step_runner_rejects_forbidden_live_context_before_provider_call() {
             &ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&ticket),
         ),
         &mut step_runner,
     )
@@ -379,6 +630,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut forbidden_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
 
     let first_error = LoopRunner::start(
@@ -388,7 +640,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
             &ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&ticket),
         ),
         &mut forbidden_runner,
     )
@@ -406,6 +658,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
     );
 
     let mut allowed_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
 
     let mut loop_runner = LoopRunner::start(
@@ -415,7 +668,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
             &ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&ticket),
         ),
         &mut allowed_runner,
     )
@@ -442,6 +695,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
     let start_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut start_runner = ProviderStepRunner::new(&start_provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -450,7 +704,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
             &ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&ticket),
         ),
         &mut start_runner,
     )
@@ -461,6 +715,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
     let resume_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("analyzer.valid.json")))]);
     let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut resumed =
         LoopRunner::resume(&runs_root, "resume-context-run", &mut resume_runner).expect("resume");
@@ -473,10 +728,15 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
         .expect("resume provider requests");
     assert_eq!(requests.len(), 1);
     let user_prompt = &requests[0].messages[0].content;
-    assert!(user_prompt.contains(UNTRUSTED_CONTEXT_MARKER));
-    assert!(user_prompt.contains("path: src/lib.rs"));
-    assert!(user_prompt.contains(&format!("sha256: {digest}")));
-    assert!(user_prompt.contains(source_content));
+    let role_input: serde_json::Value =
+        serde_json::from_str(user_prompt).expect("structured role input");
+    let repository_context = role_input["repository_context"]
+        .as_str()
+        .expect("repository context");
+    assert!(repository_context.contains(UNTRUSTED_CONTEXT_MARKER));
+    assert!(repository_context.contains("path: src/lib.rs"));
+    assert!(repository_context.contains(&format!("sha256: {digest}")));
+    assert!(repository_context.contains(source_content));
 
     let prompt_audit =
         std::fs::read_to_string(runs_root.join("resume-context-run/prompts/02-analysis.prompt.md"))
@@ -495,6 +755,7 @@ fn provider_step_runner_persists_allowed_patch_policy_decision_without_apply() {
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -553,6 +814,7 @@ fn provider_step_runner_rejected_patch_fails_development_and_never_applies() {
     let provider = provider_for_development_patch(&patch);
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -614,6 +876,7 @@ fn provider_step_runner_replaces_stale_policy_decision_when_development_is_rerun
     ]);
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -660,6 +923,7 @@ fn provider_step_runner_human_review_patch_persists_without_failing_or_applying(
     let provider = provider_for_development_patch(&patch);
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -707,6 +971,7 @@ fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
     let setup_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut setup_patch_runner = RecordingPatchRunner::default();
     let mut setup_step_runner = ProviderStepRunner::new(&setup_provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(
             patch_gate_config(&repo, false, true),
             &mut setup_patch_runner,
@@ -734,6 +999,7 @@ fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner =
         LoopRunner::resume(&runs_root, "workspace-directory", &mut step_runner).expect("resume");
@@ -759,10 +1025,12 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
     let clean_runs_root = temp_dir.path().join("clean-runs");
     let dirty_runs_root = temp_dir.path().join("dirty-runs");
     std::fs::create_dir_all(&repo).expect("repo dir");
+    let apply_ticket = ticket_with_apply(true);
 
     let clean_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut clean_patch_runner = RecordingPatchRunner::default();
     let mut clean_step_runner = ProviderStepRunner::new(&clean_provider, "fake-model", 30_000)
+        .with_ticket(apply_ticket.clone())
         .with_patch_gate(
             patch_gate_config(&repo, true, true),
             &mut clean_patch_runner,
@@ -771,10 +1039,10 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
         LoopRunnerConfig::for_ticket(
             &clean_runs_root,
             "clean-apply-run",
-            &ticket_with_apply(true),
+            &apply_ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&apply_ticket),
         ),
         &mut clean_step_runner,
     )
@@ -797,6 +1065,7 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
     let dirty_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut dirty_patch_runner = RecordingPatchRunner::default();
     let mut dirty_step_runner = ProviderStepRunner::new(&dirty_provider, "fake-model", 30_000)
+        .with_ticket(apply_ticket.clone())
         .with_patch_gate(
             patch_gate_config(&repo, true, false),
             &mut dirty_patch_runner,
@@ -805,10 +1074,10 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
         LoopRunnerConfig::for_ticket(
             &dirty_runs_root,
             "dirty-apply-run",
-            &ticket_with_apply(true),
+            &apply_ticket,
             "fake-provider",
             "fake-model",
-            test_input_digests(),
+            test_input_digests_for(&apply_ticket),
         ),
         &mut dirty_step_runner,
     )
@@ -904,7 +1173,8 @@ fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
         Ok(model_response(&spec_writer_response())),
         Ok(model_response(reviewer_requested_changes)),
     ]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -931,6 +1201,13 @@ fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
         step_status(&persisted, LoopStepName::SpecReview),
         LoopStepStatus::Blocked
     );
+    let spec_review = persisted
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::SpecReview)
+        .expect("spec review record");
+    assert!(spec_review.artifact_path.is_some());
+    assert!(spec_review.artifact_digest.is_some());
     assert_file_contains(
         &run_dir.join("responses/04-spec-review.raw.txt"),
         "request_changes",
@@ -943,6 +1220,61 @@ fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
         &run_dir.join("log.md"),
         "finished step SpecReview as Blocked",
     );
+}
+
+#[test]
+fn provider_step_runner_persists_failed_early_role_artifact_without_advancing() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let rejected = json!({
+        "role": "spec_reviewer",
+        "decision": "reject",
+        "summary": "The proposed spec violates the ticket boundary.",
+        "blocking_issues": [{
+            "summary": "Forbidden scope",
+            "evidence": "The proposed spec changes a forbidden file."
+        }],
+        "non_blocking_issues": []
+    })
+    .to_string();
+    let provider = FakeProvider::new(vec![
+        Ok(model_response(fixture("research.valid.json"))),
+        Ok(model_response(fixture("analyzer.valid.json"))),
+        Ok(model_response(&spec_writer_response())),
+        Ok(model_response(&rejected)),
+    ]);
+    let mut step_runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "failed-early-artifact",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    loop_runner.run_to_completion().expect("run to rejection");
+    drop(loop_runner);
+
+    let persisted = read_run(&runs_root.join("failed-early-artifact"));
+    let review = persisted
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::SpecReview)
+        .expect("spec review record");
+    assert_eq!(review.status, LoopStepStatus::Failed);
+    assert!(review.artifact_path.is_some());
+    assert!(review.artifact_digest.is_some());
+    assert_eq!(persisted.status, LoopStatus::Failed);
+    assert_eq!(provider.requests().expect("provider requests").len(), 4);
+    assert!(!runs_root
+        .join("failed-early-artifact/prompts/05-development.prompt.md")
+        .exists());
 }
 
 #[test]
@@ -1184,11 +1516,225 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn test_input_digests() -> LoopInputDigests {
     LoopInputDigests {
-        ticket: "a".repeat(64),
+        ticket: canonical_sha256_digest(&ticket()).expect("default ticket digest"),
         policy: "b".repeat(64),
         config: "c".repeat(64),
         repository: "d".repeat(64),
     }
+}
+
+fn test_input_digests_for(ticket: &TicketSpec) -> LoopInputDigests {
+    LoopInputDigests {
+        ticket: canonical_sha256_digest(ticket).expect("ticket digest"),
+        ..test_input_digests()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResumeArtifactMutation {
+    Missing,
+    TamperedResponse,
+    NonCanonical,
+    WrongRun,
+    WrongRole,
+    WrongStep,
+    WrongDigest,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreparedTicketMismatch {
+    TicketId,
+    GoalId,
+    Digest,
+}
+
+fn assert_prepared_ticket_mismatch_fails_closed(mismatch: PreparedTicketMismatch) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let repo = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&runs_root).expect("runs root");
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn authority() {}\n").expect("source file");
+    let authoritative = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let mut supplied = authoritative.clone();
+    let mut input_digests = test_input_digests_for(&authoritative);
+    match mismatch {
+        PreparedTicketMismatch::TicketId => supplied.ticket_id = "substituted-ticket".to_string(),
+        PreparedTicketMismatch::GoalId => supplied.goal_id = "substituted-goal".to_string(),
+        PreparedTicketMismatch::Digest => input_digests.ticket = "f".repeat(64),
+    }
+    let before = read_tree_bytes(&runs_root);
+    let provider = FakeProvider::new(Vec::new());
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(supplied.clone())
+        .with_context_pack_request(context_request(&repo, &supplied, Vec::new()));
+    let run_id = format!("prepared-ticket-{mismatch:?}").to_ascii_lowercase();
+
+    let error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            &run_id,
+            &authoritative,
+            "fake-provider",
+            "fake-model",
+            input_digests,
+        ),
+        &mut step_runner,
+    )
+    .expect_err("substituted prepared ticket must fail closed");
+
+    let expected = match mismatch {
+        PreparedTicketMismatch::TicketId => "ticket_id mismatch",
+        PreparedTicketMismatch::GoalId => "goal_id mismatch",
+        PreparedTicketMismatch::Digest => "ticket digest mismatch",
+    };
+    assert!(
+        error.to_string().contains(expected),
+        "{mismatch:?}: {error}"
+    );
+    assert_eq!(read_tree_bytes(&runs_root), before);
+    assert!(provider.requests().expect("provider requests").is_empty());
+}
+
+fn assert_resume_artifact_rejected_without_mutation(mutation: ResumeArtifactMutation) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let repo = temp_dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("repo source directory");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn changed_context() {}\n")
+        .expect("repository context");
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let run_id = format!("resume-invalid-{mutation:?}").to_ascii_lowercase();
+    let start_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut start_runner =
+        ProviderStepRunner::new(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            &run_id,
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut start_runner,
+    )
+    .expect("start loop");
+    loop_runner.run_next_step().expect("research");
+    drop(loop_runner);
+
+    let run_dir = runs_root.join(&run_id);
+    let mut verified = read_run(&run_dir);
+    let record = verified
+        .steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::Research)
+        .expect("research record");
+    let artifact_path = record.artifact_path.clone().expect("artifact path");
+    let absolute_artifact_path = run_dir.join(&artifact_path);
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&absolute_artifact_path).expect("artifact bytes"))
+            .expect("artifact JSON");
+
+    match mutation {
+        ResumeArtifactMutation::Missing => {
+            std::fs::remove_file(&absolute_artifact_path).expect("remove artifact");
+        }
+        ResumeArtifactMutation::TamperedResponse => {
+            artifact["response"]["summary"] = json!("tampered validated response");
+            std::fs::write(
+                &absolute_artifact_path,
+                canonical_json_bytes(&artifact).expect("canonical artifact"),
+            )
+            .expect("write artifact");
+            record.artifact_digest =
+                Some(canonical_sha256_digest(&artifact).expect("rewritten outer artifact digest"));
+        }
+        ResumeArtifactMutation::NonCanonical => {
+            let mut bytes = canonical_json_bytes(&artifact).expect("canonical artifact");
+            bytes.push(b'\n');
+            std::fs::write(&absolute_artifact_path, bytes).expect("write noncanonical artifact");
+        }
+        ResumeArtifactMutation::WrongRun => {
+            artifact["run_id"] = json!("different-run");
+            rewrite_artifact_and_verified_digest(&absolute_artifact_path, &artifact, record);
+        }
+        ResumeArtifactMutation::WrongRole => {
+            artifact["role"] = json!(Role::Analyzer);
+            rewrite_artifact_and_verified_digest(&absolute_artifact_path, &artifact, record);
+        }
+        ResumeArtifactMutation::WrongStep => {
+            artifact["step"] = json!(LoopStepName::Analysis);
+            rewrite_artifact_and_verified_digest(&absolute_artifact_path, &artifact, record);
+        }
+        ResumeArtifactMutation::WrongDigest => {
+            record.artifact_digest = Some("f".repeat(64));
+        }
+    }
+
+    let before = read_tree_bytes(&run_dir);
+    let provider = FakeProvider::new(Vec::new());
+    let mut resume_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
+        .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
+    let error = LoopRunner::resume_verified(&runs_root, verified, &mut resume_runner)
+        .expect_err("invalid role artifact must reject resume");
+
+    assert!(
+        error.to_string().contains("role artifact") || error.to_string().contains("artifact"),
+        "{mutation:?} should report the artifact failure, got {error}"
+    );
+    assert_eq!(
+        read_tree_bytes(&run_dir),
+        before,
+        "{mutation:?} must not mutate any loop workspace file"
+    );
+    assert!(
+        provider.requests().expect("provider requests").is_empty(),
+        "{mutation:?} must fail before provider invocation"
+    );
+}
+
+fn rewrite_artifact_and_verified_digest(
+    path: &Path,
+    artifact: &serde_json::Value,
+    record: &mut seaf_core::LoopStepRecord,
+) {
+    std::fs::write(
+        path,
+        canonical_json_bytes(artifact).expect("canonical artifact"),
+    )
+    .expect("write artifact");
+    record.artifact_digest =
+        Some(canonical_sha256_digest(artifact).expect("rewritten outer artifact digest"));
+}
+
+fn read_tree_bytes(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, current: &Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+        let mut entries = std::fs::read_dir(current)
+            .expect("read tree")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("tree entries");
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .expect("relative path")
+                        .to_path_buf(),
+                    std::fs::read(path).expect("tree file"),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files
 }
 
 fn assert_file_contains(path: &Path, expected: &str) {

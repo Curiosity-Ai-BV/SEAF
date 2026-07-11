@@ -49,7 +49,11 @@ pub trait StepRunner {
         Ok(())
     }
 
-    fn prepare_run(&mut self, workspace: &LoopWorkspace, _run_id: &str) -> Result<(), RunnerError> {
+    fn prepare_run(
+        &mut self,
+        workspace: &LoopWorkspace,
+        _run: &LoopRun,
+    ) -> Result<(), RunnerError> {
         self.prepare_workspace(workspace)
     }
 
@@ -98,9 +102,6 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
 impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     pub fn start(config: LoopRunnerConfig, step_runner: &'a mut R) -> Result<Self, RunnerError> {
         let workspace = LoopWorkspace::create(&config.runs_root, &config.run_id)?;
-        if let Err(error) = step_runner.prepare_run(&workspace, &config.run_id) {
-            return Err(cleanup_failed_start_workspace(&workspace, error));
-        }
         let run = state::create_run(NewLoopRun {
             run_id: config.run_id,
             ticket_id: config.ticket_id,
@@ -109,6 +110,9 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             model: config.model,
             input_digests: config.input_digests,
         });
+        if let Err(error) = step_runner.prepare_run(&workspace, &run) {
+            return Err(cleanup_failed_start_workspace(&workspace, error));
+        }
         state::save_run(&workspace, &run)?;
         workspace.append_log("started run")?;
 
@@ -149,7 +153,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let next_attempt = state::next_runnable_step(&run)
             .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
             .transpose()?;
-        step_runner.prepare_run(&workspace, &run.run_id)?;
+        step_runner.prepare_run(&workspace, &run)?;
         workspace.append_log("resumed run")?;
 
         Ok(Self {
@@ -210,12 +214,21 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         write_step_response(&self.workspace, step, attempt, &output.response)?;
         validate_step_output(&output)?;
         append_policy_decisions(&mut self.run, self.step_runner.drain_policy_decisions()?)?;
-        let artifact_path = match &output.artifact {
-            Some(artifact) => Some(write_step_artifact(&self.workspace, step, artifact)?),
-            None => None,
+        let (artifact_path, artifact_digest) = match &output.artifact {
+            Some(artifact) => (
+                Some(write_step_artifact(&self.workspace, step, artifact)?),
+                Some(artifact.digest()),
+            ),
+            None => (None, None),
         };
 
-        state::finish_step(&mut self.run, step, output.status, artifact_path)?;
+        state::finish_step(
+            &mut self.run,
+            step,
+            output.status,
+            artifact_path,
+            artifact_digest,
+        )?;
         state::save_run(&self.workspace, &self.run)?;
         self.workspace
             .append_log(&format!("finished step {step:?} as {:?}", output.status))?;

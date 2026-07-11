@@ -1,6 +1,7 @@
 use std::fs;
 
 use seaf_core::LoopStepName;
+use sha2::{Digest, Sha256};
 
 use crate::{
     state::step_file_stem,
@@ -34,6 +35,10 @@ impl ArtifactContent {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn digest(&self) -> String {
+        hex::encode(Sha256::digest(&self.bytes))
     }
 }
 

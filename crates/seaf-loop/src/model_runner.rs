@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use seaf_core::{LoopStepName, LoopStepStatus, Policy, TicketSpec};
+use seaf_core::{
+    canonical_sha256_digest, LoopRun, LoopStepName, LoopStepStatus, Policy, TicketSpec,
+};
 use seaf_models::{ModelMessage, ModelMessageRole, ModelProvider, ModelRequest};
 
 use crate::{
@@ -13,7 +15,7 @@ use crate::{
     runner::{RunnerError, StepRunner},
     workspace::{LoopWorkspace, ARTIFACTS_DIR},
     AgentStatus, DeveloperResponse, DeveloperStatus, ReviewDecision, Role, RoleResponse,
-    StepOutput,
+    StepOutput, ValidatedRoleArtifact,
 };
 
 pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
@@ -22,6 +24,9 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     timeout_ms: u64,
     context_pack_request: Option<ContextPackRequest>,
     context_bundle: Option<ContextBundle>,
+    ticket: Option<TicketSpec>,
+    run: Option<LoopRun>,
+    early_artifacts: Vec<ValidatedRoleArtifact>,
     run_directory: Option<PathBuf>,
     run_id: Option<String>,
     patch_gate: Option<ProviderPatchGate<'a>>,
@@ -66,6 +71,9 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             timeout_ms,
             context_pack_request: None,
             context_bundle: None,
+            ticket: None,
+            run: None,
+            early_artifacts: Vec::new(),
             run_directory: None,
             run_id: None,
             patch_gate: None,
@@ -76,6 +84,11 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
 
     pub fn with_context_pack_request(mut self, request: ContextPackRequest) -> Self {
         self.context_pack_request = Some(request);
+        self
+    }
+
+    pub fn with_ticket(mut self, ticket: TicketSpec) -> Self {
+        self.ticket = Some(ticket);
         self
     }
 
@@ -161,8 +174,15 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         self.prepare_provider_workspace(workspace, None)
     }
 
-    fn prepare_run(&mut self, workspace: &LoopWorkspace, run_id: &str) -> Result<(), RunnerError> {
-        self.prepare_provider_workspace(workspace, Some(run_id))
+    fn prepare_run(&mut self, workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), RunnerError> {
+        let ticket = self.ticket.as_ref().ok_or_else(|| {
+            RunnerError::Step(
+                "prepared provider run requires the exact effective ticket".to_string(),
+            )
+        })?;
+        validate_prepared_ticket(ticket, run)?;
+        self.run = Some(run.clone());
+        self.prepare_provider_workspace(workspace, Some(&run.run_id))
     }
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
@@ -170,10 +190,10 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             return Ok(no_model_request(step));
         };
 
-        let request = self.model_request(
-            role,
-            role_step_prompt(step, role, self.context_bundle.as_ref()),
-        );
+        let user_prompt = self
+            .early_role_prompt(step, role)?
+            .unwrap_or_else(|| role_step_prompt(step, role, self.context_bundle.as_ref()));
+        let request = self.model_request(role, user_prompt);
         serde_json::to_string_pretty(&request).map_err(|error| {
             RunnerError::Step(format!(
                 "failed to serialize {step:?} model request: {error}"
@@ -264,9 +284,36 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             RoleResponse::Agent(_) | RoleResponse::Reviewer(_) => None,
         };
 
+        let artifact = if is_early_role_step(step) && self.ticket.is_some() {
+            let run_id = self.run_id.as_deref().ok_or_else(|| {
+                RunnerError::Step(format!(
+                    "{step:?} role artifact requires a prepared authoritative loop run"
+                ))
+            })?;
+            let artifact = ValidatedRoleArtifact::new(run_id, step, role, parsed.clone()).map_err(
+                |error| {
+                    RunnerError::Step(format!("failed to build {step:?} role artifact: {error}"))
+                },
+            )?;
+            let content = crate::ArtifactContent::new(
+                "json",
+                artifact.canonical_bytes().map_err(|error| {
+                    RunnerError::Step(format!(
+                        "failed to serialize {step:?} role artifact: {error}"
+                    ))
+                })?,
+            );
+            self.early_artifacts
+                .retain(|existing| existing.step != step);
+            self.early_artifacts.push(artifact);
+            Some(content)
+        } else {
+            None
+        };
+
         Ok(StepOutput {
             response,
-            artifact: None,
+            artifact,
             status: gated_status.unwrap_or(status),
         })
     }
@@ -280,15 +327,140 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     }
 }
 
+fn validate_prepared_ticket(ticket: &TicketSpec, run: &LoopRun) -> Result<(), RunnerError> {
+    if ticket.ticket_id != run.ticket_id {
+        return Err(RunnerError::Step(format!(
+            "effective ticket_id mismatch: expected {}, got {}",
+            run.ticket_id, ticket.ticket_id
+        )));
+    }
+    if ticket.goal_id != run.goal_id {
+        return Err(RunnerError::Step(format!(
+            "effective ticket goal_id mismatch: expected {}, got {}",
+            run.goal_id, ticket.goal_id
+        )));
+    }
+    let digest = canonical_sha256_digest(ticket).map_err(|error| {
+        RunnerError::Step(format!("failed to digest effective ticket: {error}"))
+    })?;
+    if digest != run.input_digests.ticket {
+        return Err(RunnerError::Step(format!(
+            "effective ticket digest mismatch: expected {}, got {digest}",
+            run.input_digests.ticket
+        )));
+    }
+    Ok(())
+}
+
 impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
+    fn early_role_prompt(
+        &self,
+        step: LoopStepName,
+        role: Role,
+    ) -> Result<Option<String>, RunnerError> {
+        if !matches!(
+            step,
+            LoopStepName::Research
+                | LoopStepName::Analysis
+                | LoopStepName::SpecCreation
+                | LoopStepName::SpecReview
+        ) {
+            return Ok(None);
+        }
+        let (Some(run), Some(ticket)) = (&self.run, &self.ticket) else {
+            return Ok(None);
+        };
+        let prerequisites = match step {
+            LoopStepName::Research => serde_json::json!({}),
+            LoopStepName::Analysis => serde_json::json!({
+                "research": self.required_early_response(LoopStepName::Research)?,
+            }),
+            LoopStepName::SpecCreation => serde_json::json!({
+                "research": self.required_early_response(LoopStepName::Research)?,
+                "analysis": self.required_early_response(LoopStepName::Analysis)?,
+            }),
+            LoopStepName::SpecReview => serde_json::json!({
+                "proposed_spec": self.required_early_response(LoopStepName::SpecCreation)?,
+            }),
+            LoopStepName::Development
+            | LoopStepName::OutputReview
+            | LoopStepName::Testing
+            | LoopStepName::EvalReport => unreachable!("non-early step returned above"),
+        };
+        let prompt = serde_json::json!({
+            "instructions": format!(
+                "Run the {step:?} loop step as the {}. Return only JSON matching the response schema.",
+                role.as_str()
+            ),
+            "run_id": run.run_id,
+            "input_digests": run.input_digests,
+            "ticket": ticket,
+            "prerequisites": prerequisites,
+            "repository_context": self.context_bundle.as_ref().map(context_prompt),
+        });
+        serde_json::to_string(&prompt).map(Some).map_err(|error| {
+            RunnerError::Step(format!("failed to serialize {step:?} role input: {error}"))
+        })
+    }
+
+    fn required_early_response(&self, step: LoopStepName) -> Result<&RoleResponse, RunnerError> {
+        self.early_artifacts
+            .iter()
+            .find(|artifact| artifact.step == step)
+            .map(|artifact| &artifact.response)
+            .ok_or_else(|| {
+                RunnerError::Step(format!(
+                    "missing validated {step:?} prerequisite for the next role request"
+                ))
+            })
+    }
+
     fn prepare_provider_workspace(
         &mut self,
         workspace: &LoopWorkspace,
         run_id: Option<&str>,
     ) -> Result<(), RunnerError> {
         self.context_bundle = None;
+        self.early_artifacts.clear();
         self.run_directory = Some(workspace.run_directory().to_path_buf());
         self.run_id = run_id.map(str::to_string);
+        if self.ticket.is_some() {
+            let run = self.run.as_ref().ok_or_else(|| {
+                RunnerError::Step("provider runner is missing authoritative loop state".to_string())
+            })?;
+            for (step, role) in early_step_roles() {
+                let record = run
+                    .steps
+                    .iter()
+                    .find(|record| record.name == step)
+                    .ok_or_else(|| RunnerError::Step(format!("loop state is missing {step:?}")))?;
+                if !matches!(
+                    record.status,
+                    LoopStepStatus::Completed
+                        | LoopStepStatus::Passed
+                        | LoopStepStatus::Blocked
+                        | LoopStepStatus::Failed
+                ) {
+                    continue;
+                }
+                let (Some(path), Some(digest)) = (
+                    record.artifact_path.as_deref(),
+                    record.artifact_digest.as_deref(),
+                ) else {
+                    return Err(RunnerError::Step(format!(
+                        "completed {step:?} step is missing its paired role artifact path and digest"
+                    )));
+                };
+                let artifact =
+                    ValidatedRoleArtifact::load(workspace, path, digest, &run.run_id, step, role)
+                        .map_err(|error| {
+                        RunnerError::Step(format!(
+                            "failed to verify {step:?} role artifact: {error}"
+                        ))
+                    })?;
+                self.early_artifacts.push(artifact);
+            }
+        }
         let Some(request) = &self.context_pack_request else {
             return Ok(());
         };
@@ -299,6 +471,25 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         self.context_bundle = Some(bundle);
         Ok(())
     }
+}
+
+fn is_early_role_step(step: LoopStepName) -> bool {
+    matches!(
+        step,
+        LoopStepName::Research
+            | LoopStepName::Analysis
+            | LoopStepName::SpecCreation
+            | LoopStepName::SpecReview
+    )
+}
+
+fn early_step_roles() -> [(LoopStepName, Role); 4] {
+    [
+        (LoopStepName::Research, Role::Researcher),
+        (LoopStepName::Analysis, Role::Analyzer),
+        (LoopStepName::SpecCreation, Role::SpecWriter),
+        (LoopStepName::SpecReview, Role::SpecReviewer),
+    ]
 }
 
 struct DirtyWorktreePatchRunner;
@@ -366,6 +557,12 @@ fn append_context_to_prompt(prompt: &mut String, context: &ContextBundle) {
             prompt.push('\n');
         }
     }
+}
+
+fn context_prompt(context: &ContextBundle) -> String {
+    let mut prompt = String::new();
+    append_context_to_prompt(&mut prompt, context);
+    prompt
 }
 
 fn status_for_response(response: &RoleResponse) -> LoopStepStatus {

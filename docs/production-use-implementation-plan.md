@@ -164,37 +164,84 @@ Docs/tracker: recovery contract and M1-02 status.
 
 Commit boundary: resume integrity only.
 
-### M1-03 - Validated Role Artifact Chain
+### M1-03a - Validated Early Role Artifact Chain
 
 Roadmap: U2. Dependencies: M1-02.
 
-Objective: make each role consume the ticket and the validated outputs it
-depends on.
+Status: complete on 2026-07-11. M1-03b is active.
+
+Objective: make research, analysis, spec creation, and spec review consume and
+persist their exact validated prerequisites.
 
 Acceptance criteria:
 
 - Role-specific request builders include the effective ticket/policy digests
   and only the necessary prior structured artifacts.
-- Research -> analysis -> spec -> spec review -> development -> output review
-  dataflow is explicit and persisted.
-- Output review receives the exact normalized candidate patch and policy
-  decision; missing or mismatched inputs fail closed.
+- Research receives the effective TicketSpec; analysis receives validated
+  research; spec creation receives validated research and analysis; spec review
+  receives the exact proposed spec.
+- Every parsed structured response is canonically persisted as a role artifact
+  with a digest before the next role request is built.
+- Resume loads and verifies required prior role artifacts; missing, tampered,
+  wrong-role, or wrong-run artifacts fail before provider calls or mutation.
 
 Likely seams: role DTOs/schemas, provider runner, artifacts, runner state, and
 provider-runner tests.
 
-RED: per-role request assertions and a reviewer-exact-patch mismatch test.
+RED: per-role request/artifact assertions plus missing/tampered/wrong-role resume
+tests.
 
 Verification: role/provider/runner suites, workspace tests, format, Clippy, and
 diff check.
 
-Docs/tracker: artifact-flow documentation and M1-03 status.
+Docs/tracker: early artifact-flow documentation and M1-03a status.
 
-Commit boundary: fixed role dataflow; no context expansion or eval execution.
+Commit boundary: research through spec-review dataflow only; developer/output
+review, context expansion, and eval execution remain excluded.
+
+Implemented flow: each early request carries the exact effective ticket, run
+ID, and all effective input digests. Its `prerequisites` object is limited to
+research for analysis, research plus analysis for spec creation, and the
+proposed spec for spec review. Canonical validated response envelopes bind the
+run, step, role, response digest, artifact path, and artifact digest. Resume
+revalidates canonical bytes, both digest layers, identity fields, and the
+role-specific response schema before context packing or any durable mutation.
+
+### M1-03b - Development And Exact Output Review Evidence
+
+Roadmap: U2. Dependencies: M1-03a.
+
+Objective: bind development and output review to the approved specification and
+the exact normalized policy-gated patch.
+
+Acceptance criteria:
+
+- Development receives the exact approved spec artifact and its digest.
+- The developer response is normalized and policy-gated once; the resulting
+  candidate patch, patch digest, and policy decision are canonically persisted.
+- Output review receives those exact persisted values, not initial repository
+  context or reparsed model text.
+- Missing, tampered, wrong-run, digest-mismatched, or substituted patch/policy
+  evidence fails before output-review provider calls or run mutation.
+- Resume verifies and reuses the same persisted development evidence.
+
+Likely seams: developer/reviewer DTOs, provider runner, patch gate artifacts,
+runner state, and provider/CLI tests.
+
+RED: approved-spec request, reviewer exact-patch/policy request, substitution,
+tamper, and resume regressions.
+
+Verification: role/provider/policy/runner suites plus Rust workspace and Docs
+gates.
+
+Docs/tracker: exact output-review evidence and M1-03b completion.
+
+Commit boundary: development/output-review dataflow only; no context expansion,
+candidate worktree, approval, or eval execution.
 
 ### M1-04 - Bounded Additional Context
 
-Roadmap: U2. Dependencies: M1-03.
+Roadmap: U2. Dependencies: M1-03b.
 
 Objective: allow a blocked role to request more repository context without
 gaining direct tools or bypassing exclusions.

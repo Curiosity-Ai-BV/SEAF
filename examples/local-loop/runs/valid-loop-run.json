@@ -18,7 +18,8 @@
     {
       "name": "research",
       "status": "passed",
-      "artifact_path": "01-research.md"
+      "artifact_path": "01-research.md",
+      "artifact_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     }
   ],
   "policy_decisions": [],

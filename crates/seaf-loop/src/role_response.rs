@@ -141,7 +141,8 @@ pub struct ReviewIssue {
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
 pub enum RoleResponse {
     Agent(AgentResponse),
     Developer(DeveloperResponse),

@@ -6,7 +6,8 @@ use std::{
 };
 
 use seaf_core::{
-    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepRecord, LoopStepStatus,
+    validate_loop_run, LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepRecord,
+    LoopStepStatus,
 };
 use serde_json::Value;
 
@@ -53,6 +54,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
                 name,
                 status: LoopStepStatus::Pending,
                 artifact_path: None,
+                artifact_digest: None,
             })
             .collect(),
         policy_decisions: Vec::<std::collections::BTreeMap<String, Value>>::new(),
@@ -67,7 +69,9 @@ pub fn load_run(workspace: &LoopWorkspace) -> Result<LoopRun, StateError> {
     }
 
     let content = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&content)?)
+    let run = serde_json::from_str(&content)?;
+    validate_run_integrity(&run)?;
+    Ok(run)
 }
 
 pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateError> {
@@ -75,6 +79,7 @@ pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateErr
 }
 
 pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
+    validate_run_integrity(run)?;
     let mut json = serde_json::to_vec_pretty(run)?;
     json.push(b'\n');
     fs::write(path, json)?;
@@ -107,14 +112,32 @@ pub fn finish_step(
     step: LoopStepName,
     status: LoopStepStatus,
     artifact_path: Option<String>,
+    artifact_digest: Option<String>,
 ) -> Result<(), StateError> {
     if !is_terminal_step_status(status) {
         return Err(StateError::NonTerminalStepStatus(status));
+    }
+    if artifact_path.is_some() != artifact_digest.is_some() {
+        return Err(StateError::InvalidRun(
+            "artifact path and digest must either both be present or both be absent".to_string(),
+        ));
+    }
+    if let Some(digest) = &artifact_digest {
+        if digest.len() != 64
+            || !digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        {
+            return Err(StateError::InvalidRun(
+                "artifact digest must be a lowercase 64-character SHA-256 digest".to_string(),
+            ));
+        }
     }
 
     let record = step_record_mut(run, step)?;
     record.status = status;
     record.artifact_path = artifact_path;
+    record.artifact_digest = artifact_digest;
     run.current_step = step;
 
     match status {
@@ -142,6 +165,7 @@ pub fn reset_from_step(run: &mut LoopRun, step: LoopStepName) -> Result<(), Stat
     for record in run.steps.iter_mut().skip(start) {
         record.status = LoopStepStatus::Pending;
         record.artifact_path = None;
+        record.artifact_digest = None;
     }
     run.current_step = step;
     run.status = LoopStatus::Pending;
@@ -205,11 +229,25 @@ fn now_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+fn validate_run_integrity(run: &LoopRun) -> Result<(), StateError> {
+    let errors = validate_loop_run(run);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let details = errors
+        .into_iter()
+        .map(|error| format!("{}: {}", error.field, error.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(StateError::InvalidRun(details))
+}
+
 #[derive(Debug)]
 pub enum StateError {
     MissingRunFile(PathBuf),
     UnknownStep(LoopStepName),
     NonTerminalStepStatus(LoopStepStatus),
+    InvalidRun(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -224,6 +262,7 @@ impl fmt::Display for StateError {
             Self::NonTerminalStepStatus(status) => {
                 write!(formatter, "step result must be terminal, got {status:?}")
             }
+            Self::InvalidRun(message) => write!(formatter, "invalid loop run state: {message}"),
             Self::Io(error) => write!(formatter, "run state I/O error: {error}"),
             Self::Json(error) => write!(formatter, "run state JSON error: {error}"),
         }

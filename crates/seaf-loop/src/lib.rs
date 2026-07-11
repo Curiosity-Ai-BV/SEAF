@@ -6,6 +6,7 @@ pub mod model_runner;
 pub mod patch;
 pub mod policy;
 pub mod policy_gate;
+pub mod role_artifact;
 pub mod role_response;
 pub mod runner;
 pub mod state;
@@ -28,6 +29,7 @@ pub use policy_gate::{
     gate_patch, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
     PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision, PolicyDecisionReason,
 };
+pub use role_artifact::ValidatedRoleArtifact;
 pub use role_response::{
     parse_role_response, parse_role_response_with_repair, AgentResponse, AgentStatus,
     DeveloperResponse, DeveloperStatus, Finding, ReviewDecision, ReviewIssue, ReviewerResponse,

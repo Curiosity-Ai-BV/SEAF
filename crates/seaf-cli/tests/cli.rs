@@ -4366,6 +4366,7 @@ fn mark_loop_run_pending_from_step(run_path: &Path, pending_from: &str) {
             step["status"] = serde_json::json!("pending");
             if let Some(object) = step.as_object_mut() {
                 object.remove("artifact_path");
+                object.remove("artifact_digest");
             }
         } else {
             step["status"] = serde_json::json!("completed");

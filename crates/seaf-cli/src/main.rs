@@ -1157,6 +1157,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     );
     let mut patch_runner = GitCommandRunner;
     let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_ticket(config.ticket.clone())
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
     let runs_root = config.runs_root;
@@ -1188,14 +1189,16 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
 ) -> Result<LoopRun, CliFailure> {
     let policy = config.policy;
     let context_request = provider_context_request(config.repository_root, config.ticket, policy);
-    let patch_gate_config = ProviderPatchGateConfig::for_ticket(
+    let mut patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
         config.ticket,
         policy.clone(),
         config.worktree_clean,
     );
+    patch_gate_config.apply_patch &= persisted_apply_authority(&verified_run);
     let mut patch_runner = GitCommandRunner;
     let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
+        .with_ticket(config.ticket.clone())
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
     let mut runner = LoopRunner::resume_verified(
@@ -1749,12 +1752,7 @@ fn resume_provider_ticket(
 ) -> Result<TicketSpec, CliFailure> {
     validate_resume_ticket_identity(run, ticket)?;
     compare_provider_ticket_snapshot(runs_root, run, ticket)?;
-    let has_apply_authority = persisted_apply_authority(run);
-    let mut ticket = ticket.clone();
-    if !has_apply_authority {
-        ticket.autonomy.apply_patch = false;
-    }
-    Ok(ticket)
+    Ok(ticket.clone())
 }
 
 fn validate_resume_ticket_identity(run: &LoopRun, ticket: &TicketSpec) -> Result<(), CliFailure> {

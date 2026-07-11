@@ -63,6 +63,12 @@ explicit or Git-root project authority, persist canonical effective inputs and
 repository identity, and verify them before an incomplete resume can mutate
 run state or contact the provider.
 
+M1-03a resolved the early-role half of workflow-integrity item 1: research,
+analysis, spec creation, and spec review now consume only their exact validated
+prerequisites and persist canonically verified run-bound artifacts. Development
+and output review still need the exact approved-spec and patch-evidence binding
+scheduled for M1-03b.
+
 ## Production-Use Acceptance Scenario
 
 This scenario is the release gate for the roadmap. A developer must be able to:

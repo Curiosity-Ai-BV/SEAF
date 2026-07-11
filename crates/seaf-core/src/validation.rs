@@ -389,6 +389,20 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
                 artifact_path,
             );
         }
+        if let Some(artifact_digest) = &step.artifact_digest {
+            let field = format!("steps[{index}].artifact_digest");
+            validate_lowercase_sha256_digest(&mut errors, &field, artifact_digest);
+        }
+        if step.artifact_path.is_some() != step.artifact_digest.is_some() {
+            errors.push(FieldError::new(
+                format!("steps[{index}].artifact_path"),
+                "artifact_path and artifact_digest must either both be present or both be absent",
+            ));
+            errors.push(FieldError::new(
+                format!("steps[{index}].artifact_digest"),
+                "artifact_path and artifact_digest must either both be present or both be absent",
+            ));
+        }
     }
 
     for (index, decision) in run.policy_decisions.iter().enumerate() {
@@ -1170,6 +1184,99 @@ unexpected_escape: true
         assert!(fields.contains(&"input_digests.policy"));
         assert!(fields.contains(&"input_digests.config"));
         assert!(fields.contains(&"input_digests.repository"));
+    }
+
+    #[test]
+    fn loop_run_requires_artifact_path_and_digest_as_an_integrity_pair() {
+        let mut run: LoopRun = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/local-loop/runs/valid-loop-run.json"
+        )))
+        .expect("valid loop run");
+        run.steps[0].artifact_digest = None;
+
+        let errors = validate_loop_run(&run);
+        let fields: Vec<&str> = errors.iter().map(|error| error.field.as_str()).collect();
+
+        assert!(fields.contains(&"steps[0].artifact_path"));
+        assert!(fields.contains(&"steps[0].artifact_digest"));
+
+        let mut reverse: LoopRun = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/local-loop/runs/valid-loop-run.json"
+        )))
+        .expect("valid loop run");
+        reverse.steps[0].artifact_path = None;
+        let reverse_errors = validate_loop_run(&reverse);
+        let reverse_fields: Vec<&str> = reverse_errors
+            .iter()
+            .map(|error| error.field.as_str())
+            .collect();
+        assert!(reverse_fields.contains(&"steps[0].artifact_path"));
+        assert!(reverse_fields.contains(&"steps[0].artifact_digest"));
+    }
+
+    #[test]
+    fn loop_run_rejects_malformed_artifact_digest() {
+        let mut run: LoopRun = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/local-loop/runs/valid-loop-run.json"
+        )))
+        .expect("valid loop run");
+        run.steps[0].artifact_digest = Some("sha256:not-canonical".to_string());
+
+        let errors = validate_loop_run(&run);
+
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "steps[0].artifact_digest"));
+    }
+
+    #[test]
+    fn loop_run_schema_rejects_string_null_artifact_pair_in_both_directions() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/loop-run.schema.json"))
+                .expect("loop run schema");
+        let step = &schema["properties"]["steps"]["items"];
+        let branches = step["oneOf"]
+            .as_array()
+            .expect("artifact integrity must use exclusive schema branches");
+
+        let paired_strings = branches
+            .iter()
+            .find(|branch| {
+                branch["properties"]["artifact_path"]["type"] == "string"
+                    && branch["properties"]["artifact_digest"]["type"] == "string"
+            })
+            .expect("schema branch requiring both artifact strings");
+        assert_eq!(
+            paired_strings["required"],
+            serde_json::json!(["artifact_path", "artifact_digest"]),
+            "a string path with null/absent digest and a string digest with null/absent path must both fail"
+        );
+
+        let paired_nulls = branches
+            .iter()
+            .find(|branch| {
+                branch["properties"]["artifact_path"]["type"] == "null"
+                    && branch["properties"]["artifact_digest"]["type"] == "null"
+            })
+            .expect("schema branch requiring both artifact nulls");
+        assert_eq!(
+            paired_nulls["required"],
+            serde_json::json!(["artifact_path", "artifact_digest"])
+        );
+
+        assert!(
+            branches.iter().any(|branch| {
+                branch["not"]["anyOf"]
+                    == serde_json::json!([
+                        { "required": ["artifact_path"] },
+                        { "required": ["artifact_digest"] }
+                    ])
+            }),
+            "schema must retain the valid both-absent representation"
+        );
     }
 
     #[test]

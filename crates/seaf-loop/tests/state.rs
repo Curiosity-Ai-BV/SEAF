@@ -8,10 +8,43 @@ use seaf_core::{
     TicketStatus,
 };
 use seaf_loop::{
-    state::{create_run, NewLoopRun},
+    state::{create_run, finish_step, NewLoopRun},
     ArtifactContent, ContextManifest, LoopRunner, LoopRunnerConfig, LoopWorkspace, StepOutput,
     StepRunner, UNTRUSTED_CONTEXT_MARKER,
 };
+
+#[test]
+fn state_finish_step_rejects_unpaired_or_malformed_artifact_integrity() {
+    let base = NewLoopRun {
+        run_id: "artifact-integrity".to_string(),
+        ticket_id: "P2-005".to_string(),
+        goal_id: "phase-2".to_string(),
+        provider: "fake-provider".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: test_input_digests(),
+    };
+    let mut unpaired = create_run(base.clone());
+    let error = finish_step(
+        &mut unpaired,
+        LoopStepName::Research,
+        LoopStepStatus::Completed,
+        Some("artifacts/01-research.json".to_string()),
+        None,
+    )
+    .expect_err("artifact path without digest must fail");
+    assert!(error.to_string().contains("artifact path and digest"));
+
+    let mut malformed = create_run(base);
+    let error = finish_step(
+        &mut malformed,
+        LoopStepName::Research,
+        LoopStepStatus::Completed,
+        Some("artifacts/01-research.json".to_string()),
+        Some("not-a-digest".to_string()),
+    )
+    .expect_err("malformed artifact digest must fail");
+    assert!(error.to_string().contains("artifact digest"));
+}
 
 #[test]
 fn state_creation_preserves_exact_effective_input_digests() {
@@ -743,7 +776,7 @@ impl StepRunner for RecordingStepRunner {
     fn prepare_run(
         &mut self,
         _workspace: &LoopWorkspace,
-        _run_id: &str,
+        _run: &LoopRun,
     ) -> Result<(), seaf_loop::RunnerError> {
         self.prepare_calls += 1;
         Ok(())

@@ -81,8 +81,41 @@
           },
           "artifact_path": {
             "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+          },
+          "artifact_digest": {
+            "anyOf": [
+              { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              { "type": "null" }
+            ]
           }
         },
+        "oneOf": [
+          {
+            "required": ["artifact_path", "artifact_digest"],
+            "properties": {
+              "artifact_path": { "type": "string", "minLength": 1 },
+              "artifact_digest": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          },
+          {
+            "required": ["artifact_path", "artifact_digest"],
+            "properties": {
+              "artifact_path": { "type": "null" },
+              "artifact_digest": { "type": "null" }
+            }
+          },
+          {
+            "not": {
+              "anyOf": [
+                { "required": ["artifact_path"] },
+                { "required": ["artifact_digest"] }
+              ]
+            }
+          }
+        ],
         "additionalProperties": false
       }
     },
