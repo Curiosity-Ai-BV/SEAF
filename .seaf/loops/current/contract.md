@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-04 - Bounded additional context.
+M1-04b - Bounded context expansion orchestration.

@@ -1,7 +1,11 @@
-use std::{error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+pub const MAX_CONTEXT_REQUEST_PATHS: usize = 8;
+/// Reasons are bounded to 1,024 Unicode scalar values to keep response DTOs small.
+pub const MAX_CONTEXT_REQUEST_REASON_CHARS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +98,34 @@ pub enum ReviewDecision {
     Reject,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextRequest {
+    pub paths: Vec<String>,
+    pub reason: String,
+}
+
+impl<'de> Deserialize<'de> for ContextRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawContextRequest {
+            paths: Vec<String>,
+            reason: String,
+        }
+
+        let request = RawContextRequest::deserialize(deserializer)?;
+        validate_context_request(&request.paths, &request.reason)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            paths: request.paths,
+            reason: request.reason,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResponse {
@@ -103,6 +135,8 @@ pub struct AgentResponse {
     pub findings: Vec<Finding>,
     pub risks: Vec<String>,
     pub next_step_recommendation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ContextRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +156,8 @@ pub struct DeveloperResponse {
     pub requires_human_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ContextRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +229,8 @@ pub enum RoleResponseError {
     RoleMismatch { expected: Role, actual: Role },
     DeveloperPatchMissing,
     DeveloperPatchOutsidePatchField,
+    ContextRequestMissing,
+    ContextRequestUnexpected,
 }
 
 impl RoleResponseError {
@@ -222,6 +260,11 @@ impl fmt::Display for RoleResponseError {
             Self::DeveloperPatchOutsidePatchField => formatter.write_str(
                 "invalid role response: unified diff content must appear only in the patch field",
             ),
+            Self::ContextRequestMissing => formatter
+                .write_str("invalid role response: needs_context status requires context_request"),
+            Self::ContextRequestUnexpected => formatter.write_str(
+                "invalid role response: context_request is only allowed for needs_context status",
+            ),
         }
     }
 }
@@ -231,6 +274,7 @@ impl Error for RoleResponseError {}
 fn parse_agent_response(role: Role, value: Value) -> Result<RoleResponse, RoleResponseError> {
     let response: AgentResponse = serde_json::from_value(value).map_err(invalid_schema_error)?;
     ensure_role(role, response.role)?;
+    ensure_agent_context_request(response.status, response.context_request.as_ref())?;
     Ok(RoleResponse::Agent(response))
 }
 
@@ -243,6 +287,7 @@ fn parse_developer_response(role: Role, value: Value) -> Result<RoleResponse, Ro
         serde_json::from_value(value).map_err(invalid_schema_error)?;
     ensure_role(role, response.role)?;
     ensure_developer_patch(response.status, response.patch.as_deref())?;
+    ensure_developer_context_request(response.status, response.context_request.as_ref())?;
     Ok(RoleResponse::Developer(response))
 }
 
@@ -277,6 +322,81 @@ fn ensure_developer_patch(
         },
         DeveloperStatus::Blocked | DeveloperStatus::NeedsContext => Ok(()),
     }
+}
+
+fn ensure_agent_context_request(
+    status: AgentStatus,
+    request: Option<&ContextRequest>,
+) -> Result<(), RoleResponseError> {
+    ensure_context_request_presence(status == AgentStatus::NeedsContext, request.is_some())
+}
+
+fn ensure_developer_context_request(
+    status: DeveloperStatus,
+    request: Option<&ContextRequest>,
+) -> Result<(), RoleResponseError> {
+    ensure_context_request_presence(status == DeveloperStatus::NeedsContext, request.is_some())
+}
+
+fn ensure_context_request_presence(required: bool, present: bool) -> Result<(), RoleResponseError> {
+    match (required, present) {
+        (true, false) => Err(RoleResponseError::ContextRequestMissing),
+        (false, true) => Err(RoleResponseError::ContextRequestUnexpected),
+        (true, true) | (false, false) => Ok(()),
+    }
+}
+
+fn validate_context_request(paths: &[String], reason: &str) -> Result<(), &'static str> {
+    if paths.is_empty() || paths.len() > MAX_CONTEXT_REQUEST_PATHS {
+        return Err("context_request.paths must contain between 1 and 8 paths");
+    }
+
+    let mut normalized_paths = HashSet::with_capacity(paths.len());
+    for path in paths {
+        let normalized = normalized_context_path(path)?;
+        if !normalized_paths.insert(normalized) {
+            return Err("context_request.paths must not contain duplicate paths");
+        }
+    }
+
+    if reason.trim().is_empty() {
+        return Err("context_request.reason must not be empty");
+    }
+    if reason.chars().any(char::is_control) {
+        return Err("context_request.reason must not contain control characters");
+    }
+    if reason.chars().count() > MAX_CONTEXT_REQUEST_REASON_CHARS {
+        return Err("context_request.reason must not exceed 1024 characters");
+    }
+
+    Ok(())
+}
+
+fn normalized_context_path(path: &str) -> Result<String, &'static str> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return Err("context_request paths must be normalized repository-relative paths");
+    }
+    if path.chars().any(char::is_control) {
+        return Err("context_request paths must not contain control characters");
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err("context_request paths must be normalized repository-relative paths");
+    }
+
+    let components: Vec<&str> = path.split('/').collect();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Err("context_request paths must not contain empty or traversal segments");
+    }
+
+    let normalized = components.join("/");
+    if normalized != path {
+        return Err("context_request paths must already be normalized");
+    }
+    Ok(normalized)
 }
 
 fn contains_diff_outside_patch_field(value: &Value) -> bool {
@@ -339,8 +459,10 @@ fn common_agent_schema(role: Role) -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "next_step_recommendation": { "type": "string" }
-        }
+            "next_step_recommendation": { "type": "string" },
+            "context_request": context_request_schema()
+        },
+        "allOf": [context_request_presence_schema()]
     })
 }
 
@@ -367,8 +489,10 @@ fn developer_schema(role: Role) -> Value {
                 "items": { "type": "string" }
             },
             "requires_human_review": { "type": "boolean" },
-            "patch": { "type": "string" }
-        }
+            "patch": { "type": "string" },
+            "context_request": context_request_schema()
+        },
+        "allOf": [context_request_presence_schema()]
     })
 }
 
@@ -404,6 +528,43 @@ fn reviewer_schema(role: Role) -> Value {
                 "items": review_issue_schema()
             }
         }
+    })
+}
+
+fn context_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["paths", "reason"],
+        "properties": {
+            "paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_CONTEXT_REQUEST_PATHS,
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "pattern": r"^(?!/)(?![A-Za-z]:)(?!\.{1,2}(?:/|$))(?!.*\/\.{1,2}(?:/|$))(?!.*//)(?!.*[\\\u0000-\u001F\u007F-\u009F])[^/]+(?:/[^/]+)*$"
+                }
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_CONTEXT_REQUEST_REASON_CHARS,
+                "pattern": r"^(?=.*\S)[^\u0000-\u001F\u007F-\u009F]*$"
+            }
+        }
+    })
+}
+
+fn context_request_presence_schema() -> Value {
+    json!({
+        "if": {
+            "properties": { "status": { "const": "needs_context" } },
+            "required": ["status"]
+        },
+        "then": { "required": ["context_request"] },
+        "else": { "not": { "required": ["context_request"] } }
     })
 }
 

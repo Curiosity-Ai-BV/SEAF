@@ -12,7 +12,8 @@
 - [x] M1-02: Resume configuration integrity.
 - [x] M1-03a: Validated early role artifact chain.
 - [x] M1-03b: Development and exact output-review evidence.
-- [ ] M1-04: Bounded additional context (active).
+- [x] M1-04a: Context request contract.
+- [ ] M1-04b: Bounded context expansion orchestration (active).
 - [ ] M1-05: Isolated candidate workspace.
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
@@ -43,5 +44,5 @@
 
 ## Current Gate
 
-M1-03b is complete. M1-04 is the next dependency-ready slice. Milestone 1
-remains active; bounded additional context is not yet implemented.
+M1-04a is complete. M1-04b is the next dependency-ready slice. Milestone 1
+remains active; context expansion orchestration is not yet implemented.

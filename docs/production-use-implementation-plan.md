@@ -211,7 +211,7 @@ role-specific response schema before context packing or any durable mutation.
 
 Roadmap: U2. Dependencies: M1-03a.
 
-Status: complete on 2026-07-11. M1-04 is active.
+Status: complete on 2026-07-11. M1-04a is complete and M1-04b is active.
 
 Objective: bind development and output review to the approved specification and
 the exact normalized policy-gated patch.
@@ -257,35 +257,85 @@ gating is proposal-only: `apply_requested` preserves ticket intent, while
 `applied` remains false and the source checkout is never modified before the
 M1-05 isolated candidate workspace exists.
 
-### M1-04 - Bounded Additional Context
+### M1-04a - Context Request Contract
 
 Roadmap: U2. Dependencies: M1-03b.
 
-Objective: allow a blocked role to request more repository context without
-gaining direct tools or bypassing exclusions.
+Status: complete on 2026-07-11. M1-04b is active.
+
+Objective: define a strict structured request for additional repository context
+without granting model tools.
 
 Acceptance criteria:
 
-- A schema-validated request names additional paths and a reason.
-- The orchestrator reuses existing path, secret, forbidden, symlink, and byte
-  limits, records a new manifest, and caps request rounds.
-- Unsafe, duplicate, or excessive requests fail or block deterministically.
+- A typed ContextRequest names a bounded nonempty list of safe relative paths
+  and a nonempty reason, denying unknown fields. Requests contain 1-8 unique
+  normalized repository-relative paths, and reasons are capped at 1,024
+  Unicode scalar values.
+- Agent and Developer responses require exactly one ContextRequest when status
+  is `needs_context` and forbid it for passed/blocked/patch-proposed statuses.
+- Role response JSON schemas and runtime validation agree on presence,
+  cardinality, duplicate, absolute/traversal/backslash/control-character, and
+  empty-reason rules.
 
-Likely seams: role responses, context packer, provider runner, artifacts, and
-focused tests.
+Likely seams: role response DTOs/parsers/schemas, fixtures, and focused tests.
 
-RED: safe expansion, forbidden path, symlink escape, byte cap, and round-cap
-tests.
+RED: valid needs-context plus missing/unexpected request, unsafe/duplicate/path
+count, empty reason, and schema parity tests.
 
-Verification: context/role/provider suites, format, Clippy, and diff check.
+Verification: role response suites plus Rust workspace and Docs gates.
 
-Docs/tracker: context-expansion limits and M1-04 status.
+Docs/tracker: request contract and M1-04a status.
 
-Commit boundary: context-request protocol only.
+Commit boundary: response contract/schema only; no repacking, retry, provider
+round, or manifest behavior.
+
+Implemented flow: Researcher, Analyzer, SpecWriter, and Developer responses now
+carry an optional typed ContextRequest. Runtime validation and their handcrafted
+schemas require it only for `needs_context`, reject missing or unexpected
+requests, and agree on path count, uniqueness, normalized relative path,
+control-character, reason, and unknown-field constraints. Reviewer responses
+remain unchanged. The ProviderStepRunner retains the existing single-round
+semantics: a validated `needs_context` response still blocks without repacking
+or retrying until M1-04b.
+
+### M1-04b - Bounded Context Expansion Orchestration
+
+Roadmap: U2. Dependencies: M1-04a.
+
+Objective: satisfy validated ContextRequests through the orchestrator without
+direct model tools or safety-boundary bypass.
+
+Acceptance criteria:
+
+- The orchestrator reuses existing forbidden/secret/symlink/path and per-file/
+  total-byte limits for every requested path.
+- Safe additional files produce a new canonical, digest-bound context manifest
+  and a separately audited provider request/response round for the same role.
+- Previously loaded files are not duplicated; unsafe, duplicate-only,
+  unavailable, or excessive requests fail or block deterministically.
+- Per-step and per-run round caps prevent loops; resume reconstructs verified
+  context rounds and cannot reset caps or substitute manifests.
+- Every additional provider exchange is persisted before another call, and
+  failure leaves run state/evidence consistent.
+
+Likely seams: context packer, ProviderStepRunner, request/response artifacts,
+run state, and provider/CLI resume tests.
+
+RED: safe expansion, forbidden/symlink escape, byte cap, duplicate-only,
+round-cap, audited exchanges, manifest tamper, and resume-cap tests.
+
+Verification: context/provider/state/CLI suites plus Rust workspace and Docs
+gates.
+
+Docs/tracker: context rounds/limits and M1-04b completion.
+
+Commit boundary: bounded expansion orchestration only; no candidate workspace,
+approval, eval, or promotion.
 
 ### M1-05 - Isolated Candidate Workspace
 
-Roadmap: U3. Dependencies: M1-04.
+Roadmap: U3. Dependencies: M1-04b.
 
 Objective: apply and inspect the candidate outside the user's source checkout.
 

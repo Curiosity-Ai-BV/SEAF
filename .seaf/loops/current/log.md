@@ -663,3 +663,33 @@ Verification passed: all 38 focused provider-runner tests, all 13 generic
 policy-gate tests, `cargo fmt --all -- --check`, locked all-target and
 all-feature Clippy with warnings denied, all 235 locked Rust workspace tests,
 `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 implement | M1-04a context request contract
+
+RED added a valid Researcher `needs_context` fixture carrying a structured
+request and a missing-request rejection. The focused parser test failed because
+`context_request` was an unknown field. The expanded RED corpus then covered
+agent and developer presence invariants, empty/too-many/duplicate paths,
+absolute/current/parent/traversal/backslash/control paths, empty/control/large
+reasons, unknown request fields, and unexpected requests on non-needs statuses.
+
+GREEN adds the typed ContextRequest to AgentResponse and DeveloperResponse,
+omitted when absent. Deserialization denies unknown request fields and accepts
+only 1-8 unique, already-normalized repository-relative paths. Absolute paths,
+Windows prefixes, empty/current/parent segments, backslashes, and control
+characters fail closed. Reasons must be nonempty after trimming, control-free,
+and at most 1,024 Unicode scalar values. Runtime status checks require the
+request only for `needs_context`; the existing developer patch invariant is
+unchanged.
+
+Researcher, Analyzer, SpecWriter, and Developer schemas carry the same request
+shape, bounds, patterns, and status-dependent presence rule. Reviewer schemas
+remain unchanged. Schema-invalid JSON remains non-repairable. Provider behavior
+also remains unchanged: a validated needs-context response persists and blocks,
+without context repacking, retries, extra provider rounds, or manifests.
+
+Verification passed: 13 focused role-response tests, 38 focused provider-runner
+tests, `cargo fmt --all -- --check`, locked all-target and all-feature Clippy
+with warnings denied, all 239 locked Rust workspace tests, `corepack pnpm
+format:check`, and `git diff --check`. M1-04a is complete and M1-04b bounded
+context expansion orchestration is active.

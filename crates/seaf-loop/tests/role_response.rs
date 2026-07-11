@@ -17,6 +17,12 @@ fn fixture(name: &str) -> &'static str {
                 "/../../fixtures/model-responses/research.invalid_missing_status.json"
             ))
         }
+        "research.valid_needs_context.json" => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/model-responses/research.valid_needs_context.json"
+            ))
+        }
         "analyzer.valid.json" => {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -57,6 +63,18 @@ fn fixture(name: &str) -> &'static str {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../fixtures/model-responses/development.valid_patch.json"
+            ))
+        }
+        "development.valid_needs_context.json" => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/model-responses/development.valid_needs_context.json"
+            ))
+        }
+        "development.invalid_needs_context_missing_request.json" => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/model-responses/development.invalid_needs_context_missing_request.json"
             ))
         }
         "development.invalid_markdown_only.txt" => {
@@ -142,6 +160,262 @@ fn role_response_common_roles_reject_invalid_fixtures() {
 }
 
 #[test]
+fn role_response_needs_context_requires_one_structured_request() {
+    for (role, name) in [
+        (Role::Researcher, "research.valid_needs_context.json"),
+        (Role::Developer, "development.valid_needs_context.json"),
+    ] {
+        let parsed =
+            parse_role_response(role, fixture(name)).expect("valid needs-context response");
+        assert!(matches!(
+            parsed,
+            RoleResponse::Agent(_) | RoleResponse::Developer(_)
+        ));
+    }
+
+    let missing_request = r#"{
+        "role": "researcher",
+        "status": "needs_context",
+        "summary": "The current evidence does not establish the policy boundary.",
+        "findings": [],
+        "risks": [],
+        "next_step_recommendation": "Load the policy module."
+    }"#;
+    assert!(parse_role_response(Role::Researcher, missing_request).is_err());
+    assert!(parse_role_response(
+        Role::Developer,
+        fixture("development.invalid_needs_context_missing_request.json")
+    )
+    .is_err());
+}
+
+#[test]
+fn context_request_schema_and_runtime_reject_the_same_invalid_contracts() {
+    let valid_request = serde_json::json!({
+        "paths": ["crates/seaf-loop/src/policy.rs"],
+        "reason": "The policy normalizer defines the repository path boundary."
+    });
+
+    let invalid_requests = [
+        (
+            "empty paths",
+            serde_json::json!({ "paths": [], "reason": "Needed." }),
+        ),
+        (
+            "too many paths",
+            serde_json::json!({
+                "paths": (0..9).map(|index| format!("docs/{index}.md")).collect::<Vec<_>>(),
+                "reason": "Needed."
+            }),
+        ),
+        (
+            "duplicate paths",
+            serde_json::json!({ "paths": ["docs/a.md", "docs/a.md"], "reason": "Needed." }),
+        ),
+        (
+            "absolute path",
+            serde_json::json!({ "paths": ["/etc/passwd"], "reason": "Needed." }),
+        ),
+        (
+            "current directory path",
+            serde_json::json!({ "paths": ["."], "reason": "Needed." }),
+        ),
+        (
+            "parent directory path",
+            serde_json::json!({ "paths": [".."], "reason": "Needed." }),
+        ),
+        (
+            "traversal path",
+            serde_json::json!({ "paths": ["docs/../secret.md"], "reason": "Needed." }),
+        ),
+        (
+            "backslash path",
+            serde_json::json!({ "paths": ["docs\\secret.md"], "reason": "Needed." }),
+        ),
+        (
+            "control path",
+            serde_json::json!({ "paths": ["docs/\u{0}secret.md"], "reason": "Needed." }),
+        ),
+        (
+            "empty reason",
+            serde_json::json!({ "paths": ["docs/a.md"], "reason": " \t " }),
+        ),
+        (
+            "control reason",
+            serde_json::json!({ "paths": ["docs/a.md"], "reason": "Need\nthis." }),
+        ),
+        (
+            "oversized reason",
+            serde_json::json!({ "paths": ["docs/a.md"], "reason": "x".repeat(1025) }),
+        ),
+        (
+            "unknown request field",
+            serde_json::json!({
+                "paths": ["docs/a.md"],
+                "reason": "Needed.",
+                "extra": true
+            }),
+        ),
+    ];
+
+    for role in [
+        Role::Researcher,
+        Role::Analyzer,
+        Role::SpecWriter,
+        Role::Developer,
+    ] {
+        assert_context_request_schema_contract(role);
+        assert_runtime(
+            role,
+            needs_context_response(role, Some(valid_request.clone())),
+            true,
+        );
+
+        for (case, request) in &invalid_requests {
+            assert_runtime(
+                role,
+                needs_context_response(role, Some(request.clone())),
+                false,
+            );
+            assert!(
+                parse_role_response(
+                    role,
+                    &needs_context_response(role, Some(request.clone())).to_string()
+                )
+                .is_err(),
+                "{role:?} runtime accepted {case}"
+            );
+        }
+
+        assert_runtime(role, needs_context_response(role, None), false);
+    }
+}
+
+#[test]
+fn context_request_schema_and_runtime_forbid_requests_on_other_statuses() {
+    let request = serde_json::json!({
+        "paths": ["docs/agent-loop.md"],
+        "reason": "Needed."
+    });
+
+    for (role, status) in [
+        (Role::Researcher, "passed"),
+        (Role::Researcher, "blocked"),
+        (Role::Analyzer, "passed"),
+        (Role::SpecWriter, "blocked"),
+        (Role::Developer, "patch_proposed"),
+        (Role::Developer, "blocked"),
+    ] {
+        let mut response = response_for_status(role, status);
+        response["context_request"] = request.clone();
+        assert_runtime(role, response, false);
+    }
+}
+
+#[test]
+fn context_request_schema_errors_are_not_repairable() {
+    let mut repairs = 0;
+    let invalid = needs_context_response(
+        Role::Researcher,
+        Some(serde_json::json!({ "paths": [], "reason": "Needed." })),
+    );
+
+    assert!(
+        parse_role_response_with_repair(Role::Researcher, &invalid.to_string(), |_| {
+            repairs += 1;
+            fixture("research.valid_needs_context.json").to_string()
+        })
+        .is_err()
+    );
+    assert_eq!(repairs, 0);
+}
+
+fn assert_runtime(role: Role, response: serde_json::Value, expected_valid: bool) {
+    assert_eq!(
+        parse_role_response(role, &response.to_string()).is_ok(),
+        expected_valid,
+        "{role:?} runtime parity mismatch for {response}"
+    );
+}
+
+fn assert_context_request_schema_contract(role: Role) {
+    let schema = role.response_schema();
+    let request = &schema["properties"]["context_request"];
+    assert_eq!(request["type"], "object");
+    assert_eq!(request["additionalProperties"], false);
+    assert_eq!(request["required"], serde_json::json!(["paths", "reason"]));
+    assert_eq!(request["properties"]["paths"]["type"], "array");
+    assert_eq!(request["properties"]["paths"]["minItems"], 1);
+    assert_eq!(request["properties"]["paths"]["maxItems"], 8);
+    assert_eq!(request["properties"]["paths"]["uniqueItems"], true);
+    assert_eq!(request["properties"]["paths"]["items"]["type"], "string");
+    assert_eq!(
+        request["properties"]["paths"]["items"]["pattern"],
+        r"^(?!/)(?![A-Za-z]:)(?!\.{1,2}(?:/|$))(?!.*\/\.{1,2}(?:/|$))(?!.*//)(?!.*[\\\u0000-\u001F\u007F-\u009F])[^/]+(?:/[^/]+)*$"
+    );
+    assert_eq!(request["properties"]["reason"]["type"], "string");
+    assert_eq!(request["properties"]["reason"]["minLength"], 1);
+    assert_eq!(request["properties"]["reason"]["maxLength"], 1024);
+    assert_eq!(
+        request["properties"]["reason"]["pattern"],
+        r"^(?=.*\S)[^\u0000-\u001F\u007F-\u009F]*$"
+    );
+    assert_eq!(
+        schema["allOf"],
+        serde_json::json!([{
+            "if": {
+                "properties": { "status": { "const": "needs_context" } },
+                "required": ["status"]
+            },
+            "then": { "required": ["context_request"] },
+            "else": { "not": { "required": ["context_request"] } }
+        }])
+    );
+}
+
+fn needs_context_response(
+    role: Role,
+    context_request: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut response = response_for_status(role, "needs_context");
+    if let Some(context_request) = context_request {
+        response["context_request"] = context_request;
+    }
+    response
+}
+
+fn response_for_status(role: Role, status: &str) -> serde_json::Value {
+    match role {
+        Role::Researcher | Role::Analyzer | Role::SpecWriter => serde_json::json!({
+            "role": role.as_str(),
+            "status": status,
+            "summary": "Summary.",
+            "findings": [],
+            "risks": [],
+            "next_step_recommendation": "Continue."
+        }),
+        Role::Developer => {
+            let mut response = serde_json::json!({
+                "role": role.as_str(),
+                "status": status,
+                "summary": "Summary.",
+                "changed_files": [],
+                "requires_human_review": true
+            });
+            if status == "patch_proposed" {
+                response["patch"] = serde_json::Value::String(
+                    "diff --git a/docs/a.md b/docs/a.md\n--- a/docs/a.md\n+++ b/docs/a.md\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                );
+            }
+            response
+        }
+        Role::SpecReviewer | Role::OutputReviewer => {
+            unreachable!("reviewers do not request context")
+        }
+    }
+}
+
+#[test]
 fn role_response_developer_requires_patch_field_and_rejects_markdown() {
     let parsed = parse_role_response(Role::Developer, fixture("development.valid_patch.json"))
         .expect("valid developer patch response");
@@ -192,7 +466,11 @@ fn role_response_developer_patch_requirement_depends_on_status() {
         "summary": "Need the exact approved implementation spec.",
         "changed_files": [],
         "requires_human_review": true,
-        "patch": ""
+        "patch": "",
+        "context_request": {
+            "paths": ["docs/approved-spec.md"],
+            "reason": "The exact approved implementation spec is required."
+        }
     }"#;
     let needs_context = parse_role_response(Role::Developer, needs_context_empty_patch)
         .expect("needs-context developer response should allow empty patch");

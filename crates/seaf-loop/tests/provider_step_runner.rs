@@ -851,14 +851,20 @@ fn blocked_and_needs_context_development_artifacts_persist_without_policy_eviden
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runs_root = temp_dir.path().join("runs");
         let run_id = format!("development-{status}");
-        let developer_response = json!({
+        let mut developer_response = json!({
             "role": "developer",
             "status": status,
             "summary": "Development cannot safely propose a patch.",
             "changed_files": [],
             "requires_human_review": false
-        })
-        .to_string();
+        });
+        if status == "needs_context" {
+            developer_response["context_request"] = json!({
+                "paths": ["crates/seaf-loop/src/policy.rs"],
+                "reason": "The path policy is required before proposing a patch."
+            });
+        }
+        let developer_response = developer_response.to_string();
         let provider = FakeProvider::new(vec![
             Ok(model_response(fixture("research.valid.json"))),
             Ok(model_response(fixture("analyzer.valid.json"))),

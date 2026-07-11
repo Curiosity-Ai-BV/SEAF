@@ -1,0 +1,11 @@
+{
+  "role": "developer",
+  "status": "needs_context",
+  "summary": "The approved spec references a policy helper that is not in the current context.",
+  "changed_files": [],
+  "requires_human_review": true,
+  "context_request": {
+    "paths": ["crates/seaf-loop/src/policy.rs"],
+    "reason": "The patch must reuse the existing path normalization behavior."
+  }
+}

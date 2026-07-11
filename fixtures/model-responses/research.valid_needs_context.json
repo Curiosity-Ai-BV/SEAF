@@ -1,0 +1,12 @@
+{
+  "role": "researcher",
+  "status": "needs_context",
+  "summary": "The current evidence does not establish the policy boundary.",
+  "findings": [],
+  "risks": [],
+  "next_step_recommendation": "Load the policy module.",
+  "context_request": {
+    "paths": ["crates/seaf-loop/src/policy.rs"],
+    "reason": "The policy normalizer defines the repository path boundary."
+  }
+}
