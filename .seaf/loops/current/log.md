@@ -748,3 +748,117 @@ and eight-per-run caps span all attempts; legacy calls consume zero expansion
 rounds. Flat names are required because the existing workspace validator
 intentionally accepts only regular child files in its audit directories.
 M1-04b1 is active.
+
+## 2026-07-11 implement | M1-04b1 additive context expansion artifact
+
+RED introduced a focused integration suite before the production API existed.
+`cargo test -p seaf-loop --test context_expansion` failed with E0432 for the
+missing expansion create/load/reconstruct functions and types. The tests bound
+safe single/multi-file ordering, already-loaded handling, strict atomic denial,
+cumulative UTF-8 truncation, immutable initial-request authority, prior-byte
+reconstruction, create-only collisions, layout symlinks, and tamper rejection.
+
+GREEN adds a standalone version-1 canonical expansion primitive and codec. It
+normalizes semantically unordered paths, enforces default/ticket/policy and
+repository/symlink/UTF-8/byte controls before writing, and persists exact new
+content with source/included metadata and digests. Each artifact binds the
+run/step/role/attempt/round, validated request/reason, immutable initial prompt
+path/digest, previous expansion path/digest, effective limits/exclusions,
+already-loaded paths, and prior/result byte totals. Prior chains are verified
+from immutable artifacts without rereading their live repository files.
+Create-only writes accept only identical replay bytes and reject different
+bytes plus symlinked parents or targets. LoopRun, provider calls, CLI behavior,
+and the mutable initial manifest are unchanged.
+
+Focused GREEN passed all 10 context-expansion tests. Final verification passed
+`cargo fmt --all -- --check`, locked all-target/all-feature Clippy with warnings
+denied, all 249 locked Rust workspace tests, `corepack pnpm format:check`, and
+`git diff --check`. M1-04b1 is complete and M1-04b2a is active.
+
+## 2026-07-11 review fix | M1-04b1 authority and chain validation
+
+Spec review identified three gaps. RED added four focused failures proving that
+an internal repository-directory symlink could alias a forbidden target, a
+different safe run file could stand in for the initial prompt, substituted
+initial loaded-path metadata was not artifact-bound, and a canonical forged
+prior artifact could falsely classify an unloaded path as already loaded when
+its supplied link digest was also changed.
+
+GREEN rejects every symlink component in a requested repository path, derives
+the exact initial prompt audit filename from step and attempt, and persists the
+canonical complete initial loaded paths and initial byte total in every
+expansion. Chain verification now checks those initial values at every round
+and recomputes historical exclusions from the initial loaded set plus only the
+files actually accepted by preceding artifacts. M1-04b1 still treats the
+initial loaded-path/byte values as explicit expected input; M1-04b2a owns their
+authoritative reconciliation to a structured provider-request audit.
+
+Remaining spec review added a fifth RED: a canonically forged prior artifact
+replaced its request and accepted file with a default-forbidden `.env`, made
+all file digests and byte totals internally consistent, and recomputed the
+supplied link digest. The next round incorrectly accepted that history. GREEN
+now reapplies the artifact-bound effective default, ticket, and policy
+forbidden controls to every represented prior request path before accepting a
+chain link.
+
+The corrected focused suite passed all 15 tests. Final verification passed
+`cargo fmt --all -- --check`, locked all-target/all-feature Clippy with warnings
+denied, all 254 locked Rust workspace tests, `corepack pnpm format:check`, and
+`git diff --check`.
+
+## 2026-07-11 quality fix | M1-04b1 recovery and publication safety
+
+Quality review required an accepted immutable expansion to remain authoritative
+when its live source later changes. RED changed the recovery assertion and the
+old implementation failed with an existing-byte collision. A second
+deterministic unit RED failed to compile because no opened-file/current-path
+identity check existed. Concurrent identical creation, orphaned partial-temp,
+and sparse invalid-UTF-8-tail regressions were also added for the publication
+and streaming boundaries.
+
+GREEN verifies and returns an existing fixed target before any live source
+reread. New artifacts are written and synced to unique create-only regular temp
+files in the same real parent, atomically hard-linked to the absent final name,
+and reconciled against a complete byte-identical concurrent winner before temp
+cleanup. Orphan temps are ignored. Repository sources now pass component
+symlink checks, are opened once, rechecked inside the repository, and have the
+opened/current file identity compared using device/inode on Unix or volume/file
+index on Windows. A fixed 8 KiB stream hashes and validates all source bytes as
+UTF-8 while retaining only the bounded prefix.
+
+Focused GREEN passed the identity unit regression and all 18 context-expansion
+integration tests. Final verification passed `cargo fmt --all -- --check`,
+locked all-target/all-feature Clippy with warnings denied, all 258 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 final quality fix | M1-04b1 trusted recovery identity
+
+Final quality review rejected self-authentication of an unreferenced existing
+final artifact. RED canonically rewrote current accepted content together with
+internally consistent file digests, sizes, totals, and outer bytes. Loading
+with the original trusted digest rejected it, but creation incorrectly derived
+a new digest and adopted the forgery. The changed-live-source recovery test was
+also corrected to distinguish trusted load from creation.
+
+GREEN removes existing-target adoption from creation. Creation always rebuilds
+from current live inputs and delegates equality/collision handling to atomic
+publication, so changed live bytes and canonical final-target forgeries collide.
+`load_context_expansion` remains the sole trusted recovery path and requires a
+caller-supplied path/digest; M1-04b2a will persist that authoritative identity.
+Loading the original identity still returns accepted bytes without rereading
+the changed live source.
+
+Focused GREEN passed the identity unit regression and all 19 context-expansion
+integration tests. Final verification passed `cargo fmt --all -- --check`,
+locked all-target/all-feature Clippy with warnings denied, all 259 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 durability fix | M1-04b1 concurrent winner sync
+
+Final durability review found that the no-replace publication winner synced the
+parent directory, but an identical concurrent/retry loser returned success
+after byte verification without flushing the same directory entry. The
+AlreadyExists/byte-identical branch now syncs the real parent before reporting
+success, matching the winning publication branch. The existing concurrent
+identical-creator regression passed, as did all 259 locked workspace tests and
+the full Rust and documentation gates.

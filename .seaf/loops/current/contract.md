@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-04b1 - Additive context expansion artifact.
+M1-04b2a - Durable context exchange contract.

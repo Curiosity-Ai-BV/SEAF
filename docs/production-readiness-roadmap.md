@@ -69,8 +69,13 @@ run-bound artifacts. Development is bound to the approved spec and the bounded
 source context needed to construct a patch. Output review receives only the
 persisted policy-gated DevelopmentEvidence, approved-spec identities, and run
 input digests. M1-04a now defines and validates bounded typed context requests;
-M1-04b still must audit, persist, cap, and resume the additional provider
-rounds that satisfy them.
+M1-04b1 now safely materializes each additive request as an immutable,
+canonical, cumulative-budgeted artifact whose prior accepted bytes do not
+depend on the changed live repository. Its expected initial path/byte metadata
+is bound but remains caller supplied. M1-04b2 still must reconcile that metadata
+to structured audit state, persist each trusted expansion path/digest identity,
+and durably order, cap, execute, and resume the provider exchanges that consume
+those artifacts.
 
 ## Production-Use Acceptance Scenario
 

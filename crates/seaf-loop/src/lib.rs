@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod bench;
 pub mod context;
+pub mod context_expansion;
 pub mod development_evidence;
 pub mod eval_report;
 pub mod model_runner;
@@ -22,6 +23,11 @@ pub use context::{
     pack_context, pack_context_for_ticket, pack_live_context, ContextBundle, ContextError,
     ContextFile, ContextLimits, ContextManifest, ContextManifestFile, ContextPackRequest,
     CONTEXT_MANIFEST_FILE, UNTRUSTED_CONTEXT_MARKER,
+};
+pub use context_expansion::{
+    create_context_expansion, load_context_expansion, reconstruct_context_expansion_files,
+    ArtifactReference, ContextExpansionArtifact, ContextExpansionError, ContextExpansionFile,
+    ContextExpansionRequest, CreatedContextExpansion, CONTEXT_EXPANSION_SCHEMA_VERSION,
 };
 pub use development_evidence::DevelopmentEvidence;
 pub use eval_report::build_loop_eval_report;

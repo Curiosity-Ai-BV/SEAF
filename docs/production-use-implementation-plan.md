@@ -348,7 +348,7 @@ direct model tools or safety-boundary bypass.
 
 #### M1-04b1 - Additive Context Expansion Artifact
 
-Status: active. Dependencies: M1-R01.
+Status: complete on 2026-07-11. M1-04b2a is active.
 
 Objective: create one safe, canonical, immutable expansion from a validated
 ContextRequest without changing provider retry or LoopRun behavior.
@@ -399,9 +399,35 @@ Commit boundary: additive expansion primitive and immutable artifact codec only;
 no provider retry, run-state field, CLI change, candidate workspace, approval,
 eval, or promotion.
 
+Implemented flow: a validated request is normalized into deterministic path
+order, checked atomically against the same repository path, exclusion,
+forbidden-pattern, symlink-boundary, UTF-8, per-file, and cumulative-byte
+controls, then persisted as one canonical version-1 artifact. The artifact
+contains the exact accepted bytes and file metadata, immutable initial request
+audit identity, prior expansion link, excluded already-loaded paths, limits,
+and prior/result totals. Prior artifacts are verified recursively and supply
+their accepted bytes without rereading changed repository files. Trusted
+recovery requires `load_context_expansion` with a caller-supplied artifact path
+and digest; M1-04b1 never adopts an unreferenced existing final artifact or
+self-derives its authority. Creation always rebuilds canonical bytes from the
+current live inputs, then publishes from a synced same-directory temporary file
+through an atomic no-replace link. Concurrent identical publishers converge;
+changed live bytes or a canonical existing forgery collide, and partial
+temporary files are never final artifacts. Source files are opened once after
+component checks, rebound to the current in-repository file identity, then
+streamed through full-file hashing and UTF-8 validation while retaining only
+the bounded included prefix. Symlinked parents/targets, noncanonical JSON, or
+identity/link/digest mutations fail.
+Provider call count, LoopRun, CLI, and the initial context manifest are
+unchanged. This slice derives and verifies the exact initial prompt audit path
+and binds the complete caller-supplied initial loaded-path/byte metadata;
+M1-04b2a still owns authoritative reconciliation of those expected values to a
+structured provider-request audit record and persistence of the trusted
+expansion identity used for recovery.
+
 #### M1-04b2a - Durable Context Exchange Contract
 
-Status: pending. Dependencies: M1-04b1.
+Status: active. Dependencies: M1-04b1.
 
 Objective: define authoritative, backward-compatible state and immutable audit
 records for ordered provider exchanges without adding retry behavior.
