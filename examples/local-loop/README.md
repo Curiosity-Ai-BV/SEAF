@@ -19,7 +19,7 @@ From the repository root:
 
 ```bash
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
-cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --run-id local-loop-demo --allow-dirty --json
+cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id local-loop-demo --allow-dirty --json
 cargo run -p seaf-cli -- loop status --run-id local-loop-demo --json
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --loop-run .seaf/loops/runs/local-loop-demo/run.json --ticket examples/local-loop/tickets/add-health-command.yaml --output .seaf/evals/local-loop-demo-report.json --json
@@ -58,5 +58,5 @@ cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --f
 ```
 
 Use fake-provider commands for CI-safe checks. The Ollama benchmark command is a
-local live smoke check; full live model-backed `loop run` execution remains
-future work.
+small live smoke check; `loop run --provider ollama --model <model>` executes the
+full role sequence and uses the same resolved project policy gate as fake runs.

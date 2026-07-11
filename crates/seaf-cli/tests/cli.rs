@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use seaf_core::{canonical_sha256_digest, templates, Policy, ProjectConfig};
+use seaf_core::{canonical_json_bytes, canonical_sha256_digest, templates, Policy, ProjectConfig};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -591,9 +591,12 @@ fn loop_run_rejects_absolute_run_id_before_workspace_creation() {
 #[test]
 fn loop_run_accepts_valid_stable_run_id() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let runs_root = temp_dir.path().join("runs");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
 
-    let output = seaf()
+    let output = seaf_in(&repo)
         .args([
             "loop",
             "run",
@@ -681,7 +684,9 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
         seaf_core::load_ticket_file(&ticket_path).expect("effective provider ticket");
     let effective_policy: Policy =
         serde_json::from_str(templates::DEFAULT_POLICY_JSON).expect("default policy");
-    let absent_config = Option::<ProjectConfig>::None;
+    let effective_config = ProjectConfig {
+        policy_path: "seaf.policy.json".to_string(),
+    };
     assert_eq!(
         persisted_run["input_digests"]["ticket"],
         canonical_sha256_digest(&effective_ticket).expect("ticket digest")
@@ -692,7 +697,7 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
     );
     assert_eq!(
         persisted_run["input_digests"]["config"],
-        canonical_sha256_digest(&absent_config).expect("absent config digest")
+        canonical_sha256_digest(&effective_config).expect("effective config digest")
     );
     let decisions = persisted_run["policy_decisions"]
         .as_array()
@@ -746,6 +751,372 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
     let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"command\": \"resume\""));
     assert!(stdout.contains("\"status\": \"completed\""));
+}
+
+#[test]
+fn loop_run_project_config_policy_changes_fake_gating_and_explicit_policy_wins() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("config/policies")).expect("config policies dir");
+    init_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let config_path = repo.join("config/seaf.config.json");
+    fs::write(
+        &config_path,
+        r#"{"policy_path":"policies/reject-smoke.json"}"#,
+    )
+    .expect("write config");
+    write_policy(
+        &repo.join("config/policies/reject-smoke.json"),
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    write_policy(
+        &repo.join("explicit-policy.json"),
+        &[],
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+    );
+
+    let configured = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            repo.join("runs").to_str().unwrap(),
+            "--run-id",
+            "configured-rejection",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with project config");
+    assert!(configured.status.success(), "{configured:?}");
+    assert_eq!(
+        read_run_json(&repo.join("runs/configured-rejection"))["policy_decisions"][0]["decision"],
+        "rejected",
+        "the config-relative custom policy must drive the real fake-provider patch gate"
+    );
+
+    let overridden = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            repo.join("runs").to_str().unwrap(),
+            "--run-id",
+            "explicit-policy-wins",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--policy",
+            repo.join("explicit-policy.json").to_str().unwrap(),
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with explicit policy override");
+    assert!(overridden.status.success(), "{overridden:?}");
+    assert_eq!(
+        read_run_json(&repo.join("runs/explicit-policy-wins"))["policy_decisions"][0]["decision"],
+        "requires_human_review",
+        "--policy must override the policy named by --config"
+    );
+    let snapshotted_config: ProjectConfig = serde_json::from_slice(
+        &fs::read(repo.join("runs/explicit-policy-wins/inputs/config.json"))
+            .expect("effective config snapshot"),
+    )
+    .expect("effective config");
+    assert_eq!(
+        snapshotted_config.policy_path, "explicit-policy.json",
+        "the effective config snapshot must record the policy authority that actually won"
+    );
+}
+
+#[test]
+fn loop_run_explicit_policy_bypasses_malformed_discovered_config() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.config.json"),
+        r#"{"policy_path":"../unsafe.json"}"#,
+    )
+    .expect("malformed discovered config");
+    let explicit_policy = repo.join("explicit-policy.json");
+    write_policy(
+        &explicit_policy,
+        &[],
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+    );
+    let runs_root = repo.join("runs");
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            write_provider_loop_ticket(temp_dir.path(), true)
+                .to_str()
+                .unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "explicit-policy-skips-discovery",
+            "--policy",
+            explicit_policy.to_str().unwrap(),
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with explicit policy and malformed discovered config");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        read_run_json(&runs_root.join("explicit-policy-skips-discovery"))["policy_decisions"][0]
+            ["decision"],
+        "requires_human_review"
+    );
+}
+
+#[test]
+fn loop_run_persists_canonical_effective_inputs_and_matching_digests() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("config/policies")).expect("config policies dir");
+    init_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let config_path = repo.join("config/seaf.config.json");
+    fs::write(&config_path, r#"{"policy_path":"policies/effective.json"}"#).expect("write config");
+    let policy_path = repo.join("config/policies/effective.json");
+    write_policy(&policy_path, &["private/**"], &["eval_changes"]);
+    let runs_root = repo.join("runs");
+    let run_id = "canonical-input-snapshots";
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--config",
+            config_path.to_str().unwrap(),
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with effective inputs");
+    assert!(output.status.success(), "{output:?}");
+
+    let run_dir = runs_root.join(run_id);
+    let effective_ticket = seaf_core::load_ticket_file(&ticket_path).expect("ticket");
+    let effective_policy = seaf_core::load_policy_file(&policy_path).expect("policy");
+    let effective_config = ProjectConfig {
+        policy_path: "policies/effective.json".to_string(),
+    };
+    let expected = [
+        (
+            "ticket",
+            canonical_json_bytes(&effective_ticket).expect("ticket canonical bytes"),
+            canonical_sha256_digest(&effective_ticket).expect("ticket digest"),
+        ),
+        (
+            "policy",
+            canonical_json_bytes(&effective_policy).expect("policy canonical bytes"),
+            canonical_sha256_digest(&effective_policy).expect("policy digest"),
+        ),
+        (
+            "config",
+            canonical_json_bytes(&effective_config).expect("config canonical bytes"),
+            canonical_sha256_digest(&effective_config).expect("config digest"),
+        ),
+    ];
+    let run = read_run_json(&run_dir);
+    for (kind, bytes, digest) in expected {
+        assert_eq!(
+            fs::read(run_dir.join("inputs").join(format!("{kind}.json"))).expect("input snapshot"),
+            bytes,
+            "{kind} snapshot must contain canonical effective bytes"
+        );
+        assert_eq!(run["input_digests"][kind], digest);
+    }
+}
+
+#[test]
+fn loop_run_invalid_or_missing_authority_has_zero_workspace_or_provider_side_effects() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_empty_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let invalid_config = repo.join("invalid-config.json");
+    fs::write(&invalid_config, r#"{"policy_path":"../escape.json"}"#).expect("invalid config");
+    let invalid_policy = repo.join("invalid-policy.json");
+    fs::write(&invalid_policy, r#"{"policy_id":""}"#).expect("invalid policy");
+    let invalid_policy_config = repo.join("invalid-policy-config.json");
+    fs::write(
+        &invalid_policy_config,
+        r#"{"policy_path":"invalid-policy.json"}"#,
+    )
+    .expect("invalid policy config");
+    let valid_explicit_policy = repo.join("valid-explicit-policy.json");
+    write_policy(&valid_explicit_policy, &[], &[]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider probe");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking provider probe");
+    let base_url = format!("http://{}", listener.local_addr().expect("probe address"));
+    let runs_root = repo.join("runs");
+    let cases = [
+        ("no-authority", None, None),
+        (
+            "missing-config",
+            Some(repo.join("missing-config.json")),
+            None,
+        ),
+        ("invalid-config", Some(invalid_config.clone()), None),
+        (
+            "invalid-explicit-config-with-policy",
+            Some(invalid_config),
+            Some(valid_explicit_policy),
+        ),
+        ("config-invalid-policy", Some(invalid_policy_config), None),
+        ("explicit-invalid-policy", None, Some(invalid_policy)),
+    ];
+
+    for (run_id, config_path, policy_path) in cases {
+        let mut command = seaf_in(&repo);
+        command.args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "unused-model",
+            "--base-url",
+            &base_url,
+            "--allow-dirty",
+        ]);
+        if let Some(config_path) = config_path {
+            command.args(["--config", config_path.to_str().unwrap()]);
+        }
+        if let Some(policy_path) = policy_path {
+            command.args(["--policy", policy_path.to_str().unwrap()]);
+        }
+        let output = command.output().expect("run invalid authority case");
+        assert!(!output.status.success(), "{run_id} must fail closed");
+        assert!(
+            !runs_root.join(run_id).exists(),
+            "{run_id} must fail before workspace creation"
+        );
+    }
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "authority preflight must fail before contacting the provider"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn loop_run_rejects_config_relative_policy_symlink_escape_before_workspace_creation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("config")).expect("config dir");
+    init_git_repo(&repo);
+    let outside_policy = temp_dir.path().join("outside-policy.json");
+    write_policy(&outside_policy, &[], &[]);
+    symlink(&outside_policy, repo.join("config/escaped-policy.json")).expect("policy symlink");
+    let config_path = repo.join("config/seaf.config.json");
+    fs::write(&config_path, r#"{"policy_path":"escaped-policy.json"}"#).expect("write config");
+    let runs_root = repo.join("runs");
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            write_provider_loop_ticket(temp_dir.path(), false)
+                .to_str()
+                .unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "symlink-escape",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("run with escaped policy symlink");
+    assert!(!output.status.success());
+    assert!(!runs_root.join("symlink-escape").exists());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("outside the git repository"), "{stderr}");
+}
+
+#[test]
+fn loop_run_mocked_ollama_uses_discovered_project_policy_for_gating() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("policies")).expect("policies dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.config.json"),
+        r#"{"policy_path":"policies/reject-smoke.json"}"#,
+    )
+    .expect("root project config");
+    write_policy(
+        &repo.join("policies/reject-smoke.json"),
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    let runs_root = repo.join("runs");
+    let base_url = start_fake_ollama_server_sequence(provider_loop_model_responses());
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            write_provider_loop_ticket(temp_dir.path(), true)
+                .to_str()
+                .unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "ollama-discovered-policy",
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &base_url,
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run mocked Ollama with discovered config");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        read_run_json(&runs_root.join("ollama-discovered-policy"))["policy_decisions"][0]
+            ["decision"],
+        "rejected"
+    );
 }
 
 #[test]
@@ -3206,6 +3577,42 @@ acceptance_criteria:
     ticket_path
 }
 
+fn write_policy(path: &Path, forbidden_paths: &[&str], requires_human_review: &[&str]) {
+    let forbidden_paths = if forbidden_paths.is_empty() {
+        vec!["secrets/**".to_string()]
+    } else {
+        forbidden_paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect()
+    };
+    let requires_human_review = if requires_human_review.is_empty() {
+        vec!["dependency_changes".to_string()]
+    } else {
+        requires_human_review
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect()
+    };
+    let policy = Policy {
+        policy_id: "test-project-policy".to_string(),
+        default_autonomy_level: 1,
+        forbidden_paths,
+        requires_human_review,
+        allowed_without_review: vec!["tests".to_string()],
+    };
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&policy).expect("serialize test policy"),
+    )
+    .expect("write test policy");
+}
+
+fn read_run_json(run_dir: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).expect("run json"))
+        .expect("valid run json")
+}
+
 fn write_provider_loop_mutated_same_identity_ticket(root: &Path) -> PathBuf {
     let ticket_path = root.join("provider-loop-mutated-same-identity-ticket.yaml");
     fs::write(
@@ -3523,6 +3930,35 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 }
 
 fn init_git_repo(path: &Path) {
+    init_empty_git_repo(path);
+    fs::write(
+        path.join("seaf.policy.json"),
+        templates::DEFAULT_POLICY_JSON,
+    )
+    .expect("write root test policy");
+    let add = Command::new("git")
+        .args(["add", "seaf.policy.json"])
+        .current_dir(path)
+        .output()
+        .expect("git add test policy");
+    assert!(add.status.success(), "git add failed: {add:?}");
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=SEAF Tests",
+            "-c",
+            "user.email=tests@seaf.invalid",
+            "commit",
+            "-m",
+            "Add test policy",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit test policy");
+    assert!(commit.status.success(), "git commit failed: {commit:?}");
+}
+
+fn init_empty_git_repo(path: &Path) {
     let output = Command::new("git")
         .args(["init"])
         .current_dir(path)

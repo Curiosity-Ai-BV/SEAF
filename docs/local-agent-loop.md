@@ -15,9 +15,8 @@ tests, eval reports, and human review remain authoritative.
   benchmark summaries are written under the local checkout.
 - Ollama requests go to the local Ollama API at `http://localhost:11434/api`
   unless a different base URL is passed.
-- `seaf loop run` currently uses deterministic fake local-loop execution
-  through the CLI wiring. Passing `--provider ollama` is metadata for the run;
-  it is not the full live Ollama agent-loop execution path.
+- `seaf loop run --provider fake` uses deterministic provider responses, while
+  `--provider ollama` sends the role requests to the configured Ollama API.
 - CI-safe commands use `--provider fake` and do not require Ollama, network
   access, or installed local models.
 
@@ -31,7 +30,7 @@ Run the commands from the repository root:
 ```bash
 git switch codex/seaf-foundation-agent-loop
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
-cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --run-id p2-011-demo --allow-dirty --json
+cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id p2-011-demo --allow-dirty --json
 cargo run -p seaf-cli -- loop status --run-id p2-011-demo --json
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --loop-run .seaf/loops/runs/p2-011-demo/run.json --ticket examples/local-loop/tickets/add-health-command.yaml --output .seaf/evals/p2-011-demo-eval-report.json --json
@@ -46,6 +45,7 @@ new run ID or inspect/resume the existing run instead of overwriting it.
 After the commands finish, review:
 
 - `.seaf/loops/runs/p2-011-demo/run.json`
+- `.seaf/loops/runs/p2-011-demo/inputs/`
 - `.seaf/loops/runs/p2-011-demo/context-manifest.json`
 - `.seaf/loops/runs/p2-011-demo/log.md`
 - `.seaf/loops/runs/p2-011-demo/prompts/`
@@ -57,6 +57,27 @@ After the commands finish, review:
 The eval command validates the loop run and ticket before command checks run.
 Policy-gate evidence is evaluated when the final loop EvalReport is built;
 missing, malformed, mismatched, or rejected policy evidence fails closed.
+
+## Project Policy Authority
+
+New provider runs fail closed unless they can resolve one policy authority.
+The deterministic precedence is:
+
+1. an explicit `--policy` file;
+2. the policy named by explicit `--config` or Git-root `seaf.config.json`;
+3. Git-root `seaf.policy.json`.
+
+`seaf.config.json` is the only discovered project configuration filename. Its
+`policy_path` is relative to the config directory. Config and policy files are
+canonicalized and must remain inside the Git root, including through symlinks.
+An explicit config is always loaded and validated even when `--policy`
+overrides its policy choice.
+
+Before the first provider request, the run writes canonical effective
+`ticket.json`, `policy.json`, and `config.json` snapshots under `inputs/`. The
+three SHA-256 values in `run.json` digest those exact typed inputs. The effective
+config snapshot records the winning policy path for explicit-policy and
+root-policy fallback runs as well as config-backed runs.
 
 ## Failed-Run Recovery
 
@@ -115,8 +136,6 @@ Ollama smoke returned `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
 
 ## Pending Work
 
-Phase 2 CI hardening is complete. Future work is to wire `seaf loop run` to
-live provider-backed role execution and policy-gated patch proposals. Until
-that exists, `loop bench --provider ollama` is the live model smoke path, while
-`loop run --provider ollama` records provider/model metadata and still executes
-the deterministic local runner.
+New runs now bind their effective inputs. The next production-use slice is
+resume integrity: resuming a provider run must verify those persisted inputs
+before rebuilding provider context or patch-gate state.

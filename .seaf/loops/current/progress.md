@@ -8,8 +8,8 @@
 ## Milestone 1 - Coherent And Safe Loop
 
 - [x] M1-01a: Project configuration and input digest contracts.
-- [ ] M1-01b: Authoritative configuration discovery and snapshots (active).
-- [ ] M1-02: Resume configuration integrity.
+- [x] M1-01b: Authoritative configuration discovery and snapshots.
+- [ ] M1-02: Resume configuration integrity (active).
 - [ ] M1-03: Validated role artifact chain.
 - [ ] M1-04: Bounded additional context.
 - [ ] M1-05: Isolated candidate workspace.
@@ -42,5 +42,5 @@
 
 ## Current Gate
 
-M1-01a is complete. M1-01b is the next dependency-ready slice. Milestone 1
-remains active.
+M1-01b is complete. M1-02 is the next dependency-ready slice. Milestone 1
+remains active; resume digest enforcement has not started.

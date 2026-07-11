@@ -330,3 +330,41 @@ was already green and now explicitly verifies persisted digests against the
 canonical effective ticket, compiled default policy, and typed absent config.
 Focused regressions and the full locked workspace tests passed, followed by
 Rust formatting, Clippy with warnings denied, Prettier, and `git diff --check`.
+
+## 2026-07-11 act | M1-01b authoritative configuration and snapshots
+
+Added optional `loop run --config` and `--policy` inputs. New provider runs now
+resolve policy authority in this order: explicit policy, explicit or Git-root
+`seaf.config.json`, then Git-root `seaf.policy.json`; absence fails closed. All
+explicit/discovered config and policy files canonicalize inside the Git root,
+and config policy paths resolve from the config directory. The winning typed
+ticket, policy, and effective config are canonically snapshotted under the run
+`inputs/` directory before provider execution, and `LoopRun.input_digests`
+matches those values. The compiled default policy no longer authorizes new fake
+or Ollama provider runs. Resume comparison remains intentionally deferred to
+M1-02.
+
+## 2026-07-11 verify | M1-01b witnessed TDD and focused checks
+
+RED: `cargo test -p seaf-cli --locked
+loop_run_project_config_policy_changes_fake_gating_and_explicit_policy_wins --
+--exact` failed because `loop run` did not recognize `--config`. GREEN:
+`cargo test -p seaf-cli --test cli --locked loop_run_` passed all 12 focused
+tests, covering precedence and real custom gating, config-relative resolution,
+canonical snapshots/digests, no-authority and invalid-config zero side effects,
+invalid-policy zero side effects, symlink escape, root fallback, fake-provider
+execution, and mocked Ollama.
+
+Final verification passed: `cargo fmt --all -- --check`, locked Clippy for all
+targets/features with warnings denied, `cargo test --locked --workspace`,
+`corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 verify | M1-01b explicit-policy precedence review fix
+
+Spec review found that a malformed discovered Git-root `seaf.config.json`
+blocked a valid higher-precedence `--policy`. RED: the focused
+`loop_run_explicit_policy_bypasses_malformed_discovered_config` regression
+failed with project-config validation. GREEN: discovery is now skipped when an
+explicit policy is supplied without `--config`; an explicitly supplied config
+is still loaded and validated before the policy override. The new regression,
+the explicit-invalid-config guard, and all 13 focused `loop_run_` tests passed.

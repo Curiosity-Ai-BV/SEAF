@@ -42,7 +42,7 @@ summary. Use the fake-provider benchmark for deterministic CI-safe verification:
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 ```
 
-`seaf loop run` is different: it currently uses deterministic fake local-loop
-execution through the CLI wiring. Ollama checks and the Ollama AgentBench-lite
-smoke verify local model availability, but full live Ollama agent-loop
-execution is not the CI path.
+`seaf loop run --provider ollama --model gemma4:e4b-mlx` executes the full local
+role sequence. It also requires explicit or Git-root project policy authority;
+see [Project Policy Authority](../local-agent-loop.md#project-policy-authority).
+Fake-provider runs remain the deterministic CI path.

@@ -20,7 +20,7 @@ cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-ben
 Run a deterministic local loop:
 
 ```bash
-cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --run-id local-eval-demo --allow-dirty --json
+cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id local-eval-demo --allow-dirty --json
 ```
 
 Generate an eval report from the loop artifacts:

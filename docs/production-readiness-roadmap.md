@@ -61,6 +61,10 @@ features:
    capsules are unsigned development metadata. Both surfaces currently
    overstate their usable lifecycle.
 
+M1-01b resolves the new-run half of item 4: provider runs now resolve explicit
+or Git-root project authority and persist canonical effective input snapshots.
+Resume integrity remains tracked separately by M1-02.
+
 ## Production-Use Acceptance Scenario
 
 This scenario is the release gate for the roadmap. A developer must be able to:

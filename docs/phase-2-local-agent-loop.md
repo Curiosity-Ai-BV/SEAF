@@ -650,6 +650,7 @@ cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx --
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
 cargo run -p seaf-cli -- loop run \
   --ticket examples/local-loop/tickets/add-health-command.yaml \
+  --policy examples/adaptive-notes/seaf.policy.json \
   --run-id p2-local-demo \
   --allow-dirty \
   --json
@@ -670,9 +671,8 @@ Verified locally on 2026-07-01 after installing `gemma4:e4b-mlx`: the Ollama
 model check passed, and the full Ollama benchmark command above returned
 `ticket_count = 5`, `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
 `forbidden_violation_count = 0`, and `eval_weakening_accepted_count = 0`.
-`seaf loop run` remains deterministic in Phase 2; `--provider` and `--model`
-are run metadata there until a future live role-execution slice wires the
-provider through the full loop.
+For current provider-run configuration precedence and immutable input
+snapshots, see [Local Agent Loop](local-agent-loop.md#project-policy-authority).
 
 Existing docs to read before implementation:
 

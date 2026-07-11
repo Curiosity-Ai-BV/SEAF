@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -239,6 +239,12 @@ struct LoopRunArgs {
     /// Ticket file to validate and run.
     #[arg(long)]
     ticket: PathBuf,
+    /// Project configuration file. When omitted, seaf.config.json is discovered at the Git root.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Policy file that overrides project configuration and root policy discovery.
+    #[arg(long)]
+    policy: Option<PathBuf>,
     /// Directory where loop run workspaces are written.
     #[arg(long, default_value = ".seaf/loops/runs")]
     runs_root: PathBuf,
@@ -756,7 +762,6 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
     let ticket = seaf_core::load_ticket_file(&args.ticket)
         .map_err(|report| CliFailure::validation(report, args.json))?;
     validate_provider_timeout(args.timeout_ms)?;
-    let worktree_clean = ensure_clean_git_worktree(args.allow_dirty)?;
     let model = loop_model(&args.provider, args.model)?;
     let run_id = match args.run_id {
         Some(run_id) => {
@@ -766,6 +771,13 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
         None => generated_run_id("run"),
     };
     let repository_root = current_repository_root()?;
+    let effective_inputs = resolve_effective_project_inputs(
+        &repository_root,
+        args.config.as_deref(),
+        args.policy.as_deref(),
+        args.json,
+    )?;
+    let worktree_clean = ensure_clean_git_worktree(args.allow_dirty)?;
     let run = match args.provider.as_str() {
         "fake" => {
             if args.base_url != DEFAULT_OLLAMA_BASE_URL {
@@ -783,6 +795,8 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     timeout_ms: args.timeout_ms,
                     repository_root: &repository_root,
                     worktree_clean,
+                    policy: Some(&effective_inputs.policy),
+                    project_config: Some(&effective_inputs.config),
                 },
                 &args.provider,
                 &provider,
@@ -802,6 +816,8 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     timeout_ms: args.timeout_ms,
                     repository_root: &repository_root,
                     worktree_clean,
+                    policy: Some(&effective_inputs.policy),
+                    project_config: Some(&effective_inputs.config),
                 },
                 &args.provider,
                 &provider,
@@ -857,6 +873,8 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         timeout_ms: args.timeout_ms,
                         repository_root: &repository_root,
                         worktree_clean,
+                        policy: None,
+                        project_config: None,
                     },
                     &provider,
                 )?
@@ -876,6 +894,8 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         timeout_ms: args.timeout_ms,
                         repository_root: &repository_root,
                         worktree_clean,
+                        policy: None,
+                        project_config: None,
                     },
                     &provider,
                 )?
@@ -1078,6 +1098,8 @@ struct ProviderLoopConfig<'a> {
     timeout_ms: u64,
     repository_root: &'a Path,
     worktree_clean: bool,
+    policy: Option<&'a Policy>,
+    project_config: Option<&'a ProjectConfig>,
 }
 
 fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
@@ -1085,13 +1107,18 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     provider_name: &str,
     provider: &P,
 ) -> Result<LoopRun, CliFailure> {
-    let policy = default_policy()?;
-    let input_digests = current_input_digests(config.ticket, &policy)?;
-    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let policy = config
+        .policy
+        .expect("new provider runs require preflighted policy authority");
+    let project_config = config
+        .project_config
+        .expect("new provider runs require an effective project config");
+    let input_digests = current_input_digests(config.ticket, policy, project_config)?;
+    let context_request = provider_context_request(config.repository_root, config.ticket, policy);
     let patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
         config.ticket,
-        policy,
+        policy.clone(),
         config.worktree_clean,
     );
     let mut patch_runner = GitCommandRunner;
@@ -1110,6 +1137,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         input_digests,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    persist_effective_input_snapshots(runs_root, run_id, ticket, policy, project_config)?;
     persist_provider_ticket_snapshot(runs_root, run_id, ticket)?;
     runner
         .run_to_completion()
@@ -1121,7 +1149,10 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     config: ProviderLoopConfig<'_>,
     provider: &P,
 ) -> Result<LoopRun, CliFailure> {
-    let policy = default_policy()?;
+    let policy = match config.policy {
+        Some(policy) => policy.clone(),
+        None => default_policy()?,
+    };
     let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
     let patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
@@ -1167,16 +1198,218 @@ fn default_policy() -> Result<Policy, CliFailure> {
         .map_err(|err| CliFailure::message(format!("could not parse default policy: {err}")))
 }
 
-fn current_input_digests(
+struct EffectiveProjectInputs {
+    policy: Policy,
+    config: ProjectConfig,
+}
+
+fn resolve_effective_project_inputs(
+    repository_root: &Path,
+    explicit_config: Option<&Path>,
+    explicit_policy: Option<&Path>,
+    as_json: bool,
+) -> Result<EffectiveProjectInputs, CliFailure> {
+    let config_authority = match explicit_config {
+        Some(path) => Some(load_repository_project_config(
+            repository_root,
+            path,
+            as_json,
+        )?),
+        None if explicit_policy.is_some() => None,
+        None => {
+            let discovered = repository_root.join("seaf.config.json");
+            if authority_path_exists(&discovered, "project config")? {
+                Some(load_repository_project_config(
+                    repository_root,
+                    &discovered,
+                    as_json,
+                )?)
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(path) = explicit_policy {
+        let policy_path = canonical_repository_file(repository_root, path, "policy")?;
+        let policy = seaf_core::load_policy_file(&policy_path)
+            .map_err(|report| CliFailure::validation(report, as_json))?;
+        return Ok(EffectiveProjectInputs {
+            policy,
+            config: ProjectConfig {
+                policy_path: repository_relative_path(repository_root, &policy_path, "policy")?,
+            },
+        });
+    }
+
+    if let Some((config, config_path)) = config_authority {
+        let config_dir = config_path.parent().ok_or_else(|| {
+            CliFailure::message(format!(
+                "project config {} has no parent directory",
+                config_path.display()
+            ))
+        })?;
+        let policy_path = canonical_repository_file(
+            repository_root,
+            &config_dir.join(&config.policy_path),
+            "policy named by project config",
+        )?;
+        let policy = seaf_core::load_policy_file(&policy_path)
+            .map_err(|report| CliFailure::validation(report, as_json))?;
+        return Ok(EffectiveProjectInputs { policy, config });
+    }
+
+    let root_policy = repository_root.join("seaf.policy.json");
+    if authority_path_exists(&root_policy, "root policy")? {
+        let policy_path = canonical_repository_file(repository_root, &root_policy, "root policy")?;
+        let policy = seaf_core::load_policy_file(&policy_path)
+            .map_err(|report| CliFailure::validation(report, as_json))?;
+        return Ok(EffectiveProjectInputs {
+            policy,
+            config: ProjectConfig {
+                policy_path: "seaf.policy.json".to_string(),
+            },
+        });
+    }
+
+    Err(CliFailure::message(
+        "no authoritative loop policy found; pass --policy, pass --config, add seaf.config.json at the Git root, or add seaf.policy.json at the Git root"
+            .to_string(),
+    ))
+}
+
+fn authority_path_exists(path: &Path, kind: &str) -> Result<bool, CliFailure> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliFailure::message(format!(
+            "could not inspect {kind} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn load_repository_project_config(
+    repository_root: &Path,
+    path: &Path,
+    as_json: bool,
+) -> Result<(ProjectConfig, PathBuf), CliFailure> {
+    let config_path = canonical_repository_file(repository_root, path, "project config")?;
+    let config = seaf_core::load_project_config_file(&config_path)
+        .map_err(|report| CliFailure::validation(report, as_json))?;
+    Ok((config, config_path))
+}
+
+fn canonical_repository_file(
+    repository_root: &Path,
+    path: &Path,
+    kind: &str,
+) -> Result<PathBuf, CliFailure> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                CliFailure::message(format!("could not inspect current directory: {error}"))
+            })?
+            .join(path)
+    };
+    let canonical = candidate.canonicalize().map_err(|error| {
+        CliFailure::message(format!(
+            "could not resolve {kind} {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.starts_with(repository_root) {
+        return Err(CliFailure::message(format!(
+            "{kind} {} resolves outside the git repository {}",
+            candidate.display(),
+            repository_root.display()
+        )));
+    }
+    if !canonical.is_file() {
+        return Err(CliFailure::message(format!(
+            "{kind} {} is not a file",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn repository_relative_path(
+    repository_root: &Path,
+    path: &Path,
+    kind: &str,
+) -> Result<String, CliFailure> {
+    let relative = path.strip_prefix(repository_root).map_err(|_| {
+        CliFailure::message(format!(
+            "{kind} {} is outside the git repository {}",
+            path.display(),
+            repository_root.display()
+        ))
+    })?;
+    let relative = relative.to_str().ok_or_else(|| {
+        CliFailure::message(format!("{kind} path {} is not UTF-8", path.display()))
+    })?;
+    Ok(relative.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+fn current_input_digests<T: Serialize>(
     ticket: &TicketSpec,
     policy: &Policy,
+    project_config: &T,
 ) -> Result<LoopInputDigests, CliFailure> {
-    let no_project_config = Option::<ProjectConfig>::None;
     Ok(LoopInputDigests {
         ticket: canonical_sha256_digest(ticket).map_err(canonical_digest_failure("ticket"))?,
         policy: canonical_sha256_digest(policy).map_err(canonical_digest_failure("policy"))?,
-        config: canonical_sha256_digest(&no_project_config)
+        config: canonical_sha256_digest(project_config)
             .map_err(canonical_digest_failure("config"))?,
+    })
+}
+
+fn persist_effective_input_snapshots(
+    runs_root: &Path,
+    run_id: &str,
+    ticket: &TicketSpec,
+    policy: &Policy,
+    project_config: &ProjectConfig,
+) -> Result<(), CliFailure> {
+    let inputs_dir = runs_root.join(run_id).join("inputs");
+    fs::create_dir(&inputs_dir).map_err(|error| {
+        CliFailure::message(format!(
+            "could not create immutable run input directory {}: {error}",
+            inputs_dir.display()
+        ))
+    })?;
+    persist_canonical_input(&inputs_dir.join("ticket.json"), "ticket", ticket)?;
+    persist_canonical_input(&inputs_dir.join("policy.json"), "policy", policy)?;
+    persist_canonical_input(&inputs_dir.join("config.json"), "config", project_config)?;
+    Ok(())
+}
+
+fn persist_canonical_input<T: Serialize>(
+    path: &Path,
+    kind: &str,
+    value: &T,
+) -> Result<(), CliFailure> {
+    let bytes = canonical_json_bytes(value).map_err(|error| {
+        CliFailure::message(format!("could not serialize effective {kind}: {error}"))
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            CliFailure::message(format!(
+                "could not create immutable {kind} snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        CliFailure::message(format!(
+            "could not write immutable {kind} snapshot {}: {error}",
+            path.display()
+        ))
     })
 }
 
@@ -1480,13 +1713,14 @@ fn start_deterministic_loop_to_completion(
 ) -> Result<LoopRun, CliFailure> {
     let mut step_runner = DeterministicStepRunner;
     let policy = default_policy()?;
+    let no_project_config = Option::<ProjectConfig>::None;
     let config = LoopRunnerConfig::for_ticket(
         runs_root,
         run_id,
         ticket,
         provider.to_string(),
         model.to_string(),
-        current_input_digests(ticket, &policy)?,
+        current_input_digests(ticket, &policy, &no_project_config)?,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
     let run = runner
