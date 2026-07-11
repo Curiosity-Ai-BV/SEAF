@@ -833,6 +833,7 @@ fn output_review_resume_rejects_canonical_non_approving_spec_review_before_mutat
         artifact["response_digest"] = json!(canonical_sha256_digest(&artifact["response"])
             .expect("changed spec-review response digest"));
         rewrite_artifact_and_verified_digest(&absolute_artifact_path, &artifact, record);
+        persist_verified_resume_authority(&run_dir, &verified);
 
         let before = read_tree_bytes(&run_dir);
         let resume_provider = FakeProvider::new(Vec::new());
@@ -2422,6 +2423,7 @@ fn assert_resume_artifact_rejected_without_mutation(mutation: ResumeArtifactMuta
             record.artifact_digest = Some("f".repeat(64));
         }
     }
+    persist_verified_resume_authority(&run_dir, &verified);
 
     let before = read_tree_bytes(&run_dir);
     let provider = FakeProvider::new(Vec::new());
@@ -2581,6 +2583,7 @@ fn assert_downstream_artifact_rejected_without_mutation(
             verified.policy_decisions[0].insert("decision".to_string(), json!("rejected"));
         }
     }
+    persist_verified_resume_authority(&run_dir, &verified);
 
     let before = read_tree_bytes(&run_dir);
     let resume_provider = FakeProvider::new(Vec::new());
@@ -2626,6 +2629,11 @@ fn rewrite_artifact_and_verified_digest(
     .expect("write artifact");
     record.artifact_digest =
         Some(canonical_sha256_digest(artifact).expect("rewritten outer artifact digest"));
+}
+
+fn persist_verified_resume_authority(run_dir: &Path, verified: &LoopRun) {
+    seaf_loop::state::write_run_file(&run_dir.join("run.json"), verified)
+        .expect("persist exact verified resume authority");
 }
 
 fn read_tree_bytes(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {

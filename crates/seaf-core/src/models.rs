@@ -365,7 +365,37 @@ pub struct LoopRun {
     #[serde(default)]
     pub provider_exchange_records: Vec<ProviderExchangeRecordReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_workspace: Option<CandidateWorkspaceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateWorkspaceState {
+    pub schema_version: u32,
+    pub path: String,
+    pub source_worktree_root: String,
+    pub git_common_dir: String,
+    pub repository_identity_digest: String,
+    pub starting_head: String,
+    pub starting_tree: String,
+    pub candidate_head: String,
+    pub candidate_tree: String,
+    pub candidate_diff_digest: String,
+    pub lifecycle: CandidateWorkspaceLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleaned_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateWorkspaceLifecycle {
+    Active,
+    Cleaning,
+    Cleaned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,6 +120,23 @@ Terminal legacy `needs_context` history stays inert until that explicit rerun.
 Real CLI tests cover default resume, repository changes, cap exhaustion, and
 request, response, expansion, and record tampering.
 
+M1-05a now defines the candidate lifecycle boundary independently of provider
+integration. A detached worktree lives at a deterministic absolute path outside
+the source checkout and is bound to the exact source/common-directory identity,
+starting HEAD/tree, empty pre-apply candidate tree/diff, and lifecycle in closed
+typed LoopRun state. Creation bypasses hooks and configured content filters and
+can adopt only the exact clean registered detached crash remnant. Validation
+streams raw index objects through one bounded batch process, ignores replace
+refs, and fails closed on path, repository, registration, HEAD/tree, mode,
+index/worktree, extra bytes, digest, lifecycle, or helper/config injection
+drift. Creation is serialized and Unix authority directories are private.
+Cleanup uses full-LoopRun compare-and-swap, durably records intent, and
+reconciles post-removal interruption. Independent spec and quality review plus
+the full repository gate accepted M1-05a on 2026-07-11. M1-05b still owns
+provider context, indexed patch application, typed patch/policy/candidate-tree
+evidence, resume, and explicit CLI cleanup integration; the loop remains
+proposal-only until that slice is accepted.
+
 ## Production-Use Acceptance Scenario
 
 This scenario is the release gate for the roadmap. A developer must be able to:

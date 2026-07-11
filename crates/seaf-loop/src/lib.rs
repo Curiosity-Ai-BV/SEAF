@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod bench;
+pub mod candidate_workspace;
 pub mod context;
 pub mod context_expansion;
 pub mod development_evidence;
@@ -20,6 +21,10 @@ pub use artifacts::ArtifactContent;
 pub use bench::{
     evaluate_zero_tolerance, load_agent_bench_fixture, summarize_agent_bench_results,
     AgentBenchFixture, AgentBenchResult, AgentBenchSummary, BenchError, ZeroToleranceError,
+};
+pub use candidate_workspace::{
+    cleanup_candidate_workspace, create_candidate_workspace, validate_candidate_workspace,
+    CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
 };
 pub use context::{
     pack_context, pack_context_for_ticket, pack_live_context, ContextBundle, ContextError,

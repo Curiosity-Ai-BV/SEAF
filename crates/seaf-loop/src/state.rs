@@ -59,6 +59,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
             .collect(),
         policy_decisions: Vec::<std::collections::BTreeMap<String, Value>>::new(),
         provider_exchange_records: Vec::new(),
+        candidate_workspace: None,
         eval_report_path: None,
     }
 }

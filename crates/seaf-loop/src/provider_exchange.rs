@@ -414,6 +414,43 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
                 "provider exchange head changed before state publication".to_string(),
             ));
         }
+        if current.candidate_workspace != intended.candidate_workspace {
+            return Err(ProviderExchangeError::Invalid(
+                "candidate workspace changed before ordinary state publication".to_string(),
+            ));
+        }
+        validate_run_for_atomic_publication(workspace, intended)?;
+        let mut bytes = serde_json::to_vec_pretty(intended)?;
+        bytes.push(b'\n');
+        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
+            validate_opened_lock_file(
+                &lock,
+                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
+            )?;
+            Ok(())
+        })
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), _) => Err(error),
+    }
+}
+
+pub(crate) fn persist_run_with_full_compare(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+) -> Result<(), ProviderExchangeError> {
+    let lock = acquire_provider_exchange_lock(workspace)?;
+    let result = (|| {
+        let current = state::load_run(workspace)?;
+        if &current != expected {
+            return Err(ProviderExchangeError::Invalid(
+                "LoopRun changed before compare-and-swap publication".to_string(),
+            ));
+        }
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
@@ -440,10 +477,9 @@ pub(crate) fn reconcile_provider_exchange_state(
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
-        if persisted.provider_exchange_records != authoritative.provider_exchange_records {
+        if persisted != *authoritative {
             return Err(ProviderExchangeError::Invalid(
-                "persisted provider exchange head differs from the verified resume authority"
-                    .to_string(),
+                "persisted LoopRun differs from the verified reconciliation authority".to_string(),
             ));
         }
         let prospective = preflight_provider_exchange_reconciliation(workspace, authoritative)?;
@@ -1483,7 +1519,101 @@ impl From<std::io::Error> for ProviderExchangeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seaf_core::LoopInputDigests;
+    use seaf_core::{
+        CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopInputDigests, LoopStatus,
+    };
+
+    #[test]
+    fn reconciliation_rejects_stale_candidate_authority_before_adopting_a_staged_suffix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "reconcile-candidate-cas")
+            .expect("workspace");
+        let mut authoritative = state::create_run(state::NewLoopRun {
+            run_id: "reconcile-candidate-cas".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        authoritative.status = LoopStatus::Completed;
+        authoritative.candidate_workspace = Some(CandidateWorkspaceState {
+            schema_version: 1,
+            path: temp.path().join("candidate").display().to_string(),
+            source_worktree_root: temp.path().join("source").display().to_string(),
+            git_common_dir: temp.path().join("source/.git").display().to_string(),
+            repository_identity_digest: "d".repeat(64),
+            starting_head: "e".repeat(40),
+            starting_tree: "f".repeat(40),
+            candidate_head: "e".repeat(40),
+            candidate_tree: "f".repeat(40),
+            candidate_diff_digest:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            lifecycle: CandidateWorkspaceLifecycle::Active,
+            cleanup_started_at: None,
+            cleaned_at: None,
+        });
+        state::save_run(&workspace, &authoritative).expect("authoritative run");
+        crate::artifacts::write_step_request(&workspace, LoopStepName::Research, 1, "research")
+            .expect("conventional request");
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: authoritative.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request =
+            write_provider_exchange_request(workspace.run_directory(), &coordinates, b"research")
+                .expect("request audit");
+        let staged = ProviderExchangeRecord {
+            schema_version: 1,
+            run_id: authoritative.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        stage_provider_exchange_record(workspace.run_directory(), &staged).expect("staged suffix");
+
+        let mut persisted = authoritative.clone();
+        let candidate = persisted.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaning;
+        candidate.cleanup_started_at = Some("cleanup-intent".to_string());
+        state::save_run(&workspace, &persisted).expect("persisted Cleaning state");
+        let before = std::fs::read(workspace.run_file()).expect("before bytes");
+
+        let error = reconcile_provider_exchange_state(&workspace, &authoritative)
+            .expect_err("stale Active authority must not replace Cleaning");
+
+        assert!(
+            error.to_string().contains("persisted LoopRun differs"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(workspace.run_file()).unwrap(), before);
+        let current = state::load_run(&workspace).expect("current run");
+        assert_eq!(current, persisted);
+        assert!(current.provider_exchange_records.is_empty());
+        assert_eq!(
+            current.candidate_workspace.unwrap().lifecycle,
+            CandidateWorkspaceLifecycle::Cleaning
+        );
+    }
 
     #[test]
     fn compare_and_publish_rejects_a_concurrent_suffix_for_nonempty_intended_state() {

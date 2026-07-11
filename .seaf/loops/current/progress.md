@@ -18,7 +18,8 @@
 - [x] M1-04b2a: Durable context exchange contract.
 - [x] M1-04b2b: Bounded live context orchestration.
 - [x] M1-04b2c: Context round recovery and CLI integration.
-- [ ] M1-05: Isolated candidate workspace (active).
+- [x] M1-05a: Candidate workspace lifecycle contract.
+- [ ] M1-05b: Candidate provider and CLI integration (active).
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
@@ -48,6 +49,6 @@
 
 ## Current Gate
 
-M1-04b2c is complete and M1-05 is active. Milestone 1 remains active; fresh,
-resumed, and explicitly rerun provider execution now share one bounded durable
-context protocol with staged-record reconciliation and real CLI recovery.
+M1-05a is complete and M1-05b is active. Milestone 1 remains active. The
+pre-apply candidate lifecycle is independently approved and fully gated; the
+provider, indexed patch, resume, evidence, and CLI seams remain M1-05b.

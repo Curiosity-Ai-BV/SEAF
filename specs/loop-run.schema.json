@@ -282,6 +282,102 @@
         "additionalProperties": false
       }
     },
+    "candidate_workspace": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "schema_version",
+            "path",
+            "source_worktree_root",
+            "git_common_dir",
+            "repository_identity_digest",
+            "starting_head",
+            "starting_tree",
+            "candidate_head",
+            "candidate_tree",
+            "candidate_diff_digest",
+            "lifecycle"
+          ],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "path": { "type": "string", "pattern": "^/" },
+            "source_worktree_root": { "type": "string", "pattern": "^/" },
+            "git_common_dir": { "type": "string", "pattern": "^/" },
+            "repository_identity_digest": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "starting_head": {
+              "type": "string",
+              "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+            },
+            "starting_tree": {
+              "type": "string",
+              "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+            },
+            "candidate_head": {
+              "type": "string",
+              "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+            },
+            "candidate_tree": {
+              "type": "string",
+              "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+            },
+            "candidate_diff_digest": {
+              "type": "string",
+              "const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "lifecycle": { "enum": ["active", "cleaning", "cleaned"] },
+            "cleanup_started_at": {
+              "anyOf": [
+                { "type": "string", "minLength": 1 },
+                { "type": "null" }
+              ]
+            },
+            "cleaned_at": {
+              "anyOf": [
+                { "type": "string", "minLength": 1 },
+                { "type": "null" }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "lifecycle": { "const": "active" } } },
+              "then": {
+                "properties": {
+                  "cleanup_started_at": { "type": "null" },
+                  "cleaned_at": { "type": "null" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "lifecycle": { "const": "cleaning" } } },
+              "then": {
+                "required": ["cleanup_started_at"],
+                "properties": {
+                  "cleanup_started_at": { "type": "string", "minLength": 1 },
+                  "cleaned_at": { "type": "null" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "lifecycle": { "const": "cleaned" } } },
+              "then": {
+                "required": ["cleanup_started_at", "cleaned_at"],
+                "properties": {
+                  "cleanup_started_at": { "type": "string", "minLength": 1 },
+                  "cleaned_at": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          ],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
+    },
     "eval_report_path": {
       "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
     }

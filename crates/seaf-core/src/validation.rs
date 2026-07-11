@@ -417,11 +417,148 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
 
     validate_provider_exchange_references(&mut errors, run);
 
+    if let Some(candidate) = &run.candidate_workspace {
+        validate_candidate_workspace_state(&mut errors, candidate);
+        if candidate.repository_identity_digest != run.input_digests.repository {
+            errors.push(FieldError::new(
+                "candidate_workspace.repository_identity_digest",
+                "must match input_digests.repository",
+            ));
+        }
+        if matches!(
+            run.status,
+            crate::LoopStatus::Pending | crate::LoopStatus::Running
+        ) && candidate.lifecycle != crate::CandidateWorkspaceLifecycle::Active
+        {
+            errors.push(FieldError::new(
+                "candidate_workspace.lifecycle",
+                "must remain active while the LoopRun is pending or running",
+            ));
+        }
+    }
+
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
 
     errors
+}
+
+fn validate_candidate_workspace_state(
+    errors: &mut Vec<FieldError>,
+    candidate: &crate::CandidateWorkspaceState,
+) {
+    if candidate.schema_version != 1 {
+        errors.push(FieldError::new(
+            "candidate_workspace.schema_version",
+            "must be 1",
+        ));
+    }
+    for (field, value) in [
+        ("path", &candidate.path),
+        ("source_worktree_root", &candidate.source_worktree_root),
+        ("git_common_dir", &candidate.git_common_dir),
+    ] {
+        require_non_empty(errors, format!("candidate_workspace.{field}"), value);
+        if !std::path::Path::new(value).is_absolute() {
+            errors.push(FieldError::new(
+                format!("candidate_workspace.{field}"),
+                "must be an absolute path",
+            ));
+        }
+    }
+    validate_lowercase_sha256_digest(
+        errors,
+        "candidate_workspace.repository_identity_digest",
+        &candidate.repository_identity_digest,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "candidate_workspace.candidate_diff_digest",
+        &candidate.candidate_diff_digest,
+    );
+    for (field, value) in [
+        ("starting_head", &candidate.starting_head),
+        ("starting_tree", &candidate.starting_tree),
+        ("candidate_head", &candidate.candidate_head),
+        ("candidate_tree", &candidate.candidate_tree),
+    ] {
+        if !matches!(value.len(), 40 | 64)
+            || !value
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        {
+            errors.push(FieldError::new(
+                format!("candidate_workspace.{field}"),
+                "must be a lowercase 40- or 64-character Git object ID",
+            ));
+        }
+    }
+    match candidate.lifecycle {
+        crate::CandidateWorkspaceLifecycle::Active
+            if candidate.cleanup_started_at.is_some() || candidate.cleaned_at.is_some() =>
+        {
+            errors.push(FieldError::new(
+                "candidate_workspace.cleaned_at",
+                "cleanup timestamps must be absent while the candidate is active",
+            ));
+        }
+        crate::CandidateWorkspaceLifecycle::Cleaning => {
+            if candidate
+                .cleanup_started_at
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+                || candidate.cleaned_at.is_some()
+            {
+                errors.push(FieldError::new(
+                    "candidate_workspace.cleanup_started_at",
+                    "must be present only while cleanup is in progress",
+                ));
+            }
+        }
+        crate::CandidateWorkspaceLifecycle::Cleaned => {
+            if candidate
+                .cleanup_started_at
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+                || candidate
+                    .cleaned_at
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+            {
+                errors.push(FieldError::new(
+                    "candidate_workspace.cleaned_at",
+                    "cleanup start and completion timestamps must be present after cleanup",
+                ));
+            }
+        }
+        crate::CandidateWorkspaceLifecycle::Active => {}
+    }
+    if candidate.candidate_head != candidate.starting_head {
+        errors.push(FieldError::new(
+            "candidate_workspace.candidate_head",
+            "must equal starting_head because candidate commits are not authorized",
+        ));
+    }
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    if candidate.candidate_tree != candidate.starting_tree {
+        errors.push(FieldError::new(
+            "candidate_workspace.candidate_tree",
+            "must equal starting_tree until M1-05b binds an applied patch",
+        ));
+    }
+    if candidate.candidate_diff_digest != EMPTY_SHA256 {
+        errors.push(FieldError::new(
+            "candidate_workspace.candidate_diff_digest",
+            "must be the empty SHA-256 until M1-05b binds an applied patch",
+        ));
+    }
 }
 
 pub fn validate_provider_exchange_record(record: &ProviderExchangeRecord) -> Vec<FieldError> {

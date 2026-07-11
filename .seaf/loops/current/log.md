@@ -1118,3 +1118,108 @@ record tampering fails before any provider call or run-tree mutation. Broader
 inspect/revise recovery remains M1-09 scope. Focused GREEN passed 32 live
 context, 22 exchange-contract, 38 provider-runner, 24 state, and 85 CLI
 integration tests. M1-04b2c is complete and M1-05 is active.
+
+## 2026-07-11 implement | M1-05a candidate workspace lifecycle contract
+
+RED real-Git tests could not compile because no candidate lifecycle API
+existed. The contract was split from provider/CLI integration so its identity
+and cleanup boundary can be reviewed independently.
+
+GREEN adds a closed typed CandidateWorkspaceState to LoopRun and its schema.
+The state binds the canonical external path, source root, Git common directory,
+repository identity digest, starting HEAD/tree, candidate HEAD/index tree,
+full-index staged diff digest, applied patch digest, and active/cleaned
+lifecycle. Rust validation closes cross-field invariants that JSON Schema
+cannot express and explicit-null Option behavior remains aligned with schema.
+
+Candidate creation uses a deterministic path outside the source checkout,
+disables checkout hooks, rechecks the source identity after creation, rolls
+back post-add failures, and crash-adopts only the exact registered clean
+worktree. Physical validation rejects missing, symlinked, substituted,
+wrong-repository, moved-HEAD/tree, unstaged, untracked, committed, or
+digest-tampered state. Cleanup accepts LoopStatus, refuses active or unsafe
+candidates, removes only the bound worktree, and is idempotent only from valid
+retained cleaned evidence with no path or registration.
+
+Focused GREEN passed 8 real temporary-Git lifecycle tests and all 33 seaf-core
+tests. M1-05a remains incomplete until independent spec and quality approval;
+M1-05b will wire provider context, indexed patch application, resume, candidate
+patch evidence, and explicit CLI cleanup.
+
+## 2026-07-11 spec and quality fix | M1-05a pre-apply and cleanup trust boundary
+
+Review rejected the first lifecycle draft because registration, detached HEAD,
+ignored untracked bytes, repository helpers, and cleanup authority were not all
+closed. It also exposed a slice-boundary error: a caller-supplied applied patch
+digest could not be trustworthy before M1-05b owns exact patch bytes, policy
+evidence, and indexed application.
+
+M1-05a is now explicitly pre-apply only. Candidate state has no applied-patch
+field and must retain the starting HEAD/tree and empty staged diff. Creation
+uses a detached no-checkout worktree, reads the exact index, discovers cached
+filter attributes, disables every safely named filter driver, and materializes
+raw bytes without hooks. All Git subprocesses remove repository/config/object
+redirection variables and disable hooks, fsmonitor, system/global config, and
+attribute injection. Validation requires exact registration and detached HEAD,
+rejects staged/unstaged and ordinary or ignored untracked bytes, and compares
+indexed objects in one sanitized cat-file batch, including executable-mode and
+symlink semantics. Modes 100644, 100755, and 120000 are supported; gitlinks
+fail closed.
+
+Cleanup now loads the authoritative LoopRun under a candidate lock, rejects
+pending/running runs, atomically publishes Cleaning before removal through the
+existing provider-state publication lock order, verifies the exact physical
+candidate, and publishes Cleaned afterward. A retry safely reconciles durable
+Cleaning when the path and registration are both absent, including after the
+source HEAD advances. Lock opens are no-follow with opened/path identity
+checks, creation syncs the lock and parent, and the lock order is documented.
+
+## 2026-07-11 spec and quality fix | M1-05a raw object compatibility
+
+Follow-up review proved that checkout-index still applied built-in Git
+transforms such as ident even after external filter drivers were neutralized.
+RED expanded `$Id$` bytes and failed raw index verification. GREEN removes
+checkout-index entirely: the detached worktree reads the exact index, requests
+one object at a time from a single sanitized cat-file batch process, and streams
+regular bytes directly to private candidate paths with exact executable-mode
+parity. On Unix, raw symlink target bytes are created and compared without UTF-8
+conversion; other platforms fail closed for symlinks. Parent creation rejects
+symlinks and non-directories, regular I/O is bounded, and symlink targets are
+capped at 4096 bytes. Ident, hostile filters/helpers, executable files, and a
+non-UTF-8 symlink target have focused proof.
+
+Every Git command now disables replace refs; regressions bind the original
+commit, tree, and blob despite all three replacement types. Candidate creation
+uses the candidate lock, concurrent creators converge by exact adoption, and a
+failed worktree-add never deletes an unproven remnant. Unix authority root,
+repository, and worktree directories are verified private 0700.
+
+Cleanup publication now uses full canonical LoopRun compare-and-swap under the
+provider lock. A concurrent state change before intent prevents removal, an
+ordinary stale Active publisher cannot replace Cleaning, and the final
+Cleaning-to-Cleaned transition succeeds only from the exact expected state.
+
+Final quality review found that provider exchange recovery still compared only
+the ledger vector before constructing a prospective run from caller authority.
+A stale terminal Active run could therefore adopt a staged exchange suffix and
+replace persisted Cleaning state. Reconciliation now requires the entire
+persisted LoopRun to equal its verified authority before preflight or
+publication. A regression stages a valid Research request, persists Cleaning,
+and proves stale Active reconciliation leaves run.json byte-identical and the
+suffix unadopted. The context-free recovery fixture now persists its exact
+prepared authority before invoking the stricter seam.
+
+## 2026-07-11 review and controller | M1-05a accepted
+
+Fresh spec and quality reviews approved the final frozen lifecycle boundary
+after verifying registration, detachedness, raw materialization, helper and
+replace-ref isolation, private authority directories, full-state publication,
+and interruption-safe cleanup. No provider, patch-application, or CLI behavior
+entered this slice; those remain M1-05b.
+
+The controller passed 23 candidate integration tests, 16 seaf-loop library
+tests including cleanup and reconciliation CAS faults, 22 provider-exchange
+tests, 38 provider-runner tests, 33 seaf-core tests, and the complete locked
+Rust workspace. Workspace Clippy with warnings denied, Rust and Prettier
+formatting, package lint, typecheck, 8 SDK tests, SDK build, and diff check all
+passed. M1-05a is complete and M1-05b is active.

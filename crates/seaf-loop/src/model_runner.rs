@@ -2293,6 +2293,8 @@ mod live_context_cap_tests {
         let mut prepared_run = run.clone();
         prepared_run.input_digests.ticket =
             canonical_sha256_digest(&ticket).expect("ticket digest");
+        crate::state::save_run(&workspace, &prepared_run)
+            .expect("persist the exact verified resume authority");
         let provider = seaf_models::FakeProvider::new(Vec::new());
         let mut provider_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
             .with_ticket(ticket)

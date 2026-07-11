@@ -715,6 +715,62 @@ remains M1-09.
 
 ### M1-05 - Isolated Candidate Workspace
 
+Status: active. Split into M1-05a lifecycle contract and M1-05b provider/CLI
+integration so the durable identity boundary can be reviewed independently
+from patch-gate mutation.
+
+### M1-05a - Candidate Workspace Lifecycle Contract
+
+Status: complete on 2026-07-11; independently approved by spec and quality
+review and accepted by the full repository gate.
+
+Objective: define and prove the candidate worktree identity and lifecycle
+before any provider path can use it.
+
+Acceptance criteria:
+
+- A detached candidate is created at a deterministic absolute path outside the
+  source checkout, at the exact authoritative HEAD and tree, with repository
+  checkout hooks disabled.
+- Closed typed state and the LoopRun schema bind the source root, Git common
+  directory, repository identity digest, starting/candidate HEAD and tree,
+  empty pre-apply diff digest, and active/cleaning/cleaned lifecycle. Applied
+  patch identity and the candidate tree transition belong to M1-05b.
+- Creation is crash-idempotent only for the exact registered, clean candidate;
+  resume validation rejects missing, substituted, symlinked, wrong-repository,
+  attached-HEAD, wrong-HEAD/tree, staged, unstaged, ordinary/ignored untracked,
+  executable-mode, or digest-tampered candidates. Repository hooks, filters,
+  fsmonitor, diff helpers, and Git redirection/config injection cannot execute
+  during creation or validation; Git replace refs cannot substitute the bound
+  commit, tree, or blobs.
+- Cleanup reads the authoritative persisted LoopRun, durably records intent,
+  refuses active or mismatched state, removes only the verified registered
+  worktree, and reconciles interrupted removal to retained cleaned evidence.
+- Provider exchange reconciliation requires full persisted LoopRun equality
+  with its verified authority; ordinary provider state publication cannot
+  replace a newer candidate lifecycle state.
+
+Verification: real temporary-Git-repository lifecycle tests, core contract
+tests, format, Clippy, full workspace tests, and diff check.
+
+Commit boundary: lifecycle primitives and typed contract only; no provider,
+policy-gate, CLI, approval, eval, or promotion integration.
+
+Compatibility: materialization streams exact index blobs directly, bypassing
+checkout filters and built-in ident, encoding, and line-ending transforms.
+Regular non-executable/executable files are supported everywhere (Git modes
+100644 and 100755); raw symbolic links (120000), including non-UTF-8 targets,
+are supported on Unix and fail closed elsewhere. Gitlinks/submodules (160000)
+fail closed until a supported materialization contract is defined. Symlink
+targets are capped at 4096 bytes; regular blobs stream with bounded buffers.
+Unix candidate authority directories are private 0700. Candidate locks and
+opened-file identity checks coordinate SEAF processes and fail closed; hostile
+same-user directory-entry races remain M1-10/M1-11 hardening scope.
+
+### M1-05b - Candidate Provider And CLI Integration
+
+Status: active. Dependencies: M1-05a (complete).
+
 Roadmap: U3. Dependencies: M1-04b.
 
 Objective: apply and inspect the candidate outside the user's source checkout.
@@ -738,7 +794,8 @@ format, Clippy, and diff check.
 
 Docs/tracker: candidate lifecycle and M1-05 status.
 
-Commit boundary: isolated proposal/application only; no promotion or evals.
+Commit boundary: isolated proposal/application and explicit cleanup only; no
+approval, promotion, or evals.
 
 ### M1-06 - Human Approval State
 
