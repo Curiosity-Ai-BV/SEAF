@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-04b2c - Context round recovery and CLI integration.
+M1-05 - Isolated candidate workspace.

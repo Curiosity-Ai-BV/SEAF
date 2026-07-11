@@ -1338,8 +1338,8 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
     resumed.run_next_step().expect("run analysis step");
     assert_eq!(
         resumed.run().provider_exchange_records.len(),
-        2,
-        "M1-04b2b audits fresh execution only; resume orchestration remains M1-04b2c"
+        4,
+        "M1-04b2c keeps resumed provider execution in the durable exchange ledger"
     );
 
     let digest = sha256(source_content.as_bytes());

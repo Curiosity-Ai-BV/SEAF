@@ -28,7 +28,7 @@ fn coordinates(index: u32) -> ProviderExchangeCoordinates {
         run_id: "exchange-run".to_string(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: index,
         kind: if index == 1 {
             ProviderExchangeKind::Initial
@@ -159,12 +159,12 @@ fn loop_run_validation_rejects_exchange_gaps_reordering_identity_and_malformed_p
         run_id: run.run_id.clone(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: 1,
         kind: ProviderExchangeKind::Initial,
         context_round: None,
         phase: ProviderExchangePhase::Request,
-        path: "artifacts/01-research.attempt-002.exchange-001.initial.request.record.json"
+        path: "artifacts/01-research.attempt-001.exchange-001.initial.request.record.json"
             .to_string(),
         digest: digest('e'),
     };
@@ -189,7 +189,7 @@ fn loop_run_validation_rejects_exchange_gaps_reordering_identity_and_malformed_p
     let mut response = valid;
     response.phase = ProviderExchangePhase::Response;
     response.path =
-        "artifacts/01-research.attempt-002.exchange-001.initial.response.record.json".to_string();
+        "artifacts/01-research.attempt-001.exchange-001.initial.response.record.json".to_string();
     reordered.provider_exchange_records.insert(0, response);
     assert!(!validate_loop_run(&reordered).is_empty());
 }
@@ -213,10 +213,10 @@ fn exchange_artifacts_and_records_are_create_only_and_canonical() {
     .expect("response");
     assert!(request
         .path
-        .contains("attempt-002.exchange-001.initial.request"));
+        .contains("attempt-001.exchange-001.initial.request"));
     assert!(response
         .path
-        .contains("attempt-002.exchange-001.initial.response"));
+        .contains("attempt-001.exchange-001.initial.response"));
     assert_eq!(
         write_provider_exchange_request(&run_dir, &coordinates, b"request").expect("replay"),
         request
@@ -250,11 +250,11 @@ fn exchange_artifacts_and_records_are_create_only_and_canonical() {
 #[test]
 fn context_retry_requires_a_distinct_round_and_matching_canonical_expansion() {
     let request = ArtifactReference {
-        path: "prompts/01-research.attempt-002.exchange-002.context-retry.request.md".to_string(),
+        path: "prompts/01-research.attempt-001.exchange-002.context-retry.request.md".to_string(),
         digest: digest('a'),
     };
     let expansion = ArtifactReference {
-        path: "artifacts/01-research.attempt-002.context-round-001.json".to_string(),
+        path: "artifacts/01-research.attempt-001.context-round-001.json".to_string(),
         digest: digest('b'),
     };
     let valid = request_record(2, Some(digest('c')), request.clone(), Some(expansion));
@@ -271,7 +271,7 @@ fn context_retry_requires_a_distinct_round_and_matching_canonical_expansion() {
     role_mismatch.phase = ProviderExchangePhase::Response;
     role_mismatch.previous_record_digest = Some(digest('d'));
     role_mismatch.response = Some(ArtifactReference {
-        path: "responses/01-research.attempt-002.exchange-001.initial.response.txt".to_string(),
+        path: "responses/01-research.attempt-001.exchange-001.initial.response.txt".to_string(),
         digest: digest('e'),
     });
     role_mismatch.outcome = Some(ProviderExchangeOutcome::PatchProposed);
@@ -281,11 +281,11 @@ fn context_retry_requires_a_distinct_round_and_matching_canonical_expansion() {
         2,
         Some(digest('f')),
         ArtifactReference {
-            path: "prompts/01-research.attempt-002.exchange-002.json-repair.request.md".to_string(),
+            path: "prompts/01-research.attempt-001.exchange-002.json-repair.request.md".to_string(),
             digest: digest('a'),
         },
         Some(ArtifactReference {
-            path: "artifacts/01-research.attempt-002.context-round-000.json".to_string(),
+            path: "artifacts/01-research.attempt-001.context-round-000.json".to_string(),
             digest: digest('b'),
         }),
     );
@@ -430,7 +430,7 @@ fn append_transitions_follow_the_prior_parsed_outcome() {
             .expect("retry request");
     let expansion_bytes = b"canonical expansion";
     let expansion = ArtifactReference {
-        path: "artifacts/01-research.attempt-002.context-round-001.json".to_string(),
+        path: "artifacts/01-research.attempt-001.context-round-001.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(expansion_bytes)),
     };
     fs::write(
@@ -479,7 +479,7 @@ fn staging_rejects_tampered_bound_bytes_before_record_publication() {
 
     assert!(stage_provider_exchange_record(&run_dir, &record).is_err());
     assert!(!run_dir
-        .join("artifacts/01-research.attempt-002.exchange-001.initial.request.record.json")
+        .join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json")
         .exists());
 }
 
@@ -594,7 +594,7 @@ fn invalid_response_allows_only_json_repair_and_terminal_outcomes_allow_no_next_
         run_id: "invalid-run".to_string(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: 2,
         kind: ProviderExchangeKind::JsonRepair,
         context_round: None,
@@ -758,7 +758,7 @@ fn only_malformed_json_is_eligible_for_json_repair() {
             run_id: run_id.clone(),
             step: LoopStepName::Research,
             role: ProviderRole::Researcher,
-            step_attempt: 2,
+            step_attempt: 1,
             exchange_index: 2,
             kind: ProviderExchangeKind::JsonRepair,
             context_round: None,
@@ -826,7 +826,7 @@ fn repair_after_context_retry_must_inherit_the_exact_round_and_expansion_authori
     .expect("repair request");
     let substitute_bytes = b"substituted expansion";
     let substitute_expansion = ArtifactReference {
-        path: "artifacts/01-research.attempt-002.context-round-002.json".to_string(),
+        path: "artifacts/01-research.attempt-001.context-round-002.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(substitute_bytes)),
     };
     fs::write(
@@ -1114,19 +1114,12 @@ fn concurrent_appenders_never_lose_an_update_and_one_stale_head_is_rejected() {
         1,
         head.digest.clone(),
     );
-    let analysis_attempt_two = staged_request_for_group(
-        &workspace,
-        "concurrent-append",
-        LoopStepName::Analysis,
-        ProviderRole::Analyzer,
-        2,
-        head.digest,
-    );
+    let analysis_attempt_two = analysis_attempt_one.clone();
     let old_run = seaf_loop::state::load_run(&workspace).expect("old state");
     validate_provider_exchange_record_append(&workspace, &old_run, &analysis_attempt_one)
         .expect("attempt one is independently valid from old head");
     validate_provider_exchange_record_append(&workspace, &old_run, &analysis_attempt_two)
-        .expect("attempt two is independently valid from old head");
+        .expect("the same exact candidate is independently valid from old head");
     let barrier = Arc::new(Barrier::new(3));
     let left_workspace = workspace.clone();
     let left_barrier = Arc::clone(&barrier);
@@ -1190,7 +1183,7 @@ fn seeded_response_audit_run(
         run_id: run_id.to_string(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: 1,
         kind: ProviderExchangeKind::Initial,
         context_round: None,
@@ -1348,7 +1341,7 @@ fn seeded_context_invalid_response_run(
         run_id: run_id.to_string(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: 2,
         kind: ProviderExchangeKind::ContextRetry,
         context_round: Some(1),
@@ -1358,7 +1351,7 @@ fn seeded_context_invalid_response_run(
             .expect("context retry request");
     let expansion_bytes = b"trusted context expansion";
     let expansion = ArtifactReference {
-        path: "artifacts/01-research.attempt-002.context-round-001.json".to_string(),
+        path: "artifacts/01-research.attempt-001.context-round-001.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(expansion_bytes)),
     };
     fs::write(
@@ -1413,7 +1406,7 @@ fn repair_coordinates(run_id: &str, context_round: Option<u32>) -> ProviderExcha
         run_id: run_id.to_string(),
         step: LoopStepName::Research,
         role: ProviderRole::Researcher,
-        step_attempt: 2,
+        step_attempt: 1,
         exchange_index: 3,
         kind: ProviderExchangeKind::JsonRepair,
         context_round,
@@ -1552,7 +1545,7 @@ fn exchange_writer_rejects_symlink_and_non_file_collisions() {
     fs::create_dir_all(run_dir.join("responses")).expect("responses");
     fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
     let coordinates = coordinates(1);
-    let expected = run_dir.join("prompts/01-research.attempt-002.exchange-001.initial.request.md");
+    let expected = run_dir.join("prompts/01-research.attempt-001.exchange-001.initial.request.md");
     let outside = temp.path().join("outside");
     fs::write(&outside, b"outside").expect("outside");
     symlink(&outside, &expected).expect("symlink");

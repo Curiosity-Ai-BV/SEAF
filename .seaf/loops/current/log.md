@@ -1067,3 +1067,54 @@ tests plus the private audit-TOCTOU and nonempty compare unit regressions.
 Final re-verification passed `cargo fmt --all -- --check`, locked
 all-target/all-feature Clippy with warnings denied, all 300 locked Rust
 workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 implement | M1-04b2c context recovery and CLI integration
+
+RED showed that resume returned to the legacy single-call path: a durable
+context-retry request was replaced by a live attempt-two initial request, an
+orphan response passed preparation, and rerun made an unaudited call without
+preserving caps. Further crash-cut regressions covered staged initial and repair
+responses, malformed-JSON repair requests, standalone and referenced expansion
+tampering, response/request/record substitution, missing and reordered staged
+suffixes, empty-ledger interruption, conventional prompts before an exchange
+request, and state-head publication. Real CLI REDs covered default resume,
+explicit rerun, repository changes, cap exhaustion, and all four durable
+artifact classes.
+
+GREEN adds a pre-provider reconciliation transaction under the provider
+exchange lock. It validates the authoritative chain, computes one unique
+linked staged-record suffix, verifies every bound file and the complete
+prospective chain, rejects all remaining exchange-family files as orphans, and
+atomically publishes the new vector once. Request phases retry the exact
+audited ModelRequest; response phases are interpreted without another provider
+call. Standalone expansions are never self-authenticated. The same state
+machine recovers context retries and the one eligible JSON repair, closes
+durable terminal responses, and retains the b2b outcome taxonomy.
+
+Fresh initial requests now bind a closed metadata-only repository-context
+authority beside the one content-bearing readable context. Recovery verifies
+the readable bytes against path, source/included digest, byte, truncation,
+limit, exclusion, and warning metadata. First and later resumed rounds
+therefore use original accepted bytes and totals after live sources change.
+Context-free roles such as OutputReview carry no authority and still prepare
+for recovery; attempt-two replay still requires its rerun authorization.
+
+Conventional prompt recovery accepts only the byte-identical exact next
+attempt. Skips, stale prompts, unsafe files, or missing rerun authority fail
+before an exchange write. Recovery validates every initial exchange against its
+exact conventional prompt before publishing a staged suffix. Explicit rerun
+publishes its immutable old-head authorization and reset state in one exchange-
+locked transaction; a pre-publication failure is byte-identically retryable.
+Live append and authoritative replay both verify the authorization. Every new
+group uses the exact next durable attempt, including normal role advancement.
+Terminal legacy needs-context runs remain inert until explicit rerun, while an
+incomplete empty ledger starts audited attempt one. Two-per-step and eight-per-
+run caps are counted from the entire immutable ledger across resume and rerun.
+
+The CLI now accepts `loop resume --rerun-from <provider-step>`. Captured Ollama
+regressions prove default resume sends the exact durable request, including old
+accepted context after repository mutation. Request, response, expansion, and
+record tampering fails before any provider call or run-tree mutation. Broader
+inspect/revise recovery remains M1-09 scope. Focused GREEN passed 32 live
+context, 22 exchange-contract, 38 provider-runner, 24 state, and 85 CLI
+integration tests. M1-04b2c is complete and M1-05 is active.

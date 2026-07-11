@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
     io::Write,
@@ -29,6 +30,7 @@ use crate::{
 };
 
 pub const PROVIDER_EXCHANGE_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
 const PROVIDER_EXCHANGE_LOCK_FILE: &str = "provider-exchange.lock";
 static RUN_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +56,144 @@ pub enum ProviderExchangeRecordState {
 pub enum ProviderExchangeResponseAudit {
     ModelResponse { response: ModelResponse },
     ProviderFailure { error: ModelError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRerunAuthorization {
+    schema_version: u32,
+    run_id: String,
+    step: LoopStepName,
+    step_attempt: u32,
+    previous_record_digest: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn authorize_provider_exchange_rerun(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+) -> Result<(), ProviderExchangeError> {
+    validate_authoritative_provider_exchange_records(workspace, run)?;
+    let authorization = ProviderRerunAuthorization {
+        schema_version: PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION,
+        run_id: run.run_id.clone(),
+        step,
+        step_attempt,
+        previous_record_digest: run
+            .provider_exchange_records
+            .last()
+            .map(|reference| reference.digest.clone()),
+    };
+    let bytes = canonical_json_bytes(&authorization)?;
+    publish_create_only(
+        workspace.run_directory(),
+        &rerun_authorization_path(step, step_attempt),
+        &bytes,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn persist_provider_rerun_reset(
+    workspace: &LoopWorkspace,
+    previous: &LoopRun,
+    reset: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+) -> Result<(), ProviderExchangeError> {
+    persist_provider_rerun_reset_with_hook(
+        workspace,
+        previous,
+        reset,
+        step,
+        step_attempt,
+        || Ok(()),
+    )
+}
+
+fn persist_provider_rerun_reset_with_hook<F>(
+    workspace: &LoopWorkspace,
+    previous: &LoopRun,
+    reset: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+    before_run_publish: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce() -> Result<(), ProviderExchangeError>,
+{
+    let lock = acquire_provider_exchange_lock(workspace)?;
+    let result = (|| {
+        let current = state::load_run(workspace)?;
+        validate_authoritative_provider_exchange_records(workspace, &current)?;
+        if current != *previous {
+            return Err(ProviderExchangeError::Invalid(
+                "loop state changed before provider rerun reset publication".to_string(),
+            ));
+        }
+        if reset.provider_exchange_records != current.provider_exchange_records {
+            return Err(ProviderExchangeError::Invalid(
+                "provider rerun reset changed the authoritative exchange head".to_string(),
+            ));
+        }
+        let expected_attempt = crate::artifacts::next_step_attempt(workspace, step)
+            .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+        if step_attempt != expected_attempt {
+            return Err(ProviderExchangeError::Invalid(format!(
+                "provider rerun reset must use exact step attempt {expected_attempt}"
+            )));
+        }
+        let reset_status = reset
+            .steps
+            .iter()
+            .find(|record| record.name == step)
+            .map(|record| record.status);
+        if reset.current_step != step
+            || reset.status != seaf_core::LoopStatus::Pending
+            || reset_status != Some(seaf_core::LoopStepStatus::Pending)
+        {
+            return Err(ProviderExchangeError::Invalid(
+                "provider rerun authorization requires the matching pending reset state"
+                    .to_string(),
+            ));
+        }
+        validate_run_for_atomic_publication(workspace, reset)?;
+
+        let authorization = ProviderRerunAuthorization {
+            schema_version: PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION,
+            run_id: current.run_id.clone(),
+            step,
+            step_attempt,
+            previous_record_digest: current
+                .provider_exchange_records
+                .last()
+                .map(|reference| reference.digest.clone()),
+        };
+        let authorization_bytes = canonical_json_bytes(&authorization)?;
+        publish_create_only(
+            workspace.run_directory(),
+            &rerun_authorization_path(step, step_attempt),
+            &authorization_bytes,
+        )?;
+
+        let mut run_bytes = serde_json::to_vec_pretty(reset)?;
+        run_bytes.push(b'\n');
+        replace_run_file_atomically_with_hook(&workspace.run_file(), &run_bytes, || {
+            before_run_publish()?;
+            validate_opened_lock_file(
+                &lock,
+                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
+            )?;
+            Ok(())
+        })
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), _) => Err(error),
+    }
 }
 
 pub fn write_provider_exchange_request(
@@ -86,6 +226,25 @@ pub fn load_provider_exchange_request(
         ));
     }
     Ok(bytes)
+}
+
+pub(crate) fn load_provider_exchange_response_audit(
+    run_directory: &Path,
+    reference: &ArtifactReference,
+) -> Result<ProviderExchangeResponseAudit, ProviderExchangeError> {
+    let bytes = read_verified_regular_file(run_directory, &reference.path, "provider response")?;
+    if digest_bytes(&bytes) != reference.digest {
+        return Err(ProviderExchangeError::Invalid(
+            "provider response audit digest does not match its reference".to_string(),
+        ));
+    }
+    let audit: ProviderExchangeResponseAudit = serde_json::from_slice(&bytes)?;
+    if canonical_json_bytes(&audit)? != bytes {
+        return Err(ProviderExchangeError::Invalid(
+            "provider response audit is not canonical JSON".to_string(),
+        ));
+    }
+    Ok(audit)
 }
 
 pub fn stage_provider_exchange_record(
@@ -274,6 +433,181 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
     }
 }
 
+pub(crate) fn reconcile_provider_exchange_state(
+    workspace: &LoopWorkspace,
+    authoritative: &LoopRun,
+) -> Result<LoopRun, ProviderExchangeError> {
+    let lock = acquire_provider_exchange_lock(workspace)?;
+    let result = (|| {
+        let persisted = state::load_run(workspace)?;
+        if persisted.provider_exchange_records != authoritative.provider_exchange_records {
+            return Err(ProviderExchangeError::Invalid(
+                "persisted provider exchange head differs from the verified resume authority"
+                    .to_string(),
+            ));
+        }
+        let prospective = preflight_provider_exchange_reconciliation(workspace, authoritative)?;
+        if prospective.provider_exchange_records == authoritative.provider_exchange_records {
+            return Ok(authoritative.clone());
+        }
+        validate_run_for_atomic_publication(workspace, &prospective)?;
+        let mut bytes = serde_json::to_vec_pretty(&prospective)?;
+        bytes.push(b'\n');
+        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
+            validate_opened_lock_file(
+                &lock,
+                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
+            )?;
+            Ok(())
+        })?;
+        Ok(prospective)
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(run), Ok(())) => Ok(run),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn preflight_provider_exchange_reconciliation(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<LoopRun, ProviderExchangeError> {
+    let mut prospective = run.clone();
+    let mut staged = BTreeMap::new();
+    let authoritative_paths = run
+        .provider_exchange_records
+        .iter()
+        .map(|reference| reference.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for relative in exchange_family_files(workspace)? {
+        if !is_exchange_record_path(&relative) || authoritative_paths.contains(relative.as_str()) {
+            continue;
+        }
+        let bytes = read_verified_regular_file(
+            workspace.run_directory(),
+            &relative,
+            "staged provider exchange record",
+        )?;
+        let record: ProviderExchangeRecord = serde_json::from_slice(&bytes)?;
+        if canonical_json_bytes(&record)? != bytes {
+            return Err(ProviderExchangeError::Invalid(format!(
+                "staged provider exchange record is not canonical JSON: {relative}"
+            )));
+        }
+        let reference = record_reference(&record, digest_bytes(&bytes));
+        if reference.path != relative {
+            return Err(ProviderExchangeError::Invalid(format!(
+                "staged provider exchange record path does not match its identity: {relative}"
+            )));
+        }
+        load_provider_exchange_record(workspace.run_directory(), &reference)?;
+        staged.insert(relative, (record, reference));
+    }
+
+    while !staged.is_empty() {
+        let mut eligible = Vec::new();
+        for (path, (record, reference)) in &staged {
+            if validate_append_link(workspace, &prospective, record, true).is_ok() {
+                eligible.push((path.clone(), reference.clone()));
+            }
+        }
+        if eligible.len() != 1 {
+            return Err(ProviderExchangeError::Invalid(
+                "orphaned, reordered, or ambiguous staged provider exchange record".to_string(),
+            ));
+        }
+        let (path, reference) = eligible.pop().expect("one eligible staged record");
+        prospective.provider_exchange_records.push(reference);
+        staged.remove(&path);
+    }
+
+    validate_authoritative_provider_exchange_records(workspace, &prospective)?;
+    for reference in &prospective.provider_exchange_records {
+        let record = load_provider_exchange_record(workspace.run_directory(), reference)?;
+        if record.phase == ProviderExchangePhase::Request
+            && record.kind == ProviderExchangeKind::Initial
+        {
+            verify_conventional_initial_prompt(workspace, &record)?;
+        }
+    }
+    let mut bound = BTreeSet::new();
+    for reference in &prospective.provider_exchange_records {
+        let record = load_provider_exchange_record(workspace.run_directory(), reference)?;
+        bound.insert(reference.path.clone());
+        bound.insert(record.request.path);
+        if let Some(response) = record.response {
+            bound.insert(response.path);
+        }
+        if let Some(expansion) = record.expansion {
+            bound.insert(expansion.path);
+        }
+    }
+    for relative in exchange_family_files(workspace)? {
+        if bound.contains(&relative) {
+            continue;
+        }
+        return Err(ProviderExchangeError::Invalid(format!(
+            "orphaned provider exchange artifact: {relative}"
+        )));
+    }
+    Ok(prospective)
+}
+
+fn verify_conventional_initial_prompt(
+    workspace: &LoopWorkspace,
+    record: &ProviderExchangeRecord,
+) -> Result<(), ProviderExchangeError> {
+    let stem = step_file_stem(record.step);
+    let file_name = if record.step_attempt == 1 {
+        format!("{stem}.prompt.md")
+    } else {
+        format!("{stem}.attempt-{:03}.prompt.md", record.step_attempt)
+    };
+    let path = format!("prompts/{file_name}");
+    let conventional = read_verified_regular_file(
+        workspace.run_directory(),
+        &path,
+        "conventional provider prompt",
+    )?;
+    let audited = load_provider_exchange_request(workspace.run_directory(), &record.request)?;
+    if conventional != audited {
+        return Err(ProviderExchangeError::Invalid(
+            "conventional provider prompt does not match the staged initial request bytes"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn exchange_family_files(workspace: &LoopWorkspace) -> Result<Vec<String>, ProviderExchangeError> {
+    let mut files = Vec::new();
+    for directory in ["prompts", "responses", "artifacts"] {
+        for entry in fs::read_dir(workspace.run_directory().join(directory))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let exchange = name.contains(".attempt-")
+                && (name.contains(".exchange-") || name.contains(".context-round-"));
+            if exchange {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(ProviderExchangeError::Invalid(format!(
+                        "provider exchange artifact is not a real regular file: {directory}/{name}"
+                    )));
+                }
+                files.push(format!("{directory}/{name}"));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_exchange_record_path(path: &str) -> bool {
+    path.starts_with("artifacts/") && path.ends_with(".record.json")
+}
+
 pub fn validate_provider_exchange_record_append(
     workspace: &LoopWorkspace,
     run: &LoopRun,
@@ -281,7 +615,7 @@ pub fn validate_provider_exchange_record_append(
 ) -> Result<(), ProviderExchangeError> {
     validate_authoritative_provider_exchange_records(workspace, run)?;
     let record = load_provider_exchange_record(workspace.run_directory(), reference)?;
-    validate_append_link(workspace, run, &record)?;
+    validate_append_link(workspace, run, &record, false)?;
     let mut prospective = run.clone();
     prospective
         .provider_exchange_records
@@ -490,7 +824,7 @@ pub(crate) fn validate_authoritative_provider_exchange_records(
     verified_prefix.provider_exchange_records.clear();
     for reference in &run.provider_exchange_records {
         let record = load_provider_exchange_record(workspace.run_directory(), reference)?;
-        validate_append_link(workspace, &verified_prefix, &record)?;
+        validate_append_link(workspace, &verified_prefix, &record, false)?;
         verified_prefix
             .provider_exchange_records
             .push(reference.clone());
@@ -502,6 +836,7 @@ fn validate_append_link(
     workspace: &LoopWorkspace,
     run: &LoopRun,
     record: &ProviderExchangeRecord,
+    enforce_empty_current: bool,
 ) -> Result<(), ProviderExchangeError> {
     if record.run_id != run.run_id {
         return Err(ProviderExchangeError::Invalid(
@@ -541,6 +876,52 @@ fn validate_append_link(
         let same_group =
             previous.step == record.step && previous.step_attempt == record.step_attempt;
         if !same_group {
+            let previous_attempt_for_step = run
+                .provider_exchange_records
+                .iter()
+                .filter(|reference| reference.step == record.step)
+                .map(|reference| reference.step_attempt)
+                .max()
+                .unwrap_or(0);
+            let expected_attempt = previous_attempt_for_step.checked_add(1).ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "provider step attempt sequence is exhausted".to_string(),
+                )
+            })?;
+            if record.step_attempt != expected_attempt {
+                return Err(ProviderExchangeError::Invalid(format!(
+                    "new provider exchange group must use exact step attempt {expected_attempt}"
+                )));
+            }
+            let authorized_rerun = record.kind == ProviderExchangeKind::Initial
+                && record.exchange_index == 1
+                && record.step_attempt > previous_attempt_for_step
+                && verify_rerun_authorization(workspace, run, record.step, record.step_attempt)
+                    .is_ok();
+            if authorized_rerun {
+                if enforce_empty_current {
+                    let status = run
+                        .steps
+                        .iter()
+                        .find(|step| step.name == record.step)
+                        .map(|step| step.status);
+                    if record.step != run.current_step
+                        || !matches!(
+                            status,
+                            Some(
+                                seaf_core::LoopStepStatus::Pending
+                                    | seaf_core::LoopStepStatus::Running
+                            )
+                        )
+                    {
+                        return Err(ProviderExchangeError::Invalid(
+                            "provider rerun request is not aligned with the reset current step"
+                                .to_string(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
             if !is_advancing_outcome(previous_record.role, outcome)
                 || next_provider_step(previous_record.step) != Some(record.step)
             {
@@ -605,8 +986,111 @@ fn validate_append_link(
                 ));
             }
         }
+    } else if enforce_empty_current {
+        let current_status = run
+            .steps
+            .iter()
+            .find(|step| step.name == record.step)
+            .map(|step| step.status);
+        if record.kind != ProviderExchangeKind::Initial
+            || record.exchange_index != 1
+            || record.step != run.current_step
+            || !matches!(
+                current_status,
+                Some(seaf_core::LoopStepStatus::Pending | seaf_core::LoopStepStatus::Running)
+            )
+        {
+            return Err(ProviderExchangeError::Invalid(
+                "the first provider exchange must be the current runnable step initial request"
+                    .to_string(),
+            ));
+        }
+        if record.step_attempt > 1 {
+            verify_rerun_authorization(workspace, run, record.step, record.step_attempt)?;
+        }
+    } else {
+        if record.kind != ProviderExchangeKind::Initial || record.exchange_index != 1 {
+            return Err(ProviderExchangeError::Invalid(
+                "the authoritative provider exchange history must begin with an initial request"
+                    .to_string(),
+            ));
+        }
+        if record.step_attempt > 1 {
+            verify_rerun_authorization(workspace, run, record.step, record.step_attempt)?;
+        }
     }
     Ok(())
+}
+
+pub(crate) fn verify_rerun_authorization(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+) -> Result<(), ProviderExchangeError> {
+    let path = rerun_authorization_path(step, step_attempt);
+    let bytes = read_verified_regular_file(
+        workspace.run_directory(),
+        &path,
+        "provider rerun authorization",
+    )?;
+    let authorization: ProviderRerunAuthorization = serde_json::from_slice(&bytes)?;
+    if canonical_json_bytes(&authorization)? != bytes
+        || authorization.schema_version != PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION
+        || authorization.run_id != run.run_id
+        || authorization.step != step
+        || authorization.step_attempt != step_attempt
+        || authorization.previous_record_digest
+            != run
+                .provider_exchange_records
+                .last()
+                .map(|reference| reference.digest.clone())
+    {
+        return Err(ProviderExchangeError::Invalid(
+            "provider rerun authorization does not match the authoritative exchange head"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_recovered_conventional_attempt(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+) -> Result<(), ProviderExchangeError> {
+    if verify_rerun_authorization(workspace, run, step, step_attempt).is_ok() {
+        return Ok(());
+    }
+    let Some(head) = run.provider_exchange_records.last() else {
+        return Err(ProviderExchangeError::Invalid(
+            "recovered provider attempt has no explicit rerun authorization".to_string(),
+        ));
+    };
+    let record = load_provider_exchange_record(workspace.run_directory(), head)?;
+    let outcome = record.outcome.ok_or_else(|| {
+        ProviderExchangeError::Invalid(
+            "recovered provider attempt follows an incomplete exchange".to_string(),
+        )
+    })?;
+    if head.phase == ProviderExchangePhase::Response
+        && is_advancing_outcome(record.role, outcome)
+        && next_provider_step(record.step) == Some(step)
+    {
+        return Ok(());
+    }
+    Err(ProviderExchangeError::Invalid(
+        "recovered provider attempt is not authorized by the exchange head or an explicit rerun"
+            .to_string(),
+    ))
+}
+
+fn rerun_authorization_path(step: LoopStepName, step_attempt: u32) -> String {
+    format!(
+        "artifacts/{}.attempt-{step_attempt:03}.rerun-authorization.json",
+        step_file_stem(step)
+    )
 }
 
 fn is_advancing_outcome(role: ProviderRole, outcome: ProviderExchangeOutcome) -> bool {
@@ -1170,6 +1654,58 @@ mod tests {
             original
         );
         state::load_run(&workspace).expect("old run remains valid");
+    }
+
+    #[test]
+    fn failed_locked_rerun_reset_keeps_the_same_authority_retryable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "rerun-reset-retry")
+            .expect("workspace");
+        let mut previous = state::create_run(state::NewLoopRun {
+            run_id: "rerun-reset-retry".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        state::mark_step_running(&mut previous, LoopStepName::Research).expect("running");
+        state::save_run(&workspace, &previous).expect("previous run");
+        let previous_bytes = std::fs::read(workspace.run_file()).expect("previous bytes");
+        let mut reset = previous.clone();
+        state::reset_from_step(&mut reset, LoopStepName::Research).expect("reset");
+
+        let error = persist_provider_rerun_reset_with_hook(
+            &workspace,
+            &previous,
+            &reset,
+            LoopStepName::Research,
+            1,
+            || {
+                Err(ProviderExchangeError::Invalid(
+                    "injected rerun reset publication failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("injected failure");
+
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(
+            std::fs::read(workspace.run_file()).expect("unchanged run bytes"),
+            previous_bytes
+        );
+        verify_rerun_authorization(&workspace, &previous, LoopStepName::Research, 1)
+            .expect("immutable authorization remains valid for the unchanged head");
+
+        persist_provider_rerun_reset(&workspace, &previous, &reset, LoopStepName::Research, 1)
+            .expect("retry identical locked transaction");
+
+        assert_eq!(state::load_run(&workspace).expect("reset run"), reset);
     }
 
     #[test]

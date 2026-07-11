@@ -4,6 +4,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -1185,7 +1186,7 @@ fn loop_run_ollama_completes_against_fake_server_with_provider_artifacts() {
 }
 
 #[test]
-fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
+fn loop_resume_provider_rerun_requires_ticket_and_continues_with_audited_attempts() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -1229,6 +1230,8 @@ fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
             runs_root.to_str().unwrap(),
             "--run-id",
             run_id,
+            "--rerun-from",
+            "analysis",
             "--json",
         ])
         .output()
@@ -1250,6 +1253,8 @@ fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
             run_id,
             "--ticket",
             ticket_path.to_str().unwrap(),
+            "--rerun-from",
+            "analysis",
             "--json",
         ])
         .output()
@@ -1277,6 +1282,443 @@ fn loop_resume_provider_run_requires_ticket_and_continues_pending_steps() {
             .expect("resumed run json");
     assert_eq!(resumed_run["status"], "completed");
     assert_eq!(resumed_run["policy_decisions"][0]["patch_id"], run_id);
+}
+
+#[test]
+fn loop_resume_rerun_from_starts_a_new_audited_attempt_without_overwriting_exchange_history() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "cli-loop-audited-rerun";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let before = read_run_json(&run_dir);
+    let attempt_one = fs::read(
+        run_dir.join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json"),
+    )
+    .expect("attempt one record");
+
+    let rerun = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--rerun-from", "research", "--json"],
+    );
+
+    assert!(rerun.status.success(), "{rerun:?}");
+    let after = read_run_json(&run_dir);
+    assert_eq!(after["status"], "completed");
+    assert!(
+        after["provider_exchange_records"]
+            .as_array()
+            .expect("exchange records")
+            .len()
+            > before["provider_exchange_records"]
+                .as_array()
+                .expect("prior exchange records")
+                .len()
+    );
+    assert!(run_dir
+        .join("prompts/01-research.attempt-002.exchange-001.initial.request.md")
+        .is_file());
+    assert_eq!(
+        fs::read(
+            run_dir
+                .join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json")
+        )
+        .expect("attempt one remains"),
+        attempt_one
+    );
+}
+
+#[test]
+fn loop_cli_rerun_preserves_context_cap_across_attempts() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    for name in ["one.txt", "two.txt", "three.txt"] {
+        fs::write(repo.join(name), format!("{name} bytes\n")).expect("context file");
+    }
+    let runs_root = repo.join("runs");
+    let run_id = "cli-context-cap-rerun";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let mut initial_responses = vec![
+        provider_needs_context_response("researcher", "one.txt"),
+        provider_needs_context_response("researcher", "two.txt"),
+        agent_response("researcher", "Research complete.", "Continue."),
+    ];
+    initial_responses.extend(provider_loop_model_responses().into_iter().skip(1));
+    let initial_url = start_fake_ollama_server_sequence(initial_responses);
+    let initial = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &initial_url,
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("initial context run");
+    assert!(initial.status.success(), "{initial:?}");
+    let run_dir = runs_root.join(run_id);
+    let before = read_run_json(&run_dir);
+    let before_records = before["provider_exchange_records"]
+        .as_array()
+        .expect("records")
+        .len();
+
+    let rerun_url = start_fake_ollama_server_sequence(vec![provider_needs_context_response(
+        "researcher",
+        "three.txt",
+    )]);
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--base-url",
+            &rerun_url,
+            "--rerun-from",
+            "research",
+        ])
+        .output()
+        .expect("rerun at cap");
+
+    assert!(rerun.status.success(), "{rerun:?}");
+    let after = read_run_json(&run_dir);
+    assert_eq!(after["status"], "blocked");
+    assert_eq!(
+        after["provider_exchange_records"]
+            .as_array()
+            .expect("records")
+            .len(),
+        before_records + 2,
+        "the cap-denied request records only its initial exchange and makes no retry"
+    );
+    assert!(!run_dir
+        .join("artifacts/01-research.attempt-002.context-round-001.json")
+        .exists());
+}
+
+#[test]
+fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tampering() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("recovery-context.txt"),
+        "recovery context bytes\n",
+    )
+    .expect("recovery context");
+    let runs_root = repo.join("runs");
+    let run_id = "cli-durable-request-resume";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let mut initial_responses = vec![
+        provider_needs_context_response("researcher", "recovery-context.txt"),
+        agent_response("researcher", "Research complete.", "Continue."),
+    ];
+    initial_responses.extend(provider_loop_model_responses().into_iter().skip(1));
+    let initial_url = start_fake_ollama_server_sequence(initial_responses);
+    let initial = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &initial_url,
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("initial run");
+    assert!(initial.status.success(), "{initial:?}");
+    let run_dir = runs_root.join(run_id);
+    let exchange_request_path =
+        "prompts/06-output-review.attempt-001.exchange-001.initial.request.md";
+    let response_audit_path =
+        "responses/06-output-review.attempt-001.exchange-001.initial.response.json";
+    let response_record_path =
+        "artifacts/06-output-review.attempt-001.exchange-001.initial.response.record.json";
+    let audited_request: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join(exchange_request_path)).expect("exchange request"),
+    )
+    .expect("request JSON");
+    let expected_user_input = audited_request["messages"][0]["content"]
+        .as_str()
+        .expect("audited user input")
+        .to_string();
+    let mut interrupted = read_run_json(&run_dir);
+    interrupted["provider_exchange_records"]
+        .as_array_mut()
+        .expect("records")
+        .pop();
+    interrupted["status"] = serde_json::json!("running");
+    interrupted["current_step"] = serde_json::json!("output_review");
+    for step in interrupted["steps"].as_array_mut().expect("steps") {
+        match step["name"].as_str().expect("step name") {
+            "output_review" => {
+                step["status"] = serde_json::json!("running");
+                step.as_object_mut().expect("step").remove("artifact_path");
+                step.as_object_mut()
+                    .expect("step")
+                    .remove("artifact_digest");
+            }
+            "testing" | "eval_report" => {
+                step["status"] = serde_json::json!("pending");
+                step.as_object_mut().expect("step").remove("artifact_path");
+                step.as_object_mut()
+                    .expect("step")
+                    .remove("artifact_digest");
+            }
+            _ => {}
+        }
+    }
+    fs::remove_file(run_dir.join(response_audit_path)).expect("remove uncommitted response audit");
+    fs::remove_file(run_dir.join(response_record_path))
+        .expect("remove uncommitted response record");
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&interrupted).expect("interrupted run"),
+    )
+    .expect("write interrupted run");
+
+    let (resume_url, captured) =
+        start_recording_fake_ollama_server_sequence(vec![reviewer_response(
+            "output_reviewer",
+            "approve_for_tests",
+            "Recovered exact durable request.",
+        )]);
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--base-url",
+            &resume_url,
+        ])
+        .output()
+        .expect("resume durable request");
+    assert!(resume.status.success(), "{resume:?}");
+    let requests = captured.lock().expect("captured requests");
+    assert_eq!(requests.len(), 1);
+    let header_end = find_header_end(&requests[0]).expect("HTTP headers");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0][header_end + 4..]).expect("Ollama request JSON");
+    assert_eq!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("user message")["content"],
+        expected_user_input
+    );
+    drop(requests);
+    assert_eq!(read_run_json(&run_dir)["status"], "completed");
+
+    for relative in [
+        "prompts/01-research.attempt-001.exchange-001.initial.request.md",
+        "responses/01-research.attempt-001.exchange-001.initial.response.json",
+        "artifacts/01-research.attempt-001.exchange-001.initial.request.record.json",
+        "artifacts/01-research.attempt-001.context-round-001.json",
+    ] {
+        let path = run_dir.join(relative);
+        let original = fs::read(&path).expect("tamper target");
+        fs::write(&path, "tampered durable artifact").expect("tamper artifact");
+        let before = read_tree_bytes(&run_dir);
+        let (probe, probe_url) = provider_call_probe();
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "resume",
+                "--ticket",
+                ticket_path.to_str().unwrap(),
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--run-id",
+                run_id,
+                "--base-url",
+                &probe_url,
+                "--rerun-from",
+                "research",
+            ])
+            .output()
+            .expect("tampered resume");
+        assert!(!rejected.status.success(), "{relative}");
+        assert_no_provider_call(&probe);
+        assert_eq!(read_tree_bytes(&run_dir), before, "{relative}");
+        fs::write(path, original).expect("restore fixture authority");
+    }
+}
+
+#[test]
+fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_change() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let context_path = repo.join("recovery-context.txt");
+    fs::write(&context_path, "old accepted recovery bytes\n").expect("context");
+    let runs_root = repo.join("runs");
+    let run_id = "cli-context-recovery-old-bytes";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let mut responses = vec![
+        provider_needs_context_response("researcher", "recovery-context.txt"),
+        agent_response("researcher", "Research complete.", "Continue."),
+    ];
+    responses.extend(provider_loop_model_responses().into_iter().skip(1));
+    let initial_url = start_fake_ollama_server_sequence(responses);
+    let initial = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &initial_url,
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("initial run");
+    assert!(initial.status.success(), "{initial:?}");
+    let run_dir = runs_root.join(run_id);
+    let retry_path = "prompts/01-research.attempt-001.exchange-002.context-retry.request.md";
+    let retry: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join(retry_path)).expect("retry request"))
+            .expect("retry JSON");
+    let expected_expansion_message = retry["messages"][1]["content"]
+        .as_str()
+        .expect("expansion message")
+        .to_string();
+    let preserved = [
+        "prompts/01-research.attempt-001.exchange-001.initial.request.md",
+        "responses/01-research.attempt-001.exchange-001.initial.response.json",
+        "artifacts/01-research.attempt-001.exchange-001.initial.request.record.json",
+        "artifacts/01-research.attempt-001.exchange-001.initial.response.record.json",
+        "artifacts/01-research.attempt-001.context-round-001.json",
+        retry_path,
+        "artifacts/01-research.attempt-001.exchange-002.context-retry.request.record.json",
+    ];
+    for directory in ["prompts", "responses", "artifacts"] {
+        for entry in fs::read_dir(run_dir.join(directory)).expect("exchange directory") {
+            let entry = entry.expect("exchange entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let belongs_to_later_step = ["02-", "03-", "04-", "05-", "06-", "07-", "08-"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+            if belongs_to_later_step
+                || ((name.contains(".exchange-") || name.contains(".context-round-"))
+                    && !preserved.contains(&format!("{directory}/{name}").as_str()))
+            {
+                fs::remove_file(entry.path()).expect("remove post-crash exchange file");
+            }
+        }
+    }
+    let mut interrupted = read_run_json(&run_dir);
+    interrupted["provider_exchange_records"]
+        .as_array_mut()
+        .expect("records")
+        .truncate(3);
+    interrupted["status"] = serde_json::json!("running");
+    interrupted["current_step"] = serde_json::json!("research");
+    interrupted["policy_decisions"] = serde_json::json!([]);
+    for step in interrupted["steps"].as_array_mut().expect("steps") {
+        step["status"] = if step["name"] == "research" {
+            serde_json::json!("running")
+        } else {
+            serde_json::json!("pending")
+        };
+        step.as_object_mut().expect("step").remove("artifact_path");
+        step.as_object_mut()
+            .expect("step")
+            .remove("artifact_digest");
+    }
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&interrupted).expect("interrupted run"),
+    )
+    .expect("write interrupted run");
+    fs::write(&context_path, "changed live repository bytes\n").expect("mutate repository");
+    let mut resume_responses = vec![agent_response(
+        "researcher",
+        "Recovered research.",
+        "Continue.",
+    )];
+    resume_responses.extend(provider_loop_model_responses().into_iter().skip(1));
+    let (resume_url, captured) = start_recording_fake_ollama_server_sequence(resume_responses);
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--base-url",
+            &resume_url,
+        ])
+        .output()
+        .expect("resume context request");
+
+    assert!(resume.status.success(), "{resume:?}");
+    let requests = captured.lock().expect("requests");
+    let header_end = find_header_end(&requests[0]).expect("headers");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0][header_end + 4..]).expect("request body");
+    assert_eq!(
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("expansion message")["content"],
+        expected_expansion_message
+    );
+    let body_text = body.to_string();
+    assert!(body_text.contains("old accepted recovery bytes"));
+    assert!(!body_text.contains("changed live repository bytes"));
 }
 
 #[test]
@@ -1620,7 +2062,18 @@ fn loop_resume_accepts_matching_explicit_policy_authority() {
     run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &authority);
     mark_loop_run_pending_from_analysis(&runs_root.join(run_id).join("run.json"));
 
-    let resume = resume_provider_run(&repo, &ticket_path, &runs_root, run_id, &authority);
+    let resume = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &[
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--rerun-from",
+            "analysis",
+        ],
+    );
 
     assert!(resume.status.success(), "{resume:?}");
     assert_eq!(
@@ -1692,6 +2145,8 @@ fn loop_resume_mocked_ollama_uses_verified_project_policy() {
             run_id,
             "--base-url",
             &resume_url,
+            "--rerun-from",
+            "development",
         ])
         .output()
         .expect("resume Ollama run");
@@ -4341,6 +4796,22 @@ fn agent_response(role: &str, summary: &str, next_step_recommendation: &str) -> 
     .to_string()
 }
 
+fn provider_needs_context_response(role: &str, path: &str) -> String {
+    serde_json::json!({
+        "role": role,
+        "status": "needs_context",
+        "summary": "More repository evidence is required.",
+        "findings": [],
+        "risks": [],
+        "next_step_recommendation": "Load the requested path.",
+        "context_request": {
+            "paths": [path],
+            "reason": "This file is required for the current role."
+        }
+    })
+    .to_string()
+}
+
 fn reviewer_response(role: &str, decision: &str, summary: &str) -> String {
     serde_json::json!({
         "role": role,
@@ -4459,7 +4930,7 @@ fn start_fake_ollama_server_sequence(model_contents: Vec<String>) -> String {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("set fake Ollama read timeout");
-            read_http_request(&mut stream);
+            let _ = read_http_request(&mut stream);
             let body = serde_json::json!({
                 "message": {
                     "content": model_content
@@ -4479,7 +4950,40 @@ fn start_fake_ollama_server_sequence(model_contents: Vec<String>) -> String {
     format!("http://{address}/api")
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) {
+fn start_recording_fake_ollama_server_sequence(
+    model_contents: Vec<String>,
+) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Ollama");
+    let address = listener.local_addr().expect("fake Ollama address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    thread::spawn(move || {
+        for model_content in model_contents {
+            let (mut stream, _) = listener.accept().expect("accept fake Ollama request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set fake Ollama read timeout");
+            captured
+                .lock()
+                .expect("capture lock")
+                .push(read_http_request(&mut stream));
+            let body = serde_json::json!({
+                "message": { "content": model_content }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write fake Ollama response");
+        }
+    });
+    (format!("http://{address}/api"), requests)
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 512];
     loop {
@@ -4498,6 +5002,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) {
             break;
         }
     }
+    request
 }
 
 fn find_header_end(request: &[u8]) -> Option<usize> {

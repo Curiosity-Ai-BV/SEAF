@@ -308,7 +308,10 @@ Dependencies: P2-001, P2-002.
 Acceptance criteria:
 
 - A run can be resumed after interruption.
-- Completed steps are not repeated unless `--rerun-from <step>` is supplied.
+- Completed steps are not repeated. Provider-backed reruns use
+  `seaf loop resume --rerun-from <step>` and create a new immutable audited
+  attempt; supported values are `research`, `analysis`, `spec`, `spec-review`,
+  `development`, and `output-review`.
 - Every model request and response is stored.
 - Run status is updated after each step.
 - Run workspace includes `run.json`, `context-manifest.json`, prompts,
@@ -424,6 +427,10 @@ Acceptance criteria:
 
 - Commands exist for `model check`, `ticket validate`, `loop run`,
   `loop status`, `loop resume`, and `loop smoke`.
+- `loop resume --rerun-from <provider-step>` explicitly authorizes a new
+  provider attempt by publishing the old-head authorization and reset state in
+  one exchange-locked transaction, while preserving prior exchange history and
+  context caps.
 - CLI returns nonzero on validation failures.
 - JSON output is available for automation.
 - Human-readable output summarizes next action.

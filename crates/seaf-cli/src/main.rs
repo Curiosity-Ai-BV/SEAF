@@ -307,6 +307,9 @@ struct LoopResumeArgs {
     /// Provider request timeout in milliseconds.
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+    /// Explicitly rerun from this provider step using a new audited attempt.
+    #[arg(long)]
+    rerun_from: Option<String>,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -852,7 +855,12 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
     validate_provider_timeout(args.timeout_ms)?;
     let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
-    let run = if loop_run_needs_provider_resume(&existing) {
+    let rerun_from = args
+        .rerun_from
+        .as_deref()
+        .map(parse_provider_rerun_step)
+        .transpose()?;
+    let run = if loop_run_needs_provider_resume(&existing) || rerun_from.is_some() {
         let Some(ticket_path) = args.ticket.as_ref() else {
             return Err(CliFailure::message(
                 "--ticket is required to resume an incomplete provider-backed run".to_string(),
@@ -886,8 +894,9 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         "--base-url is only used with --provider ollama".to_string(),
                     ));
                 }
-                let next_step =
-                    next_pending_model_step(&existing).unwrap_or(LoopStepName::Research);
+                let next_step = rerun_from
+                    .or_else(|| next_pending_model_step(&existing))
+                    .unwrap_or(LoopStepName::Research);
                 let provider = FakeProvider::new(fake_provider_script_from(next_step));
                 let worktree_clean = ensure_clean_git_worktree(true)?;
                 let model = existing.model.clone();
@@ -906,6 +915,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     },
                     existing,
                     &provider,
+                    rerun_from,
                 )?
             }
             "ollama" => {
@@ -930,6 +940,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     },
                     existing,
                     &provider,
+                    rerun_from,
                 )?
             }
             provider => {
@@ -1186,6 +1197,7 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     config: ProviderLoopConfig<'_>,
     verified_run: LoopRun,
     provider: &P,
+    rerun_from: Option<LoopStepName>,
 ) -> Result<LoopRun, CliFailure> {
     let policy = config.policy;
     let context_request = provider_context_request(config.repository_root, config.ticket, policy);
@@ -1201,16 +1213,34 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         .with_ticket(config.ticket.clone())
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
-    let mut runner = LoopRunner::resume_verified(
+    let runner = LoopRunner::resume_verified(
         config.runs_root.to_path_buf(),
         verified_run,
         &mut step_runner,
     )
     .map_err(loop_runner_failure)?;
+    let mut runner = match rerun_from {
+        Some(step) => runner.rerun_from(step).map_err(loop_runner_failure)?,
+        None => runner,
+    };
     runner
         .run_to_completion()
         .map_err(loop_runner_failure)
         .cloned()
+}
+
+fn parse_provider_rerun_step(value: &str) -> Result<LoopStepName, CliFailure> {
+    match value {
+        "research" => Ok(LoopStepName::Research),
+        "analysis" => Ok(LoopStepName::Analysis),
+        "spec" | "spec-creation" => Ok(LoopStepName::SpecCreation),
+        "spec-review" => Ok(LoopStepName::SpecReview),
+        "development" => Ok(LoopStepName::Development),
+        "output-review" => Ok(LoopStepName::OutputReview),
+        _ => Err(CliFailure::message(format!(
+            "unsupported --rerun-from step '{value}'; expected research, analysis, spec, spec-review, development, or output-review"
+        ))),
+    }
 }
 
 fn provider_context_request(

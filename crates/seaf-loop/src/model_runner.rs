@@ -6,16 +6,24 @@ use seaf_core::{
     ProviderExchangeRecord, ProviderRole, TicketSpec,
 };
 use seaf_models::{ModelMessage, ModelMessageRole, ModelProvider, ModelRequest};
+use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::provider_exchange::authorize_provider_exchange_rerun;
 use crate::provider_exchange::{
-    persist_provider_exchange_record_reference, stage_provider_exchange_record,
-    stage_provider_exchange_response_record, write_provider_exchange_request,
-    write_provider_exchange_response, ProviderExchangeCoordinates, ProviderExchangeResponseAudit,
-    ProviderExchangeResponseClassification, PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    classify_provider_exchange_response, load_provider_exchange_record,
+    load_provider_exchange_request, load_provider_exchange_response_audit,
+    persist_provider_exchange_record_reference, persist_provider_rerun_reset,
+    reconcile_provider_exchange_state, stage_provider_exchange_record,
+    stage_provider_exchange_response_record, validate_recovered_conventional_attempt,
+    write_provider_exchange_request, write_provider_exchange_response, ProviderExchangeCoordinates,
+    ProviderExchangeResponseAudit, ProviderExchangeResponseClassification,
+    PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use crate::role_response::{parse_role_response, repair_prompt, RoleResponseError};
 use crate::{
-    context::{pack_live_context, ContextBundle, ContextPackRequest},
+    artifacts::latest_step_attempt,
+    context::{pack_live_context, ContextBundle, ContextFile, ContextLimits, ContextPackRequest},
     context_expansion::{
         create_context_expansion, reconstruct_context_expansion_files, ContextExpansionError,
         ContextExpansionRequest,
@@ -36,6 +44,30 @@ use crate::{
 type AfterResponsePersistObserver<'a> =
     dyn Fn(&LoopWorkspace, &LoopRun, &ProviderExchangeCoordinates) + 'a;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditedRepositoryContext {
+    untrusted_context_marker: String,
+    total_context_bytes: usize,
+    files: Vec<AuditedRepositoryContextFile>,
+    warnings: Vec<String>,
+    limits: ContextLimits,
+    default_exclude_globs: Vec<String>,
+    ticket_forbidden_files: Vec<String>,
+    policy_forbidden_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditedRepositoryContextFile {
+    path: String,
+    source_sha256: String,
+    included_sha256: String,
+    source_bytes: usize,
+    included_bytes: usize,
+    truncated: bool,
+}
+
 pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     provider: &'a P,
     model: String,
@@ -52,6 +84,7 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     pending_policy_decisions: Vec<PolicyDecision>,
     last_error_response: Option<String>,
     fresh_exchange_run: bool,
+    recovered_step_attempt: Option<(LoopStepName, u32)>,
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
@@ -123,6 +156,7 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             pending_policy_decisions: Vec::new(),
             last_error_response: None,
             fresh_exchange_run: false,
+            recovered_step_attempt: None,
             exchange_workspace: None,
             step_attempt: None,
             durable_provider_exchange_records: None,
@@ -237,6 +271,7 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
 
     fn prepare_run(&mut self, workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), RunnerError> {
         self.fresh_exchange_run = false;
+        self.recovered_step_attempt = None;
         self.exchange_workspace = Some(workspace.clone());
         self.durable_provider_exchange_records = None;
         let ticket = self.ticket.as_ref().ok_or_else(|| {
@@ -245,8 +280,63 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             )
         })?;
         validate_prepared_ticket(ticket, run)?;
-        self.run = Some(run.clone());
-        self.prepare_provider_workspace(workspace, Some(&run.run_id))
+        let reconciled = if workspace.run_file().exists() {
+            reconcile_provider_exchange_state(workspace, run).map_err(|error| {
+                RunnerError::Step(format!(
+                    "provider exchange recovery preflight failed: {error}"
+                ))
+            })?
+        } else {
+            run.clone()
+        };
+        if reconciled.provider_exchange_records != run.provider_exchange_records {
+            self.durable_provider_exchange_records =
+                Some(reconciled.provider_exchange_records.clone());
+        }
+        self.fresh_exchange_run = crate::state::next_runnable_step(&reconciled).is_some()
+            || !reconciled.provider_exchange_records.is_empty();
+        if let Some(step) = crate::state::next_runnable_step(&reconciled) {
+            let running = reconciled
+                .steps
+                .iter()
+                .any(|record| record.name == step && record.status == LoopStepStatus::Running);
+            if running {
+                let latest = latest_step_attempt(workspace, step)?;
+                let durable_attempt = reconciled
+                    .provider_exchange_records
+                    .iter()
+                    .filter(|reference| reference.step == step)
+                    .map(|reference| reference.step_attempt)
+                    .max()
+                    .unwrap_or(0);
+                if let Some(attempt) = latest.filter(|attempt| *attempt > durable_attempt) {
+                    let expected = durable_attempt.checked_add(1).ok_or_else(|| {
+                        RunnerError::Step("provider step attempt sequence is exhausted".to_string())
+                    })?;
+                    if attempt != expected {
+                        return Err(RunnerError::Step(format!(
+                            "conventional provider prompt attempt {attempt} is not the expected recovery attempt {expected}"
+                        )));
+                    }
+                    if attempt > 1 {
+                        validate_recovered_conventional_attempt(
+                            workspace,
+                            &reconciled,
+                            step,
+                            attempt,
+                        )
+                        .map_err(exchange_recovery_error)?;
+                    }
+                    self.recovered_step_attempt = Some((step, attempt));
+                } else if let Some(last) = reconciled.provider_exchange_records.last() {
+                    if last.step == step {
+                        self.recovered_step_attempt = Some((step, last.step_attempt));
+                    }
+                }
+            }
+        }
+        self.run = Some(reconciled.clone());
+        self.prepare_provider_workspace(workspace, Some(&reconciled.run_id))
     }
 
     fn prepare_fresh_run(
@@ -283,10 +373,77 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         attempt: u32,
     ) -> Result<(), RunnerError> {
         self.step_attempt = Some(attempt);
-        if attempt > 1 {
-            self.fresh_exchange_run = false;
-        }
         self.prepare_step(workspace, run, step)
+    }
+
+    fn recovered_step_attempt(&self, step: LoopStepName) -> Option<u32> {
+        self.recovered_step_attempt
+            .filter(|(candidate, _)| *candidate == step)
+            .map(|(_, attempt)| attempt)
+    }
+
+    fn prepare_rerun(
+        &mut self,
+        workspace: &LoopWorkspace,
+        _run: &LoopRun,
+        step: LoopStepName,
+        attempt: u32,
+    ) -> Result<(), RunnerError> {
+        self.fresh_exchange_run = true;
+        self.recovered_step_attempt = None;
+        self.step_attempt = Some(attempt);
+        if let Some(run) = &self.run {
+            if let Some(durable_attempt) = run
+                .provider_exchange_records
+                .iter()
+                .filter(|reference| reference.step == step)
+                .map(|reference| reference.step_attempt)
+                .max()
+            {
+                let expected = durable_attempt.checked_add(1).ok_or_else(|| {
+                    RunnerError::Step("provider rerun attempt sequence is exhausted".to_string())
+                })?;
+                if attempt != expected {
+                    return Err(RunnerError::Step(format!(
+                        "provider rerun attempt {attempt} is not the exact next durable attempt {expected}"
+                    )));
+                }
+            }
+            if run
+                .provider_exchange_records
+                .iter()
+                .any(|reference| reference.step == step && reference.step_attempt == attempt)
+            {
+                return Err(RunnerError::Step(
+                    "rerun attempt already has provider exchange history".to_string(),
+                ));
+            }
+        }
+        if self.context_bundle.is_none() {
+            if let Some(request) = &self.context_pack_request {
+                let mut request = request.clone();
+                request.run_directory = workspace.run_directory().to_path_buf();
+                self.context_bundle = Some(pack_live_context(&request).map_err(|error| {
+                    RunnerError::Step(format!(
+                        "failed to pack context for explicit provider rerun: {error}"
+                    ))
+                })?);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_rerun_reset(
+        &mut self,
+        workspace: &LoopWorkspace,
+        previous: &LoopRun,
+        reset: &LoopRun,
+        step: LoopStepName,
+        attempt: u32,
+    ) -> Result<bool, RunnerError> {
+        persist_provider_rerun_reset(workspace, previous, reset, step, attempt)
+            .map_err(exchange_recovery_error)?;
+        Ok(true)
     }
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
@@ -411,11 +568,12 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         role: Role,
         request: &str,
     ) -> Result<StepOutput, RunnerError> {
-        let initial_request: ModelRequest = serde_json::from_str(request).map_err(|error| {
-            RunnerError::Step(format!(
-                "failed to parse {step:?} model request audit: {error}"
-            ))
-        })?;
+        let fallback_initial_request: ModelRequest =
+            serde_json::from_str(request).map_err(|error| {
+                RunnerError::Step(format!(
+                    "failed to parse {step:?} model request audit: {error}"
+                ))
+            })?;
         let attempt = self.step_attempt.ok_or_else(|| {
             RunnerError::Step("audited provider execution is missing its step attempt".to_string())
         })?;
@@ -423,10 +581,101 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         let mut kind = ProviderExchangeKind::Initial;
         let mut context_round = None;
         let mut expansion = None;
-        let mut model_request = initial_request;
-        let initial_request_bytes = request.as_bytes().to_vec();
+        let mut model_request = fallback_initial_request;
+        let mut initial_request_bytes = request.as_bytes().to_vec();
         let mut transcript = Vec::new();
         let mut initial_request_reference = None;
+        let mut durable_request = None;
+        let mut durable_response = None;
+
+        if let Some(run) = &self.run {
+            let group = run
+                .provider_exchange_records
+                .iter()
+                .filter(|reference| reference.step == step && reference.step_attempt == attempt)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !group.is_empty() {
+                let workspace = self.exchange_workspace.as_ref().ok_or_else(|| {
+                    RunnerError::Step(
+                        "audited recovery is missing its exchange workspace".to_string(),
+                    )
+                })?;
+                let initial_reference = group
+                    .iter()
+                    .find(|reference| {
+                        reference.phase == ProviderExchangePhase::Request
+                            && reference.kind == ProviderExchangeKind::Initial
+                    })
+                    .ok_or_else(|| {
+                        RunnerError::Step(
+                            "audited recovery has no initial request authority".to_string(),
+                        )
+                    })?;
+                let initial_record =
+                    load_provider_exchange_record(workspace.run_directory(), initial_reference)
+                        .map_err(exchange_recovery_error)?;
+                initial_request_bytes = load_provider_exchange_request(
+                    workspace.run_directory(),
+                    &initial_record.request,
+                )
+                .map_err(exchange_recovery_error)?;
+                initial_request_reference = Some(initial_record.request.clone());
+                for reference in group
+                    .iter()
+                    .filter(|reference| reference.phase == ProviderExchangePhase::Response)
+                {
+                    let record =
+                        load_provider_exchange_record(workspace.run_directory(), reference)
+                            .map_err(exchange_recovery_error)?;
+                    let audit = load_provider_exchange_response_audit(
+                        workspace.run_directory(),
+                        record.response.as_ref().ok_or_else(|| {
+                            RunnerError::Step(
+                                "audited recovery response has no audit identity".to_string(),
+                            )
+                        })?,
+                    )
+                    .map_err(exchange_recovery_error)?;
+                    if let ProviderExchangeResponseAudit::ModelResponse { response } = audit {
+                        transcript.push(response.content);
+                    }
+                }
+                let last_reference = group.last().expect("nonempty exchange group");
+                let last = load_provider_exchange_record(workspace.run_directory(), last_reference)
+                    .map_err(exchange_recovery_error)?;
+                exchange_index = last.exchange_index;
+                kind = last.kind;
+                context_round = last.context_round;
+                expansion = last.expansion.clone();
+                let request_bytes =
+                    load_provider_exchange_request(workspace.run_directory(), &last.request)
+                        .map_err(exchange_recovery_error)?;
+                model_request = serde_json::from_slice(&request_bytes).map_err(|error| {
+                    RunnerError::Step(format!(
+                        "failed to parse recovered provider request audit: {error}"
+                    ))
+                })?;
+                match last.phase {
+                    ProviderExchangePhase::Request => durable_request = Some(last.request),
+                    ProviderExchangePhase::Response => {
+                        let response_reference = last.response.as_ref().ok_or_else(|| {
+                            RunnerError::Step(
+                                "audited recovery response has no audit identity".to_string(),
+                            )
+                        })?;
+                        let audit = load_provider_exchange_response_audit(
+                            workspace.run_directory(),
+                            response_reference,
+                        )
+                        .map_err(exchange_recovery_error)?;
+                        let classification =
+                            classify_provider_exchange_response(provider_role_for(role), &audit);
+                        durable_response = Some((last.request, audit, classification));
+                    }
+                }
+            }
+        }
 
         loop {
             let coordinates = self.exchange_coordinates(
@@ -437,36 +686,53 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 kind,
                 context_round,
             )?;
-            let request_bytes = if kind == ProviderExchangeKind::Initial {
-                initial_request_bytes.clone()
+            let (provider_result, classification, recovered_response) = if let Some((
+                _request_reference,
+                audit,
+                classification,
+            )) =
+                durable_response.take()
+            {
+                let result = match audit {
+                    ProviderExchangeResponseAudit::ModelResponse { response } => Ok(response),
+                    ProviderExchangeResponseAudit::ProviderFailure { error } => Err(error),
+                };
+                (result, classification, true)
             } else {
-                serde_json::to_vec_pretty(&model_request).map_err(|error| {
-                    RunnerError::Step(format!(
-                        "failed to serialize audited provider request: {error}"
-                    ))
-                })?
+                let request_reference = if let Some(reference) = durable_request.take() {
+                    reference
+                } else {
+                    let request_bytes = if kind == ProviderExchangeKind::Initial {
+                        initial_request_bytes.clone()
+                    } else {
+                        serde_json::to_vec_pretty(&model_request).map_err(|error| {
+                            RunnerError::Step(format!(
+                                "failed to serialize audited provider request: {error}"
+                            ))
+                        })?
+                    };
+                    self.append_exchange_request(&coordinates, &request_bytes, expansion.clone())?
+                };
+                if kind == ProviderExchangeKind::Initial {
+                    initial_request_reference = Some(request_reference.clone());
+                }
+                let provider_result = self.provider.complete(model_request.clone());
+                let audit = match &provider_result {
+                    Ok(response) => ProviderExchangeResponseAudit::ModelResponse {
+                        response: response.clone(),
+                    },
+                    Err(error) => ProviderExchangeResponseAudit::ProviderFailure {
+                        error: error.clone(),
+                    },
+                };
+                let classification = self.append_exchange_response(
+                    &coordinates,
+                    request_reference,
+                    expansion.clone(),
+                    &audit,
+                )?;
+                (provider_result, classification, false)
             };
-            let request_reference =
-                self.append_exchange_request(&coordinates, &request_bytes, expansion.clone())?;
-            if kind == ProviderExchangeKind::Initial {
-                initial_request_reference = Some(request_reference.clone());
-            }
-
-            let provider_result = self.provider.complete(model_request.clone());
-            let audit = match &provider_result {
-                Ok(response) => ProviderExchangeResponseAudit::ModelResponse {
-                    response: response.clone(),
-                },
-                Err(error) => ProviderExchangeResponseAudit::ProviderFailure {
-                    error: error.clone(),
-                },
-            };
-            let classification = self.append_exchange_response(
-                &coordinates,
-                request_reference,
-                expansion.clone(),
-                &audit,
-            )?;
 
             let response = match provider_result {
                 Ok(response) => response,
@@ -479,7 +745,9 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     );
                 }
             };
-            transcript.push(response.content.clone());
+            if !recovered_response {
+                transcript.push(response.content.clone());
+            }
             match parse_role_response(role, &response.content) {
                 Ok(parsed) => {
                     if classification.outcome == ProviderExchangeOutcome::InvalidResponse {
@@ -1041,6 +1309,10 @@ fn exchange_write_error(error: impl std::fmt::Display) -> RunnerError {
     RunnerError::Step(format!("durable provider exchange write failed: {error}"))
 }
 
+fn exchange_recovery_error(error: impl std::fmt::Display) -> RunnerError {
+    RunnerError::Step(format!("provider exchange recovery failed: {error}"))
+}
+
 fn context_expansion_write_error(error: ContextExpansionError) -> RunnerError {
     RunnerError::Step(format!(
         "durable context expansion write failed; staged exchange state requires reconciliation: {error}"
@@ -1098,6 +1370,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "ticket": ticket,
             "prerequisites": prerequisites,
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
+            "repository_context_authority": self.audited_repository_context(),
         });
         serde_json::to_string(&prompt).map(Some).map_err(|error| {
             RunnerError::Step(format!("failed to serialize {step:?} role input: {error}"))
@@ -1137,6 +1410,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             // Development is the one role that still needs the initially bounded source files
             // in order to construct a patch. OutputReview never receives this context.
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
+            "repository_context_authority": self.audited_repository_context(),
         });
         serde_json::to_string(&prompt).map_err(|error| {
             RunnerError::Step(format!(
@@ -1194,6 +1468,32 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     "missing validated {step:?} artifact for the Development request"
                 ))
             })
+    }
+
+    fn audited_repository_context(&self) -> Option<AuditedRepositoryContext> {
+        let bundle = self.context_bundle.as_ref()?;
+        let request = self.context_pack_request.as_ref()?;
+        Some(AuditedRepositoryContext {
+            untrusted_context_marker: bundle.untrusted_context_marker.clone(),
+            total_context_bytes: bundle.total_context_bytes,
+            files: bundle
+                .files
+                .iter()
+                .map(|file| AuditedRepositoryContextFile {
+                    path: file.path.clone(),
+                    source_sha256: file.sha256.clone(),
+                    included_sha256: sha256_bytes(file.content.as_bytes()),
+                    source_bytes: file.source_bytes,
+                    included_bytes: file.included_bytes,
+                    truncated: file.truncated,
+                })
+                .collect(),
+            warnings: bundle.warnings.clone(),
+            limits: request.limits,
+            default_exclude_globs: request.default_exclude_globs.clone(),
+            ticket_forbidden_files: request.ticket_forbidden_files.clone(),
+            policy_forbidden_paths: request.policy_forbidden_paths.clone(),
+        })
     }
 
     fn require_approved_spec_review(&self) -> Result<&PersistedRoleArtifact, RunnerError> {
@@ -1269,6 +1569,17 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         let Some(request) = &self.context_pack_request else {
             return Ok(());
         };
+        if let Some(run) = &self.run {
+            if run.provider_exchange_records.is_empty()
+                && crate::state::next_runnable_step(run).is_none()
+            {
+                return Ok(());
+            }
+            if !run.provider_exchange_records.is_empty() {
+                self.context_bundle = load_audited_initial_context_bundle(workspace, run, request)?;
+                return Ok(());
+            }
+        }
         let mut request = request.clone();
         request.run_directory = workspace.run_directory().to_path_buf();
         let bundle = pack_live_context(&request)
@@ -1327,6 +1638,186 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         }
         Ok(())
     }
+}
+
+fn load_audited_initial_context_bundle(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    request: &ContextPackRequest,
+) -> Result<Option<ContextBundle>, RunnerError> {
+    let initial_reference = run
+        .provider_exchange_records
+        .iter()
+        .find(|reference| {
+            reference.phase == ProviderExchangePhase::Request
+                && reference.kind == ProviderExchangeKind::Initial
+        })
+        .ok_or_else(|| {
+            RunnerError::Step("provider exchange history has no initial request".to_string())
+        })?;
+    let initial_record =
+        load_provider_exchange_record(workspace.run_directory(), initial_reference)
+            .map_err(exchange_recovery_error)?;
+    let initial_bytes =
+        load_provider_exchange_request(workspace.run_directory(), &initial_record.request)
+            .map_err(exchange_recovery_error)?;
+    let model_request: ModelRequest = serde_json::from_slice(&initial_bytes).map_err(|error| {
+        RunnerError::Step(format!(
+            "failed to parse audited initial provider request: {error}"
+        ))
+    })?;
+    let role_input: serde_json::Value = serde_json::from_str(
+        model_request
+            .messages
+            .first()
+            .ok_or_else(|| {
+                RunnerError::Step("audited initial provider request has no user input".to_string())
+            })?
+            .content
+            .as_str(),
+    )
+    .map_err(|error| {
+        RunnerError::Step(format!(
+            "failed to parse audited initial provider role input: {error}"
+        ))
+    })?;
+    let context = role_input
+        .get("repository_context")
+        .and_then(serde_json::Value::as_str);
+    let authority_value = role_input.get("repository_context_authority").cloned();
+    if context.is_none()
+        && authority_value
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(None);
+    }
+    let context = context.ok_or_else(|| {
+        RunnerError::Step(
+            "audited repository context is missing its human-readable bytes".to_string(),
+        )
+    })?;
+    let authority: AuditedRepositoryContext = serde_json::from_value(
+        authority_value.ok_or_else(|| {
+            RunnerError::Step(
+                "audited initial provider request predates structured context recovery; use an explicit rerun"
+                    .to_string(),
+            )
+        })?,
+    )
+    .map_err(|error| {
+        RunnerError::Step(format!(
+            "invalid structured initial repository context authority: {error}"
+        ))
+    })?;
+    if authority.limits != request.limits
+        || authority.ticket_forbidden_files != request.ticket_forbidden_files
+        || authority.policy_forbidden_paths != request.policy_forbidden_paths
+        || authority.default_exclude_globs != request.default_exclude_globs
+        || authority.total_context_bytes
+            != authority
+                .files
+                .iter()
+                .map(|file| file.included_bytes)
+                .sum::<usize>()
+        || authority.files.iter().any(|file| {
+            file.included_bytes > file.source_bytes
+                || file.truncated != (file.included_bytes < file.source_bytes)
+        })
+    {
+        return Err(RunnerError::Step(
+            "structured initial repository context authority is internally inconsistent or does not match provider configuration"
+                .to_string(),
+        ));
+    }
+    let prefix = format!(
+        "\n\nRepository context:\n{}\n",
+        authority.untrusted_context_marker
+    );
+    let mut remaining = context.strip_prefix(&prefix).ok_or_else(|| {
+        RunnerError::Step(
+            "audited initial repository context has an invalid trust marker".to_string(),
+        )
+    })?;
+    let mut files = Vec::with_capacity(authority.files.len());
+    for file in &authority.files {
+        let header = format!(
+            "\ncontext file\npath: {}\nsha256: {}\ncontent:\n",
+            file.path, file.source_sha256
+        );
+        remaining = remaining.strip_prefix(&header).ok_or_else(|| {
+            RunnerError::Step(format!(
+                "audited initial repository context does not match authority entry {}",
+                file.path
+            ))
+        })?;
+        if remaining.len() < file.included_bytes || !remaining.is_char_boundary(file.included_bytes)
+        {
+            return Err(RunnerError::Step(format!(
+                "audited initial repository context has invalid byte length for {}",
+                file.path
+            )));
+        }
+        let content = remaining[..file.included_bytes].to_string();
+        if sha256_bytes(content.as_bytes()) != file.included_sha256 {
+            return Err(RunnerError::Step(format!(
+                "audited initial repository context digest mismatch for {}",
+                file.path
+            )));
+        }
+        remaining = &remaining[file.included_bytes..];
+        if !content.ends_with('\n') {
+            remaining = remaining.strip_prefix('\n').ok_or_else(|| {
+                RunnerError::Step(format!(
+                    "audited initial repository context has no delimiter after {}",
+                    file.path
+                ))
+            })?;
+        }
+        files.push(ContextFile {
+            path: file.path.clone(),
+            content,
+            sha256: file.source_sha256.clone(),
+            source_bytes: file.source_bytes,
+            included_bytes: file.included_bytes,
+            truncated: file.truncated,
+        });
+    }
+    let expected_warnings = if authority.warnings.is_empty() {
+        String::new()
+    } else {
+        let mut rendered = "\ncontext warnings:\n".to_string();
+        for warning in &authority.warnings {
+            rendered.push_str("- ");
+            rendered.push_str(warning);
+            rendered.push('\n');
+        }
+        rendered
+    };
+    if remaining != expected_warnings {
+        return Err(RunnerError::Step(
+            "audited initial repository context has bytes outside its structured authority"
+                .to_string(),
+        ));
+    }
+    let bundle = ContextBundle {
+        untrusted_context_marker: authority.untrusted_context_marker,
+        total_context_bytes: authority.total_context_bytes,
+        files,
+        warnings: authority.warnings,
+        manifest_path: workspace.run_directory().join("context-manifest.json"),
+    };
+    if context_prompt(&bundle) != context {
+        return Err(RunnerError::Step(
+            "human-readable repository context does not match its structured audited authority"
+                .to_string(),
+        ));
+    }
+    Ok(Some(bundle))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn is_early_role_step(step: LoopStepName) -> bool {
@@ -1685,6 +2176,137 @@ mod live_context_cap_tests {
             ),
             "eight accepted expansions deny the ninth"
         );
+    }
+
+    #[test]
+    fn output_review_first_ledger_has_no_context_authority_and_remains_recoverable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).expect("repository");
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "output-first").expect("workspace");
+        let run = crate::state::create_run(crate::state::NewLoopRun {
+            run_id: "output-first".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake-model".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        crate::state::save_run(&workspace, &run).expect("save");
+        authorize_provider_exchange_rerun(&workspace, &run, LoopStepName::OutputReview, 2)
+            .expect("authorize context-free output review rerun");
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::OutputReview,
+            role: ProviderRole::OutputReviewer,
+            step_attempt: 2,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = ModelRequest {
+            model: "fake-model".to_string(),
+            system: Role::OutputReviewer.system_prompt().to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: serde_json::json!({
+                    "instructions": "Review persisted evidence.",
+                    "run_id": run.run_id
+                })
+                .to_string(),
+            }],
+            response_schema: Some(Role::OutputReviewer.response_schema()),
+            temperature: 0.0,
+            timeout_ms: 30_000,
+        };
+        let bytes = serde_json::to_vec_pretty(&request).expect("request bytes");
+        std::fs::write(
+            workspace
+                .run_directory()
+                .join("prompts/06-output-review.attempt-002.prompt.md"),
+            &bytes,
+        )
+        .expect("conventional output-review prompt");
+        let request_reference =
+            write_provider_exchange_request(workspace.run_directory(), &coordinates, &bytes)
+                .expect("request");
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: 2,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request: request_reference,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference =
+            stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage");
+        let run =
+            persist_provider_exchange_record_reference(&workspace, reference).expect("persist");
+        let ticket = TicketSpec {
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            title: "Output review recovery".to_string(),
+            status: TicketStatus::Ready,
+            priority: TicketPriority::P1,
+            problem: "Recover output review".to_string(),
+            research_questions: Vec::new(),
+            context: TicketContext {
+                relevant_files: Vec::new(),
+                forbidden_files: Vec::new(),
+            },
+            autonomy: TicketAutonomy {
+                level: 1,
+                apply_patch: false,
+                allow_shell_commands: Vec::new(),
+            },
+            acceptance_criteria: vec!["Recover".to_string()],
+            eval: None,
+        };
+        let pack = ContextPackRequest::for_ticket(
+            &repository,
+            workspace.run_directory(),
+            &ticket,
+            &[],
+            ContextLimits {
+                max_bytes_per_file: 1_024,
+                max_total_bytes: 8_192,
+            },
+        );
+
+        assert!(load_audited_initial_context_bundle(&workspace, &run, &pack)
+            .expect("contextless first ledger")
+            .is_none());
+        let mut prepared_run = run.clone();
+        prepared_run.input_digests.ticket =
+            canonical_sha256_digest(&ticket).expect("ticket digest");
+        let provider = seaf_models::FakeProvider::new(Vec::new());
+        let mut provider_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+            .with_ticket(ticket)
+            .with_context_pack_request(pack);
+        provider_runner
+            .prepare_run(&workspace, &prepared_run)
+            .expect("context-free first ledger prepares for resume");
+        std::fs::remove_file(
+            workspace
+                .run_directory()
+                .join("artifacts/06-output-review.attempt-002.rerun-authorization.json"),
+        )
+        .expect("remove authorization");
+        assert!(crate::state::load_run(&workspace).is_err());
     }
 
     #[test]

@@ -17,8 +17,8 @@
 - [x] M1-04b1: Additive context expansion artifact.
 - [x] M1-04b2a: Durable context exchange contract.
 - [x] M1-04b2b: Bounded live context orchestration.
-- [ ] M1-04b2c: Context round recovery and CLI integration (active).
-- [ ] M1-05: Isolated candidate workspace.
+- [x] M1-04b2c: Context round recovery and CLI integration.
+- [ ] M1-05: Isolated candidate workspace (active).
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
@@ -48,6 +48,6 @@
 
 ## Current Gate
 
-M1-04b2b is complete and M1-04b2c is active. Milestone 1 remains active; fresh
-provider execution now uses bounded durable context rounds, while resume,
-rerun, staged-record reconciliation, and CLI recovery remain pending.
+M1-04b2c is complete and M1-05 is active. Milestone 1 remains active; fresh,
+resumed, and explicitly rerun provider execution now share one bounded durable
+context protocol with staged-record reconciliation and real CLI recovery.

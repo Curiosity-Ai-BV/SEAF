@@ -53,11 +53,31 @@ pub fn write_step_request(
         PROMPTS_DIR,
         request_file_name(step_file_stem(step), attempt)
     );
-    write_artifact(
-        workspace.run_directory(),
-        &relative_path,
-        request.as_bytes(),
-    )?;
+    let absolute = workspace.run_directory().join(&relative_path);
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(WorkspaceError::UnsafeExistingLayout(
+                absolute,
+                "prompt attempt is not a real regular file or is a symlink".to_string(),
+            ));
+        }
+        Ok(_) => {
+            if fs::read(&absolute)? != request.as_bytes() {
+                return Err(WorkspaceError::UnsafeExistingLayout(
+                    absolute,
+                    "existing prompt attempt differs from the recovered request bytes".to_string(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_artifact(
+                workspace.run_directory(),
+                &relative_path,
+                request.as_bytes(),
+            )?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(relative_path)
 }
 
@@ -99,26 +119,40 @@ pub fn next_step_attempt(
     workspace: &LoopWorkspace,
     step: LoopStepName,
 ) -> Result<u32, WorkspaceError> {
+    latest_step_attempt(workspace, step)?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            WorkspaceError::UnsafeExistingLayout(
+                workspace.run_directory().join(PROMPTS_DIR),
+                format!(
+                    "prompt attempt sequence is exhausted for {}; start a new run",
+                    step_file_stem(step)
+                ),
+            )
+        })
+}
+
+pub fn latest_step_attempt(
+    workspace: &LoopWorkspace,
+    step: LoopStepName,
+) -> Result<Option<u32>, WorkspaceError> {
     let prompts_dir = workspace.run_directory().join(PROMPTS_DIR);
     let stem = step_file_stem(step);
     let canonical_name = request_file_name(stem.clone(), 1);
-    let mut highest_attempt = 0;
-
+    let mut highest_attempt = None;
     if !prompts_dir.exists() {
-        return Ok(1);
+        return Ok(None);
     }
-
     for entry in fs::read_dir(&prompts_dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-
         let attempt = if file_name == canonical_name {
             Some(1)
         } else {
             attempt_from_request_file_name(&stem, &file_name)
         };
-
         if let Some(attempt) = attempt {
             let file_type = entry.file_type()?;
             if file_type.is_symlink() || !file_type.is_file() {
@@ -127,16 +161,11 @@ pub fn next_step_attempt(
                     "prompt attempt is not a real regular file or is a symlink".to_string(),
                 ));
             }
-            highest_attempt = highest_attempt.max(attempt);
+            highest_attempt =
+                Some(highest_attempt.map_or(attempt, |current: u32| current.max(attempt)));
         }
     }
-
-    highest_attempt.checked_add(1).ok_or_else(|| {
-        WorkspaceError::UnsafeExistingLayout(
-            prompts_dir,
-            format!("prompt attempt sequence is exhausted for {stem}; start a new run"),
-        )
-    })
+    Ok(highest_attempt)
 }
 
 fn request_file_name(stem: String, attempt: u32) -> String {

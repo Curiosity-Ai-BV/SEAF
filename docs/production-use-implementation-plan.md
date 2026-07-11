@@ -339,7 +339,7 @@ production 250ms drain grace and eval behavior remain unchanged.
 
 Roadmap: U2. Dependencies: M1-R01.
 
-Status: active. This work is split into M1-04b1 and M1-04b2a through M1-04b2c
+Status: complete on 2026-07-11. This work is split into M1-04b1 and M1-04b2a through M1-04b2c
 so context data, durable exchange state, live orchestration, and recovery can be
 reviewed independently.
 
@@ -348,7 +348,8 @@ direct model tools or safety-boundary bypass.
 
 #### M1-04b1 - Additive Context Expansion Artifact
 
-Status: complete on 2026-07-11. M1-04b2a is also complete and M1-04b2b is active.
+Status: complete on 2026-07-11. M1-04b2a through M1-04b2c are also complete;
+M1-05 is active.
 
 Objective: create one safe, canonical, immutable expansion from a validated
 ContextRequest without changing provider retry or LoopRun behavior.
@@ -427,8 +428,8 @@ expansion identity used for recovery.
 
 #### M1-04b2a - Durable Context Exchange Contract
 
-Status: complete on 2026-07-11. M1-04b2b is also complete and M1-04b2c is
-active.
+Status: complete on 2026-07-11. M1-04b2b and M1-04b2c are also complete;
+M1-05 is active.
 
 Objective: define authoritative, backward-compatible state and immutable audit
 records for ordered provider exchanges without adding retry behavior.
@@ -529,7 +530,8 @@ that threat boundary.
 
 #### M1-04b2b - Bounded Live Context Orchestration
 
-Status: complete on 2026-07-11. M1-04b2c is active. Dependencies: M1-04b2a.
+Status: complete on 2026-07-11. M1-04b2c is also complete and M1-05 is active.
+Dependencies: M1-04b2a.
 
 Objective: execute bounded same-role context retries with every exchange durable
 before the next provider call.
@@ -620,13 +622,13 @@ an older in-memory `LoopRun`. M1-10 still owns comparison and coordination for
 general non-ledger state changes; this seam preserves only provider-exchange
 history.
 
-This behavior is deliberately wired only through the fresh-run hook. Resume
-and rerun retain their pre-b2b single-round behavior until M1-04b2c verifies or
-reconciles staged exchange chains and restores live bounded orchestration.
+M1-04b2c extends this behavior through verified resume and explicitly
+authorized rerun. It reconciles staged exchange chains before provider
+preparation and restores the same bounded orchestration without resetting caps.
 
 #### M1-04b2c - Context Round Recovery And CLI Integration
 
-Status: active. Dependencies: M1-04b2b.
+Status: complete on 2026-07-11. M1-05 is active. Dependencies: M1-04b2b.
 
 Objective: verify or reconcile interrupted exchange chains and preserve caps
 through resume, rerun, and real CLI entrypoints.
@@ -664,6 +666,52 @@ Docs/tracker: recovery behavior and complete M1-04b status.
 
 Commit boundary: M1-04b recovery/CLI integration only; no candidate workspace,
 approval, eval, promotion, or general M1-09 recovery operations.
+
+Implemented flow: resume first validates every authoritative request, response,
+expansion, and record byte. Under the narrow exchange lock it scans flat
+exchange-family files, computes at most one uniquely linked staged-record
+suffix, validates the complete prospective chain and all bound files, rejects
+any raw orphan or ambiguity, then publishes the reconciled vector in one atomic
+run-state replacement. A standalone expansion has no trusted digest and is
+rejected; a staged retry record may bind and adopt its exact expansion digest.
+
+The runner resumes at the durable request or response phase. It never repeats a
+durable response, and a request phase reuses the exact audited ModelRequest.
+Malformed-JSON repair requests and staged repair responses follow the same
+path. A durable terminal response closes the step without another provider
+call. Provider failures, invalid responses, context denials, audit failures,
+and unwritable state retain the M1-04b2b taxonomy and audit-before-control
+ordering.
+
+Fresh initial requests contain a closed metadata-only
+`repository_context_authority` next to the single human-readable
+content-bearing context payload. The request digest therefore binds paths,
+source and included digests and byte counts, truncation, limits, exclusions,
+warnings, and exact included content without duplicating that content. Recovery
+cross-checks the readable payload against this authority and reconstructs the
+original bundle. Later rounds use only this bundle and referenced expansion
+artifacts; changed live initial or accepted expansion sources are never reread.
+Context-free initial roles such as OutputReview legitimately recover with no
+context authority.
+
+Conventional prompt cuts before the first exchange request reuse only a
+byte-identical exact attempt. Skipped, stale, substituted, symlinked, or
+unauthorized prompts fail before an exchange write. Every new exchange group
+uses the exact next durable attempt. Reconciliation checks every initial
+exchange against its exact conventional prompt before publishing a staged
+suffix. Explicit rerun writes the canonical previous-head authorization and
+the reset run state in one exchange-locked transaction; an interrupted
+pre-publication attempt can retry the identical authorization without a stale
+collision. Replay rechecks that authorization, including context-free or
+first-ledger attempt-two cases. Earlier attempt files are create-only or byte-
+identical and are never overwritten.
+
+Both caps are recomputed from all durable context-retry request records, so
+resume and rerun cannot reset them. Empty-ledger incomplete runs enter audited
+execution, while terminal legacy M1-04a `needs_context` runs remain inert until
+an explicit rerun. The CLI exposes that narrow operation as
+`seaf loop resume --rerun-from <provider-step>`; broader inspect/revise recovery
+remains M1-09.
 
 ### M1-05 - Isolated Candidate Workspace
 

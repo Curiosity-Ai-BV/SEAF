@@ -87,6 +87,31 @@ pub trait StepRunner {
         self.prepare_step(workspace, run, step)
     }
 
+    fn recovered_step_attempt(&self, _step: LoopStepName) -> Option<u32> {
+        None
+    }
+
+    fn prepare_rerun(
+        &mut self,
+        _workspace: &LoopWorkspace,
+        _run: &LoopRun,
+        _step: LoopStepName,
+        _attempt: u32,
+    ) -> Result<(), RunnerError> {
+        Ok(())
+    }
+
+    fn persist_rerun_reset(
+        &mut self,
+        _workspace: &LoopWorkspace,
+        _previous: &LoopRun,
+        _reset: &LoopRun,
+        _step: LoopStepName,
+        _attempt: u32,
+    ) -> Result<bool, RunnerError> {
+        Ok(false)
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
@@ -186,25 +211,53 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         run: LoopRun,
         step_runner: &'a mut R,
     ) -> Result<Self, RunnerError> {
-        let next_attempt = state::next_runnable_step(&run)
+        let filesystem_next_attempt = state::next_runnable_step(&run)
             .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
             .transpose()?;
         step_runner.prepare_run(&workspace, &run)?;
-        workspace.append_log("resumed run")?;
-
-        Ok(Self {
+        let mut runner = Self {
             workspace,
             run,
             step_runner,
-            next_attempt,
-        })
+            next_attempt: None,
+        };
+        runner.import_durable_provider_exchange_records()?;
+        runner.next_attempt = state::next_runnable_step(&runner.run)
+            .map(|step| {
+                runner
+                    .step_runner
+                    .recovered_step_attempt(step)
+                    .or_else(|| {
+                        filesystem_next_attempt
+                            .filter(|(candidate, _)| *candidate == step)
+                            .map(|(_, attempt)| attempt)
+                    })
+                    .map_or_else(|| next_step_attempt(&runner.workspace, step), Ok)
+                    .map(|attempt| (step, attempt))
+            })
+            .transpose()?;
+        runner.workspace.append_log("resumed run")?;
+        Ok(runner)
     }
 
     pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
-        self.next_attempt = None;
+        let attempt = next_step_attempt(&self.workspace, step)?;
+        let previous = self.run.clone();
+        self.step_runner
+            .prepare_rerun(&self.workspace, &self.run, step, attempt)?;
+        self.next_attempt = Some((step, attempt));
         state::reset_from_step(&mut self.run, step)?;
         clear_current_run_policy_decisions_from_step(&mut self.run, step)?;
-        self.persist_run_state()?;
+        let reset_persisted = self.step_runner.persist_rerun_reset(
+            &self.workspace,
+            &previous,
+            &self.run,
+            step,
+            attempt,
+        )?;
+        if !reset_persisted {
+            self.persist_run_state()?;
+        }
         self.workspace
             .append_log(&format!("reset run from {step:?}"))?;
         Ok(self)

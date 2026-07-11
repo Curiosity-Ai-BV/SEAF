@@ -103,8 +103,22 @@ an exact exchange-vector compare, including when the intended vector is empty,
 so it cannot erase a concurrent cooperative first request or later suffix. The
 compare protects provider-exchange history only; general state coordination
 remains M1-10 scope.
-M1-04b2c still must reconcile staged state and enable the same bounded behavior
-through resume, rerun, and real CLI recovery flows.
+M1-04b2c now applies the same bounded protocol to resume and explicit rerun.
+Recovery verifies the authoritative chain, adopts only one uniquely linked
+canonical staged-record suffix, and rejects raw orphans, missing bytes,
+reordering, substitution, digest failure, unsafe file types, and skipped
+attempts before another provider call. Conventional prompt crash cuts reuse
+only the exact byte-identical authorized attempt. Structured metadata inside
+the immutable initial request binds the one content-bearing repository-context
+payload, so resumed rounds reconstruct accepted bytes and original limits
+without rereading changed sources. Context-free roles remain recoverable.
+`seaf loop resume --rerun-from <step>` publishes an immutable rerun
+authorization and reset state in one exchange-locked transaction, then uses a
+fresh exact attempt while preserving the two-per-step and eight-per-run caps.
+Recovery validates the exact conventional prompt before staged-head adoption.
+Terminal legacy `needs_context` history stays inert until that explicit rerun.
+Real CLI tests cover default resume, repository changes, cap exhaustion, and
+request, response, expansion, and record tampering.
 
 ## Production-Use Acceptance Scenario
 
