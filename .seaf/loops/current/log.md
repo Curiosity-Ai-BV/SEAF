@@ -862,3 +862,128 @@ AlreadyExists/byte-identical branch now syncs the real parent before reporting
 success, matching the winning publication branch. The existing concurrent
 identical-creator regression passed, as did all 259 locked workspace tests and
 the full Rust and documentation gates.
+
+## 2026-07-11 implement | M1-04b2a durable context exchange contract
+
+RED first introduced the provider-exchange integration suite. Its initial
+compile failed with E0432/E0609 because the typed records, LoopRun reference
+field, immutable writers, classifier, and append protocol did not exist. Later
+focused REDs proved that bound request tampering was accepted before staging,
+new step groups could not link the run-wide ledger head, and run loading ignored
+tampered authoritative record bytes.
+
+GREEN adds version-1 two-phase canonical records with exact role outcomes and
+typed ordered LoopRun references. Request and response phases bind the run,
+step, role, attempt, exchange index/kind, optional distinct context round,
+global prior-record digest, audited request/response identities, trusted
+M1-04b1 expansion identity, and parsed outcome. Sequence validation rejects
+gaps, reorderings, identity/path/digest mismatches, wrong phase and role/outcome
+pairings, broken global links, response substitutions, and invalid transitions.
+Only `needs_context` can start the next context round, only malformed JSON can
+start repair, and terminal outcomes end that step-attempt exchange chain.
+
+The M1-04b1 atomic no-replace publisher is now shared by expansion and exchange
+artifacts. Request, response, and record creation is create-only and
+byte-identical-idempotent; expansion records reference the existing canonical
+M1-04b1 artifact rather than copying it. Safe real-file and digest checks happen
+before record publication and again on load. Staged records are inspectable but
+never auto-adopted, and conflicting authoritative identities fail closed. The
+append API verifies one record against the run-wide head before persisting its
+reference, while run loading re-verifies the full authoritative chain.
+
+Focused GREEN passed all 13 provider-exchange tests and the live provider
+single-call regression. Final verification passed `cargo fmt --all -- --check`,
+locked all-target/all-feature Clippy with warnings denied, all 272 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`. M1-04b2a
+is complete and M1-04b2b is active.
+
+## 2026-07-11 spec fix | M1-04b2a atomic append and repair authority
+
+Spec review found that exchange references were appended with a truncating
+write and no lock, so concurrent callers could both report success while one
+update was lost. RED made two same-head appenders succeed and proved a symlinked
+prospective lock path was ignored. A separate injected pre-publication RED could
+not compile because no atomic replacement seam existed. GREEN adds a stable
+real-file provider-exchange lock, reloads and verifies state while holding it,
+writes and syncs a unique same-parent temporary file, atomically replaces
+`run.json` on macOS/Linux, syncs the parent, and then unlocks. Exactly one
+concurrent caller commits; the stale-head caller rejects. Pre-publication
+failure leaves the prior state byte-identical and parseable, while orphaned
+temporary-name collisions advance to a fresh reservation. This narrow safety
+boundary is pulled forward because another provider call depends on it; M1-10
+still generalizes atomic locking to every other mutation.
+
+Repair REDs showed that JSON repair could not retain context authority. Repair
+records may now carry either both a nonzero context round and expansion or
+neither. An invalid initial response repairs without context, while an invalid
+context response requires the repair to inherit the exact round and expansion.
+Missing, zero, or substituted authority rejects, and repair records do not
+consume expansion rounds.
+
+The LoopRun JSON Schema now has closed cross-field conditionals for
+step/role/path stem, kind/path, phase/path, and context-round presence. The docs
+attribute gaps, ordering, run-wide links, outcomes, and bound-byte checks only
+to Rust runtime/state validation rather than claiming JSON Schema can validate
+array history. Focused GREEN passed 17 provider-exchange integration tests and
+both atomic-state unit tests. Final verification passed
+`cargo fmt --all -- --check`, locked all-target/all-feature Clippy with warnings
+denied, all 278 locked Rust workspace tests, `corepack pnpm format:check`, and
+`git diff --check`.
+
+## 2026-07-11 quality fix | M1-04b2a derived outcomes and transition closure
+
+Quality review found that a record caller could claim any role-compatible
+outcome and that non-advancing responses could jump to a new step or attempt.
+RED bound valid `needs_context` content to a false `passed` claim, blocked
+content to `invalid_response`, a provider failure to `passed`, and a valid
+repair response to `invalid_response`. Further REDs attempted cross-step and
+incremented-attempt bypasses after needs-context, invalid, blocked, and provider
+failure outcomes, and exercised a second repair after an invalid repair.
+
+GREEN replaces raw response bytes with a canonical typed audit containing the
+complete `ModelResponse` or `ModelError`. Stage and load verify its path/digest
+and canonical bytes, parse model content through the existing exact role
+parser, derive the precise outcome, and reject any record mismatch. Invalid
+JSON/schema derives `invalid_response`; a failure envelope derives
+`provider_failure`. Only malformed JSON is repair-eligible; schema, role,
+reviewer-decision, and context-contract invalidity is terminal. Only the
+role-specific advancing success may start the exact next provider step.
+Same-group needs-context enters context retry, malformed JSON permits one
+repair, and all other outcomes terminate that chain without a step/attempt
+escape.
+
+The ledger lock is documented as cooperative SEAF-process concurrency only.
+Preexisting unsafe paths still fail closed and the opened lock identity is
+rechecked immediately before publication, but no claim is made against a
+hostile same-user process replacing directory entries inside the critical
+section. M1-10 will generalize locking, and M1-11 private artifact protection
+will strengthen that boundary. Focused GREEN passed 20 provider-exchange
+integration tests.
+Final verification passed `cargo fmt --all -- --check`, locked
+all-target/all-feature Clippy with warnings denied, all 281 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 final spec fix | M1-04b2a repair eligibility and valid concurrency proof
+
+Final review found that every `invalid_response` outcome could enter repair,
+even when exact role parsing had classified valid JSON as schema-, role-, or
+context-contract-invalid. RED showed schema-invalid canonical content starting
+a repair. GREEN retains the exact parser classification alongside the outcome:
+only `RoleResponseError::InvalidJson` is repair-eligible. Other invalid response
+classes remain durably representable but terminal.
+
+Reviewer parsing also accepts both approval decision strings structurally. RED
+showed that SpecReviewer `approve_for_tests` content was unstageable as an
+invalid response; the symmetric OutputReviewer `approve_spec` case was covered
+in the same regression. These cross-role decisions now derive terminal
+`invalid_response`, stage and load canonically, and cannot begin repair.
+
+The concurrency regression previously raced one valid Analysis candidate
+against a SpecCreation candidate that was already invalid from the Research
+head. The corrected test stages two distinct immutable Analysis attempts,
+preflights both independently against the same old successful Research state,
+then races them. Exactly one locked append succeeds; the loser rejects only
+after reload reveals its stale head. Focused GREEN passed 22 provider-exchange
+integration tests. Final verification passed `cargo fmt --all -- --check`,
+locked all-target/all-feature Clippy with warnings denied, all 283 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.

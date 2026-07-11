@@ -102,6 +102,11 @@ fn research_request_contains_exact_ticket_and_all_run_input_digests() {
     loop_runner.run_next_step().expect("run research");
 
     let requests = provider.requests().expect("provider requests");
+    assert_eq!(requests.len(), 1, "M1-04b2a must not add provider calls");
+    assert!(
+        loop_runner.run().provider_exchange_records.is_empty(),
+        "M1-04b2a defines durable exchange state without changing live orchestration"
+    );
     let prompt: serde_json::Value =
         serde_json::from_str(&requests[0].messages[0].content).expect("structured role prompt");
     assert_eq!(prompt["run_id"], "exact-research-request");

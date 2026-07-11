@@ -72,10 +72,22 @@ input digests. M1-04a now defines and validates bounded typed context requests;
 M1-04b1 now safely materializes each additive request as an immutable,
 canonical, cumulative-budgeted artifact whose prior accepted bytes do not
 depend on the changed live repository. Its expected initial path/byte metadata
-is bound but remains caller supplied. M1-04b2 still must reconcile that metadata
-to structured audit state, persist each trusted expansion path/digest identity,
-and durably order, cap, execute, and resume the provider exchanges that consume
-those artifacts.
+is bound but remains caller supplied. M1-04b2a now defines the authoritative
+ordered exchange ledger: immutable request/response records and typed LoopRun
+references bind every audited call, its exact role outcome, the run-wide prior
+record, and any trusted M1-04b1 expansion identity. Its narrow stable lock and
+atomic synced state replacement protect the ledger append that must precede a
+later provider call; M1-10 still generalizes those guarantees to all other
+state mutations. This is cooperative SEAF-process locking, not protection from
+a hostile same-user process replacing run-directory entries; M1-10 and M1-11
+own that stronger boundary. Outcomes are derived from canonical full provider
+response/failure audits through the exact role parser rather than trusted from
+callers; only malformed JSON is repair-eligible, while schema, role, reviewer,
+and context-contract invalidity is terminal. Existing single-round provider
+behavior remains unchanged and intentionally writes no ledger records in this
+slice. M1-04b2b and M1-04b2c still must reconcile the initial metadata to live
+orchestration, enforce both context caps, execute the durable retries, and
+recover interrupted chains through real CLI flows.
 
 ## Production-Use Acceptance Scenario
 

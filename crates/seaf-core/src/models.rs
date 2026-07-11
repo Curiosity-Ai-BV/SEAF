@@ -362,8 +362,98 @@ pub struct LoopRun {
     pub updated_at: String,
     pub steps: Vec<LoopStepRecord>,
     pub policy_decisions: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub provider_exchange_records: Vec<ProviderExchangeRecordReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactReference {
+    pub path: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRole {
+    Researcher,
+    Analyzer,
+    SpecWriter,
+    SpecReviewer,
+    Developer,
+    OutputReviewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExchangeKind {
+    Initial,
+    JsonRepair,
+    ContextRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExchangePhase {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExchangeOutcome {
+    Passed,
+    Blocked,
+    NeedsContext,
+    PatchProposed,
+    ApproveSpec,
+    ApproveForTests,
+    RequestChanges,
+    Reject,
+    InvalidResponse,
+    ProviderFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderExchangeRecord {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub step: LoopStepName,
+    pub role: ProviderRole,
+    pub step_attempt: u32,
+    pub exchange_index: u32,
+    pub kind: ProviderExchangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_round: Option<u32>,
+    pub phase: ProviderExchangePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_record_digest: Option<String>,
+    pub request: ArtifactReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<ArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ProviderExchangeOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderExchangeRecordReference {
+    pub run_id: String,
+    pub step: LoopStepName,
+    pub role: ProviderRole,
+    pub step_attempt: u32,
+    pub exchange_index: u32,
+    pub kind: ProviderExchangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_round: Option<u32>,
+    pub phase: ProviderExchangePhase,
+    pub path: String,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

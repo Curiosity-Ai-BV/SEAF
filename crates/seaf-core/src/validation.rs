@@ -4,8 +4,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ProjectConfig, ReleaseCapsule, SeafEvent,
-    TicketSpec,
+    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ProjectConfig, ProviderExchangeKind,
+    ProviderExchangeOutcome, ProviderExchangePhase, ProviderExchangeRecord,
+    ProviderExchangeRecordReference, ProviderRole, ReleaseCapsule, SeafEvent, TicketSpec,
 };
 
 pub type ValidationResult<T> = Result<T, ValidationReport>;
@@ -414,11 +415,342 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         }
     }
 
+    validate_provider_exchange_references(&mut errors, run);
+
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
 
     errors
+}
+
+pub fn validate_provider_exchange_record(record: &ProviderExchangeRecord) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if record.schema_version != 1 {
+        errors.push(FieldError::new("schema_version", "must be 1"));
+    }
+    require_non_empty(&mut errors, "run_id", &record.run_id);
+    validate_exchange_identity(
+        &mut errors,
+        record.step,
+        record.role,
+        record.step_attempt,
+        record.exchange_index,
+    );
+    validate_artifact_reference(&mut errors, "request", &record.request);
+    if let Some(response) = &record.response {
+        validate_artifact_reference(&mut errors, "response", response);
+    }
+    if let Some(expansion) = &record.expansion {
+        validate_artifact_reference(&mut errors, "expansion", expansion);
+    }
+    if let Some(digest) = &record.previous_record_digest {
+        validate_lowercase_sha256_digest(&mut errors, "previous_record_digest", digest);
+    }
+    if record.context_round == Some(0) {
+        errors.push(FieldError::new(
+            "context_round",
+            "must be at least 1 when present",
+        ));
+    }
+
+    match record.phase {
+        ProviderExchangePhase::Request => {
+            if record.response.is_some() || record.outcome.is_some() {
+                errors.push(FieldError::new(
+                    "phase",
+                    "request records must not contain a response or outcome",
+                ));
+            }
+        }
+        ProviderExchangePhase::Response => {
+            if record.previous_record_digest.is_none() {
+                errors.push(FieldError::new(
+                    "previous_record_digest",
+                    "response records must link their request record",
+                ));
+            }
+            if record.response.is_none() || record.outcome.is_none() {
+                errors.push(FieldError::new(
+                    "phase",
+                    "response records require a response and parsed outcome",
+                ));
+            }
+        }
+    }
+
+    match record.kind {
+        ProviderExchangeKind::ContextRetry | ProviderExchangeKind::JsonRepair => {
+            let requires_context = record.kind == ProviderExchangeKind::ContextRetry;
+            if requires_context
+                && (record.context_round.is_none() || record.context_round == Some(0))
+            {
+                errors.push(FieldError::new(
+                    "context_round",
+                    "context retry records require a nonzero context round",
+                ));
+            }
+            if requires_context && record.expansion.is_none() {
+                errors.push(FieldError::new(
+                    "expansion",
+                    "context retry records require an expansion",
+                ));
+            } else if record.context_round.is_some() != record.expansion.is_some() {
+                errors.push(FieldError::new(
+                    "expansion",
+                    "context round and expansion must either both be present or both be absent",
+                ));
+            } else if let (Some(round), Some(expansion)) = (record.context_round, &record.expansion)
+            {
+                let expected = format!(
+                    "artifacts/{}.attempt-{:03}.context-round-{round:03}.json",
+                    exchange_step_stem(record.step),
+                    record.step_attempt
+                );
+                if expansion.path != expected {
+                    errors.push(FieldError::new(
+                        "expansion.path",
+                        format!("must be {expected}"),
+                    ));
+                }
+            }
+        }
+        ProviderExchangeKind::Initial
+            if record.expansion.is_some() || record.context_round.is_some() =>
+        {
+            errors.push(FieldError::new(
+                "context_round",
+                "initial records must not contain context expansion identity",
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(outcome) = record.outcome {
+        if !outcome_matches_role(record.role, outcome) {
+            errors.push(FieldError::new(
+                "outcome",
+                "parsed outcome is not valid for this provider role",
+            ));
+        }
+    }
+    errors
+}
+
+fn validate_provider_exchange_references(errors: &mut Vec<FieldError>, run: &LoopRun) {
+    let mut finished_groups = Vec::new();
+    let mut current_group = None;
+    for (index, reference) in run.provider_exchange_records.iter().enumerate() {
+        let field = format!("provider_exchange_records[{index}]");
+        validate_exchange_identity(
+            errors,
+            reference.step,
+            reference.role,
+            reference.step_attempt,
+            reference.exchange_index,
+        );
+        if reference.run_id != run.run_id {
+            errors.push(FieldError::new(
+                format!("{field}.run_id"),
+                "must match the loop run",
+            ));
+        }
+        validate_lowercase_sha256_digest(errors, &format!("{field}.digest"), &reference.digest);
+        if reference.context_round == Some(0) {
+            errors.push(FieldError::new(
+                format!("{field}.context_round"),
+                "must be at least 1 when present",
+            ));
+        }
+        let expected_path = exchange_record_path(reference);
+        if reference.path != expected_path {
+            errors.push(FieldError::new(
+                format!("{field}.path"),
+                format!("must be {expected_path}"),
+            ));
+        }
+        match reference.kind {
+            ProviderExchangeKind::ContextRetry
+                if reference.context_round.is_none() || reference.context_round == Some(0) =>
+            {
+                errors.push(FieldError::new(
+                    format!("{field}.context_round"),
+                    "context retry references require a nonzero context round",
+                ));
+            }
+            ProviderExchangeKind::Initial if reference.context_round.is_some() => {
+                errors.push(FieldError::new(
+                    format!("{field}.context_round"),
+                    "initial references must not contain a context round",
+                ));
+            }
+            _ => {}
+        }
+
+        let group = (reference.step, reference.step_attempt);
+        if current_group != Some(group) {
+            if index > 0
+                && run.provider_exchange_records[index - 1].phase != ProviderExchangePhase::Response
+            {
+                errors.push(FieldError::new(
+                    field.clone(),
+                    "a new exchange group cannot start before the prior response",
+                ));
+            }
+            if let Some(previous) = current_group.replace(group) {
+                finished_groups.push(previous);
+            }
+            if finished_groups.contains(&group) {
+                errors.push(FieldError::new(
+                    field.clone(),
+                    "exchange group is reordered",
+                ));
+            }
+            if reference.exchange_index != 1
+                || reference.phase != ProviderExchangePhase::Request
+                || reference.kind != ProviderExchangeKind::Initial
+            {
+                errors.push(FieldError::new(
+                    field.clone(),
+                    "an exchange group must start with its initial request at index 1",
+                ));
+            }
+        } else if let Some(previous) = index
+            .checked_sub(1)
+            .map(|prior| &run.provider_exchange_records[prior])
+        {
+            match reference.phase {
+                ProviderExchangePhase::Response => {
+                    if previous.phase != ProviderExchangePhase::Request
+                        || reference.exchange_index != previous.exchange_index
+                        || reference.kind != previous.kind
+                        || reference.context_round != previous.context_round
+                        || reference.role != previous.role
+                    {
+                        errors.push(FieldError::new(
+                            field.clone(),
+                            "a response must immediately follow its matching request",
+                        ));
+                    }
+                }
+                ProviderExchangePhase::Request => {
+                    if previous.phase != ProviderExchangePhase::Response
+                        || reference.exchange_index != previous.exchange_index.saturating_add(1)
+                    {
+                        errors.push(FieldError::new(
+                            field.clone(),
+                            "the next request must follow the prior response without gaps",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_exchange_identity(
+    errors: &mut Vec<FieldError>,
+    step: crate::LoopStepName,
+    role: ProviderRole,
+    step_attempt: u32,
+    exchange_index: u32,
+) {
+    if step_attempt == 0 {
+        errors.push(FieldError::new("step_attempt", "must be at least 1"));
+    }
+    if exchange_index == 0 {
+        errors.push(FieldError::new("exchange_index", "must be at least 1"));
+    }
+    let expected = match step {
+        crate::LoopStepName::Research => Some(ProviderRole::Researcher),
+        crate::LoopStepName::Analysis => Some(ProviderRole::Analyzer),
+        crate::LoopStepName::SpecCreation => Some(ProviderRole::SpecWriter),
+        crate::LoopStepName::SpecReview => Some(ProviderRole::SpecReviewer),
+        crate::LoopStepName::Development => Some(ProviderRole::Developer),
+        crate::LoopStepName::OutputReview => Some(ProviderRole::OutputReviewer),
+        crate::LoopStepName::Testing | crate::LoopStepName::EvalReport => None,
+    };
+    if expected != Some(role) {
+        errors.push(FieldError::new("role", "does not match the loop step"));
+    }
+}
+
+fn validate_artifact_reference(
+    errors: &mut Vec<FieldError>,
+    field: &str,
+    reference: &crate::ArtifactReference,
+) {
+    validate_safe_relative_path(errors, &format!("{field}.path"), &reference.path);
+    validate_lowercase_sha256_digest(errors, &format!("{field}.digest"), &reference.digest);
+}
+
+fn outcome_matches_role(role: ProviderRole, outcome: ProviderExchangeOutcome) -> bool {
+    use ProviderExchangeOutcome as Outcome;
+    matches!(outcome, Outcome::InvalidResponse | Outcome::ProviderFailure)
+        || match role {
+            ProviderRole::Researcher | ProviderRole::Analyzer | ProviderRole::SpecWriter => {
+                matches!(
+                    outcome,
+                    Outcome::Passed | Outcome::Blocked | Outcome::NeedsContext
+                )
+            }
+            ProviderRole::Developer => matches!(
+                outcome,
+                Outcome::PatchProposed | Outcome::Blocked | Outcome::NeedsContext
+            ),
+            ProviderRole::SpecReviewer => {
+                matches!(
+                    outcome,
+                    Outcome::ApproveSpec | Outcome::RequestChanges | Outcome::Reject
+                )
+            }
+            ProviderRole::OutputReviewer => matches!(
+                outcome,
+                Outcome::ApproveForTests | Outcome::RequestChanges | Outcome::Reject
+            ),
+        }
+}
+
+fn exchange_record_path(reference: &ProviderExchangeRecordReference) -> String {
+    let phase = match reference.phase {
+        ProviderExchangePhase::Request => "request",
+        ProviderExchangePhase::Response => "response",
+    };
+    let kind = match reference.kind {
+        ProviderExchangeKind::Initial => "initial",
+        ProviderExchangeKind::JsonRepair => "json-repair",
+        ProviderExchangeKind::ContextRetry => "context-retry",
+    };
+    format!(
+        "artifacts/{}.attempt-{:03}.exchange-{:03}.{kind}.{phase}.record.json",
+        exchange_step_stem(reference.step),
+        reference.step_attempt,
+        reference.exchange_index
+    )
+}
+
+fn exchange_step_stem(step: crate::LoopStepName) -> String {
+    let index = match step {
+        crate::LoopStepName::Research => 1,
+        crate::LoopStepName::Analysis => 2,
+        crate::LoopStepName::SpecCreation => 3,
+        crate::LoopStepName::SpecReview => 4,
+        crate::LoopStepName::Development => 5,
+        crate::LoopStepName::OutputReview => 6,
+        crate::LoopStepName::Testing => 7,
+        crate::LoopStepName::EvalReport => 8,
+    };
+    let slug = match step {
+        crate::LoopStepName::Research => "research",
+        crate::LoopStepName::Analysis => "analysis",
+        crate::LoopStepName::SpecCreation => "spec",
+        crate::LoopStepName::SpecReview => "spec-review",
+        crate::LoopStepName::Development => "development",
+        crate::LoopStepName::OutputReview => "output-review",
+        crate::LoopStepName::Testing => "testing",
+        crate::LoopStepName::EvalReport => "eval-report",
+    };
+    format!("{index:02}-{slug}")
 }
 
 pub fn sha256_digest_file(path: &Path) -> Result<String, std::io::Error> {

@@ -348,7 +348,7 @@ direct model tools or safety-boundary bypass.
 
 #### M1-04b1 - Additive Context Expansion Artifact
 
-Status: complete on 2026-07-11. M1-04b2a is active.
+Status: complete on 2026-07-11. M1-04b2a is also complete and M1-04b2b is active.
 
 Objective: create one safe, canonical, immutable expansion from a validated
 ContextRequest without changing provider retry or LoopRun behavior.
@@ -421,13 +421,13 @@ identity/link/digest mutations fail.
 Provider call count, LoopRun, CLI, and the initial context manifest are
 unchanged. This slice derives and verifies the exact initial prompt audit path
 and binds the complete caller-supplied initial loaded-path/byte metadata;
-M1-04b2a still owns authoritative reconciliation of those expected values to a
-structured provider-request audit record and persistence of the trusted
+M1-04b2a now provides authoritative reconciliation of those expected values to
+a structured provider-request audit record and persistence of the trusted
 expansion identity used for recovery.
 
 #### M1-04b2a - Durable Context Exchange Contract
 
-Status: active. Dependencies: M1-04b1.
+Status: complete on 2026-07-11. M1-04b2b is active.
 
 Objective: define authoritative, backward-compatible state and immutable audit
 records for ordered provider exchanges without adding retry behavior.
@@ -469,9 +469,66 @@ Docs/tracker: durable exchange contract and M1-04b2a completion.
 Commit boundary: exchange/state contract only; no context retry, cap enforcement,
 resume reconciliation, CLI change, or later-milestone behavior.
 
+Implemented flow: the ledger contract and API can represent each logical
+provider call as an immutable request record followed by an immutable response
+record; the live provider runner intentionally remains ledger-empty in this
+slice. Version-1 canonical records bind the run, step, exact provider role,
+step attempt, logical exchange index and kind, optional distinct context round,
+run-wide previous-record digest, request and response identities, the trusted
+M1-04b1 expansion identity when required, and the exact parsed role outcome.
+Response files are canonical typed audits containing the complete
+`ModelResponse` or `ModelError`; stage and load derive the outcome by running
+model content through the existing exact role parser, so callers cannot choose
+the recorded outcome. Parse/schema failures become `invalid_response` and
+provider failure envelopes become `provider_failure`. Only
+`RoleResponseError::InvalidJson` is JSON-repair eligible; schema, role,
+reviewer-decision, and context-contract invalidity are terminal. Role/outcome
+compatibility and phase invariants fail closed. `needs_context` may advance only
+to the next context retry round, malformed JSON permits exactly one JSON repair,
+and successful role-specific outcomes alone may advance to the exact next
+provider step. Blocked, failed, invalid, change-requested, and rejected results
+cannot bypass their chain by starting another step or attempt.
+
+`LoopRun.provider_exchange_records` is the ordered authority and defaults to an
+empty list for legacy runs; no duplicate count is stored. The closed JSON
+Schema enforces structural identity conditionals across step/role/path stem,
+kind/path, phase/path, and context-round presence. Rust runtime and state
+validation enforce ordered gaps, reorderings, global links, role outcomes, and
+bound-file equality; those sequence guarantees are not attributed to JSON
+Schema. Request, response, and record names include step attempt, exchange
+index, kind, and phase where applicable, so they cannot collide with the
+ordinary single-round files. The M1-04b1 publisher was extracted as the shared
+synced atomic create-only primitive; byte-identical replay converges and
+different bytes, symlinks, or non-files are tampering. Expansion bytes are
+never duplicated: context records reference the exact existing M1-04b1
+path/digest and explicit context round. JSON repair inherits either the exact
+round and expansion of the invalid context response or neither from an initial
+exchange, and it never consumes another context round.
+
+A verified unreferenced record is classified as staged, while a conflicting
+authoritative identity is rejected. Because another provider call depends on a
+durable ledger head, this slice pulls forward a narrow provider-exchange lock
+and atomic run-state publication: the stable real lock file is held while state
+is reloaded and verified, the new state is written and synced to a unique
+same-parent temporary file, the file is atomically replaced on macOS/Linux, and
+the parent is synced. Concurrent stale-head appenders reject without losing an
+update, and pre-publication failure leaves the old `run.json` valid. M1-10 still
+generalizes atomic replacement and per-run locking to every other state
+mutation. Loading a run re-verifies its entire authoritative chain. This slice
+does not scan or auto-adopt staged records and makes no provider call or retry;
+M1-04b2b owns live orchestration and cap enforcement.
+
+The narrow lock is a cooperative concurrency guarantee between SEAF processes,
+not an adversarial same-user filesystem boundary. Preexisting symlink and
+non-file lock paths fail closed, and lock identity is rechecked immediately
+before publication as defense in depth, but a hostile process with permission
+to unlink or replace run-directory entries remains outside this slice. M1-10
+will generalize locking, and M1-11 private artifact permissions will strengthen
+that threat boundary.
+
 #### M1-04b2b - Bounded Live Context Orchestration
 
-Status: pending. Dependencies: M1-04b2a.
+Status: active. Dependencies: M1-04b2a.
 
 Objective: execute bounded same-role context retries with every exchange durable
 before the next provider call.
@@ -701,6 +758,11 @@ Commit boundary: recovery operations only.
 Roadmap: U5. Dependencies: M1-09.
 
 Objective: prevent corrupt or concurrently mutated run state.
+
+M1-04b2a already provides a narrow stable lock and atomic replacement for the
+provider-exchange append that must complete before another provider call. This
+slice generalizes the guarantee to every other run-state mutation and recovery
+operation; it does not replace or weaken the earlier ledger-specific guard.
 
 Acceptance criteria:
 

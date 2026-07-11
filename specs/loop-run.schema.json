@@ -123,6 +123,165 @@
       "type": "array",
       "items": { "type": "object", "minProperties": 1 }
     },
+    "provider_exchange_records": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "step",
+          "role",
+          "step_attempt",
+          "exchange_index",
+          "kind",
+          "phase",
+          "path",
+          "digest"
+        ],
+        "properties": {
+          "run_id": { "type": "string", "minLength": 1 },
+          "step": {
+            "enum": [
+              "research",
+              "analysis",
+              "spec_creation",
+              "spec_review",
+              "development",
+              "output_review"
+            ]
+          },
+          "role": {
+            "enum": [
+              "researcher",
+              "analyzer",
+              "spec_writer",
+              "spec_reviewer",
+              "developer",
+              "output_reviewer"
+            ]
+          },
+          "step_attempt": { "type": "integer", "minimum": 1 },
+          "exchange_index": { "type": "integer", "minimum": 1 },
+          "kind": { "enum": ["initial", "json_repair", "context_retry"] },
+          "context_round": { "type": "integer", "minimum": 1 },
+          "phase": { "enum": ["request", "response"] },
+          "path": {
+            "type": "string",
+            "pattern": "^artifacts/[0-9]{2}-[a-z-]+\\.attempt-[0-9]{3,}\\.exchange-[0-9]{3,}\\.(initial|json-repair|context-retry)\\.(request|response)\\.record\\.json$"
+          },
+          "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "kind": { "const": "initial" } } },
+            "then": { "not": { "required": ["context_round"] } }
+          },
+          {
+            "if": { "properties": { "kind": { "const": "context_retry" } } },
+            "then": { "required": ["context_round"] }
+          },
+          {
+            "if": { "properties": { "phase": { "const": "request" } } },
+            "then": {
+              "properties": {
+                "path": { "pattern": "\\.request\\.record\\.json$" }
+              }
+            },
+            "else": {
+              "properties": {
+                "path": { "pattern": "\\.response\\.record\\.json$" }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "kind": { "const": "initial" } } },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "\\.initial\\.(request|response)\\.record\\.json$"
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "kind": { "const": "json_repair" } } },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "\\.json-repair\\.(request|response)\\.record\\.json$"
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "kind": { "const": "context_retry" } } },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "\\.context-retry\\.(request|response)\\.record\\.json$"
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "research" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "researcher" },
+                "path": { "pattern": "^artifacts/01-research\\." }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "analysis" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "analyzer" },
+                "path": { "pattern": "^artifacts/02-analysis\\." }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "spec_creation" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "spec_writer" },
+                "path": { "pattern": "^artifacts/03-spec\\." }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "spec_review" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "spec_reviewer" },
+                "path": { "pattern": "^artifacts/04-spec-review\\." }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "development" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "developer" },
+                "path": { "pattern": "^artifacts/05-development\\." }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "step": { "const": "output_review" } } },
+            "then": {
+              "properties": {
+                "role": { "const": "output_reviewer" },
+                "path": { "pattern": "^artifacts/06-output-review\\." }
+              }
+            }
+          }
+        ],
+        "additionalProperties": false
+      }
+    },
     "eval_report_path": {
       "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
     }

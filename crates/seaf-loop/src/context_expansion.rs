@@ -2,18 +2,18 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fmt, fs,
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
-use seaf_core::{canonical_json_bytes, canonical_sha256_digest, LoopStepName};
+use seaf_core::{canonical_json_bytes, canonical_sha256_digest, ArtifactReference, LoopStepName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
     context::{ContextLimits, UNTRUSTED_CONTEXT_MARKER},
+    immutable_artifact::{publish_create_only, read_verified_regular_file, ImmutableArtifactError},
     policy::{default_exclude_patterns, matching_pattern, normalize_repo_path},
     state::step_file_stem,
     ContextRequest, Role,
@@ -21,15 +21,6 @@ use crate::{
 
 pub const CONTEXT_EXPANSION_SCHEMA_VERSION: u32 = 1;
 const SOURCE_READ_BUFFER_BYTES: usize = 8 * 1024;
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArtifactReference {
-    pub path: String,
-    pub digest: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextExpansionRequest {
     pub repository_root: PathBuf,
@@ -195,7 +186,7 @@ pub fn create_context_expansion(
     };
     validate_artifact_structure(&artifact)?;
     let bytes = canonical_json_bytes(&artifact)?;
-    write_create_only(&request.run_directory, &relative_path, &bytes)?;
+    publish_create_only(&request.run_directory, &relative_path, &bytes)?;
     Ok(CreatedContextExpansion {
         identity: ArtifactReference {
             path: relative_path,
@@ -219,7 +210,8 @@ pub fn load_context_expansion(
             "context expansion artifact path does not match its identity".to_string(),
         ));
     }
-    let bytes = read_safe_run_file(&request.run_directory, &identity.path, "context expansion")?;
+    let bytes =
+        read_verified_regular_file(&request.run_directory, &identity.path, "context expansion")?;
     let artifact = decode_artifact(&bytes, &identity.digest)?;
     validate_expected_artifact(&artifact, request, &prepared, &prior)?;
     Ok(artifact)
@@ -278,6 +270,16 @@ impl From<std::io::Error> for ContextExpansionError {
 impl From<serde_json::Error> for ContextExpansionError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+impl From<ImmutableArtifactError> for ContextExpansionError {
+    fn from(error: ImmutableArtifactError) -> Self {
+        match error {
+            ImmutableArtifactError::Safety(message) => Self::Safety(message),
+            ImmutableArtifactError::Collision(message) => Self::Collision(message),
+            ImmutableArtifactError::Io(error) => Self::Io(error),
+        }
     }
 }
 
@@ -557,7 +559,7 @@ fn load_prior_chain(
                 "previous context expansion path does not match its round".to_string(),
             ));
         }
-        let bytes = read_safe_run_file(
+        let bytes = read_verified_regular_file(
             &request.run_directory,
             &identity.path,
             "previous context expansion",
@@ -665,7 +667,7 @@ fn verify_initial_provider_request(
     request: &ContextExpansionRequest,
     reference: &ArtifactReference,
 ) -> Result<(), ContextExpansionError> {
-    let bytes = read_safe_run_file(
+    let bytes = read_verified_regular_file(
         &request.run_directory,
         &reference.path,
         "initial provider request",
@@ -816,153 +818,6 @@ fn reject_forbidden_path(
         }
     }
     Ok(())
-}
-
-fn read_safe_run_file(
-    run_directory: &Path,
-    relative_path: &str,
-    label: &str,
-) -> Result<Vec<u8>, ContextExpansionError> {
-    validate_relative_path(relative_path)?;
-    let path = run_directory.join(relative_path);
-    validate_real_run_parent(run_directory, Path::new(relative_path))?;
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        ContextExpansionError::Safety(format!("{label} could not be inspected: {error}"))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ContextExpansionError::Safety(format!(
-            "{label} is not a real regular file"
-        )));
-    }
-    Ok(fs::read(path)?)
-}
-
-fn write_create_only(
-    run_directory: &Path,
-    relative_path: &str,
-    bytes: &[u8],
-) -> Result<(), ContextExpansionError> {
-    validate_relative_path(relative_path)?;
-    let canonical_parent = validate_real_run_parent(run_directory, Path::new(relative_path))?;
-    let file_name = Path::new(relative_path).file_name().ok_or_else(|| {
-        ContextExpansionError::Safety("artifact has no flat file name".to_string())
-    })?;
-    let target = canonical_parent.join(file_name);
-    let (temp_path, mut temp) = create_unique_temp_file(&canonical_parent, file_name)?;
-    let result = (|| {
-        temp.write_all(bytes)?;
-        temp.sync_all()?;
-        drop(temp);
-
-        match fs::hard_link(&temp_path, &target) {
-            Ok(()) => {
-                sync_parent_directory(&canonical_parent)?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                verify_existing_winner(&target, bytes)?;
-                sync_parent_directory(&canonical_parent)?;
-                Ok(())
-            }
-            Err(error) => Err(ContextExpansionError::Io(error)),
-        }
-    })();
-    let cleanup = fs::remove_file(&temp_path);
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), _) => Err(error),
-    }
-}
-
-fn create_unique_temp_file(
-    parent: &Path,
-    final_name: &std::ffi::OsStr,
-) -> Result<(PathBuf, fs::File), ContextExpansionError> {
-    let final_name = final_name.to_string_lossy();
-    loop {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{final_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-fn verify_existing_winner(target: &Path, bytes: &[u8]) -> Result<(), ContextExpansionError> {
-    let metadata = fs::symlink_metadata(target)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ContextExpansionError::Collision(
-            "existing artifact target is not a real regular file".to_string(),
-        ));
-    }
-    let existing = fs::read(target)?;
-    if existing == bytes {
-        Ok(())
-    } else {
-        Err(ContextExpansionError::Collision(
-            "existing artifact has different bytes".to_string(),
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> Result<(), ContextExpansionError> {
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> Result<(), ContextExpansionError> {
-    Ok(())
-}
-
-fn validate_real_run_parent(
-    run_directory: &Path,
-    relative_path: &Path,
-) -> Result<PathBuf, ContextExpansionError> {
-    let run_metadata = fs::symlink_metadata(run_directory)?;
-    if run_metadata.file_type().is_symlink() || !run_metadata.is_dir() {
-        return Err(ContextExpansionError::Safety(
-            "run directory must be a real directory".to_string(),
-        ));
-    }
-    let canonical_run = run_directory.canonicalize()?;
-    let parent = relative_path.parent().ok_or_else(|| {
-        ContextExpansionError::Safety("artifact reference has no parent".to_string())
-    })?;
-    let mut current = run_directory.to_path_buf();
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            return Err(ContextExpansionError::Safety(
-                "artifact parent is not a safe relative path".to_string(),
-            ));
-        };
-        current.push(component);
-        let metadata = fs::symlink_metadata(&current)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ContextExpansionError::Safety(format!(
-                "artifact layout parent is not a real directory: {}",
-                current.display()
-            )));
-        }
-    }
-    let canonical_parent = current.canonicalize()?;
-    if !canonical_parent.starts_with(&canonical_run) {
-        return Err(ContextExpansionError::Safety(
-            "artifact parent resolves outside the run directory".to_string(),
-        ));
-    }
-    Ok(canonical_parent)
 }
 
 fn validate_reference(reference: &ArtifactReference) -> Result<(), ContextExpansionError> {

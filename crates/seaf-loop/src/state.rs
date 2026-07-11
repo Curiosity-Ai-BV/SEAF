@@ -58,6 +58,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
             })
             .collect(),
         policy_decisions: Vec::<std::collections::BTreeMap<String, Value>>::new(),
+        provider_exchange_records: Vec::new(),
         eval_report_path: None,
     }
 }
@@ -71,6 +72,8 @@ pub fn load_run(workspace: &LoopWorkspace) -> Result<LoopRun, StateError> {
     let content = fs::read_to_string(&path)?;
     let run = serde_json::from_str(&content)?;
     validate_run_integrity(&run)?;
+    crate::provider_exchange::validate_authoritative_provider_exchange_records(workspace, &run)
+        .map_err(|error| StateError::InvalidRun(error.to_string()))?;
     Ok(run)
 }
 
