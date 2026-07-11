@@ -68,7 +68,9 @@ consumes its exact validated prerequisites and persists canonically verified
 run-bound artifacts. Development is bound to the approved spec and the bounded
 source context needed to construct a patch. Output review receives only the
 persisted policy-gated DevelopmentEvidence, approved-spec identities, and run
-input digests. Bounded additional context requests remain scheduled for M1-04.
+input digests. M1-04a now defines and validates bounded typed context requests;
+M1-04b still must audit, persist, cap, and resume the additional provider
+rounds that satisfy them.
 
 ## Production-Use Acceptance Scenario
 

@@ -693,3 +693,35 @@ tests, `cargo fmt --all -- --check`, locked all-target and all-feature Clippy
 with warnings denied, all 239 locked Rust workspace tests, `corepack pnpm
 format:check`, and `git diff --check`. M1-04a is complete and M1-04b bounded
 context expansion orchestration is active.
+
+## 2026-07-11 implement | M1-R01 descendant pipe regression stability
+
+Repeated full workspace gates had failed the existing
+`eval_run_cleans_up_descendants_that_keep_pipes_open` regression near its own
+1-second boundary, including observed elapsed times from approximately 1.011 to
+1.050 seconds. Exact and serial reruns passed around 0.90 to 0.92 seconds. The
+test configured a 1,000ms eval timeout and independently required the entire CLI
+to finish in under 1 second, so harmless direct-child scheduling variance could
+fail before the production pipe-drain behavior was evaluated.
+
+Deterministic RED added a bounded 1,200ms direct-child delay after the detached
+pipe owner was ready while preserving the old 1,000ms eval timeout. The exact
+test failed after 1,264ms with `command timed out after 1000ms`, demonstrating
+the test's timeout race rather than a product regression.
+
+GREEN raises only the regression's eval timeout to 4,000ms and elapsed ceiling
+to 3 seconds. The detached `setsid` descendant keeps inherited pipes open for
+up to 8 seconds, so waiting for descendant EOF still exceeds the assertion by
+a material margin. Each execution writes a stop sentinel after the CLI returns
+and requires an exit marker, keeping the safety lifetime bounded and verifying
+that escaped descendants terminate. The production 250ms drain grace and all
+eval implementation logic remain unchanged.
+
+The exact regression passed 20 consecutive executions with zero failures;
+per-run wall times ranged from 2.13 to 2.25 seconds, including compilation of
+the temporary Rust helper. M1-R01 is complete and M1-04b bounded context
+expansion orchestration is active.
+
+Final verification passed: `cargo fmt --all -- --check`, locked all-target and
+all-feature Clippy with warnings denied, all 239 locked Rust workspace tests,
+`corepack pnpm format:check`, and `git diff --check`.

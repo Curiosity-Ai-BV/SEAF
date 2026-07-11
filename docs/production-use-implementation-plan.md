@@ -299,9 +299,45 @@ remain unchanged. The ProviderStepRunner retains the existing single-round
 semantics: a validated `needs_context` response still blocks without repacking
 or retrying until M1-04b.
 
+### M1-R01 - Stabilize Descendant Pipe Cleanup Regression
+
+Roadmap: execution-gate remediation. Dependencies: M1-04a.
+
+Status: complete on 2026-07-11. M1-04b is active.
+
+Objective: make the existing descendant-pipe cleanup regression reliably prove
+the intended behavior without racing its own eval timeout.
+
+Acceptance criteria:
+
+- The test still fails if SEAF waits for the detached pipe-owning descendant.
+- The eval command timeout is comfortably above normal direct-child completion,
+  while the assertion threshold remains comfortably below descendant lifetime.
+- At least 20 consecutive focused executions pass locally.
+- No production timing constant changes unless a new failing behavioral test
+  proves the implementation itself is wrong.
+
+Likely seams: `crates/seaf-cli/tests/cli.rs` helper/test only.
+
+RED/evidence: record repeated full-gate failures near 1,000ms and demonstrate
+the old test can fail under harmless scheduling delay.
+
+Verification: 20 focused repetitions plus Rust workspace and Docs gates.
+
+Docs/tracker: remediation evidence and M1-R01 completion.
+
+Commit boundary: timing-regression design only; no unrelated eval behavior.
+
+Implemented flow: the regression now gives the direct child a bounded 1,200ms
+scheduling delay after its detached pipe-owning descendant is ready. The eval
+timeout is 4,000ms and the elapsed ceiling is 3 seconds, while the detached
+descendant has an 8-second safety lifetime. A stop sentinel and required exit
+marker terminate and verify descendant cleanup after every execution. The
+production 250ms drain grace and eval behavior remain unchanged.
+
 ### M1-04b - Bounded Context Expansion Orchestration
 
-Roadmap: U2. Dependencies: M1-04a.
+Roadmap: U2. Dependencies: M1-R01.
 
 Objective: satisfy validated ContextRequests through the orchestrator without
 direct model tools or safety-boundary bypass.

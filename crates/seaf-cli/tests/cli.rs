@@ -2525,17 +2525,25 @@ fn main() {
             setsid();
         }
         let marker = std::env::args().nth(2).unwrap();
+        let stop = std::env::args().nth(3).unwrap();
+        let exited = std::env::args().nth(4).unwrap();
         fs::write(marker, "ready").unwrap();
-        thread::sleep(Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !Path::new(&stop).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(exited, "exited").unwrap();
         return;
     }
 
     let marker = std::env::args().nth(1).unwrap();
-    println!("direct-child-done");
-    io::stdout().flush().unwrap();
+    let stop = std::env::args().nth(2).unwrap();
+    let exited = std::env::args().nth(3).unwrap();
     Command::new(std::env::current_exe().unwrap())
         .arg("--hold-pipes")
         .arg(&marker)
+        .arg(&stop)
+        .arg(&exited)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -2545,6 +2553,9 @@ fn main() {
     while !Path::new(&marker).exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
+    thread::sleep(Duration::from_millis(1200));
+    println!("direct-child-done");
+    io::stdout().flush().unwrap();
 }
 "#,
     )
@@ -3800,6 +3811,8 @@ fn eval_run_cleans_up_descendants_that_keep_pipes_open() {
     let report_path = temp_dir.path().join("eval-report.json");
     let helper_path = compile_descendant_pipe_helper(temp_dir.path());
     let marker_path = temp_dir.path().join("descendant-ready");
+    let stop_path = temp_dir.path().join("descendant-stop");
+    let exited_path = temp_dir.path().join("descendant-exited");
     fs::write(
         &config_path,
         format!(
@@ -3808,11 +3821,13 @@ fn eval_run_cleans_up_descendants_that_keep_pipes_open() {
     - {command}
   required:
     - name: descendant_pipe
-      command: "{command} {marker}"
-      timeout_ms: 1000
+      command: "{command} {marker} {stop} {exited}"
+      timeout_ms: 4000
 "#,
             command = helper_path.display(),
-            marker = marker_path.display()
+            marker = marker_path.display(),
+            stop = stop_path.display(),
+            exited = exited_path.display()
         ),
     )
     .expect("write eval config");
@@ -3831,9 +3846,19 @@ fn eval_run_cleans_up_descendants_that_keep_pipes_open() {
         .expect("run eval");
     let elapsed = started.elapsed();
 
+    fs::write(&stop_path, "stop").expect("signal detached descendant to exit");
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !exited_path.exists() && std::time::Instant::now() < cleanup_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        exited_path.exists(),
+        "detached descendant did not confirm exit"
+    );
+
     assert!(output.status.success(), "{output:?}");
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_secs(3),
         "eval should not wait for pipe-inheriting descendants; elapsed {elapsed:?}"
     );
     let stdout_log = fs::read_to_string(temp_dir.path().join("logs/descendant_pipe.stdout.log"))
