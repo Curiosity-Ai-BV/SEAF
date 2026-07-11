@@ -94,9 +94,11 @@ pub fn create_context_expansion(
     let relative_path =
         expansion_artifact_path(request.step, request.step_attempt, request.context_round);
 
-    let repository_root = request.repository_root.canonicalize()?;
+    let repository_root = request.repository_root.canonicalize().map_err(|error| {
+        ContextExpansionError::Unavailable(format!("repository root is unavailable: {error}"))
+    })?;
     if !repository_root.is_dir() {
-        return Err(ContextExpansionError::Safety(
+        return Err(ContextExpansionError::Unavailable(
             "repository root is not a directory".to_string(),
         ));
     }
@@ -186,7 +188,8 @@ pub fn create_context_expansion(
     };
     validate_artifact_structure(&artifact)?;
     let bytes = canonical_json_bytes(&artifact)?;
-    publish_create_only(&request.run_directory, &relative_path, &bytes)?;
+    publish_create_only(&request.run_directory, &relative_path, &bytes)
+        .map_err(ContextExpansionError::from_publication)?;
     Ok(CreatedContextExpansion {
         identity: ArtifactReference {
             path: relative_path,
@@ -241,8 +244,12 @@ pub fn reconstruct_context_expansion_files(
 #[derive(Debug)]
 pub enum ContextExpansionError {
     Safety(String),
+    Unavailable(String),
     Invalid(String),
+    AuditSafety(String),
+    PublicationSafety(String),
     Collision(String),
+    PublicationIo(std::io::Error),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -251,8 +258,23 @@ impl fmt::Display for ContextExpansionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Safety(message) => write!(formatter, "context expansion safety error: {message}"),
+            Self::Unavailable(message) => {
+                write!(formatter, "context expansion source unavailable: {message}")
+            }
             Self::Invalid(message) => write!(formatter, "invalid context expansion: {message}"),
+            Self::AuditSafety(message) => {
+                write!(formatter, "unsafe trusted context audit: {message}")
+            }
+            Self::PublicationSafety(message) => {
+                write!(formatter, "unsafe context expansion publication: {message}")
+            }
             Self::Collision(message) => write!(formatter, "context expansion collision: {message}"),
+            Self::PublicationIo(error) => {
+                write!(
+                    formatter,
+                    "context expansion publication I/O error: {error}"
+                )
+            }
             Self::Io(error) => write!(formatter, "context expansion I/O error: {error}"),
             Self::Json(error) => write!(formatter, "context expansion JSON error: {error}"),
         }
@@ -260,6 +282,16 @@ impl fmt::Display for ContextExpansionError {
 }
 
 impl Error for ContextExpansionError {}
+
+impl ContextExpansionError {
+    fn from_publication(error: ImmutableArtifactError) -> Self {
+        match error {
+            ImmutableArtifactError::Safety(message) => Self::PublicationSafety(message),
+            ImmutableArtifactError::Collision(message) => Self::Collision(message),
+            ImmutableArtifactError::Io(error) => Self::PublicationIo(error),
+        }
+    }
+}
 
 impl From<std::io::Error> for ContextExpansionError {
     fn from(error: std::io::Error) -> Self {
@@ -276,7 +308,7 @@ impl From<serde_json::Error> for ContextExpansionError {
 impl From<ImmutableArtifactError> for ContextExpansionError {
     fn from(error: ImmutableArtifactError) -> Self {
         match error {
-            ImmutableArtifactError::Safety(message) => Self::Safety(message),
+            ImmutableArtifactError::Safety(message) => Self::AuditSafety(message),
             ImmutableArtifactError::Collision(message) => Self::Collision(message),
             ImmutableArtifactError::Io(error) => Self::Io(error),
         }
@@ -318,11 +350,12 @@ impl PreparedRequest {
             ));
         }
         validate_reference(&request.initial_provider_request)?;
-        let expected_initial_path =
-            initial_provider_request_path(request.step, request.step_attempt);
-        if request.initial_provider_request.path != expected_initial_path {
+        let expected_initial_paths =
+            initial_provider_request_paths(request.step, request.step_attempt);
+        if !expected_initial_paths.contains(&request.initial_provider_request.path) {
             return Err(ContextExpansionError::Invalid(format!(
-                "initial provider request audit path mismatch: expected {expected_initial_path}"
+                "initial provider request audit path mismatch: expected one of {}",
+                expected_initial_paths.join(", ")
             )));
         }
         if let Some(previous) = &request.previous_expansion {
@@ -697,19 +730,27 @@ fn read_context_source(
         .read(true)
         .open(&source_path)
         .map_err(|error| {
-            ContextExpansionError::Safety(format!(
+            ContextExpansionError::Unavailable(format!(
                 "requested context file {repo_path} is unavailable: {error}"
             ))
         })?;
 
     reject_repository_symlink_components(repository_root, repo_path)?;
-    let canonical_source = source_path.canonicalize()?;
+    let canonical_source = source_path.canonicalize().map_err(|error| {
+        ContextExpansionError::Unavailable(format!(
+            "requested context file {repo_path} became unavailable: {error}"
+        ))
+    })?;
     if !canonical_source.starts_with(repository_root) || !canonical_source.is_file() {
         return Err(ContextExpansionError::Safety(format!(
             "requested context path is not a repository file: {repo_path}"
         )));
     }
-    if !opened_file_matches_path_identity(&file, &source_path)? {
+    if !opened_file_matches_path_identity(&file, &source_path).map_err(|error| {
+        ContextExpansionError::Unavailable(format!(
+            "requested context file {repo_path} could not be revalidated: {error}"
+        ))
+    })? {
         return Err(ContextExpansionError::Safety(format!(
             "requested context file identity changed while opening: {repo_path}"
         )));
@@ -729,7 +770,11 @@ fn stream_context_source(
     let mut source_bytes = 0usize;
     let mut buffer = [0u8; SOURCE_READ_BUFFER_BYTES];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file.read(&mut buffer).map_err(|error| {
+            ContextExpansionError::Unavailable(format!(
+                "requested context file {repo_path} could not be read: {error}"
+            ))
+        })?;
         if read == 0 {
             break;
         }
@@ -864,13 +909,17 @@ fn expansion_artifact_path(step: LoopStepName, attempt: u32, round: u32) -> Stri
     )
 }
 
-fn initial_provider_request_path(step: LoopStepName, attempt: u32) -> String {
+fn initial_provider_request_paths(step: LoopStepName, attempt: u32) -> Vec<String> {
     let stem = step_file_stem(step);
-    if attempt == 1 {
+    let legacy = if attempt == 1 {
         format!("prompts/{stem}.prompt.md")
     } else {
         format!("prompts/{stem}.attempt-{attempt:03}.prompt.md")
-    }
+    };
+    vec![
+        legacy,
+        format!("prompts/{stem}.attempt-{attempt:03}.exchange-001.initial.request.md"),
+    ]
 }
 
 fn reject_repository_symlink_components(

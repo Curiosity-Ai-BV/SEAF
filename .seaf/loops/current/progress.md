@@ -16,8 +16,8 @@
 - [x] M1-R01: Stabilize descendant pipe cleanup regression.
 - [x] M1-04b1: Additive context expansion artifact.
 - [x] M1-04b2a: Durable context exchange contract.
-- [ ] M1-04b2b: Bounded live context orchestration (active).
-- [ ] M1-04b2c: Context round recovery and CLI integration.
+- [x] M1-04b2b: Bounded live context orchestration.
+- [ ] M1-04b2c: Context round recovery and CLI integration (active).
 - [ ] M1-05: Isolated candidate workspace.
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
@@ -48,6 +48,6 @@
 
 ## Current Gate
 
-M1-04b2a is complete. M1-04b2b is active and M1-04b2c remains pending.
-Milestone 1 remains active; the authoritative exchange ledger exists, but live
-bounded context orchestration and recovery are not yet implemented.
+M1-04b2b is complete and M1-04b2c is active. Milestone 1 remains active; fresh
+provider execution now uses bounded durable context rounds, while resume,
+rerun, staged-record reconciliation, and CLI recovery remain pending.

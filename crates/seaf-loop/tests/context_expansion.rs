@@ -103,6 +103,26 @@ fn expansion_is_canonical_additive_and_deterministic() {
 }
 
 #[test]
+fn expansion_accepts_fresh_live_exchange_request_authority_without_breaking_legacy_identity() {
+    let (_temp, mut request) = fixture();
+    let legacy = request
+        .run_directory
+        .join(&request.initial_provider_request.path);
+    let bytes = std::fs::read(&legacy).expect("legacy request bytes");
+    request.initial_provider_request.path =
+        "prompts/01-research.attempt-002.exchange-001.initial.request.md".to_string();
+    std::fs::write(
+        request
+            .run_directory
+            .join(&request.initial_provider_request.path),
+        &bytes,
+    )
+    .expect("exchange request audit");
+
+    create_context_expansion(&request).expect("fresh exchange authority is accepted");
+}
+
+#[test]
 fn expansion_excludes_loaded_paths_but_rejects_duplicate_only() {
     let (_temp, mut request) = fixture();
     request.initial_loaded_paths.push("src/a.rs".to_string());

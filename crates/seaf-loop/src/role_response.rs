@@ -422,7 +422,7 @@ fn looks_like_unified_diff(text: &str) -> bool {
         || (text.contains("--- ") && text.contains("+++ ") && text.contains("@@"))
 }
 
-fn repair_prompt(role: Role, raw: &str, error: &RoleResponseError) -> String {
+pub(crate) fn repair_prompt(role: Role, raw: &str, error: &RoleResponseError) -> String {
     format!(
         "Repair the invalid JSON for role {}. Return only JSON matching this schema: {}\nError: {}\nRaw response:\n{}",
         role.as_str(),

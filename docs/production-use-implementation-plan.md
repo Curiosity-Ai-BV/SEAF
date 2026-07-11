@@ -427,7 +427,8 @@ expansion identity used for recovery.
 
 #### M1-04b2a - Durable Context Exchange Contract
 
-Status: complete on 2026-07-11. M1-04b2b is active.
+Status: complete on 2026-07-11. M1-04b2b is also complete and M1-04b2c is
+active.
 
 Objective: define authoritative, backward-compatible state and immutable audit
 records for ordered provider exchanges without adding retry behavior.
@@ -528,7 +529,7 @@ that threat boundary.
 
 #### M1-04b2b - Bounded Live Context Orchestration
 
-Status: active. Dependencies: M1-04b2a.
+Status: complete on 2026-07-11. M1-04b2c is active. Dependencies: M1-04b2a.
 
 Objective: execute bounded same-role context retries with every exchange durable
 before the next provider call.
@@ -540,9 +541,12 @@ Acceptance criteria:
   before the next call. Every repair request/response in every round follows the
   same ordering.
 - Retry the same role with the original audited input and ordered expansion
-  chain. Initial/additional paths appear exactly once; initial bytes come from
-  the verified provider-request audit and expansion bytes from verified
-  artifacts, never a fresh repository read.
+  chain. Preserve the complete authoritative ticket even when its metadata
+  names a context path; exact-once means each content-bearing initial or
+  additive file entry appears once in the combined repository-context and
+  expansion payload. Initial bytes come from the verified provider-request
+  audit and expansion bytes from verified artifacts, never a fresh repository
+  read.
 - Permit at most two accepted expansions per logical step across all attempts
   and eight per run across all steps and attempts. Initial role calls and JSON
   repairs are audited exchanges but consume zero expansion rounds. Unit tests
@@ -572,9 +576,57 @@ Docs/tracker: live round behavior/caps and M1-04b2b completion.
 Commit boundary: fresh-run bounded orchestration only; no resume/rerun/CLI
 recovery, candidate workspace, approval, eval, or promotion.
 
+Implemented flow: `LoopRunner` now hands the exact step attempt to the provider
+runner and imports only the verified append-only exchange-reference suffix
+before it can finish or fail the step, so its older in-memory `LoopRun` cannot
+erase durable exchange references and the step runner cannot replace unrelated
+run state. Fresh provider calls publish and append the immutable
+request record before invocation, then publish the canonical full
+response/failure audit, derive its classification inside the bound response
+record seam, and persist that response record before returning the
+classification to orchestration. Callers never supply the outcome. The same
+ordering applies to the one allowed malformed-JSON repair in the initial or any
+context round.
+
+A valid `needs_context` response creates the canonical M1-04b1 expansion, then
+reconstructs the retry from the exact verified initial exchange request plus
+the ordered verified expansion chain. The complete authoritative ticket stays
+in the original role input; each content-bearing initial or added file entry
+appears once in the combined repository-context and expansion payload, and no
+accepted expansion is reread from the live repository. Legacy M1-04b1 prompt
+identities remain loadable, while fresh b2b expansion artifacts bind the
+initial exchange request identity. Context retry request records carry the
+exact expansion identity before another provider call.
+
+Only durable context-retry request records count as accepted expansions. The
+runner enforces two per logical step across attempts and eight per run across
+roles; initial and repair exchanges consume neither cap. Unsafe, unavailable,
+duplicate-only, byte-exhausted, and cap-exhausted requests finish `Blocked`
+with canonical denial evidence. Provider failures and invalid response/audit
+outcomes finish `Failed` with canonical failure evidence when normal state
+writes remain available, including post-response interpretation or patch-gate
+failures. Source-unavailable errors are distinct from trusted-audit safety
+failures and immutable publication safety failures, collisions, and I/O. A
+trusted-audit failure never becomes a user context denial. A durable write
+failure returns immediately, makes no later provider call or terminal claim,
+and leaves the authoritative prefix plus any staged artifact for M1-04b2c.
+
+After initial workspace/run creation, every ordinary `LoopRunner` step-state
+publication uses the same narrow exchange lock and atomic writer. It reloads
+the current run under lock and requires the intended exchange vector, including
+an expected empty vector, to match exactly before publishing. A concurrent
+cooperative first request or later suffix therefore cannot be overwritten by
+an older in-memory `LoopRun`. M1-10 still owns comparison and coordination for
+general non-ledger state changes; this seam preserves only provider-exchange
+history.
+
+This behavior is deliberately wired only through the fresh-run hook. Resume
+and rerun retain their pre-b2b single-round behavior until M1-04b2c verifies or
+reconciles staged exchange chains and restores live bounded orchestration.
+
 #### M1-04b2c - Context Round Recovery And CLI Integration
 
-Status: pending. Dependencies: M1-04b2b.
+Status: active. Dependencies: M1-04b2b.
 
 Objective: verify or reconcile interrupted exchange chains and preserve caps
 through resume, rerun, and real CLI entrypoints.

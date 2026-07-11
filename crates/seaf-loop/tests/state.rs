@@ -4,14 +4,114 @@ use std::{fs, path::Path};
 use std::os::unix::fs::symlink;
 
 use seaf_core::{
-    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketContext, TicketSpec,
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, ProviderExchangeKind,
+    ProviderExchangePhase, ProviderExchangeRecord, ProviderRole, TicketContext, TicketSpec,
     TicketStatus,
 };
 use seaf_loop::{
+    persist_provider_exchange_record_reference, stage_provider_exchange_record,
     state::{create_run, finish_step, NewLoopRun},
-    ArtifactContent, ContextManifest, LoopRunner, LoopRunnerConfig, LoopWorkspace, StepOutput,
-    StepRunner, UNTRUSTED_CONTEXT_MARKER,
+    write_provider_exchange_request, ArtifactContent, ContextManifest, LoopRunner,
+    LoopRunnerConfig, LoopWorkspace, ProviderExchangeCoordinates, StepOutput, StepRunner,
+    UNTRUSTED_CONTEXT_MARKER,
 };
+
+#[test]
+fn state_save_with_stale_empty_exchange_vector_cannot_erase_first_concurrent_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runs_root = temp.path().join("runs");
+    let ticket = ticket();
+    let mut step_runner = FirstConcurrentExchangeRunner { workspace: None };
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "first-exchange-race",
+            &ticket,
+            "fake",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut step_runner,
+    )
+    .expect("start");
+
+    let error = runner
+        .run_next_step()
+        .expect_err("stale empty state must not erase the first exchange");
+
+    assert!(error.to_string().contains("exchange head changed"));
+    let workspace = LoopWorkspace::open(&runs_root, "first-exchange-race").expect("workspace");
+    let persisted = seaf_loop::state::load_run(&workspace).expect("persisted run");
+    assert_eq!(persisted.provider_exchange_records.len(), 1);
+    assert_eq!(
+        persisted.provider_exchange_records[0].phase,
+        ProviderExchangePhase::Request
+    );
+    assert_eq!(persisted.status, LoopStatus::Running);
+}
+
+struct FirstConcurrentExchangeRunner {
+    workspace: Option<LoopWorkspace>,
+}
+
+impl StepRunner for FirstConcurrentExchangeRunner {
+    fn prepare_run(
+        &mut self,
+        workspace: &LoopWorkspace,
+        _run: &LoopRun,
+    ) -> Result<(), seaf_loop::RunnerError> {
+        self.workspace = Some(workspace.clone());
+        Ok(())
+    }
+
+    fn step_request(&mut self, _step: LoopStepName) -> Result<String, seaf_loop::RunnerError> {
+        Ok("ordinary step request".to_string())
+    }
+
+    fn run_step(
+        &mut self,
+        step: LoopStepName,
+        _request: &str,
+    ) -> Result<StepOutput, seaf_loop::RunnerError> {
+        let workspace = self.workspace.as_ref().expect("prepared workspace");
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: "first-exchange-race".to_string(),
+            step,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = write_provider_exchange_request(
+            workspace.run_directory(),
+            &coordinates,
+            b"concurrent request",
+        )
+        .expect("concurrent request");
+        let record = ProviderExchangeRecord {
+            schema_version: 1,
+            run_id: coordinates.run_id,
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: coordinates.context_round,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference = stage_provider_exchange_record(workspace.run_directory(), &record)
+            .expect("stage concurrent request");
+        persist_provider_exchange_record_reference(workspace, reference)
+            .expect("append concurrent request");
+        Ok(StepOutput::completed("ordinary step response"))
+    }
+}
 
 #[test]
 fn state_finish_step_rejects_unpaired_or_malformed_artifact_integrity() {

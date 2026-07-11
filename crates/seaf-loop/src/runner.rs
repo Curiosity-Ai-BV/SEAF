@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, fs, path::PathBuf};
 
-use seaf_core::{LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketSpec};
+use seaf_core::{
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
+    ProviderExchangeRecordReference, TicketSpec,
+};
 
 use crate::{
     artifacts::{
@@ -57,6 +60,14 @@ pub trait StepRunner {
         self.prepare_workspace(workspace)
     }
 
+    fn prepare_fresh_run(
+        &mut self,
+        workspace: &LoopWorkspace,
+        run: &LoopRun,
+    ) -> Result<(), RunnerError> {
+        self.prepare_run(workspace, run)
+    }
+
     fn prepare_step(
         &mut self,
         _workspace: &LoopWorkspace,
@@ -64,6 +75,16 @@ pub trait StepRunner {
         _step: LoopStepName,
     ) -> Result<(), RunnerError> {
         Ok(())
+    }
+
+    fn prepare_step_attempt(
+        &mut self,
+        workspace: &LoopWorkspace,
+        run: &LoopRun,
+        step: LoopStepName,
+        _attempt: u32,
+    ) -> Result<(), RunnerError> {
+        self.prepare_step(workspace, run, step)
     }
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
@@ -75,6 +96,12 @@ pub trait StepRunner {
     }
 
     fn error_response(&self) -> Option<&str> {
+        None
+    }
+
+    fn take_durable_provider_exchange_records(
+        &mut self,
+    ) -> Option<Vec<ProviderExchangeRecordReference>> {
         None
     }
 }
@@ -119,7 +146,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             model: config.model,
             input_digests: config.input_digests,
         });
-        if let Err(error) = step_runner.prepare_run(&workspace, &run) {
+        if let Err(error) = step_runner.prepare_fresh_run(&workspace, &run) {
             return Err(cleanup_failed_start_workspace(&workspace, error));
         }
         state::save_run(&workspace, &run)?;
@@ -177,7 +204,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         self.next_attempt = None;
         state::reset_from_step(&mut self.run, step)?;
         clear_current_run_policy_decisions_from_step(&mut self.run, step)?;
-        state::save_run(&self.workspace, &self.run)?;
+        self.persist_run_state()?;
         self.workspace
             .append_log(&format!("reset run from {step:?}"))?;
         Ok(self)
@@ -204,10 +231,10 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         };
 
         self.step_runner
-            .prepare_step(&self.workspace, &self.run, step)?;
+            .prepare_step_attempt(&self.workspace, &self.run, step, attempt)?;
 
         state::mark_step_running(&mut self.run, step)?;
-        state::save_run(&self.workspace, &self.run)?;
+        self.persist_run_state()?;
         self.workspace
             .append_log(&format!("started step {step:?}"))?;
 
@@ -217,12 +244,14 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let output = match self.step_runner.run_step(step, &request) {
             Ok(output) => output,
             Err(error) => {
+                self.import_durable_provider_exchange_records()?;
                 if let Some(response) = self.step_runner.error_response() {
                     write_step_response(&self.workspace, step, attempt, response)?;
                 }
                 return Err(error);
             }
         };
+        self.import_durable_provider_exchange_records()?;
         write_step_response(&self.workspace, step, attempt, &output.response)?;
         validate_step_output(&output)?;
         append_policy_decisions(&mut self.run, self.step_runner.drain_policy_decisions()?)?;
@@ -241,7 +270,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             artifact_path,
             artifact_digest,
         )?;
-        state::save_run(&self.workspace, &self.run)?;
+        self.persist_run_state()?;
         self.workspace
             .append_log(&format!("finished step {step:?} as {:?}", output.status))?;
 
@@ -251,6 +280,40 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     pub fn run_to_completion(&mut self) -> Result<&LoopRun, RunnerError> {
         while self.run_next_step()? {}
         Ok(&self.run)
+    }
+
+    fn import_durable_provider_exchange_records(&mut self) -> Result<(), RunnerError> {
+        let Some(records) = self.step_runner.take_durable_provider_exchange_records() else {
+            return Ok(());
+        };
+        if !records.starts_with(&self.run.provider_exchange_records) {
+            return Err(RunnerError::Step(
+                "step runner attempted to replace the authoritative provider exchange prefix"
+                    .to_string(),
+            ));
+        }
+        let mut prospective = self.run.clone();
+        prospective.provider_exchange_records = records;
+        crate::provider_exchange::validate_authoritative_provider_exchange_records(
+            &self.workspace,
+            &prospective,
+        )
+        .map_err(|error| {
+            RunnerError::Step(format!(
+                "step runner supplied invalid durable provider exchange records: {error}"
+            ))
+        })?;
+        self.run.provider_exchange_records = prospective.provider_exchange_records;
+        Ok(())
+    }
+
+    fn persist_run_state(&self) -> Result<(), RunnerError> {
+        crate::provider_exchange::persist_run_with_provider_exchange_compare(
+            &self.workspace,
+            &self.run,
+        )
+        .map_err(|error| RunnerError::Step(format!("failed to publish loop state: {error}")))?;
+        Ok(())
     }
 }
 

@@ -83,11 +83,28 @@ a hostile same-user process replacing run-directory entries; M1-10 and M1-11
 own that stronger boundary. Outcomes are derived from canonical full provider
 response/failure audits through the exact role parser rather than trusted from
 callers; only malformed JSON is repair-eligible, while schema, role, reviewer,
-and context-contract invalidity is terminal. Existing single-round provider
-behavior remains unchanged and intentionally writes no ledger records in this
-slice. M1-04b2b and M1-04b2c still must reconcile the initial metadata to live
-orchestration, enforce both context caps, execute the durable retries, and
-recover interrupted chains through real CLI flows.
+and context-contract invalidity is terminal. M1-04b2b now uses that ledger for
+fresh provider execution: each request is durable before its call, each full
+response/failure audit is durable before interpretation, and accepted
+same-role context retries rebuild the prompt only from the verified initial
+exchange request and ordered immutable expansion artifacts. The exact ticket
+remains in the original role input even when its metadata names a context path;
+each content-bearing initial or additive file entry appears once in the
+combined repository-context and expansion payload. Two expansions per logical
+step and eight per run are enforced across attempts and roles; initial and
+JSON-repair calls consume neither cap. Denied context requests end blocked with
+evidence, trusted-audit and post-response interpretation failures end failed
+with evidence when safe state publication remains possible, and immutable
+publication failures stop without another call or false terminal claim. Typed
+response audits are published before their classification is derived inside
+the response-record seam, and that record is durable before orchestration acts.
+Every post-creation `LoopRunner` state publication uses the same narrow lock and
+an exact exchange-vector compare, including when the intended vector is empty,
+so it cannot erase a concurrent cooperative first request or later suffix. The
+compare protects provider-exchange history only; general state coordination
+remains M1-10 scope.
+M1-04b2c still must reconcile staged state and enable the same bounded behavior
+through resume, rerun, and real CLI recovery flows.
 
 ## Production-Use Acceptance Scenario
 

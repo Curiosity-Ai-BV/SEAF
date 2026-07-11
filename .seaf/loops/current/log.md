@@ -987,3 +987,83 @@ after reload reveals its stale head. Focused GREEN passed 22 provider-exchange
 integration tests. Final verification passed `cargo fmt --all -- --check`,
 locked all-target/all-feature Clippy with warnings denied, all 283 locked Rust
 workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+
+## 2026-07-11 implement | M1-04b2b bounded live context orchestration
+
+RED fake-provider callbacks inspected `run.json` immediately before each call
+and found no durable request record. The initial three regressions covered a
+needs-context retry, malformed-JSON repair followed by context, and provider
+failure; all compiled and failed at the first call with zero exchange records
+instead of one. Further REDs covered every denial class, exact and one-over
+caps, cross-attempt and cross-role counting, initial/response/expansion/next
+request collisions, terminal schema failure, and one completion transition.
+
+GREEN adds fresh-run-only orchestration through an explicit fresh preparation
+hook, exact step-attempt handoff, and a verified append-only exchange-reference
+handoff that prevents `LoopRunner` from overwriting atomic ledger appends with
+stale in-memory state without granting the step runner unrelated state authority.
+Every call now has a durable request record first and a canonical full
+response/failure audit and response record afterward. Malformed JSON receives
+one audited repair in any round. A valid context request creates an immutable
+expansion and durably binds the next request before retrying the same role.
+
+Retry prompts are rebuilt from the verified exact initial exchange request and
+the ordered verified expansion chain. The live path never rereads accepted
+expansion content from the repository. Legacy M1-04b1 initial prompt identities
+remain valid, while fresh rounds bind the exchange request. Accepted context
+request records enforce two expansions per logical step across attempts and
+eight per run across roles; initial and repair exchanges consume zero.
+
+Unsafe, unavailable, duplicate-only, byte-exhausted, and cap-exhausted requests
+finish blocked with canonical denial evidence. Provider and response/audit
+failures finish failed with canonical failure evidence. Source unavailability
+is distinct from publication failure: unsafe artifact targets, immutable
+collisions, or publication I/O return a clear error, make no later provider call
+or terminal claim, and leave staged state for M1-04b2c. Focused GREEN passed 20
+context-expansion tests, 11 live
+context integration tests, 38 provider-runner regressions, and both cap unit
+tests. Final verification passed `cargo fmt --all -- --check`, locked
+all-target/all-feature Clippy with warnings denied, all 297 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.
+M1-04b2b is complete and M1-04b2c is active.
+
+## 2026-07-11 spec and quality fix | M1-04b2b ordering and terminal closure
+
+Spec RED showed that a missing Development patch gate returned an error after a
+durable `patch_proposed` response but left the writable step `Running`. A
+trusted-request substitution regression initially mutated too early and was
+replaced by a private unit observer at the exact boundary: the response record
+is durable, then the trusted initial request becomes a symlink before context
+reconstruction. Quality RED added a concurrent valid exchange suffix after an
+ordinary state writer captured its intended ledger vector; the compare-and-save
+API did not yet exist, so the regression failed to compile. Final quality
+review then found the empty-vector branch still used an unlocked write. A
+runner-level RED let a second cooperative writer append the first request after
+the controller captured empty state; the delayed controller incorrectly
+returned success and erased that request.
+
+GREEN moves live classification behind typed response-audit publication. A
+specialized internal response-record seam reads the verified canonical audit,
+derives the exact outcome with the shared classifier, publishes the derived
+record without accepting a caller outcome, and returns the classification only
+after its reference is durable. Trusted immutable-read safety is now distinct
+from repository request safety, so audit substitution can never produce
+`context_denied`. Post-response interpretation and gating errors produce a
+canonical failed step when evidence can still be written; the missing-gate
+regression now records one failed Development outcome and remains terminal on a
+second step call.
+
+The stale ordinary-state race is closed narrowly for provider-vector
+preservation. Every post-creation `LoopRunner` step-state write uses the
+existing exchange lock and atomic writer, reloads and verifies the current
+chain under lock, and requires the intended vector, including empty, to match
+exactly before publication. A concurrent first request or later suffix makes
+the older writer fail without changing `run.json`. General non-ledger state
+coordination remains M1-10 scope. The compare helper remains crate-private; its
+nonempty race proof is a private unit test and the empty-vector proof runs
+through `LoopRunner`. Focused GREEN passed 20 context-expansion, 22
+provider-exchange, 11 live-context, 38 provider-runner, and 24 state integration
+tests plus the private audit-TOCTOU and nonempty compare unit regressions.
+Final re-verification passed `cargo fmt --all -- --check`, locked
+all-target/all-feature Clippy with warnings denied, all 300 locked Rust
+workspace tests, `corepack pnpm format:check`, and `git diff --check`.

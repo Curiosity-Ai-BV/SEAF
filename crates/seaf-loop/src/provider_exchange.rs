@@ -75,6 +75,19 @@ pub fn write_provider_exchange_response(
     write_exchange_bytes(run_directory, response_path(coordinates), &bytes)
 }
 
+pub fn load_provider_exchange_request(
+    run_directory: &Path,
+    reference: &ArtifactReference,
+) -> Result<Vec<u8>, ProviderExchangeError> {
+    let bytes = read_verified_regular_file(run_directory, &reference.path, "provider request")?;
+    if digest_bytes(&bytes) != reference.digest {
+        return Err(ProviderExchangeError::Invalid(
+            "provider request audit digest does not match its reference".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
 pub fn stage_provider_exchange_record(
     run_directory: &Path,
     record: &ProviderExchangeRecord,
@@ -92,6 +105,40 @@ pub fn stage_provider_exchange_record(
     let bytes = canonical_json_bytes(record)?;
     publish_create_only(run_directory, &reference.path, &bytes)?;
     Ok(reference)
+}
+
+pub(crate) fn stage_provider_exchange_response_record(
+    run_directory: &Path,
+    mut record: ProviderExchangeRecord,
+) -> Result<
+    (
+        ProviderExchangeRecordReference,
+        ProviderExchangeResponseClassification,
+    ),
+    ProviderExchangeError,
+> {
+    if record.phase != ProviderExchangePhase::Response || record.outcome.is_some() {
+        return Err(ProviderExchangeError::Invalid(
+            "derived response staging requires a response record without a caller outcome"
+                .to_string(),
+        ));
+    }
+    verify_bound_artifact(run_directory, &record.request, "provider request")?;
+    let response = record.response.as_ref().ok_or_else(|| {
+        ProviderExchangeError::Invalid("response record has no response audit".to_string())
+    })?;
+    verify_bound_artifact(run_directory, response, "provider response")?;
+    if let Some(expansion) = &record.expansion {
+        verify_bound_artifact(run_directory, expansion, "context expansion")?;
+    }
+    let classification =
+        classify_bound_provider_exchange_response(run_directory, record.role, response)?;
+    record.outcome = Some(classification.outcome);
+    validate_record(&record)?;
+    let reference = record_reference(&record, canonical_sha256_digest(&record)?);
+    let bytes = canonical_json_bytes(&record)?;
+    publish_create_only(run_directory, &reference.path, &bytes)?;
+    Ok((reference, classification))
 }
 
 pub fn load_provider_exchange_record(
@@ -192,6 +239,37 @@ pub fn persist_provider_exchange_record_reference(
     match (result, unlock) {
         (Ok(run), Ok(())) => Ok(run),
         (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), _) => Err(error),
+    }
+}
+
+pub(crate) fn persist_run_with_provider_exchange_compare(
+    workspace: &LoopWorkspace,
+    intended: &LoopRun,
+) -> Result<(), ProviderExchangeError> {
+    let lock = acquire_provider_exchange_lock(workspace)?;
+    let result = (|| {
+        let current = state::load_run(workspace)?;
+        if current.provider_exchange_records != intended.provider_exchange_records {
+            return Err(ProviderExchangeError::Invalid(
+                "provider exchange head changed before state publication".to_string(),
+            ));
+        }
+        validate_run_for_atomic_publication(workspace, intended)?;
+        let mut bytes = serde_json::to_vec_pretty(intended)?;
+        bytes.push(b'\n');
+        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
+            validate_opened_lock_file(
+                &lock,
+                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
+            )?;
+            Ok(())
+        })
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error.into()),
         (Err(error), _) => Err(error),
     }
 }
@@ -593,18 +671,26 @@ fn validate_derived_response_outcome(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DerivedResponseClassification {
-    outcome: ProviderExchangeOutcome,
-    json_repair_eligible: bool,
+pub(crate) struct ProviderExchangeResponseClassification {
+    pub outcome: ProviderExchangeOutcome,
+    pub json_repair_eligible: bool,
 }
 
 fn derive_bound_response_classification(
     run_directory: &Path,
     record: &ProviderExchangeRecord,
-) -> Result<DerivedResponseClassification, ProviderExchangeError> {
+) -> Result<ProviderExchangeResponseClassification, ProviderExchangeError> {
     let response = record.response.as_ref().ok_or_else(|| {
         ProviderExchangeError::Invalid("response record has no response audit".to_string())
     })?;
+    classify_bound_provider_exchange_response(run_directory, record.role, response)
+}
+
+fn classify_bound_provider_exchange_response(
+    run_directory: &Path,
+    role: ProviderRole,
+    response: &ArtifactReference,
+) -> Result<ProviderExchangeResponseClassification, ProviderExchangeError> {
     let bytes = read_verified_regular_file(run_directory, &response.path, "provider response")?;
     if digest_bytes(&bytes) != response.digest {
         return Err(ProviderExchangeError::Invalid(
@@ -617,15 +703,15 @@ fn derive_bound_response_classification(
             "provider response audit is not canonical JSON".to_string(),
         ));
     }
-    Ok(derive_response_classification(record.role, &audit))
+    Ok(classify_provider_exchange_response(role, &audit))
 }
 
-fn derive_response_classification(
+pub(crate) fn classify_provider_exchange_response(
     role: ProviderRole,
     audit: &ProviderExchangeResponseAudit,
-) -> DerivedResponseClassification {
+) -> ProviderExchangeResponseClassification {
     let ProviderExchangeResponseAudit::ModelResponse { response } = audit else {
-        return DerivedResponseClassification {
+        return ProviderExchangeResponseClassification {
             outcome: ProviderExchangeOutcome::ProviderFailure,
             json_repair_eligible: false,
         };
@@ -656,14 +742,14 @@ fn derive_response_classification(
             ReviewDecision::Reject => ProviderExchangeOutcome::Reject,
         },
         Err(RoleResponseError::InvalidJson { .. }) => {
-            return DerivedResponseClassification {
+            return ProviderExchangeResponseClassification {
                 outcome: ProviderExchangeOutcome::InvalidResponse,
                 json_repair_eligible: true,
             };
         }
         Err(_) => ProviderExchangeOutcome::InvalidResponse,
     };
-    DerivedResponseClassification {
+    ProviderExchangeResponseClassification {
         outcome,
         json_repair_eligible: false,
     }
@@ -914,6 +1000,136 @@ impl From<std::io::Error> for ProviderExchangeError {
 mod tests {
     use super::*;
     use seaf_core::LoopInputDigests;
+
+    #[test]
+    fn compare_and_publish_rejects_a_concurrent_suffix_for_nonempty_intended_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "state-compare-race")
+            .expect("workspace");
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "state-compare-race".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        state::save_run(&workspace, &run).expect("initial run");
+        let research = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request =
+            write_provider_exchange_request(workspace.run_directory(), &research, b"research")
+                .expect("research request");
+        let request_record = ProviderExchangeRecord {
+            schema_version: 1,
+            run_id: run.run_id.clone(),
+            step: research.step,
+            role: research.role,
+            step_attempt: research.step_attempt,
+            exchange_index: research.exchange_index,
+            kind: research.kind,
+            context_round: research.context_round,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request: request.clone(),
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let request_reference =
+            stage_provider_exchange_record(workspace.run_directory(), &request_record)
+                .expect("stage research request");
+        persist_provider_exchange_record_reference(&workspace, request_reference.clone())
+            .expect("append research request");
+        let response = write_provider_exchange_response(
+            workspace.run_directory(),
+            &research,
+            &ProviderExchangeResponseAudit::ModelResponse {
+                response: ModelResponse {
+                    content: serde_json::json!({
+                        "role": "researcher",
+                        "status": "passed",
+                        "summary": "Complete.",
+                        "findings": [],
+                        "risks": [],
+                        "next_step_recommendation": "Continue."
+                    })
+                    .to_string(),
+                    latency_ms: 1,
+                    raw_provider_metadata: serde_json::Value::Null,
+                },
+            },
+        )
+        .expect("research response");
+        let response_record = ProviderExchangeRecord {
+            phase: ProviderExchangePhase::Response,
+            previous_record_digest: Some(request_reference.digest),
+            response: Some(response),
+            outcome: Some(ProviderExchangeOutcome::Passed),
+            ..request_record
+        };
+        let response_reference =
+            stage_provider_exchange_record(workspace.run_directory(), &response_record)
+                .expect("stage research response");
+        persist_provider_exchange_record_reference(&workspace, response_reference.clone())
+            .expect("append research response");
+        let mut intended = state::load_run(&workspace).expect("intended state");
+        intended.updated_at = "intended-terminal-state".to_string();
+
+        let analysis = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Analysis,
+            role: ProviderRole::Analyzer,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let analysis_request =
+            write_provider_exchange_request(workspace.run_directory(), &analysis, b"analysis")
+                .expect("analysis request");
+        let analysis_record = ProviderExchangeRecord {
+            schema_version: 1,
+            run_id: run.run_id,
+            step: analysis.step,
+            role: analysis.role,
+            step_attempt: analysis.step_attempt,
+            exchange_index: analysis.exchange_index,
+            kind: analysis.kind,
+            context_round: analysis.context_round,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: Some(response_reference.digest),
+            request: analysis_request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let concurrent =
+            stage_provider_exchange_record(workspace.run_directory(), &analysis_record)
+                .expect("stage concurrent suffix");
+        persist_provider_exchange_record_reference(&workspace, concurrent.clone())
+            .expect("append concurrent suffix");
+
+        let error = persist_run_with_provider_exchange_compare(&workspace, &intended)
+            .expect_err("stale state must not erase suffix");
+
+        assert!(error.to_string().contains("exchange head changed"));
+        let current = state::load_run(&workspace).expect("current run");
+        assert_eq!(current.provider_exchange_records.last(), Some(&concurrent));
+        assert_ne!(current.updated_at, intended.updated_at);
+    }
 
     #[test]
     fn pre_publish_failure_leaves_the_old_run_json_valid_and_byte_identical() {

@@ -102,10 +102,15 @@ fn research_request_contains_exact_ticket_and_all_run_input_digests() {
     loop_runner.run_next_step().expect("run research");
 
     let requests = provider.requests().expect("provider requests");
-    assert_eq!(requests.len(), 1, "M1-04b2a must not add provider calls");
-    assert!(
-        loop_runner.run().provider_exchange_records.is_empty(),
-        "M1-04b2a defines durable exchange state without changing live orchestration"
+    assert_eq!(
+        requests.len(),
+        1,
+        "initial execution makes one provider call"
+    );
+    assert_eq!(
+        loop_runner.run().provider_exchange_records.len(),
+        2,
+        "fresh live execution durably records the request and response"
     );
     let prompt: serde_json::Value =
         serde_json::from_str(&requests[0].messages[0].content).expect("structured role prompt");
@@ -404,7 +409,7 @@ fn development_request_uses_exact_approved_spec_and_only_developer_repository_co
 }
 
 #[test]
-fn development_rejects_non_approving_spec_review_before_step_mutation_or_provider() {
+fn wrong_spec_reviewer_approval_fails_spec_review_and_never_reaches_development() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
     let ticket = ticket();
@@ -438,16 +443,18 @@ fn development_rejects_non_approving_spec_review_before_step_mutation_or_provide
     .expect("start loop");
     finish_steps_before_development(&mut loop_runner);
     let run_dir = runs_root.join("wrong-spec-approval");
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
+    assert_eq!(
+        step_status(loop_runner.run(), LoopStepName::SpecReview),
+        LoopStepStatus::Failed
+    );
+    assert!(run_dir.join("artifacts/04-spec-review.json").is_file());
+    assert!(!run_dir.join("prompts/05-development.prompt.md").exists());
     let before = read_tree_bytes(&run_dir);
 
-    let error = loop_runner
+    assert!(!loop_runner
         .run_next_step()
-        .expect_err("Development requires approve_spec evidence");
-
-    assert!(
-        error.to_string().contains("approving SpecReview"),
-        "{error}"
-    );
+        .expect("terminal failed review stops the loop"));
     assert_eq!(read_tree_bytes(&run_dir), before);
     assert_eq!(provider.requests().expect("provider requests").len(), 4);
 }
@@ -586,22 +593,30 @@ fn patch_proposed_development_requires_one_authoritative_policy_gate() {
     )
     .expect("start loop");
     finish_steps_before_development(&mut loop_runner);
-    let before = read_tree_bytes(&runs_root.join("missing-development-gate"));
-
-    let error = loop_runner
+    assert!(loop_runner
         .run_next_step()
-        .expect_err("patch_proposed must fail without an authoritative policy gate");
-
-    assert!(error.to_string().contains("patch gate"), "{error}");
-    assert_eq!(provider.requests().expect("provider requests").len(), 5);
-    assert!(!runs_root
-        .join("missing-development-gate/artifacts/05-development.json")
-        .exists());
-    assert_ne!(
-        read_tree_bytes(&runs_root.join("missing-development-gate")),
-        before,
-        "the raw provider response remains auditable even when gating cannot proceed"
+        .expect("missing patch gate becomes durable failed evidence"));
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
+    assert_eq!(
+        step_status(loop_runner.run(), LoopStepName::Development),
+        LoopStepStatus::Failed
     );
+    assert_eq!(provider.requests().expect("provider requests").len(), 5);
+    let run_dir = runs_root.join("missing-development-gate");
+    let persisted = read_run(&run_dir);
+    assert_eq!(persisted.provider_exchange_records.len(), 10);
+    let evidence = persisted_step_artifact(&run_dir, &persisted, LoopStepName::Development);
+    assert_eq!(evidence.2["result"], "post_response_failure");
+    assert!(evidence.2["reason"]
+        .as_str()
+        .expect("failure reason")
+        .contains("patch gate"));
+    assert!(!run_dir.join("prompts/06-output-review.prompt.md").exists());
+    let terminal_tree = read_tree_bytes(&run_dir);
+    assert!(!loop_runner
+        .run_next_step()
+        .expect("failed development remains terminal"));
+    assert_eq!(read_tree_bytes(&run_dir), terminal_tree);
 }
 
 #[test]
@@ -905,7 +920,11 @@ fn blocked_and_needs_context_development_artifacts_persist_without_policy_eviden
             LoopStepStatus::Blocked
         );
         assert!(persisted.policy_decisions.is_empty());
-        assert_eq!(artifact.2["response"]["status"], status);
+        if status == "needs_context" {
+            assert_eq!(artifact.2["result"], "context_denied");
+        } else {
+            assert_eq!(artifact.2["response"]["status"], status);
+        }
         assert!(artifact.2.get("policy_decision").is_none());
         assert!(artifact.2.get("patch_digest").is_none());
         assert!(!run_dir.join("prompts/06-output-review.prompt.md").exists());
@@ -1004,14 +1023,10 @@ fn provider_step_runner_persists_provider_response_when_parse_failure_stops_loop
     )
     .expect("start loop");
 
-    let error = loop_runner
+    assert!(loop_runner
         .run_next_step()
-        .expect_err("parse failure should stop loop");
-
-    assert!(
-        error.to_string().contains("invalid role response"),
-        "parse error should remain useful, got {error}"
-    );
+        .expect("parse failure becomes a durable terminal step"));
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
     assert_file_contains(
         &runs_root.join("parse-failure-run/responses/01-research.raw.txt"),
         fixture("research.invalid_missing_status.json"),
@@ -1045,20 +1060,14 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
     )
     .expect("start loop");
 
-    let error = loop_runner
+    assert!(loop_runner
         .run_next_step()
-        .expect_err("repair provider failure should stop loop");
-
-    assert!(
-        error.to_string().contains("repair service failed"),
-        "provider error should remain useful, got {error}"
-    );
+        .expect("repair provider failure becomes a durable terminal step"));
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
     let response_path = runs_root.join("repair-failure-run/responses/01-research.raw.txt");
-    assert_file_contains(&response_path, "initial provider response");
-    assert_file_contains(&response_path, "not json");
-    assert_file_contains(&response_path, "repair provider request");
-    assert_file_contains(&response_path, "repair provider error");
     assert_file_contains(&response_path, "repair service failed");
+    assert!(runs_root.join("repair-failure-run/responses/01-research.attempt-001.exchange-001.initial.response.json").is_file());
+    assert!(runs_root.join("repair-failure-run/responses/01-research.attempt-001.exchange-002.json-repair.response.json").is_file());
 }
 
 #[test]
@@ -1112,14 +1121,10 @@ fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails(
     )
     .expect("start loop");
 
-    let error = loop_runner
+    assert!(loop_runner
         .run_next_step()
-        .expect_err("timeout should stop the live loop step");
-
-    assert!(
-        error.to_string().contains("research model timed out"),
-        "provider timeout should remain visible, got {error}"
-    );
+        .expect("timeout becomes a durable terminal live step"));
+    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
     let response_path = runs_root.join("timeout-artifact-run/responses/01-research.raw.txt");
     assert_file_contains(&response_path, "provider request failed for Research");
     assert_file_contains(&response_path, "\"kind\": \"timeout\"");
@@ -1331,6 +1336,11 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
         LoopRunner::resume(&runs_root, "resume-context-run", &mut resume_runner).expect("resume");
 
     resumed.run_next_step().expect("run analysis step");
+    assert_eq!(
+        resumed.run().provider_exchange_records.len(),
+        2,
+        "M1-04b2b audits fresh execution only; resume orchestration remains M1-04b2c"
+    );
 
     let digest = sha256(source_content.as_bytes());
     let requests = resume_provider
