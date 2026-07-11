@@ -1,29 +1,44 @@
 # Progress
 
-## Prior Baseline
+## Baseline
 
-- [x] Phase 2 complete through P2-012; see
-      `docs/phase-2-local-agent-loop.md`.
+- [x] Fresh production-use roadmap authored and independently reviewed (`4a20922`).
+- [x] S0: Establish shared execution contract and tracker.
 
-## Phase 0 Production-Readiness Baseline
+## Milestone 1 - Coherent And Safe Loop
 
-- [x] P3-001: Create post-Phase-2 loop contract and current tracker.
-- [x] P3-002: Reconcile stale docs so implemented primitives are separated from
-      missing live integration.
-- [x] P3-003: Fix default policy drift for CI, eval, policy, updater, and
-      signing change categories.
-- [x] P3-004: Fix generated artifact hygiene for `.seaf/loops/runs` and default
-      context exclusions.
-- [x] P3-005: Harden CI determinism with locked commands, toolchain policy,
-      workflow permissions, timeouts, concurrency, and split lint environments.
+- [ ] M1-01: Authoritative project configuration (active).
+- [ ] M1-02: Resume configuration integrity.
+- [ ] M1-03: Validated role artifact chain.
+- [ ] M1-04: Bounded additional context.
+- [ ] M1-05: Isolated candidate workspace.
+- [ ] M1-06: Human approval state.
+- [ ] M1-07: Integrated Testing and EvalReport.
+- [ ] M1-08: Promotion integrity.
+- [ ] M1-09: Audited recovery operations.
+- [ ] M1-10: Atomic state and run locking.
+- [ ] M1-11: Minimum artifact protection.
+- [ ] M1-12: Interruption recovery acceptance.
 
-## Next Acceptance Criteria
+## Milestone 2 - Consumable Loop
 
-- Live provider-backed loop execution replaces deterministic-runner behavior for
-  non-smoke runs.
-- Shell command execution is sandboxed by ticket/eval allowlists, working
-  directory, environment, timeout, output, and redaction controls.
-- Loop evals require real policy evidence and fail closed on missing,
-  placeholder, mismatched, malformed, or rejected decisions.
-- Public Rust, TypeScript, and JSON Schema contracts have drift tests before SDK
-  or production-readiness claims.
+- [ ] M2-01: Generic project initialization.
+- [ ] M2-02: Project doctor.
+- [ ] M2-03: Package metadata and version identity.
+- [ ] M2-04: Release artifact workflow.
+- [ ] M2-05: Human-authorized tagged prerelease.
+- [ ] M2-06: Packaged external golden path.
+- [ ] M2-07: Executed Ollama acceptance.
+
+## Milestone 3 - Piloted Preview
+
+- [ ] M3-01: Typed durable loop contracts.
+- [ ] M3-02: Artifact format versions and migration.
+- [ ] M3-03: Retention and audited purge.
+- [ ] M3-04: Two-repository pilot evidence.
+- [ ] M3-05: Supported preview readiness.
+- [ ] M3-06: Human-authorized preview publication.
+
+## Current Gate
+
+M1-01 is the next dependency-ready slice. S0 passed spec and quality review.

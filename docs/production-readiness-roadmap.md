@@ -87,6 +87,18 @@ secrets.
 
 ## Lean Roadmap
 
+### Execution Status
+
+Detailed slice contracts and review gates are maintained in
+`docs/production-use-implementation-plan.md`.
+
+| Milestone | Slices        | Status   |
+| --------- | ------------- | -------- |
+| Contract  | S0            | complete |
+| 1         | M1-01 - M1-12 | active   |
+| 2         | M2-01 - M2-07 | pending  |
+| 3         | M3-01 - M3-06 | pending  |
+
 ### Milestone 1 - Make One Loop Coherent And Safe
 
 Goal: one command produces a reviewable candidate and trustworthy evidence.
@@ -116,8 +128,7 @@ Goal: one command produces a reviewable candidate and trustworthy evidence.
   workspace, persist logs, bind real policy evidence, set
   `LoopRun.eval_report_path`, and fail the loop when checks or evidence fail.
   Do not execute model-modified code before the exact diff is approved by a
-  human unless a separately reviewed OS-level sandbox blocks access to the
-  source checkout, home directory, shared Git metadata, secrets, and network.
+  human.
 - **U5 - Make recovery real.** Add audited CLI operations to inspect, revise,
   and rerun from a named step. Preserve attempt history, bind the candidate and
   config snapshots, use atomic state replacement and a per-run lock, and cover

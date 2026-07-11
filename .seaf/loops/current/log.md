@@ -1,5 +1,12 @@
 # Loop Log
 
+## 2026-07-11 gather | production-use program
+
+Committed the independently reviewed production-use roadmap as `4a20922` on
+`codex/production-use-milestones`. Started S0 to establish one shared execution
+contract for U1-U11. Production code is blocked until the contract has separate
+spec and quality approval.
+
 ## 2026-06-30 gather | initial context
 
 Read the blueprint, confirmed the repo was an initial README-only project, and extracted loop concepts from the supplied Karpathy image: separated roles, negotiated contracts, disk-backed progress, trace logs, restartable loops, scored subjective criteria, and periodic harness deletion.
@@ -279,3 +286,14 @@ Hardened CI with read-only contents permissions, per-ref concurrency cancellatio
 job timeouts, locked Cargo checks, and a documented stable Rust toolchain policy.
 Split root lint into `lint:rust` and `lint:packages`, then pointed the TypeScript
 CI job at package-only lint so it does not invoke Rust setup.
+
+## 2026-07-11 verify | S0 execution contract
+
+The first spec review found promotion/eval ordering, persistent-execution,
+slice-size, external release, and per-repository pilot-gate gaps. The contract
+was split into smaller dependency-ordered slices and re-review approved it. The
+quality review then found a contradictory sandbox exception, mutable revision
+ambiguity, non-executable verification shorthand, and an untracked final
+publication action. Those were corrected with a strict pre-execution human
+gate, immutable revision attempts, an exact command matrix, and M3-06. Quality
+re-review approved. Prettier and `git diff --check` passed.
