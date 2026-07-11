@@ -770,7 +770,7 @@ same-user directory-entry races remain M1-10/M1-11 hardening scope.
 ### M1-05b - Candidate Provider And CLI Integration
 
 Status: active. Dependencies: M1-05a (complete). Split into four reviewable
-boundaries: M1-05b1 is complete and M1-05b2 is active.
+boundaries: M1-05b1 and M1-05b2 are complete; M1-05b3 is active.
 
 Roadmap: U3. Dependencies: M1-04b.
 
@@ -820,15 +820,58 @@ indexed materialization; no provider, CLI, approval, eval, or promotion wiring.
 
 #### M1-05b2 - Provider Start And Resume Candidate Authority
 
-Status: active. Dependencies: M1-05b1.
+Status: complete on 2026-07-12. Dependencies: M1-05b1.
 
 Create and atomically persist the exact candidate before context, provider, or
 log side effects. Resume must validate that authority before mutation and route
 initial/additive repository context through the candidate.
 
+- `Provisioning` is a closed pristine candidate lifecycle. Planning snapshots
+  the canonical source/common-directory identity, repository digest, exact
+  HEAD/tree, and deterministic candidate path without creating the worktree.
+  Provisioning loads only that persisted authority, creates or adopts the exact
+  detached worktree, raw-validates it, and full-state-CAS publishes `Active`.
+- Provider startup is typed and two-stage: a minimal run directory atomically
+  publishes the Provisioning run, provisions Active, creates a retry-safe
+  synced runtime scaffold, publishes the complete canonical input snapshot set,
+  and only then prepares context/provider execution and appends the semantic
+  start log. Exact crash prefixes converge; collisions fail before new files.
+- Resume compares current input digests read-only, validates or provisions the
+  candidate before snapshot repair or provider reconciliation, repairs only
+  missing exact snapshots, then derives both context and patch-gate roots from
+  the candidate. Staged provider history is audited read-only for exact
+  candidate authority before reconciliation may publish it.
+- Initial and additive context artifacts bind the repository digest, candidate
+  path digest, and starting HEAD/tree. Every predecessor in an expansion chain
+  must carry the same authority. Candidate-native tests cover dirty source-only
+  bytes, NeedsContext, replay, and cross-candidate substitution.
+- Provider patch gating preserves `apply_requested` but is check-only. A real
+  command spy proves one candidate-cwd `git apply --check`, no direct apply, and
+  unchanged source and candidate trees. Context and patch roots are rejected
+  independently when either differs from the candidate.
+- All provider use of legacy execution fails with an explicit start-new-run
+  error, including fresh library construction, incomplete resume, and terminal
+  rerun. Deterministic non-provider `LoopRunner::start` remains unchanged.
+- Real fault cuts cover pre-create, post-create/pre-CAS, post-Active, stale CAS,
+  scaffold prefixes, and snapshot prefixes/collisions. Shared Git worktree
+  mutations use a no-follow, identity-checked repository operation lock for
+  both provisioning and cleanup.
+
+The former provider integration suites were moved under `cfg(test)` unit
+modules so their explicitly legacy historical harness is compiled only inside
+the crate test build. A separate integration target uses the normal dependency
+build and public constructor to prove no test harness or source-root provider
+bypass ships.
+
+Verification: full locked Rust workspace passes with 85 CLI tests, 33 core
+tests, 94 seaf-loop library tests, 34 candidate integration tests, 22 context
+expansion tests, 22 provider-exchange tests, 28 state tests, and focused
+candidate/provider authority integration tests. Clippy with warnings denied,
+Rust/Prettier formatting, and diff checks pass.
+
 #### M1-05b3 - Development And Output-Review Integration
 
-Status: pending. Dependencies: M1-05b2.
+Status: active. Dependencies: M1-05b2.
 
 Wire policy-gated Development evidence into the candidate transaction and make
 OutputReview consume the verified candidate tree/diff evidence.

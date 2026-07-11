@@ -700,6 +700,15 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
         persisted_run["input_digests"]["config"],
         canonical_sha256_digest(&effective_config).expect("effective config digest")
     );
+    assert_eq!(persisted_run["execution_mode"], "isolated_candidate");
+    assert_eq!(persisted_run["candidate_workspace"]["lifecycle"], "active");
+    let role_input: serde_json::Value =
+        serde_json::from_str(request["messages"][0]["content"].as_str().unwrap())
+            .expect("structured role input");
+    assert_eq!(
+        role_input["repository_context_authority"]["candidate_authority"]["kind"],
+        "isolated_candidate"
+    );
     let decisions = persisted_run["policy_decisions"]
         .as_array()
         .expect("policy decisions");
@@ -1344,6 +1353,7 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
     for name in ["one.txt", "two.txt", "three.txt"] {
         fs::write(repo.join(name), format!("{name} bytes\n")).expect("context file");
     }
+    commit_all(&repo, "Add context cap fixtures");
     let runs_root = repo.join("runs");
     let run_id = "cli-context-cap-rerun";
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
@@ -1431,6 +1441,7 @@ fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tamp
         "recovery context bytes\n",
     )
     .expect("recovery context");
+    commit_all(&repo, "Add recovery context");
     let runs_root = repo.join("runs");
     let run_id = "cli-durable-request-resume";
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
@@ -1592,6 +1603,7 @@ fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_ch
     init_git_repo(&repo);
     let context_path = repo.join("recovery-context.txt");
     fs::write(&context_path, "old accepted recovery bytes\n").expect("context");
+    commit_all(&repo, "Add recovery context");
     let runs_root = repo.join("runs");
     let run_id = "cli-context-recovery-old-bytes";
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
@@ -1631,6 +1643,26 @@ fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_ch
         .as_str()
         .expect("expansion message")
         .to_string();
+    let expansion: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join("artifacts/01-research.attempt-001.context-round-001.json"))
+            .expect("candidate context expansion"),
+    )
+    .expect("candidate context expansion JSON");
+    let persisted = read_run_json(&run_dir);
+    let candidate_root = PathBuf::from(
+        persisted["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    assert_eq!(
+        expansion["candidate_authority"]["kind"],
+        "isolated_candidate"
+    );
+    assert_eq!(
+        expansion["files"][0]["content"],
+        fs::read_to_string(candidate_root.join("recovery-context.txt")).unwrap(),
+        "NeedsContext must read candidate bytes"
+    );
     let preserved = [
         "prompts/01-research.attempt-001.exchange-001.initial.request.md",
         "responses/01-research.attempt-001.exchange-001.initial.response.json",
@@ -1786,7 +1818,7 @@ fn loop_resume_provider_run_rejects_mutated_same_identity_ticket() {
 }
 
 #[test]
-fn loop_resume_provider_run_rejects_unverifiable_ticket_snapshot() {
+fn loop_resume_repairs_missing_exact_provider_ticket_snapshot_before_provider_recovery() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -1817,8 +1849,9 @@ fn loop_resume_provider_run_rejects_unverifiable_ticket_snapshot() {
 
     let run_path = runs_root.join(run_id).join("run.json");
     mark_loop_run_pending_from_analysis(&run_path);
-    fs::remove_file(runs_root.join(run_id).join("ticket.snapshot.json"))
-        .expect("remove provider ticket snapshot");
+    let snapshot_path = runs_root.join(run_id).join("ticket.snapshot.json");
+    let expected_snapshot = fs::read(&snapshot_path).expect("ticket snapshot");
+    fs::remove_file(&snapshot_path).expect("remove provider ticket snapshot");
 
     let resume = seaf_in(&repo)
         .args([
@@ -1836,13 +1869,14 @@ fn loop_resume_provider_run_rejects_unverifiable_ticket_snapshot() {
         .expect("resume loop without ticket snapshot");
     assert!(
         !resume.status.success(),
-        "resume must fail closed when the original ticket snapshot is unverifiable"
+        "synthetic provider history remains inconsistent"
     );
     let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("refusing to resume with unverifiable ticket content"),
-        "missing snapshot should explain the resume trust-boundary failure, got {stderr}"
+        !stderr.contains("snapshot"),
+        "missing exact snapshot must be repaired before downstream recovery, got {stderr}"
     );
+    assert_eq!(fs::read(snapshot_path).unwrap(), expected_snapshot);
     assert_eq!(
         git_status_porcelain(&repo),
         "",
@@ -1973,7 +2007,7 @@ fn loop_resume_rejects_mutated_config_even_when_effective_policy_is_unchanged() 
 }
 
 #[test]
-fn loop_resume_rejects_missing_or_noncanonical_input_snapshots_without_mutation() {
+fn loop_resume_repairs_missing_input_but_rejects_noncanonical_collision() {
     for case in ["missing-policy", "noncanonical-config"] {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let repo = temp_dir.path().join("repo");
@@ -1985,29 +2019,47 @@ fn loop_resume_rejects_missing_or_noncanonical_input_snapshots_without_mutation(
         run_fake_provider(&repo, &ticket_path, &runs_root, case, &[]);
         let run_dir = runs_root.join(case);
         mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
-        match case {
+        let removed = match case {
             "missing-policy" => {
-                fs::remove_file(run_dir.join("inputs/policy.json")).expect("remove policy snapshot")
+                let path = run_dir.join("inputs/policy.json");
+                let bytes = fs::read(&path).unwrap();
+                fs::remove_file(path).expect("remove policy snapshot");
+                Some(bytes)
             }
             "noncanonical-config" => {
                 let path = run_dir.join("inputs/config.json");
                 let mut bytes = fs::read(&path).expect("config snapshot");
                 bytes.push(b'\n');
                 fs::write(path, bytes).expect("tamper config snapshot");
+                None
             }
             _ => unreachable!(),
-        }
+        };
         let before = read_tree_bytes(&run_dir);
 
         let resume = resume_provider_run(&repo, &ticket_path, &runs_root, case, &[]);
 
-        assert!(!resume.status.success(), "{case} must fail closed");
-        let stderr = String::from_utf8(resume.stderr).expect("stderr");
         assert!(
-            stderr.contains("snapshot") && stderr.contains("start a new run"),
-            "{case} must identify an unverifiable snapshot, got {stderr}"
+            !resume.status.success(),
+            "synthetic provider history remains inconsistent"
         );
-        assert_eq!(read_tree_bytes(&run_dir), before);
+        let stderr = String::from_utf8(resume.stderr).expect("stderr");
+        if let Some(expected) = removed {
+            assert!(
+                !stderr.contains("snapshot"),
+                "missing exact prefix should repair: {stderr}"
+            );
+            assert_eq!(
+                fs::read(run_dir.join("inputs/policy.json")).unwrap(),
+                expected
+            );
+        } else {
+            assert!(
+                stderr.contains("collision"),
+                "noncanonical snapshot must collide: {stderr}"
+            );
+            assert_eq!(read_tree_bytes(&run_dir), before);
+        }
     }
 }
 
@@ -2332,7 +2384,7 @@ fn loop_resume_provider_run_rejects_ticket_identity_mismatch() {
 }
 
 #[test]
-fn loop_run_fake_from_subdirectory_uses_git_root_for_context() {
+fn loop_run_fake_from_subdirectory_uses_committed_candidate_context_not_dirty_source() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     let subdir = repo.join("crates/example");
@@ -2380,17 +2432,19 @@ fn loop_run_fake_from_subdirectory_uses_git_root_for_context() {
     .expect("context manifest json");
     let files = manifest["files"].as_array().expect("manifest files");
     assert!(
-        files
-            .iter()
-            .any(|file| file["path"] == "docs/root-context.txt"),
-        "provider context must resolve relevant files from git root, got {manifest}"
+        files.is_empty(),
+        "dirty source-only bytes must not enter candidate context"
     );
     assert!(
         manifest["warnings"]
             .as_array()
             .expect("manifest warnings")
-            .is_empty(),
-        "root-relative context should not be reported missing from subdirectories"
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("skipped missing context file")),
+        "candidate context should report the uncommitted source-only file as missing"
     );
 }
 
@@ -4422,6 +4476,17 @@ fn seaf() -> Command {
 fn seaf_in(path: &Path) -> Command {
     let mut command = seaf();
     command.current_dir(path);
+    if let Some(repository_root) = path
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+    {
+        let test_temp = repository_root
+            .parent()
+            .expect("test repository parent")
+            .join("seaf-test-tmp");
+        fs::create_dir_all(&test_temp).expect("candidate test temp root");
+        command.env("TMPDIR", test_temp);
+    }
     command
 }
 
@@ -5061,6 +5126,29 @@ fn init_empty_git_repo(path: &Path) {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn commit_all(path: &Path, message: &str) {
+    let add = Command::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .output()
+        .expect("git add fixtures");
+    assert!(add.status.success(), "git add failed: {add:?}");
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=SEAF Tests",
+            "-c",
+            "user.email=tests@seaf.invalid",
+            "commit",
+            "-m",
+            message,
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit fixtures");
+    assert!(commit.status.success(), "git commit failed: {commit:?}");
 }
 
 fn git_status_porcelain(path: &Path) -> String {

@@ -66,6 +66,15 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
 }
 
 pub fn load_run(workspace: &LoopWorkspace) -> Result<LoopRun, StateError> {
+    let run = load_run_before_provider_reconciliation(workspace)?;
+    crate::provider_exchange::validate_authoritative_provider_exchange_records(workspace, &run)
+        .map_err(|error| StateError::InvalidRun(error.to_string()))?;
+    Ok(run)
+}
+
+pub(crate) fn load_run_before_provider_reconciliation(
+    workspace: &LoopWorkspace,
+) -> Result<LoopRun, StateError> {
     let path = workspace.run_file();
     if !path.is_file() {
         return Err(StateError::MissingRunFile(path));
@@ -74,8 +83,6 @@ pub fn load_run(workspace: &LoopWorkspace) -> Result<LoopRun, StateError> {
     let content = fs::read_to_string(&path)?;
     let run = serde_json::from_str(&content)?;
     validate_run_integrity(&run)?;
-    crate::provider_exchange::validate_authoritative_provider_exchange_records(workspace, &run)
-        .map_err(|error| StateError::InvalidRun(error.to_string()))?;
     Ok(run)
 }
 

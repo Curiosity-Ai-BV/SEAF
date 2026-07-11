@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::{error::Error, fmt, fs, path::PathBuf};
 
 use seaf_core::{
@@ -160,7 +161,402 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
     next_attempt: Option<(LoopStepName, u32)>,
 }
 
+#[derive(Debug)]
+pub struct InitializedLoopRun {
+    workspace: LoopWorkspace,
+    run: LoopRun,
+}
+
+#[derive(Debug)]
+pub struct ScaffoldedLoopRun {
+    workspace: LoopWorkspace,
+    run: LoopRun,
+}
+
+#[derive(Debug)]
+pub struct PreparedLoopRun {
+    workspace: LoopWorkspace,
+    run: LoopRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeRunInputSnapshots {
+    pub ticket: Vec<u8>,
+    pub policy: Vec<u8>,
+    pub config: Vec<u8>,
+    pub repository: Vec<u8>,
+    pub provider_ticket: Vec<u8>,
+}
+
+impl InitializedLoopRun {
+    pub fn create_isolated(
+        config: LoopRunnerConfig,
+        source_worktree_root: &Path,
+    ) -> Result<Self, RunnerError> {
+        let workspace = LoopWorkspace::create_minimal(&config.runs_root, &config.run_id)?;
+        let result =
+            Self::create_isolated_in_workspace(workspace.clone(), config, source_worktree_root);
+        if result.is_err() && !workspace.run_file().exists() {
+            let empty = fs::read_dir(workspace.run_directory())
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                fs::remove_dir(workspace.run_directory()).map_err(WorkspaceError::Io)?;
+                fs::File::open(
+                    workspace
+                        .run_directory()
+                        .parent()
+                        .ok_or_else(|| RunnerError::Step("runs root is missing".to_string()))?,
+                )
+                .and_then(|directory| directory.sync_all())
+                .map_err(WorkspaceError::Io)?;
+            }
+        }
+        result
+    }
+
+    fn create_isolated_in_workspace(
+        workspace: LoopWorkspace,
+        config: LoopRunnerConfig,
+        source_worktree_root: &Path,
+    ) -> Result<Self, RunnerError> {
+        let mut run = state::create_run(NewLoopRun {
+            run_id: config.run_id,
+            ticket_id: config.ticket_id,
+            goal_id: config.goal_id,
+            provider: config.provider,
+            model: config.model,
+            input_digests: config.input_digests,
+        });
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+        run.candidate_workspace = Some(
+            crate::candidate_workspace::plan_candidate_workspace(
+                workspace.run_directory(),
+                source_worktree_root,
+                &run.input_digests.repository,
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?,
+        );
+        let mut bytes = serde_json::to_vec_pretty(&run).map_err(|error| {
+            RunnerError::Step(format!("failed to serialize provisioning run: {error}"))
+        })?;
+        bytes.push(b'\n');
+        crate::immutable_artifact::publish_create_only(
+            workspace.run_directory(),
+            crate::workspace::RUN_FILE,
+            &bytes,
+        )
+        .map_err(|error| {
+            RunnerError::Step(format!("failed to publish provisioning run: {error}"))
+        })?;
+        crate::candidate_workspace::provision_candidate_workspace(&workspace)
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+        let run = state::load_run(&workspace)?;
+        Ok(Self { workspace, run })
+    }
+
+    pub fn run(&self) -> &LoopRun {
+        &self.run
+    }
+
+    pub fn resume_isolated(runs_root: &Path, verified_run: LoopRun) -> Result<Self, RunnerError> {
+        if verified_run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
+            return Err(RunnerError::Step(
+                "incomplete legacy provider run cannot be resumed; start a new isolated run"
+                    .to_string(),
+            ));
+        }
+        let workspace = LoopWorkspace::open_minimal(runs_root, &verified_run.run_id)?;
+        let persisted = state::load_run_before_provider_reconciliation(&workspace)?;
+        if persisted != verified_run {
+            return Err(RunnerError::Step(
+                "persisted run changed before candidate recovery".to_string(),
+            ));
+        }
+        let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("isolated run has no candidate authority".to_string())
+        })?;
+        if candidate
+            .patch_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.phase == seaf_core::CandidatePatchPhase::Applying
+            })
+        {
+            return Err(RunnerError::Step(
+                "candidate patch transaction is still applying and cannot resume before recovery"
+                    .to_string(),
+            ));
+        }
+        let run = match candidate.lifecycle {
+            seaf_core::CandidateWorkspaceLifecycle::Provisioning => {
+                crate::candidate_workspace::provision_candidate_workspace(&workspace)
+                    .map_err(|error| RunnerError::Step(error.to_string()))?;
+                state::load_run(&workspace)?
+            }
+            seaf_core::CandidateWorkspaceLifecycle::Active => {
+                crate::candidate_workspace::validate_candidate_workspace(
+                    workspace.run_directory(),
+                    Path::new(&candidate.source_worktree_root),
+                    candidate,
+                )
+                .map_err(|error| RunnerError::Step(error.to_string()))?;
+                if candidate
+                    .patch_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| {
+                        transaction.phase == seaf_core::CandidatePatchPhase::Applied
+                    })
+                {
+                    crate::candidate_workspace::apply_candidate_development_evidence(
+                        &workspace,
+                        Path::new(&candidate.source_worktree_root),
+                    )
+                    .map_err(|error| RunnerError::Step(error.to_string()))?;
+                }
+                persisted
+            }
+            _ => {
+                return Err(RunnerError::Step(
+                    "candidate is not resumable from its persisted lifecycle".to_string(),
+                ));
+            }
+        };
+        Ok(Self { workspace, run })
+    }
+
+    pub fn workspace(&self) -> &LoopWorkspace {
+        &self.workspace
+    }
+
+    pub fn scaffold(self) -> Result<ScaffoldedLoopRun, RunnerError> {
+        let candidate = self.run.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("initialized isolated run lost candidate authority".to_string())
+        })?;
+        crate::candidate_workspace::validate_candidate_workspace(
+            self.workspace.run_directory(),
+            Path::new(&candidate.source_worktree_root),
+            candidate,
+        )
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+        self.workspace.scaffold_runtime()?;
+        Ok(ScaffoldedLoopRun {
+            workspace: self.workspace,
+            run: self.run,
+        })
+    }
+}
+
+impl ScaffoldedLoopRun {
+    pub fn run(&self) -> &LoopRun {
+        &self.run
+    }
+
+    pub fn workspace(&self) -> &LoopWorkspace {
+        &self.workspace
+    }
+
+    pub fn publish_authoritative_inputs(
+        self,
+        snapshots: AuthoritativeRunInputSnapshots,
+    ) -> Result<PreparedLoopRun, RunnerError> {
+        let persisted = state::load_run_before_provider_reconciliation(&self.workspace)?;
+        if persisted != self.run {
+            return Err(RunnerError::Step(
+                "initialized run changed before authoritative input publication".to_string(),
+            ));
+        }
+        let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("isolated run lost candidate authority".to_string())
+        })?;
+        crate::candidate_workspace::validate_candidate_workspace(
+            self.workspace.run_directory(),
+            Path::new(&candidate.source_worktree_root),
+            candidate,
+        )
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+        ensure_authoritative_run_inputs(&self.workspace, &self.run, &snapshots)?;
+        Ok(PreparedLoopRun {
+            workspace: self.workspace,
+            run: self.run,
+        })
+    }
+}
+
+impl PreparedLoopRun {
+    pub fn run(&self) -> &LoopRun {
+        &self.run
+    }
+
+    pub fn workspace(&self) -> &LoopWorkspace {
+        &self.workspace
+    }
+}
+
+fn ensure_authoritative_run_inputs(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    snapshots: &AuthoritativeRunInputSnapshots,
+) -> Result<(), RunnerError> {
+    let entries = [
+        (
+            "inputs/ticket.json",
+            &snapshots.ticket,
+            &run.input_digests.ticket,
+        ),
+        (
+            "inputs/policy.json",
+            &snapshots.policy,
+            &run.input_digests.policy,
+        ),
+        (
+            "inputs/config.json",
+            &snapshots.config,
+            &run.input_digests.config,
+        ),
+        (
+            "inputs/repository.json",
+            &snapshots.repository,
+            &run.input_digests.repository,
+        ),
+        (
+            "ticket.snapshot.json",
+            &snapshots.provider_ticket,
+            &run.input_digests.ticket,
+        ),
+    ];
+    for (name, bytes, expected_digest) in entries {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            RunnerError::Step(format!("authoritative {name} is not JSON: {error}"))
+        })?;
+        let canonical = seaf_core::canonical_json_bytes(&value).map_err(|error| {
+            RunnerError::Step(format!(
+                "authoritative {name} cannot be canonicalized: {error}"
+            ))
+        })?;
+        if canonical != *bytes {
+            return Err(RunnerError::Step(format!(
+                "authoritative {name} bytes are not canonical"
+            )));
+        }
+        let digest = seaf_core::canonical_sha256_digest(&value).map_err(|error| {
+            RunnerError::Step(format!("authoritative {name} cannot be digested: {error}"))
+        })?;
+        if &digest != expected_digest {
+            return Err(RunnerError::Step(format!(
+                "authoritative {name} digest differs from the provisioning run"
+            )));
+        }
+    }
+    if snapshots.provider_ticket != snapshots.ticket {
+        return Err(RunnerError::Step(
+            "provider ticket snapshot differs from the authoritative ticket".to_string(),
+        ));
+    }
+
+    let inputs = workspace.run_directory().join("inputs");
+    match fs::symlink_metadata(&inputs) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(RunnerError::Step(
+                "authoritative input directory is not a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(RunnerError::Step(error.to_string())),
+    }
+    for (name, bytes, _) in entries {
+        let path = workspace.run_directory().join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(RunnerError::Step(format!(
+                    "authoritative snapshot collision at {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                if fs::read(&path).map_err(|error| RunnerError::Step(error.to_string()))? != *bytes
+                {
+                    return Err(RunnerError::Step(format!(
+                        "authoritative snapshot collision at {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RunnerError::Step(error.to_string())),
+        }
+    }
+
+    if !inputs.exists() {
+        fs::create_dir(&inputs).map_err(|error| RunnerError::Step(error.to_string()))?;
+    }
+    fs::File::open(workspace.run_directory())
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+    for (name, bytes, _) in entries {
+        crate::immutable_artifact::publish_create_only(workspace.run_directory(), name, bytes)
+            .map_err(|error| {
+                RunnerError::Step(format!("failed to publish authoritative {name}: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
 impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
+    pub fn start_initialized(
+        initialized: PreparedLoopRun,
+        step_runner: &'a mut R,
+    ) -> Result<Self, RunnerError> {
+        let persisted = state::load_run_before_provider_reconciliation(&initialized.workspace)?;
+        if persisted != initialized.run {
+            return Err(RunnerError::Step(
+                "initialized run changed before provider preparation".to_string(),
+            ));
+        }
+        let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("isolated run lost candidate authority".to_string())
+        })?;
+        crate::candidate_workspace::validate_candidate_workspace(
+            initialized.workspace.run_directory(),
+            Path::new(&candidate.source_worktree_root),
+            candidate,
+        )
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+        step_runner.prepare_fresh_run(&initialized.workspace, &initialized.run)?;
+        initialized
+            .workspace
+            .append_log("started isolated provider run")?;
+        Ok(Self {
+            workspace: initialized.workspace,
+            run: initialized.run,
+            step_runner,
+            next_attempt: None,
+        })
+    }
+
+    pub fn resume_initialized(
+        initialized: PreparedLoopRun,
+        step_runner: &'a mut R,
+    ) -> Result<Self, RunnerError> {
+        let persisted = state::load_run_before_provider_reconciliation(&initialized.workspace)?;
+        if persisted != initialized.run {
+            return Err(RunnerError::Step(
+                "initialized resume run changed before provider preparation".to_string(),
+            ));
+        }
+        let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("isolated run lost candidate authority".to_string())
+        })?;
+        crate::candidate_workspace::validate_candidate_workspace(
+            initialized.workspace.run_directory(),
+            Path::new(&candidate.source_worktree_root),
+            candidate,
+        )
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+        Self::resume_with_workspace(initialized.workspace, initialized.run, step_runner)
+    }
+
     pub fn start(config: LoopRunnerConfig, step_runner: &'a mut R) -> Result<Self, RunnerError> {
         let workspace = LoopWorkspace::create(&config.runs_root, &config.run_id)?;
         let run = state::create_run(NewLoopRun {
@@ -241,6 +637,17 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     }
 
     pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
+        if self
+            .run
+            .candidate_workspace
+            .as_ref()
+            .and_then(|candidate| candidate.patch_transaction.as_ref())
+            .is_some()
+        {
+            return Err(RunnerError::Step(
+                "candidate patch transaction must be resolved before rerun reset".to_string(),
+            ));
+        }
         let attempt = next_step_attempt(&self.workspace, step)?;
         let previous = self.run.clone();
         self.step_runner

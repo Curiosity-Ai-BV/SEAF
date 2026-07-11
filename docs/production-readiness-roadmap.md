@@ -140,10 +140,19 @@ tree and staged diff, persists Applying before index mutation, raw-materializes
 the exact resulting index objects, and persists Applied evidence afterward.
 Recovery recomputes the authoritative plan and accepts only pristine or exact
 planned state; coherent tampering, partial indexes, unrelated drift, configured
-filters, ident expansion, and source-checkout mutation are covered. M1-05b2 is
-active for provider start/resume and candidate-native context; provider/output
-integration and explicit cleanup remain M1-05b3/M1-05b4. The production loop
-remains proposal-only until those boundaries are accepted.
+filters, ident expansion, and source-checkout mutation are covered.
+
+M1-05b2 now makes every new provider CLI run isolated. Provisioning authority
+is persisted before worktree creation; Active candidate validation precedes
+scaffold, complete create-only input snapshots, context, reconciliation,
+provider calls, and semantic logs. Resume repairs exact missing snapshot
+prefixes only after candidate validation. Initial and additive context bind the
+candidate identity, patch gating runs check-only in the candidate, and the
+source checkout remains unchanged even when apply intent is true or source
+bytes are dirty. Legacy provider execution and rerun fail closed while the
+deterministic non-provider runner remains compatible. M1-05b3 is active for
+Development/OutputReview integration; explicit cleanup remains M1-05b4. The
+production loop remains proposal-only until those boundaries are accepted.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

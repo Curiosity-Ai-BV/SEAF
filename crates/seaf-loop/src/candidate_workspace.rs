@@ -30,6 +30,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 pub const CANDIDATE_WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const CANDIDATE_ROOT_DIR: &str = "seaf-candidates";
 const CANDIDATE_LOCK_FILE: &str = ".candidate-workspace.lock";
+const REPOSITORY_OPERATION_LOCKS_DIR: &str = ".repository-operation-locks";
+const REPOSITORY_OPERATION_LOCK_FILE: &str = ".repository-operation.lock";
 const PATCH_INTENT_PATH: &str = "artifacts/candidate-patch.intent.json";
 const PATCH_EXPECTED_DIFF_PATH: &str = "artifacts/candidate-patch.expected.diff";
 const PATCH_APPLIED_DIFF_PATH: &str = "artifacts/candidate-patch.applied.diff";
@@ -745,12 +747,13 @@ pub fn create_candidate_workspace(
     source_worktree_root: &Path,
     repository_identity_digest: &str,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
-    let lock = acquire_candidate_directory_lock(run_directory)?;
-    let result = create_candidate_workspace_locked(
+    let planned = plan_candidate_workspace(
         run_directory,
         source_worktree_root,
         repository_identity_digest,
-    );
+    )?;
+    let lock = acquire_candidate_directory_lock(run_directory)?;
+    let result = provision_planned_candidate(run_directory, &planned);
     let unlock = lock.unlock();
     match (result, unlock) {
         (Ok(value), Ok(())) => Ok(value),
@@ -759,13 +762,118 @@ pub fn create_candidate_workspace(
     }
 }
 
-fn create_candidate_workspace_locked(
+pub fn plan_candidate_workspace(
     run_directory: &Path,
     source_worktree_root: &Path,
     repository_identity_digest: &str,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
     validate_digest(repository_identity_digest, "repository identity")?;
-    let run_id = run_directory
+    let run_id = safe_run_id(run_directory)?;
+    let source = canonical_real_directory(source_worktree_root, "source worktree")?;
+    let starting_head = git_text(&source, &["rev-parse", "HEAD"])?;
+    let starting_tree = git_text(&source, &["rev-parse", "HEAD^{tree}"])?;
+    validate_object_id(&starting_head, "starting HEAD")?;
+    validate_object_id(&starting_tree, "starting tree")?;
+    let common_dir = git_common_dir(&source)?;
+    let temp_root = env::temp_dir().canonicalize()?;
+    let candidate_path = temp_root
+        .join(CANDIDATE_ROOT_DIR)
+        .join(repository_identity_digest)
+        .join(run_id);
+    if candidate_path.starts_with(&source) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate path must be outside the source worktree".to_string(),
+        ));
+    }
+    Ok(CandidateWorkspaceState {
+        schema_version: CANDIDATE_WORKSPACE_SCHEMA_VERSION,
+        path: path_text(&candidate_path, "candidate path")?.to_string(),
+        source_worktree_root: path_text(&source, "source worktree")?.to_string(),
+        git_common_dir: path_text(&common_dir, "Git common directory")?.to_string(),
+        repository_identity_digest: repository_identity_digest.to_string(),
+        starting_head: starting_head.clone(),
+        starting_tree: starting_tree.clone(),
+        candidate_head: starting_head,
+        candidate_tree: starting_tree,
+        candidate_diff_digest: sha256_bytes(&[]),
+        patch_transaction: None,
+        lifecycle: CandidateWorkspaceLifecycle::Provisioning,
+        cleanup_started_at: None,
+        cleaned_at: None,
+    })
+}
+
+pub fn provision_candidate_workspace(
+    workspace: &LoopWorkspace,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    provision_candidate_workspace_with_hook(workspace, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateProvisionPhase {
+    BeforeWorktreeCreate,
+    WorktreeCreated,
+    ActivePersisted,
+}
+
+fn provision_candidate_workspace_with_hook<F>(
+    workspace: &LoopWorkspace,
+    mut hook: F,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError>
+where
+    F: FnMut(CandidateProvisionPhase) -> Result<(), CandidateWorkspaceError>,
+{
+    let lock = acquire_candidate_lock(workspace)?;
+    let result = provision_candidate_workspace_locked(workspace, &mut hook);
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn provision_candidate_workspace_locked(
+    workspace: &LoopWorkspace,
+    hook: &mut dyn FnMut(CandidateProvisionPhase) -> Result<(), CandidateWorkspaceError>,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    let run = crate::state::load_run(workspace)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if run.execution_mode != LoopExecutionMode::IsolatedCandidate {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate provisioning requires isolated_candidate execution".to_string(),
+        ));
+    }
+    let planned = run.candidate_workspace.clone().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "isolated candidate run has no candidate workspace authority".to_string(),
+        )
+    })?;
+    if planned.lifecycle == CandidateWorkspaceLifecycle::Active {
+        return validate_candidate_physical(
+            workspace.run_directory(),
+            Path::new(&planned.source_worktree_root),
+            &planned,
+            true,
+        );
+    }
+    if planned.lifecycle != CandidateWorkspaceLifecycle::Provisioning {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate provisioning requires Provisioning or exact Active authority".to_string(),
+        ));
+    }
+    hook(CandidateProvisionPhase::BeforeWorktreeCreate)?;
+    let active = provision_planned_candidate(workspace.run_directory(), &planned)?;
+    hook(CandidateProvisionPhase::WorktreeCreated)?;
+    let mut intended = run.clone();
+    intended.candidate_workspace = Some(active.clone());
+    persist_candidate_run(workspace, &run, &intended)?;
+    hook(CandidateProvisionPhase::ActivePersisted)?;
+    Ok(active)
+}
+
+fn safe_run_id(run_directory: &Path) -> Result<&str, CandidateWorkspaceError> {
+    run_directory
         .file_name()
         .and_then(|value| value.to_str())
         .filter(|value| {
@@ -778,30 +886,40 @@ fn create_candidate_workspace_locked(
             CandidateWorkspaceError::Unsafe(
                 "run directory must end in a safe UTF-8 run ID".to_string(),
             )
-        })?;
-    let source = canonical_real_directory(source_worktree_root, "source worktree")?;
-    let starting_head = git_text(&source, &["rev-parse", "HEAD"])?;
-    let starting_tree = git_text(&source, &["rev-parse", "HEAD^{tree}"])?;
-    validate_object_id(&starting_head, "starting HEAD")?;
-    validate_object_id(&starting_tree, "starting tree")?;
-    let git_common_dir = git_common_dir(&source)?;
+        })
+}
 
-    let candidate_parent = create_candidate_parent(repository_identity_digest)?;
-    let candidate_path = candidate_parent.join(run_id);
-    if candidate_path.starts_with(&source) {
-        return Err(CandidateWorkspaceError::Unsafe(
-            "candidate path must be outside the source worktree".to_string(),
+fn provision_planned_candidate(
+    run_directory: &Path,
+    planned: &CandidateWorkspaceState,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    validate_provisioning_authority(run_directory, planned)?;
+    let source = PathBuf::from(&planned.source_worktree_root);
+    let common_dir = PathBuf::from(&planned.git_common_dir);
+
+    let candidate_parent = create_candidate_parent(&planned.repository_identity_digest)?;
+    let repository_lock = acquire_repository_operation_lock(&common_dir)?;
+    let candidate_path = candidate_parent.join(safe_run_id(run_directory)?);
+    if candidate_path != Path::new(&planned.path) {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate path differs from persisted deterministic authority".to_string(),
         ));
     }
     if fs::symlink_metadata(&candidate_path).is_ok() {
-        return adopt_existing_candidate(
+        let adopted = adopt_existing_candidate(
             &candidate_path,
             &source,
-            repository_identity_digest,
-            &git_common_dir,
-            &starting_head,
-            &starting_tree,
+            &planned.repository_identity_digest,
+            &common_dir,
+            &planned.starting_head,
+            &planned.starting_tree,
         );
+        let unlock = repository_lock.unlock();
+        return match (adopted, unlock) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+            (Err(error), _) => Err(error),
+        };
     }
 
     git_success(
@@ -812,7 +930,7 @@ fn create_candidate_workspace_locked(
             "--detach",
             "--no-checkout",
             path_text(&candidate_path, "candidate path")?,
-            &starting_head,
+            &planned.starting_head,
         ],
     )?;
     let result = (|| {
@@ -824,8 +942,8 @@ fn create_candidate_workspace_locked(
         }
         set_and_validate_private_directory(&candidate)?;
         materialize_candidate_without_filters(&candidate)?;
-        if git_text(&source, &["rev-parse", "HEAD"])? != starting_head
-            || git_text(&source, &["rev-parse", "HEAD^{tree}"])? != starting_tree
+        if git_text(&source, &["rev-parse", "HEAD"])? != planned.starting_head
+            || git_text(&source, &["rev-parse", "HEAD^{tree}"])? != planned.starting_tree
         {
             return Err(CandidateWorkspaceError::Mismatch(
                 "source HEAD or tree changed while creating the candidate".to_string(),
@@ -833,33 +951,20 @@ fn create_candidate_workspace_locked(
         }
         require_detached_head(&candidate)?;
 
-        let mut state = CandidateWorkspaceState {
-            schema_version: CANDIDATE_WORKSPACE_SCHEMA_VERSION,
-            path: path_text(&candidate, "candidate path")?.to_string(),
-            source_worktree_root: path_text(&source, "source worktree")?.to_string(),
-            git_common_dir: path_text(&git_common_dir, "Git common directory")?.to_string(),
-            repository_identity_digest: repository_identity_digest.to_string(),
-            starting_head: starting_head.clone(),
-            starting_tree: starting_tree.clone(),
-            candidate_head: starting_head.clone(),
-            candidate_tree: starting_tree.clone(),
-            candidate_diff_digest: sha256_bytes(&[]),
-            patch_transaction: None,
-            lifecycle: CandidateWorkspaceLifecycle::Active,
-            cleanup_started_at: None,
-            cleaned_at: None,
-        };
+        let mut state = planned.clone();
+        state.path = path_text(&candidate, "candidate path")?.to_string();
+        state.lifecycle = CandidateWorkspaceLifecycle::Active;
         refresh_candidate_workspace(&mut state)?;
         Ok(state)
     })();
-    match result {
+    let result = match result {
         Ok(state) => Ok(state),
         Err(error) => {
             let rollback = if exact_owned_candidate_remnant(
                 &source,
                 &candidate_path,
-                &git_common_dir,
-                &starting_head,
+                &common_dir,
+                &planned.starting_head,
             )
             .unwrap_or(false)
             {
@@ -885,7 +990,49 @@ fn create_candidate_workspace_locked(
                 ))),
             }
         }
+    };
+    let unlock = repository_lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+        (Err(error), _) => Err(error),
     }
+}
+
+fn validate_provisioning_authority(
+    run_directory: &Path,
+    planned: &CandidateWorkspaceState,
+) -> Result<(), CandidateWorkspaceError> {
+    if planned.lifecycle != CandidateWorkspaceLifecycle::Provisioning
+        || planned.patch_transaction.is_some()
+        || planned.cleanup_started_at.is_some()
+        || planned.cleaned_at.is_some()
+        || planned.candidate_head != planned.starting_head
+        || planned.candidate_tree != planned.starting_tree
+        || planned.candidate_diff_digest != sha256_bytes(&[])
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "persisted candidate provisioning authority is not pristine".to_string(),
+        ));
+    }
+    let source =
+        canonical_real_directory(Path::new(&planned.source_worktree_root), "source worktree")?;
+    let expected_path = env::temp_dir()
+        .canonicalize()?
+        .join(CANDIDATE_ROOT_DIR)
+        .join(&planned.repository_identity_digest)
+        .join(safe_run_id(run_directory)?);
+    if Path::new(&planned.path) != expected_path
+        || git_common_dir(&source)? != Path::new(&planned.git_common_dir)
+        || git_text(&source, &["rev-parse", "HEAD"])? != planned.starting_head
+        || git_text(&source, &["rev-parse", "HEAD^{tree}"])? != planned.starting_tree
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "source identity, starting HEAD/tree, or candidate path differs from persisted provisioning authority"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_candidate_workspace(
@@ -1018,8 +1165,15 @@ where
                 "authoritative LoopRun has no candidate workspace".to_string(),
             )
         })?;
+        let repository_lock =
+            acquire_repository_operation_lock(Path::new(&candidate.git_common_dir))?;
 
         let mut cleaning = match candidate.lifecycle {
+            CandidateWorkspaceLifecycle::Provisioning => {
+                return Err(CandidateWorkspaceError::Unsafe(
+                    "refusing to clean a candidate before provisioning completes".to_string(),
+                ));
+            }
             CandidateWorkspaceLifecycle::Active => {
                 validate_candidate_physical(
                     workspace.run_directory(),
@@ -1053,6 +1207,7 @@ where
                         "cleaned candidate path or registration reappeared".to_string(),
                     ));
                 }
+                repository_lock.unlock()?;
                 return Ok(candidate);
             }
         };
@@ -1108,6 +1263,7 @@ where
         let expected = run.clone();
         run.candidate_workspace = Some(cleaning.clone());
         persist_candidate_run(workspace, &expected, &run)?;
+        repository_lock.unlock()?;
         Ok(cleaning)
     })();
     let unlock = lock.unlock();
@@ -1410,11 +1566,85 @@ fn ensure_private_authority_directory(path: &Path) -> Result<(), CandidateWorksp
         }
         Ok(_) => validate_private_directory(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(CandidateWorkspaceError::Io)?;
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+            }
             set_and_validate_private_directory(path)
         }
         Err(error) => Err(CandidateWorkspaceError::Io(error)),
     }
+}
+
+fn repository_operation_lock_path(
+    git_common_dir: &Path,
+) -> Result<PathBuf, CandidateWorkspaceError> {
+    let canonical = canonical_real_directory(git_common_dir, "Git common directory")?;
+    if canonical != git_common_dir {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "persisted Git common directory is not canonical".to_string(),
+        ));
+    }
+    let common_dir_digest = sha256_bytes(canonical.as_os_str().as_encoded_bytes());
+    Ok(std::env::temp_dir()
+        .join(CANDIDATE_ROOT_DIR)
+        .join(REPOSITORY_OPERATION_LOCKS_DIR)
+        .join(common_dir_digest)
+        .join(REPOSITORY_OPERATION_LOCK_FILE))
+}
+
+fn acquire_repository_operation_lock(
+    git_common_dir: &Path,
+) -> Result<fs::File, CandidateWorkspaceError> {
+    let path = repository_operation_lock_path(git_common_dir)?;
+    let candidate_root = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            CandidateWorkspaceError::Unsafe(
+                "repository operation lock has no candidate authority root".to_string(),
+            )
+        })?;
+    let lock_namespace = path.parent().and_then(Path::parent).ok_or_else(|| {
+        CandidateWorkspaceError::Unsafe(
+            "repository operation lock has no private namespace".to_string(),
+        )
+    })?;
+    let lock_parent = path.parent().ok_or_else(|| {
+        CandidateWorkspaceError::Unsafe(
+            "repository operation lock has no private parent".to_string(),
+        )
+    })?;
+    ensure_private_authority_directory(candidate_root)?;
+    ensure_private_authority_directory(lock_namespace)?;
+    ensure_private_authority_directory(lock_parent)?;
+    let file = match open_candidate_lock(&path, true) {
+        Ok(file) => {
+            file.sync_all()?;
+            fs::File::open(lock_parent)?.sync_all()?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            inspect_candidate_lock_path(&path)?;
+            open_candidate_lock(&path, false)?
+        }
+        Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+    };
+    validate_candidate_lock_file(&file, &path)?;
+    file.lock().map_err(CandidateWorkspaceError::Io)?;
+    if let Err(error) = validate_candidate_lock_file(&file, &path) {
+        let _ = file.unlock();
+        return Err(CandidateWorkspaceError::Io(error));
+    }
+    Ok(file)
 }
 
 fn set_and_validate_private_directory(path: &Path) -> Result<(), CandidateWorkspaceError> {
@@ -2232,6 +2462,270 @@ mod tests {
     use super::*;
     use seaf_core::LoopInputDigests;
     use std::process::Command;
+
+    #[test]
+    fn linked_worktree_authorities_share_the_git_common_directory_operation_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        let linked = temp.path().join("linked");
+        fs::create_dir(&source).expect("source");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "seaf@example.invalid"],
+            vec!["config", "user.name", "SEAF Test"],
+        ] {
+            test_git(&source, &args);
+        }
+        fs::write(source.join("tracked.txt"), "source\n").expect("tracked");
+        test_git(&source, &["add", "tracked.txt"]);
+        test_git(&source, &["commit", "-qm", "initial"]);
+        test_git(
+            &source,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+
+        let source_workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "source-authority").unwrap();
+        let linked_workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "linked-authority").unwrap();
+        let source_identity = sha256_bytes(source.as_os_str().as_encoded_bytes());
+        let linked_identity = sha256_bytes(linked.as_os_str().as_encoded_bytes());
+        let source_plan =
+            plan_candidate_workspace(source_workspace.run_directory(), &source, &source_identity)
+                .expect("source plan");
+        let linked_plan =
+            plan_candidate_workspace(linked_workspace.run_directory(), &linked, &linked_identity)
+                .expect("linked plan");
+
+        assert_ne!(
+            source_plan.repository_identity_digest,
+            linked_plan.repository_identity_digest
+        );
+        assert_eq!(source_plan.git_common_dir, linked_plan.git_common_dir);
+        assert_eq!(
+            repository_operation_lock_path(Path::new(&source_plan.git_common_dir))
+                .expect("source operation lock"),
+            repository_operation_lock_path(Path::new(&linked_plan.git_common_dir))
+                .expect("linked operation lock")
+        );
+
+        for (workspace, plan, identity) in [
+            (&source_workspace, &source_plan, &source_identity),
+            (&linked_workspace, &linked_plan, &linked_identity),
+        ] {
+            let mut run = crate::state::create_run(crate::state::NewLoopRun {
+                run_id: workspace
+                    .run_directory()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                ticket_id: "T-LINKED-LOCK".to_string(),
+                goal_id: "production-use".to_string(),
+                provider: "fake".to_string(),
+                model: "fake-model".to_string(),
+                input_digests: LoopInputDigests {
+                    ticket: "1".repeat(64),
+                    policy: "2".repeat(64),
+                    config: "3".repeat(64),
+                    repository: identity.clone(),
+                },
+            });
+            run.execution_mode = LoopExecutionMode::IsolatedCandidate;
+            run.candidate_workspace = Some(plan.clone());
+            crate::state::save_run(workspace, &run).expect("planned run");
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let source_thread = {
+            let workspace = source_workspace.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                provision_candidate_workspace(&workspace)
+            })
+        };
+        let linked_thread = {
+            let workspace = linked_workspace.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                provision_candidate_workspace(&workspace)
+            })
+        };
+        barrier.wait();
+        let source_candidate = source_thread.join().unwrap().expect("source candidate");
+        let linked_candidate = linked_thread.join().unwrap().expect("linked candidate");
+
+        assert_ne!(source_candidate.path, linked_candidate.path);
+        assert_eq!(
+            source_candidate.lifecycle,
+            CandidateWorkspaceLifecycle::Active
+        );
+        assert_eq!(
+            linked_candidate.lifecycle,
+            CandidateWorkspaceLifecycle::Active
+        );
+        validate_candidate_workspace(source_workspace.run_directory(), &source, &source_candidate)
+            .expect("source candidate authority");
+        validate_candidate_workspace(linked_workspace.run_directory(), &linked, &linked_candidate)
+            .expect("linked candidate authority");
+        assert!(worktree_registered(&source, Path::new(&source_candidate.path)).unwrap());
+        assert!(worktree_registered(&linked, Path::new(&linked_candidate.path)).unwrap());
+
+        for workspace in [&source_workspace, &linked_workspace] {
+            let mut run = crate::state::load_run(workspace).expect("active run");
+            run.status = LoopStatus::Completed;
+            crate::state::save_run(workspace, &run).expect("terminal run");
+        }
+        assert_eq!(
+            cleanup_candidate_workspace(&source_workspace, &source)
+                .expect("source cleanup")
+                .lifecycle,
+            CandidateWorkspaceLifecycle::Cleaned
+        );
+        assert_eq!(
+            cleanup_candidate_workspace(&linked_workspace, &linked)
+                .expect("linked cleanup")
+                .lifecycle,
+            CandidateWorkspaceLifecycle::Cleaned
+        );
+        assert!(!worktree_registered(&source, Path::new(&source_candidate.path)).unwrap());
+        assert!(!worktree_registered(&linked, Path::new(&linked_candidate.path)).unwrap());
+
+        test_git(
+            &source,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+    }
+
+    #[test]
+    fn candidate_provisioning_recovers_real_create_and_publication_cuts() {
+        for (run_id, cut) in [
+            (
+                "provision-before-create",
+                CandidateProvisionPhase::BeforeWorktreeCreate,
+            ),
+            (
+                "provision-after-create",
+                CandidateProvisionPhase::WorktreeCreated,
+            ),
+            (
+                "provision-after-active",
+                CandidateProvisionPhase::ActivePersisted,
+            ),
+        ] {
+            let (temp, source, workspace, planned) = provisioning_fixture(run_id);
+            let error = provision_candidate_workspace_with_hook(&workspace, |phase| {
+                if phase == cut {
+                    Err(CandidateWorkspaceError::State(format!(
+                        "injected {phase:?}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("inject provisioning cut");
+            assert!(error.to_string().contains("injected"), "{error}");
+            let persisted = crate::state::load_run(&workspace).unwrap();
+            match cut {
+                CandidateProvisionPhase::BeforeWorktreeCreate => {
+                    assert!(!Path::new(&planned.path).exists());
+                    assert_eq!(
+                        persisted.candidate_workspace.unwrap().lifecycle,
+                        CandidateWorkspaceLifecycle::Provisioning
+                    );
+                }
+                CandidateProvisionPhase::WorktreeCreated => {
+                    assert!(Path::new(&planned.path).is_dir());
+                    assert_eq!(
+                        persisted.candidate_workspace.unwrap().lifecycle,
+                        CandidateWorkspaceLifecycle::Provisioning
+                    );
+                }
+                CandidateProvisionPhase::ActivePersisted => {
+                    assert_eq!(
+                        persisted.candidate_workspace.unwrap().lifecycle,
+                        CandidateWorkspaceLifecycle::Active
+                    );
+                }
+            }
+            let active = provision_candidate_workspace(&workspace).expect("retry exact cut");
+            assert_eq!(active.lifecycle, CandidateWorkspaceLifecycle::Active);
+            test_git(
+                &source,
+                &["worktree", "remove", "--force", active.path.as_str()],
+            );
+            drop(temp);
+        }
+    }
+
+    #[test]
+    fn candidate_provisioning_stale_cas_leaves_an_exact_retryable_remnant() {
+        let (_temp, source, workspace, planned) = provisioning_fixture("provision-stale-cas");
+        let error = provision_candidate_workspace_with_hook(&workspace, |phase| {
+            if phase == CandidateProvisionPhase::WorktreeCreated {
+                let mut concurrent = crate::state::load_run(&workspace).unwrap();
+                concurrent.updated_at = "concurrent-change".to_string();
+                crate::state::save_run(&workspace, &concurrent).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("stale full-run CAS must fail");
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert!(Path::new(&planned.path).is_dir());
+        let active = provision_candidate_workspace(&workspace).expect("adopt exact remnant");
+        assert_eq!(active.lifecycle, CandidateWorkspaceLifecycle::Active);
+        test_git(
+            &source,
+            &["worktree", "remove", "--force", active.path.as_str()],
+        );
+    }
+
+    fn provisioning_fixture(
+        run_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        LoopWorkspace,
+        CandidateWorkspaceState,
+    ) {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "seaf@example.invalid"],
+            vec!["config", "user.name", "SEAF Test"],
+        ] {
+            test_git(&source, &args);
+        }
+        fs::write(source.join("tracked.txt"), "source\n").unwrap();
+        test_git(&source, &["add", "tracked.txt"]);
+        test_git(&source, &["commit", "-qm", "initial"]);
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), run_id).unwrap();
+        let repository = sha256_bytes(source.as_os_str().as_encoded_bytes());
+        let planned =
+            plan_candidate_workspace(workspace.run_directory(), &source, &repository).unwrap();
+        let mut run = crate::state::create_run(crate::state::NewLoopRun {
+            run_id: run_id.to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "goal".to_string(),
+            provider: "fake".to_string(),
+            model: "model".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "1".repeat(64),
+                policy: "2".repeat(64),
+                config: "3".repeat(64),
+                repository,
+            },
+        });
+        run.execution_mode = LoopExecutionMode::IsolatedCandidate;
+        run.candidate_workspace = Some(planned.clone());
+        crate::state::save_run(&workspace, &run).unwrap();
+        (temp, source, workspace, planned)
+    }
 
     #[test]
     fn injected_post_remove_failure_leaves_durable_cleaning_for_retry() {

@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    context::{ContextLimits, UNTRUSTED_CONTEXT_MARKER},
+    context::{CandidateContextAuthority, ContextLimits, UNTRUSTED_CONTEXT_MARKER},
     immutable_artifact::{publish_create_only, read_verified_regular_file, ImmutableArtifactError},
     policy::{default_exclude_patterns, matching_pattern, normalize_repo_path},
     state::step_file_stem,
@@ -33,6 +33,7 @@ pub struct ContextExpansionRequest {
     pub context_request: ContextRequest,
     pub initial_provider_request: ArtifactReference,
     pub previous_expansion: Option<ArtifactReference>,
+    pub candidate_authority: Option<CandidateContextAuthority>,
     pub initial_loaded_paths: Vec<String>,
     pub initial_context_bytes: usize,
     pub ticket_forbidden_files: Vec<String>,
@@ -56,6 +57,8 @@ pub struct ContextExpansionArtifact {
     pub initial_context_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_expansion: Option<ArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_authority: Option<CandidateContextAuthority>,
     pub limits: ContextLimits,
     pub default_exclude_globs: Vec<String>,
     pub ticket_forbidden_files: Vec<String>,
@@ -176,6 +179,7 @@ pub fn create_context_expansion(
         initial_loaded_paths: prepared.initial_loaded_paths.iter().cloned().collect(),
         initial_context_bytes: request.initial_context_bytes,
         previous_expansion: request.previous_expansion.clone(),
+        candidate_authority: request.candidate_authority.clone(),
         limits: request.limits,
         default_exclude_globs: prepared.default_exclude_globs.clone(),
         ticket_forbidden_files: prepared.ticket_forbidden_files.clone(),
@@ -432,6 +436,7 @@ fn validate_expected_artifact(
                 .collect::<Vec<_>>()
         || artifact.initial_context_bytes != request.initial_context_bytes
         || artifact.previous_expansion != request.previous_expansion
+        || artifact.candidate_authority != request.candidate_authority
         || artifact.limits != request.limits
         || artifact.default_exclude_globs != prepared.default_exclude_globs
         || artifact.ticket_forbidden_files != prepared.ticket_forbidden_files
@@ -611,6 +616,7 @@ fn load_prior_chain(
                     .cloned()
                     .collect::<Vec<_>>()
             || artifact.initial_context_bytes != request.initial_context_bytes
+            || artifact.candidate_authority != request.candidate_authority
             || artifact.limits != request.limits
             || artifact.default_exclude_globs != prepared.default_exclude_globs
             || artifact.ticket_forbidden_files != prepared.ticket_forbidden_files
@@ -709,6 +715,45 @@ fn verify_initial_provider_request(
         return Err(ContextExpansionError::Invalid(
             "initial provider request audit digest mismatch".to_string(),
         ));
+    }
+    if let Some(expected) = &request.candidate_authority {
+        let model_request: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            ContextExpansionError::Invalid(format!(
+                "candidate-bound initial provider request is invalid JSON: {error}"
+            ))
+        })?;
+        let role_input = model_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ContextExpansionError::Invalid(
+                    "candidate-bound initial provider request has no role input".to_string(),
+                )
+            })?;
+        let role_input: Value = serde_json::from_str(role_input).map_err(|error| {
+            ContextExpansionError::Invalid(format!(
+                "candidate-bound initial provider role input is invalid JSON: {error}"
+            ))
+        })?;
+        let observed: CandidateContextAuthority = serde_json::from_value(
+            role_input
+                .get("repository_context_authority")
+                .and_then(|authority| authority.get("candidate_authority"))
+                .cloned()
+                .ok_or_else(|| {
+                    ContextExpansionError::Invalid(
+                        "initial provider request has no candidate context authority".to_string(),
+                    )
+                })?,
+        )?;
+        if &observed != expected {
+            return Err(ContextExpansionError::Invalid(
+                "initial provider request candidate authority mismatch".to_string(),
+            ));
+        }
     }
     Ok(())
 }

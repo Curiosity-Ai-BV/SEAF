@@ -425,14 +425,41 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
                 "must match input_digests.repository",
             ));
         }
-        if matches!(
-            run.status,
-            crate::LoopStatus::Pending | crate::LoopStatus::Running
-        ) && candidate.lifecycle != crate::CandidateWorkspaceLifecycle::Active
+        if run.status == crate::LoopStatus::Running
+            && candidate.lifecycle != crate::CandidateWorkspaceLifecycle::Active
         {
             errors.push(FieldError::new(
                 "candidate_workspace.lifecycle",
-                "must remain active while the LoopRun is pending or running",
+                "must remain active while the LoopRun is running",
+            ));
+        }
+        if run.status == crate::LoopStatus::Pending
+            && !matches!(
+                candidate.lifecycle,
+                crate::CandidateWorkspaceLifecycle::Provisioning
+                    | crate::CandidateWorkspaceLifecycle::Active
+            )
+        {
+            errors.push(FieldError::new(
+                "candidate_workspace.lifecycle",
+                "must be provisioning or active while the LoopRun is pending",
+            ));
+        }
+        if candidate.lifecycle == crate::CandidateWorkspaceLifecycle::Provisioning
+            && (run.status != crate::LoopStatus::Pending
+                || run.current_step != crate::LoopStepName::Research
+                || run.steps.iter().any(|step| {
+                    step.status != crate::LoopStepStatus::Pending
+                        || step.artifact_path.is_some()
+                        || step.artifact_digest.is_some()
+                })
+                || !run.policy_decisions.is_empty()
+                || !run.provider_exchange_records.is_empty()
+                || run.eval_report_path.is_some())
+        {
+            errors.push(FieldError::new(
+                "candidate_workspace.lifecycle",
+                "provisioning is valid only for an untouched pending Research run",
             ));
         }
     }
@@ -506,6 +533,14 @@ fn validate_candidate_workspace_state(
         }
     }
     match candidate.lifecycle {
+        crate::CandidateWorkspaceLifecycle::Provisioning
+            if candidate.cleanup_started_at.is_some() || candidate.cleaned_at.is_some() =>
+        {
+            errors.push(FieldError::new(
+                "candidate_workspace.cleaned_at",
+                "cleanup timestamps must be absent while the candidate is provisioning",
+            ));
+        }
         crate::CandidateWorkspaceLifecycle::Active
             if candidate.cleanup_started_at.is_some() || candidate.cleaned_at.is_some() =>
         {
@@ -549,7 +584,16 @@ fn validate_candidate_workspace_state(
                 ));
             }
         }
-        crate::CandidateWorkspaceLifecycle::Active => {}
+        crate::CandidateWorkspaceLifecycle::Provisioning
+        | crate::CandidateWorkspaceLifecycle::Active => {}
+    }
+    if candidate.lifecycle == crate::CandidateWorkspaceLifecycle::Provisioning
+        && candidate.patch_transaction.is_some()
+    {
+        errors.push(FieldError::new(
+            "candidate_workspace.patch_transaction",
+            "must be absent while provisioning",
+        ));
     }
     if candidate.candidate_head != candidate.starting_head {
         errors.push(FieldError::new(

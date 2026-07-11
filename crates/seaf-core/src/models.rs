@@ -500,6 +500,7 @@ pub enum CandidatePatchPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateWorkspaceLifecycle {
+    Provisioning,
     Active,
     Cleaning,
     Cleaned,

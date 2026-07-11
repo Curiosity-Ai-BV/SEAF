@@ -414,7 +414,9 @@
                 { "type": "null" }
               ]
             },
-            "lifecycle": { "enum": ["active", "cleaning", "cleaned"] },
+            "lifecycle": {
+              "enum": ["provisioning", "active", "cleaning", "cleaned"]
+            },
             "cleanup_started_at": {
               "anyOf": [
                 { "type": "string", "minLength": 1 },
@@ -429,6 +431,19 @@
             }
           },
           "allOf": [
+            {
+              "if": {
+                "required": ["lifecycle"],
+                "properties": { "lifecycle": { "const": "provisioning" } }
+              },
+              "then": {
+                "properties": {
+                  "patch_transaction": { "type": "null" },
+                  "cleanup_started_at": { "type": "null" },
+                  "cleaned_at": { "type": "null" }
+                }
+              }
+            },
             {
               "if": {
                 "required": ["patch_transaction"],
@@ -497,6 +512,70 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "required": ["status", "candidate_workspace"],
+        "properties": {
+          "status": { "const": "pending" },
+          "candidate_workspace": { "type": "object" }
+        }
+      },
+      "then": {
+        "properties": {
+          "candidate_workspace": {
+            "properties": {
+              "lifecycle": { "enum": ["provisioning", "active"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["status", "candidate_workspace"],
+        "properties": {
+          "status": { "const": "running" },
+          "candidate_workspace": { "type": "object" }
+        }
+      },
+      "then": {
+        "properties": {
+          "candidate_workspace": {
+            "properties": { "lifecycle": { "const": "active" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["candidate_workspace"],
+        "properties": {
+          "candidate_workspace": {
+            "type": "object",
+            "required": ["lifecycle"],
+            "properties": { "lifecycle": { "const": "provisioning" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": { "const": "pending" },
+          "current_step": { "const": "research" },
+          "steps": {
+            "items": {
+              "properties": {
+                "status": { "const": "pending" },
+                "artifact_path": { "type": "null" },
+                "artifact_digest": { "type": "null" }
+              }
+            }
+          },
+          "policy_decisions": { "maxItems": 0 },
+          "provider_exchange_records": { "maxItems": 0 },
+          "eval_report_path": { "type": "null" }
+        }
+      }
+    },
     {
       "if": {
         "required": ["execution_mode"],

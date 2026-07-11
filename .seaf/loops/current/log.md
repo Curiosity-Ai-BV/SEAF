@@ -1263,3 +1263,64 @@ still forbids candidate authority.
 Focused candidate tests pass 31/31 with 6 candidate-specific unit/fault tests;
 core passes 33/33, provider exchange 22/22, provider step runner 38/38, and the
 complete locked Rust workspace passes.
+
+## 2026-07-12 implementation | M1-05b2 provider candidate authority
+
+Provider CLI startup now uses a typed two-stage isolated initialization path.
+A minimal run directory first publishes a closed Provisioning LoopRun, then
+provisions the exact persisted candidate and full-state-CAS advances it to
+Active. Only after Active validation does the retry-safe synced scaffold appear;
+the complete canonical ticket, policy, config, repository, and provider-ticket
+snapshot set is preflighted and atomically create-only published before context,
+provider preparation, or the semantic start log. Exact scaffold and snapshot
+prefixes converge after interruption, while any collision causes zero later
+publication. Planning failure before run.json removes only the exact empty
+minimal directory so the same run ID remains retryable.
+
+Resume compares live input digests before mutation, validates or provisions the
+candidate before snapshot repair and provider reconciliation, and derives both
+context and patch roots from the candidate. ProviderStepRunner independently
+requires both roots to canonicalize to that candidate and authenticates every
+durable or staged Initial request against the exact candidate before
+reconciliation may publish; the first Initial retains its step-specific context
+reconstruction role afterward. Initial context and every additive expansion
+bind the repository digest, candidate-path digest, and starting HEAD/tree;
+every predecessor must match. Missing exact snapshots repair, noncanonical
+collisions fail before any new snapshot, and pre-B2 provider history without
+candidate authority fails with start-new-run guidance.
+
+Patch gating remains proposal-only. Apply intent is audited, but the only Git
+operation is `git apply --check` in the candidate; a command spy proves its cwd
+and that neither candidate nor source bytes/tree/status change. Dirty source-
+only context is excluded, while NeedsContext reads and persists candidate
+bytes. Fresh, incomplete, and terminal/rerun legacy ProviderStepRunner flows
+fail closed; deterministic non-provider legacy LoopRunner behavior is unchanged.
+Exact Applied candidate evidence may resume, but Applying resume and any
+Applying/Applied rerun reset remain blocked until the next integration slice.
+
+Real provisioning cuts cover before create, after create before CAS, after
+Active publication, and stale CAS with exact remnant adoption. Candidate and
+provider locks preserve candidate-before-provider order; a no-follow,
+opened-identity-checked repository operation lock is keyed from canonical Git
+common-directory bytes in a private shared candidate-authority namespace. It
+therefore serializes add/adopt/remove operations even when distinct source
+worktrees and repository digests share one Git worktree registry. Atomic 0700
+directory creation closes the parallel first-creator permission race.
+
+The historical provider integration suites required intentional legacy setup.
+They were moved into cfg(test) unit modules and use a pub(crate), cfg(test)-only
+harness, so no bypass exists in normal dependency builds. A separate public-
+constructor integration target proves fresh legacy provider rejection, zero
+provider calls, and failed-start workspace cleanup.
+
+The complete locked Rust workspace passes: CLI 85, core 33, seaf-loop library
+95, candidate 34, context expansion 22, provider exchange 22, state 28, plus
+the focused provider candidate/isolation/staged-authority suites and all
+remaining tests and doc-tests. Clippy with all targets/features and warnings
+denied passes. Independent spec and quality re-reviews approved the final
+frozen boundary after verifying every-Initial candidate authentication and
+canonical Git-common-directory lock sharing across linked worktrees. The final
+controller gate repeated the complete Rust workspace, Clippy, package lint,
+typecheck, 8 SDK tests, SDK build, Rust/Prettier formatting, and diff check with
+no failures. M1-05b2 is accepted, and M1-05b3 is active in the roadmap and
+current-loop trackers.

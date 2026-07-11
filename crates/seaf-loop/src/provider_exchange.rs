@@ -506,7 +506,7 @@ pub(crate) fn reconcile_provider_exchange_state(
     }
 }
 
-fn preflight_provider_exchange_reconciliation(
+pub(crate) fn preflight_provider_exchange_reconciliation(
     workspace: &LoopWorkspace,
     run: &LoopRun,
 ) -> Result<LoopRun, ProviderExchangeError> {

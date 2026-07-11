@@ -36,6 +36,22 @@ pub struct ContextPackRequest {
     pub limits: ContextLimits,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateContextAuthority {
+    pub kind: CandidateContextAuthorityKind,
+    pub repository_identity_digest: String,
+    pub candidate_path_digest: String,
+    pub starting_head: String,
+    pub starting_tree: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateContextAuthorityKind {
+    IsolatedCandidate,
+}
+
 impl ContextPackRequest {
     pub fn for_ticket(
         repository_root: &Path,

@@ -45,9 +45,69 @@ fn fixture(name: &str) -> &'static str {
 }
 
 #[test]
+fn fresh_provider_runner_cannot_bypass_isolated_candidate_initialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let ticket = ticket();
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+
+    let error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            temp.path().join("runs"),
+            "legacy-provider-bypass",
+            &ticket,
+            "fake",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut runner,
+    )
+    .expect_err("fresh provider execution must use the isolated initializer");
+    assert!(error.to_string().contains("start a new isolated run"), "{error}");
+    assert!(provider.requests().unwrap().is_empty());
+}
+
+#[test]
+fn terminal_legacy_provider_run_rejects_before_resume_or_rerun_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let ticket = ticket();
+    let workspace = seaf_loop::LoopWorkspace::create(&runs_root, "terminal-legacy").unwrap();
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "terminal-legacy".to_string(),
+        ticket_id: ticket.ticket_id.clone(),
+        goal_id: ticket.goal_id.clone(),
+        provider: "fake".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: test_input_digests_for(&ticket),
+    });
+    run.status = LoopStatus::Completed;
+    for step in &mut run.steps {
+        step.status = LoopStepStatus::Completed;
+    }
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    let before_run = std::fs::read(workspace.run_file()).unwrap();
+    let before_log = std::fs::read(workspace.run_directory().join("log.md")).unwrap();
+    let provider = FakeProvider::new(Vec::new());
+    let mut runner =
+        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket);
+
+    let error = LoopRunner::resume(&runs_root, "terminal-legacy", &mut runner)
+        .expect_err("terminal legacy provider history cannot enter resume/rerun");
+    assert!(error.to_string().contains("start a new isolated run"), "{error}");
+    assert_eq!(std::fs::read(workspace.run_file()).unwrap(), before_run);
+    assert_eq!(
+        std::fs::read(workspace.run_directory().join("log.md")).unwrap(),
+        before_log
+    );
+    assert!(provider.requests().unwrap().is_empty());
+}
+
+#[test]
 fn provider_step_runner_sends_role_request_and_maps_common_passed_status() {
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 12_345);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 12_345);
 
     let request_audit = runner
         .step_request(LoopStepName::Research)
@@ -85,7 +145,7 @@ fn research_request_contains_exact_ticket_and_all_run_input_digests() {
     let input_digests = test_input_digests();
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -131,7 +191,7 @@ fn prepared_provider_run_requires_effective_ticket_before_workspace_or_provider_
     let authoritative = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let before = read_tree_bytes(&runs_root);
     let provider = FakeProvider::new(Vec::new());
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_context_pack_request(context_request(&repo, &authoritative, Vec::new()));
 
     let error = LoopRunner::start(
@@ -182,7 +242,7 @@ fn early_role_requests_chain_only_exact_validated_prerequisites_and_persist_cano
             .collect(),
     );
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -280,7 +340,7 @@ fn resumed_analysis_reuses_verified_research_artifact_without_unrelated_prerequi
     let start_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut start_runner =
-        ProviderStepRunner::new(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -299,7 +359,7 @@ fn resumed_analysis_reuses_verified_research_artifact_without_unrelated_prerequi
     let resume_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("analyzer.valid.json")))]);
     let mut resume_runner =
-        ProviderStepRunner::new(&resume_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut resumed = LoopRunner::resume(&runs_root, "resume-exact-chain", &mut resume_runner)
         .expect("resume verified role chain");
     resumed.run_next_step().expect("analysis");
@@ -338,7 +398,7 @@ fn development_request_uses_exact_approved_spec_and_only_developer_repository_co
         Ok(model_response(&spec_review_approved_response())),
         Ok(model_response(&developer_blocked)),
     ]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut loop_runner = LoopRunner::start(
@@ -428,7 +488,7 @@ fn wrong_spec_reviewer_approval_fails_spec_review_and_never_reaches_development(
         Ok(model_response(&wrong_approval)),
     ]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -479,7 +539,7 @@ fn output_review_uses_only_canonical_policy_gated_development_evidence() {
         Ok(model_response(&output_review_approved_response())),
     ]);
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()))
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
@@ -579,7 +639,7 @@ fn patch_proposed_development_requires_one_authoritative_policy_gate() {
     let ticket = ticket();
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -628,7 +688,7 @@ fn resume_at_output_review_reuses_verified_evidence_without_rerunning_patch_gate
     let ticket = ticket_with_apply(true);
     let start_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut start_patch_runner = RecordingPatchRunner::default();
-    let mut start_runner = ProviderStepRunner::new(&start_provider, "fake-model", 30_000)
+    let mut start_runner = ProviderStepRunner::new_legacy_unit_test_harness(&start_provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_patch_gate(
             ProviderPatchGateConfig::for_ticket(&repo, &ticket, policy(), true),
@@ -665,7 +725,7 @@ fn resume_at_output_review_reuses_verified_evidence_without_rerunning_patch_gate
     let resume_provider =
         FakeProvider::new(vec![Ok(model_response(&output_review_approved_response()))]);
     let mut resume_patch_runner = RecordingPatchRunner::default();
-    let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+    let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_patch_gate(
             ProviderPatchGateConfig::for_ticket(&repo, &ticket, policy(), true),
@@ -704,7 +764,7 @@ fn resume_at_development_reuses_verified_approved_spec_with_one_provider_call() 
         Ok(model_response(&spec_review_approved_response())),
     ]);
     let mut start_runner =
-        ProviderStepRunner::new(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -731,7 +791,7 @@ fn resume_at_development_reuses_verified_approved_spec_with_one_provider_call() 
     .to_string();
     let resume_provider = FakeProvider::new(vec![Ok(model_response(&blocked))]);
     let mut resume_runner =
-        ProviderStepRunner::new(&resume_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut resumed = LoopRunner::resume(&runs_root, "resume-at-development", &mut resume_runner)
         .expect("resume at development");
     resumed.run_next_step().expect("development");
@@ -796,7 +856,7 @@ fn output_review_resume_rejects_canonical_non_approving_spec_review_before_mutat
         let ticket = ticket();
         let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
         let mut patch_runner = RecordingPatchRunner::default();
-        let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
             .with_ticket(ticket.clone())
             .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
         let mut loop_runner = LoopRunner::start(
@@ -838,7 +898,7 @@ fn output_review_resume_rejects_canonical_non_approving_spec_review_before_mutat
         let before = read_tree_bytes(&run_dir);
         let resume_provider = FakeProvider::new(Vec::new());
         let mut resume_patch_runner = RecordingPatchRunner::default();
-        let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+        let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
             .with_ticket(ticket.clone())
             .with_patch_gate(
                 patch_gate_config(&repo, false, true),
@@ -895,7 +955,7 @@ fn blocked_and_needs_context_development_artifacts_persist_without_policy_eviden
         ]);
         let ticket = ticket();
         let mut step_runner =
-            ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
+            ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket.clone());
         let mut loop_runner = LoopRunner::start(
             LoopRunnerConfig::for_ticket(
                 &runs_root,
@@ -954,7 +1014,7 @@ fn provider_step_runner_repairs_invalid_json_once_and_audits_both_responses() {
         Ok(model_response("not json")),
         Ok(model_response(fixture("research.valid.json"))),
     ]);
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
 
     let request_audit = runner
         .step_request(LoopStepName::Research)
@@ -986,7 +1046,7 @@ fn provider_step_runner_does_not_repair_schema_invalid_json() {
         ))),
         Ok(model_response(fixture("research.valid.json"))),
     ]);
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
 
     let request_audit = runner
         .step_request(LoopStepName::Research)
@@ -1010,7 +1070,7 @@ fn provider_step_runner_persists_provider_response_when_parse_failure_stops_loop
         "research.invalid_missing_status.json",
     )))]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -1047,7 +1107,7 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
         )),
     ]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -1078,7 +1138,7 @@ fn provider_step_runner_surfaces_model_timeout_without_retrying_a_role_step() {
         10,
         json!({ "provider": "fake" }),
     ))]);
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 10);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 10);
 
     let request_audit = runner
         .step_request(LoopStepName::Research)
@@ -1108,7 +1168,7 @@ fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails(
         json!({ "provider": "fake" }),
     ))]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 10).with_ticket(ticket());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 10).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -1144,7 +1204,7 @@ fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps
 
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut loop_runner = LoopRunner::start(
@@ -1205,7 +1265,7 @@ fn provider_step_runner_rejects_forbidden_live_context_before_provider_call() {
 
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
 
@@ -1245,7 +1305,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
 
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
-    let mut forbidden_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut forbidden_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, vec!["src/**".to_string()]));
 
@@ -1273,7 +1333,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
         "failed prepare should not leave a partial run directory that blocks retry"
     );
 
-    let mut allowed_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut allowed_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
 
@@ -1310,7 +1370,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
     let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
     let start_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
-    let mut start_runner = ProviderStepRunner::new(&start_provider, "fake-model", 30_000)
+    let mut start_runner = ProviderStepRunner::new_legacy_unit_test_harness(&start_provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut loop_runner = LoopRunner::start(
@@ -1330,7 +1390,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
 
     let resume_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("analyzer.valid.json")))]);
-    let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+    let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let mut resumed =
@@ -1375,7 +1435,7 @@ fn provider_step_runner_persists_allowed_patch_policy_decision_without_apply() {
 
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
@@ -1434,7 +1494,7 @@ fn provider_step_runner_rejected_patch_fails_development_and_never_applies() {
 
     let provider = provider_for_development_patch(&patch);
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
@@ -1496,7 +1556,7 @@ fn development_evidence_preserves_exact_malformed_and_binary_gate_rejections() {
         let ticket = ticket();
         let provider = provider_for_development_patch(&patch);
         let mut patch_runner = RecordingPatchRunner::default();
-        let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
             .with_ticket(ticket.clone())
             .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
         let mut loop_runner = LoopRunner::start(
@@ -1531,7 +1591,7 @@ fn development_evidence_preserves_exact_malformed_and_binary_gate_rejections() {
 
         let resume_provider = FakeProvider::new(Vec::new());
         let mut resume_patch_runner = RecordingPatchRunner::default();
-        let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+        let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
             .with_ticket(ticket.clone())
             .with_patch_gate(
                 patch_gate_config(&repo, false, true),
@@ -1566,7 +1626,7 @@ fn provider_step_runner_replaces_stale_policy_decision_when_development_is_rerun
         )))),
     ]);
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
@@ -1620,7 +1680,7 @@ fn provider_step_runner_human_review_patch_may_reach_output_review_without_apply
         Ok(model_response(&output_review_approved_response())),
     ]);
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, true, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
@@ -1675,7 +1735,7 @@ fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
 
     let setup_provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut setup_patch_runner = RecordingPatchRunner::default();
-    let mut setup_step_runner = ProviderStepRunner::new(&setup_provider, "fake-model", 30_000)
+    let mut setup_step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&setup_provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(
             patch_gate_config(&repo, false, true),
@@ -1703,7 +1763,7 @@ fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
 
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner =
@@ -1734,7 +1794,7 @@ fn provider_development_is_proposal_only_even_when_artifact_persistence_fails() 
     let apply_ticket = ticket_with_apply(true);
     let provider = provider_for_development_patch(fixture("allowed-doc.diff"));
     let mut patch_runner = MutatingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(apply_ticket.clone())
         .with_patch_gate(
             ProviderPatchGateConfig::for_ticket(&repo, &apply_ticket, policy(), true),
@@ -1857,7 +1917,7 @@ fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
         Ok(model_response(reviewer_requested_changes)),
     ]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -1927,7 +1987,7 @@ fn provider_step_runner_persists_failed_early_role_artifact_without_advancing() 
         Ok(model_response(&rejected)),
     ]);
     let mut step_runner =
-        ProviderStepRunner::new(&provider, "fake-model", 30_000).with_ticket(ticket());
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000).with_ticket(ticket());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -1963,7 +2023,7 @@ fn provider_step_runner_persists_failed_early_role_artifact_without_advancing() 
 #[test]
 fn provider_step_runner_keeps_testing_and_eval_report_as_no_model_steps() {
     let provider = FakeProvider::new(Vec::new());
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
 
     for step in [LoopStepName::Testing, LoopStepName::EvalReport] {
         let request = runner.step_request(step).expect("no-model request");
@@ -1988,7 +2048,7 @@ fn request_audit_user_prompt(request_audit: &str) -> String {
 
 fn run_scripted_step(step: LoopStepName, content: &str) -> seaf_loop::StepOutput {
     let provider = FakeProvider::new(vec![Ok(model_response(content))]);
-    let mut runner = ProviderStepRunner::new(&provider, "fake-model", 30_000);
+    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
     let request = runner.step_request(step).expect("step request");
     runner.run_step(step, &request).expect("step output")
 }
@@ -2316,7 +2376,7 @@ fn assert_prepared_ticket_mismatch_fails_closed(mismatch: PreparedTicketMismatch
     }
     let before = read_tree_bytes(&runs_root);
     let provider = FakeProvider::new(Vec::new());
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(supplied.clone())
         .with_context_pack_request(context_request(&repo, &supplied, Vec::new()));
     let run_id = format!("prepared-ticket-{mismatch:?}").to_ascii_lowercase();
@@ -2359,7 +2419,7 @@ fn assert_resume_artifact_rejected_without_mutation(mutation: ResumeArtifactMuta
     let start_provider =
         FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
     let mut start_runner =
-        ProviderStepRunner::new(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
+        ProviderStepRunner::new_legacy_unit_test_harness(&start_provider, "fake-model", 30_000).with_ticket(ticket.clone());
     let mut loop_runner = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
             &runs_root,
@@ -2427,7 +2487,7 @@ fn assert_resume_artifact_rejected_without_mutation(mutation: ResumeArtifactMuta
 
     let before = read_tree_bytes(&run_dir);
     let provider = FakeProvider::new(Vec::new());
-    let mut resume_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&repo, &ticket, Vec::new()));
     let error = LoopRunner::resume_verified(&runs_root, verified, &mut resume_runner)
@@ -2472,7 +2532,7 @@ fn assert_downstream_artifact_rejected_without_mutation(
     let provider = FakeProvider::new(responses);
     let mut patch_runner = RecordingPatchRunner::default();
     let ticket = ticket();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
     let mut loop_runner = LoopRunner::start(
@@ -2588,7 +2648,7 @@ fn assert_downstream_artifact_rejected_without_mutation(
     let before = read_tree_bytes(&run_dir);
     let resume_provider = FakeProvider::new(Vec::new());
     let mut resume_patch_runner = RecordingPatchRunner::default();
-    let mut resume_runner = ProviderStepRunner::new(&resume_provider, "fake-model", 30_000)
+    let mut resume_runner = ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
         .with_patch_gate(
             patch_gate_config(&repo, false, true),

@@ -6,7 +6,8 @@ use std::{
 use seaf_core::LoopStepName;
 use seaf_loop::{
     create_context_expansion, load_context_expansion, reconstruct_context_expansion_files,
-    ArtifactReference, ContextExpansionRequest, ContextLimits, ContextRequest, Role,
+    ArtifactReference, CandidateContextAuthority, CandidateContextAuthorityKind,
+    ContextExpansionRequest, ContextLimits, ContextRequest, Role,
 };
 use sha2::{Digest, Sha256};
 
@@ -44,6 +45,7 @@ fn fixture() -> (tempfile::TempDir, ContextExpansionRequest) {
                 digest: hex::encode(Sha256::digest(initial_request_bytes)),
             },
             previous_expansion: None,
+            candidate_authority: None,
             initial_loaded_paths: vec!["README.md".to_string()],
             initial_context_bytes: 10,
             ticket_forbidden_files: Vec::new(),
@@ -55,6 +57,77 @@ fn fixture() -> (tempfile::TempDir, ContextExpansionRequest) {
             },
         },
     )
+}
+
+#[test]
+fn expansion_rejects_initial_request_from_a_different_candidate_authority() {
+    let (_temp, mut request) = fixture();
+    let expected = CandidateContextAuthority {
+        kind: CandidateContextAuthorityKind::IsolatedCandidate,
+        repository_identity_digest: "a".repeat(64),
+        candidate_path_digest: "b".repeat(64),
+        starting_head: "c".repeat(40),
+        starting_tree: "d".repeat(40),
+    };
+    let mut observed = expected.clone();
+    observed.candidate_path_digest = "e".repeat(64);
+    request.candidate_authority = Some(expected);
+    let role_input = serde_json::json!({
+        "repository_context_authority": { "candidate_authority": observed }
+    })
+    .to_string();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "messages": [{ "content": role_input }]
+    }))
+    .unwrap();
+    std::fs::write(
+        request
+            .run_directory
+            .join(&request.initial_provider_request.path),
+        &bytes,
+    )
+    .unwrap();
+    request.initial_provider_request.digest = hex::encode(Sha256::digest(&bytes));
+
+    let error = create_context_expansion(&request)
+        .expect_err("another candidate's initial request must not authorize expansion");
+    assert!(
+        error.to_string().contains("candidate authority mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn second_round_rejects_a_valid_link_to_predecessor_from_another_candidate() {
+    let (_temp, mut first) = fixture();
+    first.context_request.paths = vec!["src/a.rs".to_string()];
+    let created = create_context_expansion(&first).expect("round one");
+    let mut predecessor = created.artifact;
+    predecessor.candidate_authority = Some(CandidateContextAuthority {
+        kind: CandidateContextAuthorityKind::IsolatedCandidate,
+        repository_identity_digest: "a".repeat(64),
+        candidate_path_digest: "b".repeat(64),
+        starting_head: "c".repeat(40),
+        starting_tree: "d".repeat(40),
+    });
+    let predecessor_bytes = seaf_core::canonical_json_bytes(&predecessor).unwrap();
+    std::fs::write(
+        first.run_directory.join(&created.identity.path),
+        &predecessor_bytes,
+    )
+    .unwrap();
+    let predecessor_identity = ArtifactReference {
+        path: created.identity.path,
+        digest: hex::encode(Sha256::digest(&predecessor_bytes)),
+    };
+
+    let mut second = first;
+    second.context_round = 2;
+    second.previous_expansion = Some(predecessor_identity);
+    second.context_request.paths = vec!["src/b.rs".to_string()];
+    let error = create_context_expansion(&second)
+        .expect_err("every predecessor must share current candidate authority");
+    assert!(error.to_string().contains("authority mismatch"), "{error}");
 }
 
 #[test]

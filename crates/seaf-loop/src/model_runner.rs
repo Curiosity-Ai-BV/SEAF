@@ -14,16 +14,19 @@ use crate::provider_exchange::{
     classify_provider_exchange_response, load_provider_exchange_record,
     load_provider_exchange_request, load_provider_exchange_response_audit,
     persist_provider_exchange_record_reference, persist_provider_rerun_reset,
-    reconcile_provider_exchange_state, stage_provider_exchange_record,
-    stage_provider_exchange_response_record, validate_recovered_conventional_attempt,
-    write_provider_exchange_request, write_provider_exchange_response, ProviderExchangeCoordinates,
-    ProviderExchangeResponseAudit, ProviderExchangeResponseClassification,
-    PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    preflight_provider_exchange_reconciliation, reconcile_provider_exchange_state,
+    stage_provider_exchange_record, stage_provider_exchange_response_record,
+    validate_recovered_conventional_attempt, write_provider_exchange_request,
+    write_provider_exchange_response, ProviderExchangeCoordinates, ProviderExchangeResponseAudit,
+    ProviderExchangeResponseClassification, PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use crate::role_response::{parse_role_response, repair_prompt, RoleResponseError};
 use crate::{
     artifacts::latest_step_attempt,
-    context::{pack_live_context, ContextBundle, ContextFile, ContextLimits, ContextPackRequest},
+    context::{
+        pack_live_context, CandidateContextAuthority, CandidateContextAuthorityKind, ContextBundle,
+        ContextFile, ContextLimits, ContextPackRequest,
+    },
     context_expansion::{
         create_context_expansion, reconstruct_context_expansion_files, ContextExpansionError,
         ContextExpansionRequest,
@@ -47,6 +50,8 @@ type AfterResponsePersistObserver<'a> =
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditedRepositoryContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_authority: Option<CandidateContextAuthority>,
     untrusted_context_marker: String,
     total_context_bytes: usize,
     files: Vec<AuditedRepositoryContextFile>,
@@ -88,6 +93,8 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
+    #[cfg(test)]
+    legacy_unit_test_harness: bool,
     #[cfg(test)]
     after_response_persist: Option<&'a AfterResponsePersistObserver<'a>>,
 }
@@ -161,8 +168,21 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             step_attempt: None,
             durable_provider_exchange_records: None,
             #[cfg(test)]
+            legacy_unit_test_harness: false,
+            #[cfg(test)]
             after_response_persist: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_legacy_unit_test_harness(
+        provider: &'a P,
+        model: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Self {
+        let mut runner = Self::new(provider, model, timeout_ms);
+        runner.legacy_unit_test_harness = true;
+        runner
     }
 
     pub fn with_context_pack_request(mut self, request: ContextPackRequest) -> Self {
@@ -280,6 +300,26 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             )
         })?;
         validate_prepared_ticket(ticket, run)?;
+        if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
+            self.validate_isolated_candidate_authority(workspace, run)?;
+            let prospective = preflight_provider_exchange_reconciliation(workspace, run)
+                .map_err(exchange_recovery_error)?;
+            if !prospective.provider_exchange_records.is_empty() {
+                validate_all_audited_initial_candidate_authorities(workspace, &prospective)?;
+                let request = self.context_pack_request.as_ref().ok_or_else(|| {
+                    RunnerError::Step(
+                        "candidate-root context configuration is required before provider recovery"
+                            .to_string(),
+                    )
+                })?;
+                load_audited_initial_context_bundle(workspace, &prospective, request)?;
+            }
+        } else if !self.legacy_unit_test_harness_enabled() {
+            return Err(RunnerError::Step(
+                "legacy provider run cannot execute or resume; start a new isolated run"
+                    .to_string(),
+            ));
+        }
         let reconciled = if workspace.run_file().exists() {
             reconcile_provider_exchange_state(workspace, run).map_err(|error| {
                 RunnerError::Step(format!(
@@ -385,10 +425,17 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     fn prepare_rerun(
         &mut self,
         workspace: &LoopWorkspace,
-        _run: &LoopRun,
+        run: &LoopRun,
         step: LoopStepName,
         attempt: u32,
     ) -> Result<(), RunnerError> {
+        if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate
+            && !self.legacy_unit_test_harness_enabled()
+        {
+            return Err(RunnerError::Step(
+                "legacy provider run cannot be rerun; start a new isolated run".to_string(),
+            ));
+        }
         self.fresh_exchange_run = true;
         self.recovered_step_attempt = None;
         self.step_attempt = Some(attempt);
@@ -562,6 +609,93 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
 }
 
 impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
+    #[cfg(test)]
+    fn legacy_unit_test_harness_enabled(&self) -> bool {
+        self.legacy_unit_test_harness
+    }
+
+    #[cfg(not(test))]
+    fn legacy_unit_test_harness_enabled(&self) -> bool {
+        false
+    }
+
+    fn validate_isolated_candidate_authority(
+        &self,
+        workspace: &LoopWorkspace,
+        run: &LoopRun,
+    ) -> Result<(), RunnerError> {
+        let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("isolated provider run has no candidate authority".to_string())
+        })?;
+        crate::candidate_workspace::validate_candidate_workspace(
+            workspace.run_directory(),
+            Path::new(&candidate.source_worktree_root),
+            candidate,
+        )
+        .map_err(|error| RunnerError::Step(format!("candidate preflight failed: {error}")))?;
+        let candidate_root = Path::new(&candidate.path).canonicalize().map_err(|error| {
+            RunnerError::Step(format!("candidate root is unavailable: {error}"))
+        })?;
+        let context_root = self
+            .context_pack_request
+            .as_ref()
+            .ok_or_else(|| {
+                RunnerError::Step(
+                    "isolated provider run requires candidate-root context configuration"
+                        .to_string(),
+                )
+            })?
+            .repository_root
+            .canonicalize()
+            .map_err(|error| RunnerError::Step(format!("context root is unavailable: {error}")))?;
+        let patch_root = self
+            .patch_gate
+            .as_ref()
+            .ok_or_else(|| {
+                RunnerError::Step(
+                    "isolated provider run requires candidate-root patch configuration".to_string(),
+                )
+            })?
+            .config
+            .repository_root
+            .canonicalize()
+            .map_err(|error| RunnerError::Step(format!("patch root is unavailable: {error}")))?;
+        if context_root != candidate_root || patch_root != candidate_root {
+            return Err(RunnerError::Step(
+                "provider context and patch roots must both equal the active candidate".to_string(),
+            ));
+        }
+        for (relative, expected) in [
+            ("inputs/ticket.json", &run.input_digests.ticket),
+            ("inputs/policy.json", &run.input_digests.policy),
+            ("inputs/config.json", &run.input_digests.config),
+            ("inputs/repository.json", &run.input_digests.repository),
+            ("ticket.snapshot.json", &run.input_digests.ticket),
+        ] {
+            let bytes = crate::immutable_artifact::read_verified_regular_file(
+                workspace.run_directory(),
+                relative,
+                "authoritative provider input",
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                RunnerError::Step(format!("authoritative provider input is invalid: {error}"))
+            })?;
+            if seaf_core::canonical_json_bytes(&value)
+                .map_err(|error| RunnerError::Step(error.to_string()))?
+                != bytes
+                || seaf_core::canonical_sha256_digest(&value)
+                    .map_err(|error| RunnerError::Step(error.to_string()))?
+                    != *expected
+            {
+                return Err(RunnerError::Step(
+                    "authoritative provider input bytes or digest do not match the run".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn run_audited_provider_step(
         &mut self,
         step: LoopStepName,
@@ -1066,6 +1200,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             context_request,
             initial_provider_request,
             previous_expansion,
+            candidate_authority: self.run.as_ref().and_then(candidate_context_authority),
             initial_loaded_paths: bundle.files.iter().map(|file| file.path.clone()).collect(),
             initial_context_bytes: bundle.total_context_bytes,
             ticket_forbidden_files: pack.ticket_forbidden_files.clone(),
@@ -1369,6 +1504,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "input_digests": run.input_digests,
             "ticket": ticket,
             "prerequisites": prerequisites,
+            "candidate_authority": candidate_context_authority(run),
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
             "repository_context_authority": self.audited_repository_context(),
         });
@@ -1407,6 +1543,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 "spec_creation": persisted_artifact_prompt(spec_creation)?,
                 "spec_review": persisted_artifact_prompt(spec_review)?,
             },
+            "candidate_authority": candidate_context_authority(run),
             // Development is the one role that still needs the initially bounded source files
             // in order to construct a patch. OutputReview never receives this context.
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
@@ -1447,6 +1584,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 "artifact_digest": development.artifact_digest,
                 "artifact": development.evidence,
             },
+            "candidate_authority": candidate_context_authority(run),
         });
         serde_json::to_string(&prompt).map_err(|error| {
             RunnerError::Step(format!(
@@ -1474,6 +1612,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         let bundle = self.context_bundle.as_ref()?;
         let request = self.context_pack_request.as_ref()?;
         Some(AuditedRepositoryContext {
+            candidate_authority: self.run.as_ref().and_then(candidate_context_authority),
             untrusted_context_marker: bundle.untrusted_context_marker.clone(),
             total_context_bytes: bundle.total_context_bytes,
             files: bundle
@@ -1640,6 +1779,73 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
     }
 }
 
+fn validate_all_audited_initial_candidate_authorities(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<(), RunnerError> {
+    let expected = candidate_context_authority(run).ok_or_else(|| {
+        RunnerError::Step(
+            "isolated provider history lost its candidate authority; start a new run".to_string(),
+        )
+    })?;
+    for reference in run.provider_exchange_records.iter().filter(|reference| {
+        reference.phase == ProviderExchangePhase::Request
+            && reference.kind == ProviderExchangeKind::Initial
+    }) {
+        let record = load_provider_exchange_record(workspace.run_directory(), reference)
+            .map_err(exchange_recovery_error)?;
+        let bytes = load_provider_exchange_request(workspace.run_directory(), &record.request)
+            .map_err(exchange_recovery_error)?;
+        let model_request: ModelRequest = serde_json::from_slice(&bytes).map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to parse audited initial provider request: {error}"
+            ))
+        })?;
+        let role_input: serde_json::Value = serde_json::from_str(
+            model_request
+                .messages
+                .first()
+                .ok_or_else(|| {
+                    RunnerError::Step(
+                        "audited initial provider request has no user input".to_string(),
+                    )
+                })?
+                .content
+                .as_str(),
+        )
+        .map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to parse audited initial provider role input: {error}"
+            ))
+        })?;
+        let dedicated = role_input.get("candidate_authority");
+        let context_bound = role_input
+            .get("repository_context_authority")
+            .and_then(|authority| authority.get("candidate_authority"));
+        if dedicated.is_none() && context_bound.is_none() {
+            return Err(RunnerError::Step(
+                "audited provider history has no candidate-root context authority; start a new run"
+                    .to_string(),
+            ));
+        }
+        for actual in [dedicated, context_bound].into_iter().flatten() {
+            let actual: CandidateContextAuthority = serde_json::from_value(actual.clone())
+                .map_err(|error| {
+                    RunnerError::Step(format!(
+                        "invalid audited initial candidate authority: {error}"
+                    ))
+                })?;
+            if actual != expected {
+                return Err(RunnerError::Step(
+                    "audited initial repository context has no exact candidate authority; start a new run"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_audited_initial_context_bundle(
     workspace: &LoopWorkspace,
     run: &LoopRun,
@@ -1685,6 +1891,17 @@ fn load_audited_initial_context_bundle(
         .get("repository_context")
         .and_then(serde_json::Value::as_str);
     let authority_value = role_input.get("repository_context_authority").cloned();
+    if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate
+        && authority_value
+            .as_ref()
+            .and_then(|authority| authority.get("candidate_authority"))
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(RunnerError::Step(
+            "audited provider history has no candidate-root context authority; start a new run"
+                .to_string(),
+        ));
+    }
     if context.is_none()
         && authority_value
             .as_ref()
@@ -1710,6 +1927,15 @@ fn load_audited_initial_context_bundle(
             "invalid structured initial repository context authority: {error}"
         ))
     })?;
+    let expected_candidate_authority = candidate_context_authority(run);
+    if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate
+        && authority.candidate_authority != expected_candidate_authority
+    {
+        return Err(RunnerError::Step(
+            "audited initial repository context has no exact candidate authority; start a new run"
+                .to_string(),
+        ));
+    }
     if authority.limits != request.limits
         || authority.ticket_forbidden_files != request.ticket_forbidden_files
         || authority.policy_forbidden_paths != request.policy_forbidden_paths
@@ -1814,6 +2040,17 @@ fn load_audited_initial_context_bundle(
         ));
     }
     Ok(Some(bundle))
+}
+
+fn candidate_context_authority(run: &LoopRun) -> Option<CandidateContextAuthority> {
+    let candidate = run.candidate_workspace.as_ref()?;
+    Some(CandidateContextAuthority {
+        kind: CandidateContextAuthorityKind::IsolatedCandidate,
+        repository_identity_digest: candidate.repository_identity_digest.clone(),
+        candidate_path_digest: sha256_bytes(candidate.path.as_bytes()),
+        starting_head: candidate.starting_head.clone(),
+        starting_tree: candidate.starting_tree.clone(),
+    })
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -2296,9 +2533,10 @@ mod live_context_cap_tests {
         crate::state::save_run(&workspace, &prepared_run)
             .expect("persist the exact verified resume authority");
         let provider = seaf_models::FakeProvider::new(Vec::new());
-        let mut provider_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-            .with_ticket(ticket)
-            .with_context_pack_request(pack);
+        let mut provider_runner =
+            ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+                .with_ticket(ticket)
+                .with_context_pack_request(pack);
         provider_runner
             .prepare_run(&workspace, &prepared_run)
             .expect("context-free first ledger prepares for resume");
@@ -2403,10 +2641,11 @@ mod live_context_cap_tests {
                 max_total_bytes: 8_192,
             },
         );
-        let mut runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-            .with_ticket(ticket)
-            .with_context_pack_request(context)
-            .with_after_response_persist_observer(&observer);
+        let mut runner =
+            ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+                .with_ticket(ticket)
+                .with_context_pack_request(context)
+                .with_after_response_persist_observer(&observer);
         runner
             .prepare_fresh_run(&workspace, &run)
             .expect("prepare fresh");

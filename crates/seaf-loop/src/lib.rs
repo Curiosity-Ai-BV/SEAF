@@ -24,12 +24,14 @@ pub use bench::{
 };
 pub use candidate_workspace::{
     apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
-    validate_candidate_workspace, CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
+    plan_candidate_workspace, provision_candidate_workspace, validate_candidate_workspace,
+    CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
 };
 pub use context::{
-    pack_context, pack_context_for_ticket, pack_live_context, ContextBundle, ContextError,
-    ContextFile, ContextLimits, ContextManifest, ContextManifestFile, ContextPackRequest,
-    CONTEXT_MANIFEST_FILE, UNTRUSTED_CONTEXT_MARKER,
+    pack_context, pack_context_for_ticket, pack_live_context, CandidateContextAuthority,
+    CandidateContextAuthorityKind, ContextBundle, ContextError, ContextFile, ContextLimits,
+    ContextManifest, ContextManifestFile, ContextPackRequest, CONTEXT_MANIFEST_FILE,
+    UNTRUSTED_CONTEXT_MARKER,
 };
 pub use context_expansion::{
     create_context_expansion, load_context_expansion, reconstruct_context_expansion_files,
@@ -59,6 +61,22 @@ pub use role_response::{
     ReviewerResponse, Role, RoleResponse, RoleResponseError, MAX_CONTEXT_REQUEST_PATHS,
     MAX_CONTEXT_REQUEST_REASON_CHARS,
 };
-pub use runner::{LoopRunner, LoopRunnerConfig, RunnerError, StepOutput, StepRunner};
+pub use runner::{
+    AuthoritativeRunInputSnapshots, InitializedLoopRun, LoopRunner, LoopRunnerConfig,
+    PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
+};
 pub use seaf_core::ArtifactReference;
 pub use workspace::{LoopWorkspace, WorkspaceError};
+
+#[cfg(test)]
+extern crate self as seaf_loop;
+
+#[cfg(test)]
+mod legacy_provider_step_runner_tests {
+    include!("test_suites/provider_step_runner.rs");
+}
+
+#[cfg(test)]
+mod legacy_provider_live_context_tests {
+    include!("test_suites/provider_live_context.rs");
+}

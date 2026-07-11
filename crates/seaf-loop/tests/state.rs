@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -11,10 +11,240 @@ use seaf_core::{
 use seaf_loop::{
     persist_provider_exchange_record_reference, stage_provider_exchange_record,
     state::{create_run, finish_step, NewLoopRun},
-    write_provider_exchange_request, ArtifactContent, ContextManifest, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, ProviderExchangeCoordinates, StepOutput, StepRunner,
-    UNTRUSTED_CONTEXT_MARKER,
+    write_provider_exchange_request, ArtifactContent, AuthoritativeRunInputSnapshots,
+    ContextManifest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
+    ProviderExchangeCoordinates, StepOutput, StepRunner, UNTRUSTED_CONTEXT_MARKER,
 };
+
+#[test]
+fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_prepare() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    git_ok(&source, &["init", "-q"]);
+    git_ok(&source, &["config", "user.email", "test@example.com"]);
+    git_ok(&source, &["config", "user.name", "SEAF Test"]);
+    fs::write(source.join("tracked.txt"), "source\n").unwrap();
+    git_ok(&source, &["add", "tracked.txt"]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    let runs_root = temp.path().join("runs");
+    let ticket_bytes = seaf_core::canonical_json_bytes(&ticket()).unwrap();
+    let policy_bytes =
+        seaf_core::canonical_json_bytes(&serde_json::json!({"policy": "test"})).unwrap();
+    let config_bytes =
+        seaf_core::canonical_json_bytes(&serde_json::json!({"config": "test"})).unwrap();
+    let repository_bytes = seaf_core::canonical_json_bytes(&serde_json::json!({
+        "repository": source.canonicalize().unwrap()
+    }))
+    .unwrap();
+    let digest = |bytes: &[u8]| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let config = LoopRunnerConfig::for_ticket(
+        &runs_root,
+        "isolated-init",
+        &ticket(),
+        "fake-provider",
+        "fake-model",
+        LoopInputDigests {
+            ticket: digest(&ticket_bytes),
+            policy: digest(&policy_bytes),
+            config: digest(&config_bytes),
+            repository: digest(&repository_bytes),
+        },
+    );
+
+    let initialized = InitializedLoopRun::create_isolated(config, &source).expect("initialize");
+    assert_eq!(
+        initialized
+            .run()
+            .candidate_workspace
+            .as_ref()
+            .unwrap()
+            .lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Active
+    );
+    let run_dir = runs_root.join("isolated-init");
+    assert!(run_dir.join("run.json").is_file());
+    for absent in [
+        "artifacts",
+        "prompts",
+        "responses",
+        "context-manifest.json",
+        "log.md",
+    ] {
+        assert!(
+            !run_dir.join(absent).exists(),
+            "{absent} must wait for Active"
+        );
+    }
+
+    let scaffolded = initialized.scaffold().expect("scaffold active run");
+    for present in [
+        "artifacts",
+        "prompts",
+        "responses",
+        "context-manifest.json",
+        "log.md",
+    ] {
+        assert!(
+            run_dir.join(present).exists(),
+            "{present} must be scaffolded"
+        );
+    }
+    let prepared = scaffolded
+        .publish_authoritative_inputs(AuthoritativeRunInputSnapshots {
+            ticket: ticket_bytes.clone(),
+            policy: policy_bytes,
+            config: config_bytes,
+            repository: repository_bytes,
+            provider_ticket: ticket_bytes,
+        })
+        .expect("publish exact input set");
+    let mut step_runner = RecordingStepRunner::new();
+    let runner =
+        LoopRunner::start_initialized(prepared, &mut step_runner).expect("prepare provider");
+    assert_eq!(
+        runner.run().execution_mode,
+        seaf_core::LoopExecutionMode::IsolatedCandidate
+    );
+    assert!(fs::read_to_string(run_dir.join("log.md"))
+        .unwrap()
+        .contains("started isolated provider run"));
+    let candidate = runner
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    drop(runner);
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn stale_initialized_token_rejects_before_any_input_snapshot_publication() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (source, initialized, snapshots) = isolated_fixture(temp.path(), "stale-input-token");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let scaffolded = initialized.scaffold().unwrap();
+    let run_path = scaffolded.workspace().run_file();
+    let mut run: serde_json::Value = serde_json::from_slice(&fs::read(&run_path).unwrap()).unwrap();
+    run["updated_at"] = serde_json::json!("tampered-after-scaffold");
+    fs::write(&run_path, serde_json::to_vec_pretty(&run).unwrap()).unwrap();
+
+    let error = scaffolded
+        .publish_authoritative_inputs(snapshots)
+        .expect_err("stale token must fail before snapshot publication");
+    assert!(error.to_string().contains("changed"), "{error}");
+    let run_dir = run_path.parent().unwrap();
+    assert!(!run_dir.join("inputs").exists());
+    assert!(!run_dir.join("ticket.snapshot.json").exists());
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn scaffold_recovers_an_exact_prefix_but_rejects_a_collision_before_new_entries() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (source, initialized, _snapshots) = isolated_fixture(temp.path(), "scaffold-prefix");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let run_dir = initialized.workspace().run_directory().to_path_buf();
+    fs::create_dir(run_dir.join("prompts")).unwrap();
+    fs::write(run_dir.join("log.md"), "# Loop run log\n").unwrap();
+    initialized.scaffold().expect("exact prefix is retryable");
+    assert!(run_dir.join("responses").is_dir());
+    assert!(run_dir.join("artifacts").is_dir());
+    assert!(run_dir.join("context-manifest.json").is_file());
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+
+    let (source, initialized, _snapshots) = isolated_fixture(temp.path(), "scaffold-collision");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let run_dir = initialized.workspace().run_directory().to_path_buf();
+    fs::write(run_dir.join("log.md"), "partial").unwrap();
+    let error = initialized
+        .scaffold()
+        .expect_err("partial final must collide");
+    assert!(error.to_string().contains("canonical header"), "{error}");
+    assert!(!run_dir.join("prompts").exists());
+    assert!(!run_dir.join("responses").exists());
+    assert!(!run_dir.join("artifacts").exists());
+    assert!(!run_dir.join("context-manifest.json").exists());
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn input_snapshots_recover_exact_prefix_and_preflight_collision_before_new_publication() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (source, initialized, snapshots) = isolated_fixture(temp.path(), "snapshot-prefix");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let scaffolded = initialized.scaffold().unwrap();
+    let run_dir = scaffolded.workspace().run_directory().to_path_buf();
+    fs::create_dir(run_dir.join("inputs")).unwrap();
+    fs::write(run_dir.join("inputs/ticket.json"), &snapshots.ticket).unwrap();
+    scaffolded
+        .publish_authoritative_inputs(snapshots)
+        .expect("exact snapshot prefix is retryable");
+    for relative in [
+        "inputs/policy.json",
+        "inputs/config.json",
+        "inputs/repository.json",
+        "ticket.snapshot.json",
+    ] {
+        assert!(run_dir.join(relative).is_file(), "missing {relative}");
+    }
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+
+    let (source, initialized, snapshots) = isolated_fixture(temp.path(), "snapshot-collision");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let scaffolded = initialized.scaffold().unwrap();
+    let run_dir = scaffolded.workspace().run_directory().to_path_buf();
+    fs::create_dir(run_dir.join("inputs")).unwrap();
+    fs::write(run_dir.join("inputs/config.json"), b"partial").unwrap();
+    let error = scaffolded
+        .publish_authoritative_inputs(snapshots)
+        .expect_err("collision must fail before publishing missing snapshots");
+    assert!(error.to_string().contains("collision"), "{error}");
+    for relative in [
+        "inputs/ticket.json",
+        "inputs/policy.json",
+        "inputs/repository.json",
+        "ticket.snapshot.json",
+    ] {
+        assert!(!run_dir.join(relative).exists(), "unexpected {relative}");
+    }
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
 
 #[test]
 fn state_save_with_stale_empty_exchange_vector_cannot_erase_first_concurrent_request() {
@@ -992,6 +1222,78 @@ fn test_input_digests() -> LoopInputDigests {
         config: "c".repeat(64),
         repository: "d".repeat(64),
     }
+}
+
+fn git_ok(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn isolated_fixture(
+    root: &Path,
+    run_id: &str,
+) -> (
+    std::path::PathBuf,
+    InitializedLoopRun,
+    AuthoritativeRunInputSnapshots,
+) {
+    let source = root.join(format!("{run_id}-source"));
+    fs::create_dir(&source).unwrap();
+    git_ok(&source, &["init", "-q"]);
+    git_ok(&source, &["config", "user.email", "test@example.com"]);
+    git_ok(&source, &["config", "user.name", "SEAF Test"]);
+    fs::write(source.join("tracked.txt"), "source\n").unwrap();
+    git_ok(&source, &["add", "tracked.txt"]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    let ticket_bytes = seaf_core::canonical_json_bytes(&ticket()).unwrap();
+    let policy = seaf_core::canonical_json_bytes(&serde_json::json!({"policy": run_id})).unwrap();
+    let config = seaf_core::canonical_json_bytes(&serde_json::json!({"config": run_id})).unwrap();
+    let repository = seaf_core::canonical_json_bytes(&serde_json::json!({
+        "repository": source.canonicalize().unwrap(),
+        "run": run_id
+    }))
+    .unwrap();
+    let digest = |bytes: &[u8]| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let initialized = InitializedLoopRun::create_isolated(
+        LoopRunnerConfig::for_ticket(
+            root.join("runs"),
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            LoopInputDigests {
+                ticket: digest(&ticket_bytes),
+                policy: digest(&policy),
+                config: digest(&config),
+                repository: digest(&repository),
+            },
+        ),
+        &source,
+    )
+    .unwrap();
+    (
+        source,
+        initialized,
+        AuthoritativeRunInputSnapshots {
+            provider_ticket: ticket_bytes.clone(),
+            ticket: ticket_bytes,
+            policy,
+            config,
+            repository,
+        },
+    )
 }
 
 fn create_test_run(runs_root: &Path, run_id: &str) {

@@ -20,13 +20,15 @@ pub struct LoopWorkspace {
 }
 
 impl LoopWorkspace {
-    pub fn create(runs_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
+    pub(crate) fn create_minimal(runs_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
         fs::create_dir_all(runs_root)?;
         let workspace = Self {
             run_directory: runs_root.join(run_id),
         };
         match fs::create_dir(&workspace.run_directory) {
-            Ok(()) => {}
+            Ok(()) => {
+                fs::File::open(runs_root)?.sync_all()?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(WorkspaceError::RunDirectoryAlreadyExists(
                     workspace.run_directory,
@@ -34,11 +36,22 @@ impl LoopWorkspace {
             }
             Err(error) => return Err(error.into()),
         }
+        Ok(workspace)
+    }
+
+    pub fn create(runs_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
+        let workspace = Self::create_minimal(runs_root, run_id)?;
         workspace.ensure_layout()?;
         Ok(workspace)
     }
 
     pub fn open(runs_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
+        let workspace = Self::open_minimal(runs_root, run_id)?;
+        workspace.validate_existing_layout()?;
+        Ok(workspace)
+    }
+
+    pub fn open_minimal(runs_root: &Path, run_id: &str) -> Result<Self, WorkspaceError> {
         let run_directory = runs_root.join(run_id);
         let metadata = match fs::symlink_metadata(&run_directory) {
             Ok(metadata) => metadata,
@@ -81,7 +94,7 @@ impl LoopWorkspace {
         let workspace = Self {
             run_directory: canonical_run_directory,
         };
-        workspace.validate_existing_layout()?;
+        validate_regular_file(&workspace.run_file())?;
         Ok(workspace)
     }
 
@@ -91,6 +104,10 @@ impl LoopWorkspace {
 
     pub fn run_file(&self) -> PathBuf {
         self.run_directory.join(RUN_FILE)
+    }
+
+    pub(crate) fn scaffold_runtime(&self) -> Result<(), WorkspaceError> {
+        self.ensure_layout()
     }
 
     pub fn append_log(&self, line: &str) -> Result<(), WorkspaceError> {
@@ -104,20 +121,80 @@ impl LoopWorkspace {
     }
 
     fn ensure_layout(&self) -> Result<(), WorkspaceError> {
-        fs::create_dir_all(self.run_directory.join(PROMPTS_DIR))?;
-        fs::create_dir_all(self.run_directory.join(RESPONSES_DIR))?;
-        fs::create_dir_all(self.run_directory.join(ARTIFACTS_DIR))?;
-
-        let manifest_path = self.run_directory.join(CONTEXT_MANIFEST_PLACEHOLDER_FILE);
-        if !manifest_path.exists() {
-            write_empty_context_manifest(&manifest_path)?;
+        let manifest = empty_context_manifest_bytes()?;
+        let files = [
+            (CONTEXT_MANIFEST_PLACEHOLDER_FILE, manifest.as_slice()),
+            (LOG_FILE, b"# Loop run log\n".as_slice()),
+        ];
+        for directory_name in [PROMPTS_DIR, RESPONSES_DIR, ARTIFACTS_DIR] {
+            let directory = self.run_directory.join(directory_name);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(WorkspaceError::UnsafeExistingLayout(
+                        directory,
+                        "runtime scaffold directory is not a real directory".to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-
-        let log_path = self.run_directory.join(LOG_FILE);
-        if !log_path.exists() {
-            fs::write(log_path, b"# Loop run log\n")?;
+        for (name, _) in files {
+            let path = self.run_directory.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(WorkspaceError::UnsafeExistingLayout(
+                        path,
+                        "runtime scaffold file is not a regular file".to_string(),
+                    ));
+                }
+                Ok(_) if name == LOG_FILE => {
+                    if !fs::read(&path)?.starts_with(b"# Loop run log\n") {
+                        return Err(WorkspaceError::UnsafeExistingLayout(
+                            path,
+                            "runtime log does not begin with the canonical header".to_string(),
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    let parsed: ContextManifest = serde_json::from_slice(&fs::read(&path)?)
+                        .map_err(|error| {
+                            WorkspaceError::UnsafeExistingLayout(
+                                path.clone(),
+                                format!("context manifest is invalid: {error}"),
+                            )
+                        })?;
+                    if parsed.untrusted_context_marker != UNTRUSTED_CONTEXT_MARKER {
+                        return Err(WorkspaceError::UnsafeExistingLayout(
+                            path,
+                            "context manifest has the wrong trust marker".to_string(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-
+        for directory_name in [PROMPTS_DIR, RESPONSES_DIR, ARTIFACTS_DIR] {
+            let directory = self.run_directory.join(directory_name);
+            if !directory.exists() {
+                fs::create_dir(&directory)?;
+                fs::File::open(&self.run_directory)?.sync_all()?;
+            }
+        }
+        fs::File::open(&self.run_directory)?.sync_all()?;
+        for (name, expected) in files {
+            if !self.run_directory.join(name).exists() {
+                crate::immutable_artifact::publish_create_only(&self.run_directory, name, expected)
+                    .map_err(|error| {
+                        WorkspaceError::UnsafeExistingLayout(
+                            self.run_directory.join(name),
+                            format!("runtime scaffold publication failed: {error}"),
+                        )
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -212,7 +289,7 @@ fn validate_regular_child_files(
     Ok(())
 }
 
-fn write_empty_context_manifest(path: &Path) -> Result<(), WorkspaceError> {
+fn empty_context_manifest_bytes() -> Result<Vec<u8>, WorkspaceError> {
     let manifest = ContextManifest {
         untrusted_context_marker: UNTRUSTED_CONTEXT_MARKER.to_string(),
         total_context_bytes: 0,
@@ -226,8 +303,7 @@ fn write_empty_context_manifest(path: &Path) -> Result<(), WorkspaceError> {
     };
     let mut json = serde_json::to_vec_pretty(&manifest)?;
     json.push(b'\n');
-    fs::write(path, json)?;
-    Ok(())
+    Ok(json)
 }
 
 pub fn write_artifact(

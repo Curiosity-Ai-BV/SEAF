@@ -7,8 +7,9 @@ use std::{
 use seaf_core::{canonical_json_bytes, validate_loop_run, LoopInputDigests, LoopStatus};
 use seaf_loop::{
     apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
-    patch_digest, validate_candidate_workspace, DeveloperResponse, DeveloperStatus,
-    DevelopmentEvidence, LoopWorkspace, PatchDecisionKind, PolicyDecision, Role,
+    patch_digest, plan_candidate_workspace, provision_candidate_workspace,
+    validate_candidate_workspace, DeveloperResponse, DeveloperStatus, DevelopmentEvidence,
+    LoopWorkspace, PatchDecisionKind, PolicyDecision, Role,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,6 +41,201 @@ fn candidate_apply_changes_only_the_bound_worktree_and_resume_reuses_it() {
         candidate
     );
     remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn candidate_plan_is_durable_authority_before_provisioning_creates_the_worktree() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let workspace = LoopWorkspace::create(&temp.path().join("runs"), "run-plan").unwrap();
+    let digest = identity_digest(&source);
+
+    let planned = plan_candidate_workspace(workspace.run_directory(), &source, &digest)
+        .expect("plan candidate");
+    assert_eq!(
+        planned.lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Provisioning
+    );
+    assert!(!Path::new(&planned.path).exists());
+    assert_eq!(planned.candidate_head, planned.starting_head);
+    assert_eq!(planned.candidate_tree, planned.starting_tree);
+    assert_eq!(planned.candidate_diff_digest, empty_sha256());
+    assert!(planned.patch_transaction.is_none());
+    assert!(planned.cleanup_started_at.is_none());
+    assert!(planned.cleaned_at.is_none());
+
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "run-plan".to_string(),
+        ticket_id: "ticket-plan".to_string(),
+        goal_id: "goal-plan".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: seaf_core::LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: digest,
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(planned.clone());
+    seaf_loop::state::save_run(&workspace, &run).expect("persist provisioning authority");
+
+    let active = provision_candidate_workspace(&workspace).expect("provision exact plan");
+    assert_eq!(
+        active.lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Active
+    );
+    assert_eq!(active.starting_head, planned.starting_head);
+    assert_eq!(active.starting_tree, planned.starting_tree);
+    assert!(Path::new(&active.path).is_dir());
+    let persisted = seaf_loop::state::load_run(&workspace).expect("load active run");
+    assert_eq!(persisted.candidate_workspace.as_ref(), Some(&active));
+
+    remove_worktree(&source, Path::new(&active.path));
+}
+
+#[test]
+fn provisioning_uses_the_persisted_starting_head_instead_of_resnapshotting_source() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let workspace = LoopWorkspace::create(&temp.path().join("runs"), "run-stale-plan").unwrap();
+    let digest = identity_digest(&source);
+    let planned = plan_candidate_workspace(workspace.run_directory(), &source, &digest).unwrap();
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "run-stale-plan".to_string(),
+        ticket_id: "ticket-plan".to_string(),
+        goal_id: "goal-plan".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: seaf_core::LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: digest,
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(planned.clone());
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    fs::write(source.join("tracked.txt"), "new source commit\n").unwrap();
+    git_ok(&source, &["add", "tracked.txt"]);
+    git_ok(&source, &["commit", "-qm", "advance source"]);
+
+    let error = provision_candidate_workspace(&workspace)
+        .expect_err("source drift must not silently replace planned authority");
+    assert!(error.to_string().contains("starting HEAD"), "{error}");
+    assert!(!Path::new(&planned.path).exists());
+}
+
+#[test]
+fn provisioning_runtime_and_schema_contracts_are_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let run_dir = temp.path().join("runs/run-provisioning-contract");
+    fs::create_dir_all(&run_dir).unwrap();
+    let digest = identity_digest(&source);
+    let planned = plan_candidate_workspace(&run_dir, &source, &digest).unwrap();
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "run-provisioning-contract".to_string(),
+        ticket_id: "ticket-plan".to_string(),
+        goal_id: "goal-plan".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: seaf_core::LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: digest,
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(planned);
+    assert!(validate_loop_run(&run).is_empty());
+
+    let mut transaction_run = run.clone();
+    transaction_run
+        .candidate_workspace
+        .as_mut()
+        .unwrap()
+        .patch_transaction = Some(seaf_core::CandidatePatchTransaction {
+        schema_version: 1,
+        phase: seaf_core::CandidatePatchPhase::Applying,
+        intent: seaf_core::ArtifactReference {
+            path: "artifacts/candidate-patch.intent.json".to_string(),
+            digest: "a".repeat(64),
+        },
+        applied_evidence: None,
+        started_at: "1".to_string(),
+        applied_at: None,
+    });
+    assert!(validate_loop_run(&transaction_run).iter().any(|error| {
+        error.field == "candidate_workspace.patch_transaction"
+            && error.message.contains("absent while provisioning")
+    }));
+
+    let mut cleaning_run = run.clone();
+    let candidate = cleaning_run.candidate_workspace.as_mut().unwrap();
+    candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaning;
+    candidate.cleanup_started_at = Some("1".to_string());
+    assert!(validate_loop_run(&cleaning_run).iter().any(|error| {
+        error.field == "candidate_workspace.lifecycle" && error.message.contains("pending")
+    }));
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../specs/loop-run.schema.json"
+    )))
+    .unwrap();
+    let candidate = &schema["properties"]["candidate_workspace"]["anyOf"][0];
+    assert_eq!(
+        candidate["properties"]["lifecycle"]["enum"],
+        serde_json::json!(["provisioning", "active", "cleaning", "cleaned"])
+    );
+    assert!(candidate["allOf"].as_array().unwrap().iter().any(|branch| {
+        branch["if"]["properties"]["lifecycle"]["const"] == "provisioning"
+            && branch["then"]["properties"]["patch_transaction"]["type"] == "null"
+    }));
+    let provisioning_run = schema["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| {
+            branch["if"]["properties"]["candidate_workspace"]["properties"]["lifecycle"]["const"]
+                == "provisioning"
+        })
+        .expect("top-level provisioning run contract");
+    let then = &provisioning_run["then"]["properties"];
+    assert_eq!(then["status"]["const"], "pending");
+    assert_eq!(then["current_step"]["const"], "research");
+    assert_eq!(then["policy_decisions"]["maxItems"], 0);
+    assert_eq!(then["provider_exchange_records"]["maxItems"], 0);
+    assert_eq!(then["eval_report_path"]["type"], "null");
+    assert_eq!(
+        then["steps"]["items"]["properties"]["status"]["const"],
+        "pending"
+    );
+    let status_lifecycle = |status: &str| {
+        schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["if"]["properties"]["status"]["const"] == status)
+            .expect("status lifecycle branch")
+    };
+    assert_eq!(
+        status_lifecycle("pending")["then"]["properties"]["candidate_workspace"]["properties"]
+            ["lifecycle"]["enum"],
+        serde_json::json!(["provisioning", "active"])
+    );
+    assert_eq!(
+        status_lifecycle("running")["then"]["properties"]["candidate_workspace"]["properties"]
+            ["lifecycle"]["const"],
+        "active"
+    );
 }
 
 #[test]
@@ -1225,6 +1421,25 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     assert_eq!(fs::read(source.join("tracked.txt")).unwrap(), source_bytes);
     let persisted = seaf_loop::state::load_run(&workspace).expect("persisted run");
     assert_eq!(persisted.candidate_workspace.as_ref(), Some(&applied));
+    let resumed = seaf_loop::InitializedLoopRun::resume_isolated(
+        &temp.path().join("runs"),
+        persisted.clone(),
+    )
+    .expect("ordinary resume accepts exact Applied evidence");
+    assert_eq!(resumed.run(), &persisted);
+    let mut noop = NoopStepRunner;
+    let runner = seaf_loop::LoopRunner::resume_verified(
+        temp.path().join("runs"),
+        persisted.clone(),
+        &mut noop,
+    )
+    .expect("generic resume");
+    let before_rerun = fs::read(workspace.run_file()).unwrap();
+    let error = runner
+        .rerun_from(seaf_core::LoopStepName::Development)
+        .expect_err("Applied transaction must block reset until B3");
+    assert!(error.to_string().contains("before rerun reset"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), before_rerun);
     let replayed = apply_candidate_development_evidence(&workspace, &source)
         .expect("exact Applied replay is idempotent");
     assert_eq!(replayed, applied);
@@ -1341,6 +1556,25 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
         "coherently rewritten intent/diff/index must not replace authoritative Development"
     );
     remove_worktree(&source, Path::new(&candidate.path));
+}
+
+struct NoopStepRunner;
+
+impl seaf_loop::StepRunner for NoopStepRunner {
+    fn step_request(
+        &mut self,
+        _step: seaf_core::LoopStepName,
+    ) -> Result<String, seaf_loop::RunnerError> {
+        Ok(String::new())
+    }
+
+    fn run_step(
+        &mut self,
+        _step: seaf_core::LoopStepName,
+        _request: &str,
+    ) -> Result<seaf_loop::StepOutput, seaf_loop::RunnerError> {
+        Ok(seaf_loop::StepOutput::completed("noop"))
+    }
 }
 
 #[test]
