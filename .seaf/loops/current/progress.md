@@ -7,7 +7,8 @@
 
 ## Milestone 1 - Coherent And Safe Loop
 
-- [ ] M1-01: Authoritative project configuration (active).
+- [x] M1-01a: Project configuration and input digest contracts.
+- [ ] M1-01b: Authoritative configuration discovery and snapshots (active).
 - [ ] M1-02: Resume configuration integrity.
 - [ ] M1-03: Validated role artifact chain.
 - [ ] M1-04: Bounded additional context.
@@ -41,4 +42,5 @@
 
 ## Current Gate
 
-M1-01 is the next dependency-ready slice. S0 passed spec and quality review.
+M1-01a is complete. M1-01b is the next dependency-ready slice. Milestone 1
+remains active.

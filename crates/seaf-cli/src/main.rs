@@ -11,10 +11,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use seaf_core::{
-    sha256_digest_file, templates, AgentTaskBrief, AgentTaskConstraints, CheckStatus, EvalCheck,
-    EvalDecision, EvalReport, FieldError, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
-    Policy, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy,
-    TicketContext, TicketPriority, TicketSpec, TicketStatus, ValidationReport,
+    canonical_json_bytes, canonical_sha256_digest, sha256_digest_file, templates, AgentTaskBrief,
+    AgentTaskConstraints, CheckStatus, EvalCheck, EvalDecision, EvalReport, FieldError,
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, ProjectConfig,
+    ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext,
+    TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
     build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture, AgentBenchSummary,
@@ -1085,6 +1086,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     provider: &P,
 ) -> Result<LoopRun, CliFailure> {
     let policy = default_policy()?;
+    let input_digests = current_input_digests(config.ticket, &policy)?;
     let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
     let patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
@@ -1105,6 +1107,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         ticket,
         provider_name.to_string(),
         config.model.to_string(),
+        input_digests,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
     persist_provider_ticket_snapshot(runs_root, run_id, ticket)?;
@@ -1162,6 +1165,23 @@ fn provider_context_request(
 fn default_policy() -> Result<Policy, CliFailure> {
     serde_json::from_str(templates::DEFAULT_POLICY_JSON)
         .map_err(|err| CliFailure::message(format!("could not parse default policy: {err}")))
+}
+
+fn current_input_digests(
+    ticket: &TicketSpec,
+    policy: &Policy,
+) -> Result<LoopInputDigests, CliFailure> {
+    let no_project_config = Option::<ProjectConfig>::None;
+    Ok(LoopInputDigests {
+        ticket: canonical_sha256_digest(ticket).map_err(canonical_digest_failure("ticket"))?,
+        policy: canonical_sha256_digest(policy).map_err(canonical_digest_failure("policy"))?,
+        config: canonical_sha256_digest(&no_project_config)
+            .map_err(canonical_digest_failure("config"))?,
+    })
+}
+
+fn canonical_digest_failure(kind: &'static str) -> impl FnOnce(serde_json::Error) -> CliFailure {
+    move |error| CliFailure::message(format!("could not digest effective {kind}: {error}"))
 }
 
 fn loop_model(provider: &str, model: Option<String>) -> Result<String, CliFailure> {
@@ -1293,7 +1313,7 @@ fn provider_ticket_snapshot_path(runs_root: &Path, run_id: &str) -> PathBuf {
 }
 
 fn canonical_ticket_snapshot(ticket: &TicketSpec) -> Result<Vec<u8>, CliFailure> {
-    serde_json::to_vec_pretty(ticket)
+    canonical_json_bytes(ticket)
         .map_err(|err| CliFailure::message(format!("could not serialize ticket snapshot: {err}")))
 }
 
@@ -1459,12 +1479,14 @@ fn start_deterministic_loop_to_completion(
     model: &str,
 ) -> Result<LoopRun, CliFailure> {
     let mut step_runner = DeterministicStepRunner;
+    let policy = default_policy()?;
     let config = LoopRunnerConfig::for_ticket(
         runs_root,
         run_id,
         ticket,
         provider.to_string(),
         model.to_string(),
+        current_input_digests(ticket, &policy)?,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
     let run = runner

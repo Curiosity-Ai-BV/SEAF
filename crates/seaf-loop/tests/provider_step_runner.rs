@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use seaf_core::{
-    LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, TicketContext, TicketSpec,
-    TicketStatus,
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, TicketContext,
+    TicketSpec, TicketStatus,
 };
 use seaf_loop::{
     CommandOutput, ContextLimits, ContextManifest, ContextPackRequest, LoopRunner,
@@ -146,6 +146,7 @@ fn provider_step_runner_persists_provider_response_when_parse_failure_stops_loop
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -185,6 +186,7 @@ fn provider_step_runner_persists_repair_transcript_when_repair_failure_stops_loo
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -250,6 +252,7 @@ fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails(
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -290,6 +293,7 @@ fn provider_step_runner_packs_live_context_into_prompt_and_manifest_before_steps
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -345,6 +349,7 @@ fn provider_step_runner_rejects_forbidden_live_context_before_provider_call() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -383,6 +388,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut forbidden_runner,
     )
@@ -409,6 +415,7 @@ fn provider_step_runner_cleans_failed_prepare_workspace_so_same_run_id_can_retry
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut allowed_runner,
     )
@@ -443,6 +450,7 @@ fn provider_step_runner_resume_with_fresh_runner_prepares_live_context_for_next_
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut start_runner,
     )
@@ -495,6 +503,7 @@ fn provider_step_runner_persists_allowed_patch_policy_decision_without_apply() {
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -552,6 +561,7 @@ fn provider_step_runner_rejected_patch_fails_development_and_never_applies() {
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -612,6 +622,7 @@ fn provider_step_runner_replaces_stale_policy_decision_when_development_is_rerun
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -657,6 +668,7 @@ fn provider_step_runner_human_review_patch_persists_without_failing_or_applying(
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -706,6 +718,7 @@ fn provider_step_runner_uses_persisted_run_id_for_patch_gate_patch_id() {
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut setup_step_runner,
     )
@@ -761,6 +774,7 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
             &ticket_with_apply(true),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut clean_step_runner,
     )
@@ -794,6 +808,7 @@ fn provider_step_runner_only_attempts_apply_when_autonomy_and_clean_guard_allow(
             &ticket_with_apply(true),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut dirty_step_runner,
     )
@@ -897,6 +912,7 @@ fn provider_step_runner_persists_blocked_reviewer_state_in_live_loop() {
             &ticket(),
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -1164,6 +1180,14 @@ fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn test_input_digests() -> LoopInputDigests {
+    LoopInputDigests {
+        ticket: "a".repeat(64),
+        policy: "b".repeat(64),
+        config: "c".repeat(64),
+    }
 }
 
 fn assert_file_contains(path: &Path, expected: &str) {

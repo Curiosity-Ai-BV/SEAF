@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use seaf_core::{canonical_sha256_digest, templates, Policy, ProjectConfig};
+
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -675,6 +677,23 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
     let persisted_run: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).expect("run json"))
             .expect("persisted run json");
+    let effective_ticket =
+        seaf_core::load_ticket_file(&ticket_path).expect("effective provider ticket");
+    let effective_policy: Policy =
+        serde_json::from_str(templates::DEFAULT_POLICY_JSON).expect("default policy");
+    let absent_config = Option::<ProjectConfig>::None;
+    assert_eq!(
+        persisted_run["input_digests"]["ticket"],
+        canonical_sha256_digest(&effective_ticket).expect("ticket digest")
+    );
+    assert_eq!(
+        persisted_run["input_digests"]["policy"],
+        canonical_sha256_digest(&effective_policy).expect("policy digest")
+    );
+    assert_eq!(
+        persisted_run["input_digests"]["config"],
+        canonical_sha256_digest(&absent_config).expect("absent config digest")
+    );
     let decisions = persisted_run["policy_decisions"]
         .as_array()
         .expect("policy decisions");
@@ -3553,6 +3572,11 @@ fn write_loop_run_file(path: &Path, run_id: &str) {
   "goal_id": "local_agent_loop_mvp",
   "provider": "fake",
   "model": "fake-model",
+  "input_digests": {{
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }},
   "status": "completed",
   "current_step": "eval_report",
   "started_at": "1",
@@ -3575,6 +3599,11 @@ fn write_passing_loop_run_file(path: &Path, run_id: &str) {
   "goal_id": "local_agent_loop_mvp",
   "provider": "fake",
   "model": "fake-model",
+  "input_digests": {{
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }},
   "status": "completed",
   "current_step": "eval_report",
   "started_at": "1",

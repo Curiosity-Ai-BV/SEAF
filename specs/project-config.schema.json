@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/project-config.schema.json",
+  "title": "SEAF ProjectConfig",
+  "type": "object",
+  "required": ["policy_path"],
+  "properties": {
+    "policy_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$))(?!\\s)(?!.*\\s$)[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    }
+  },
+  "additionalProperties": false
+}

@@ -4,6 +4,11 @@
   "goal_id": "local_agent_loop_mvp",
   "provider": "ollama",
   "model": "gemma4:e4b-mlx",
+  "input_digests": {
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
   "status": "running",
   "current_step": "development",
   "started_at": "2026-07-01T12:00:00Z",

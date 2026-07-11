@@ -9,6 +9,7 @@
     "goal_id",
     "provider",
     "model",
+    "input_digests",
     "status",
     "current_step",
     "started_at",
@@ -22,6 +23,16 @@
     "goal_id": { "type": "string", "minLength": 1 },
     "provider": { "type": "string", "minLength": 1 },
     "model": { "type": "string", "minLength": 1 },
+    "input_digests": {
+      "type": "object",
+      "required": ["ticket", "policy", "config"],
+      "properties": {
+        "ticket": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "policy": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "config": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    },
     "status": {
       "enum": ["pending", "running", "blocked", "failed", "passed", "completed"]
     },

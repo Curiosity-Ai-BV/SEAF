@@ -5,7 +5,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use seaf_core::{LoopRun, LoopStatus, LoopStepName, LoopStepRecord, LoopStepStatus};
+use seaf_core::{
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepRecord, LoopStepStatus,
+};
 use serde_json::Value;
 
 use crate::workspace::LoopWorkspace;
@@ -28,6 +30,7 @@ pub struct NewLoopRun {
     pub goal_id: String,
     pub provider: String,
     pub model: String,
+    pub input_digests: LoopInputDigests,
 }
 
 pub fn create_run(config: NewLoopRun) -> LoopRun {
@@ -38,6 +41,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
         goal_id: config.goal_id,
         provider: config.provider,
         model: config.model,
+        input_digests: config.input_digests,
         status: LoopStatus::Pending,
         current_step: LOOP_STEPS[0],
         started_at: now.clone(),

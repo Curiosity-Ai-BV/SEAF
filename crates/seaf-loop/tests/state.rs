@@ -1,12 +1,34 @@
 use std::path::Path;
 
 use seaf_core::{
-    LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketContext, TicketSpec, TicketStatus,
+    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketContext, TicketSpec,
+    TicketStatus,
 };
 use seaf_loop::{
+    state::{create_run, NewLoopRun},
     ArtifactContent, ContextManifest, LoopRunner, LoopRunnerConfig, StepOutput, StepRunner,
     UNTRUSTED_CONTEXT_MARKER,
 };
+
+#[test]
+fn state_creation_preserves_exact_effective_input_digests() {
+    let input_digests = LoopInputDigests {
+        ticket: "a".repeat(64),
+        policy: "b".repeat(64),
+        config: "c".repeat(64),
+    };
+
+    let run = create_run(NewLoopRun {
+        run_id: "run-with-input-digests".to_string(),
+        ticket_id: "T-LOCAL-001".to_string(),
+        goal_id: "local_agent_loop_mvp".to_string(),
+        provider: "fake-provider".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: input_digests.clone(),
+    });
+
+    assert_eq!(run.input_digests, input_digests);
+}
 
 #[test]
 fn state_resume_skips_completed_steps_after_interruption() {
@@ -22,6 +44,7 @@ fn state_resume_skips_completed_steps_after_interruption() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut first_runner,
     )
@@ -61,6 +84,7 @@ fn state_start_rejects_duplicate_run_id_without_touching_audit_files() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut first_runner,
     )
@@ -81,6 +105,7 @@ fn state_start_rejects_duplicate_run_id_without_touching_audit_files() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut duplicate_runner,
     )
@@ -118,6 +143,7 @@ fn state_passed_run_status_is_terminal_even_with_runnable_steps() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut setup_runner,
     )
@@ -161,6 +187,7 @@ fn state_resume_reruns_persisted_running_step() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut setup_runner,
     )
@@ -220,6 +247,7 @@ fn state_rerun_from_repeats_selected_step_without_repeating_prior_steps() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut initial_runner,
     )
@@ -287,6 +315,7 @@ fn state_writes_run_workspace_prompt_response_artifact_and_log() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -347,6 +376,7 @@ fn state_persists_request_before_failed_step_execution() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -381,6 +411,7 @@ fn state_persists_response_before_rejecting_invalid_step_status() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -417,6 +448,7 @@ fn state_artifact_extensions_fall_back_to_bin_when_invalid() {
             &ticket,
             "fake-provider",
             "fake-model",
+            test_input_digests(),
         ),
         &mut step_runner,
     )
@@ -546,7 +578,14 @@ fn assert_terminal_step_output_updates_run_and_stops(
     let mut step_runner =
         RecordingStepRunner::with_prefix("terminal").returning_status(step_status);
     let mut run = LoopRunner::start(
-        LoopRunnerConfig::for_ticket(&runs_root, run_id, &ticket, "fake-provider", "fake-model"),
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
         &mut step_runner,
     )
     .expect("start run");
@@ -595,6 +634,14 @@ fn ticket() -> TicketSpec {
             "Every model request and response is stored.".to_string(),
         ],
         eval: None,
+    }
+}
+
+fn test_input_digests() -> LoopInputDigests {
+    LoopInputDigests {
+        ticket: "a".repeat(64),
+        policy: "b".repeat(64),
+        config: "c".repeat(64),
     }
 }
 

@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, fs, path::PathBuf};
 
-use seaf_core::{LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketSpec};
+use seaf_core::{LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketSpec};
 
 use crate::{
     artifacts::{
@@ -20,6 +20,7 @@ pub struct LoopRunnerConfig {
     pub goal_id: String,
     pub provider: String,
     pub model: String,
+    pub input_digests: LoopInputDigests,
 }
 
 impl LoopRunnerConfig {
@@ -29,6 +30,7 @@ impl LoopRunnerConfig {
         ticket: &TicketSpec,
         provider: impl Into<String>,
         model: impl Into<String>,
+        input_digests: LoopInputDigests,
     ) -> Self {
         Self {
             runs_root: runs_root.into(),
@@ -37,6 +39,7 @@ impl LoopRunnerConfig {
             goal_id: ticket.goal_id.clone(),
             provider: provider.into(),
             model: model.into(),
+            input_digests,
         }
     }
 }
@@ -103,6 +106,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             goal_id: config.goal_id,
             provider: config.provider,
             model: config.model,
+            input_digests: config.input_digests,
         });
         state::save_run(&workspace, &run)?;
         workspace.append_log("started run")?;

@@ -68,6 +68,12 @@ pub struct Policy {
     pub allowed_without_review: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    pub policy_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCapability {
@@ -349,6 +355,7 @@ pub struct LoopRun {
     pub goal_id: String,
     pub provider: String,
     pub model: String,
+    pub input_digests: LoopInputDigests,
     pub status: LoopStatus,
     pub current_step: LoopStepName,
     pub started_at: String,
@@ -357,6 +364,14 @@ pub struct LoopRun {
     pub policy_decisions: Vec<BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopInputDigests {
+    pub ticket: String,
+    pub policy: String,
+    pub config: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

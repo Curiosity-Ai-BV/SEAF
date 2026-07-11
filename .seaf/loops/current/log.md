@@ -297,3 +297,36 @@ ambiguity, non-executable verification shorthand, and an untracked final
 publication action. Those were corrected with a strict pre-execution human
 gate, immutable revision attempts, an exact command matrix, and M3-06. Quality
 re-review approved. Prettier and `git diff --check` passed.
+
+## 2026-07-11 act | M1-01a project configuration and input digests
+
+Added the deny-unknown-fields `ProjectConfig` contract with safe relative policy
+path validation, public schema, and valid/invalid fixtures. Added deterministic
+typed canonical JSON and SHA-256 helpers. Made lowercase 64-hex ticket, policy,
+and config digests required in `LoopRun`, its public schema, state creation, and
+runner construction. No configuration discovery, input snapshot persistence, or
+resume enforcement was added.
+
+## 2026-07-11 verify | M1-01a witnessed TDD and checks
+
+RED: `cargo test -p seaf-core project_config --locked` failed to compile with
+the expected missing `ProjectConfig`, load/validate, and canonical helper errors
+before production edits. GREEN: focused `seaf-core`, state, eval-report, and
+provider-runner tests passed, including exact digest propagation. The first
+workspace run correctly exposed stale handcrafted CLI LoopRun fixtures; after
+adding the required digests, the focused regressions and the previously
+timing-sensitive descendant-cleanup test passed. Final locked workspace tests,
+Rust formatting, and Clippy passed. `corepack pnpm format:check` then identified
+only the pre-existing roadmap table alignment and was rerun after formatting.
+
+## 2026-07-11 verify | M1-01a quality review fixes
+
+RED: reverse-ordered root and nested serialized maps produced different
+canonical bytes, and an embedded-newline project policy path passed runtime
+validation. GREEN: canonical serialization now recursively sorts JSON object
+keys, and Rust plus the public schema reject C0/C1 control characters with
+newline, NUL, and control fixtures. The provider-backed fake-loop regression
+was already green and now explicitly verifies persisted digests against the
+canonical effective ticket, compiled default policy, and typed absent config.
+Focused regressions and the full locked workspace tests passed, followed by
+Rust formatting, Clippy with warnings denied, Prettier, and `git diff --check`.

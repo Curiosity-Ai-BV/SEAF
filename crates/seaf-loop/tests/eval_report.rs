@@ -103,6 +103,11 @@ fn passing_run(ticket: &TicketSpec) -> seaf_core::LoopRun {
         goal_id: ticket.goal_id.clone(),
         provider: "fake".to_string(),
         model: "fake-model".to_string(),
+        input_digests: seaf_core::LoopInputDigests {
+            ticket: "a".repeat(64),
+            policy: "b".repeat(64),
+            config: "c".repeat(64),
+        },
     });
     for step in &mut run.steps {
         step.status = LoopStepStatus::Passed;

@@ -78,37 +78,71 @@ Verification: Prettier on changed docs and `git diff --check`.
 
 Commit boundary: documentation and tracking only.
 
-### M1-01 - Authoritative Project Configuration
+### M1-01a - Project Configuration And Input Digest Contracts
 
 Roadmap: U1. Dependencies: S0.
 
-Objective: make an explicit project policy/config, not compiled defaults, drive
-new provider runs.
+Objective: define the typed configuration and LoopRun input-digest contracts
+before changing CLI behavior.
 
 Acceptance criteria:
 
-- `loop run` discovers documented defaults and accepts explicit overrides.
-- Missing, invalid, or ambiguous project configuration fails before workspace
-  mutation or provider calls.
-- The effective ticket, policy, config, and SHA-256 digests are snapshotted in
-  the run directory and exposed in the run contract.
+- The smallest project configuration required now names a policy path, denies
+  unknown fields, and rejects empty/unsafe values.
+- LoopRun has typed required SHA-256 digests for effective ticket, policy, and
+  config inputs; state creation and public schema/fixtures agree.
+- Canonical serialization/digest helpers are deterministic and shared rather
+  than CLI-local.
 
-Likely seams: `seaf-core` config/run models and validation, CLI loop arguments,
-provider-loop setup, specs, templates, and CLI/core tests.
+Likely seams: `seaf-core` models/validation/digest helpers, loop state creation,
+public schemas/fixtures, and core/state tests.
 
-RED: CLI tests proving a custom policy changes gating, invalid config has no
-side effects, and snapshots/digests exist.
+RED: config validation/unknown-field tests, deterministic digest tests, and
+LoopRun schema/fixture tests requiring all three digests.
 
-Verification: focused core/CLI tests, schema fixtures, workspace tests, format,
-Clippy, and diff check.
+Verification: focused core/state tests plus Rust workspace gate.
 
-Docs/tracker: configuration precedence and M1-01 status.
+Docs/tracker: contract ownership and M1-01a status.
 
-Commit boundary: configuration discovery and new-run snapshots only.
+Commit boundary: contracts, schemas, fixtures, and state construction only; no
+CLI discovery or snapshots.
+
+### M1-01b - Authoritative Configuration Discovery And Snapshots
+
+Roadmap: U1. Dependencies: M1-01a.
+
+Objective: make explicit/discovered project configuration and policy drive new
+provider runs instead of compiled defaults.
+
+Acceptance criteria:
+
+- Precedence is explicit policy override, then explicit/discovered config policy,
+  then root `seaf.policy.json`; no authority fails closed.
+- Explicit missing/invalid config, ambiguous input, unsafe path, or repository
+  escape fails before workspace creation or provider calls.
+- Config-relative paths resolve from the config directory and remain inside the
+  Git repository.
+- Canonical effective ticket, policy, and config snapshots are persisted under
+  the run directory and their digests populate LoopRun.
+- Custom project policy demonstrably changes patch gating for fake and mocked
+  Ollama paths.
+
+Likely seams: CLI loop args/preflight, provider-loop setup, input snapshots, and
+CLI integration tests.
+
+RED: custom-gating, zero-side-effect failure, relative/escape path, and
+snapshot/digest-match tests.
+
+Verification: focused CLI tests plus Rust workspace and Docs gates.
+
+Docs/tracker: precedence/authority docs and M1-01b completion.
+
+Commit boundary: new-run discovery/preflight/snapshots only; resume comparison
+belongs to M1-02.
 
 ### M1-02 - Resume Configuration Integrity
 
-Roadmap: U1. Dependencies: M1-01.
+Roadmap: U1. Dependencies: M1-01b.
 
 Objective: bind resume to the exact authoritative inputs used at run creation.
 

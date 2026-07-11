@@ -92,12 +92,12 @@ secrets.
 Detailed slice contracts and review gates are maintained in
 `docs/production-use-implementation-plan.md`.
 
-| Milestone | Slices        | Status   |
-| --------- | ------------- | -------- |
-| Contract  | S0            | complete |
-| 1         | M1-01 - M1-12 | active   |
-| 2         | M2-01 - M2-07 | pending  |
-| 3         | M3-01 - M3-06 | pending  |
+| Milestone | Slices         | Status   |
+| --------- | -------------- | -------- |
+| Contract  | S0             | complete |
+| 1         | M1-01a - M1-12 | active   |
+| 2         | M2-01 - M2-07  | pending  |
+| 3         | M3-01 - M3-06  | pending  |
 
 ### Milestone 1 - Make One Loop Coherent And Safe
 

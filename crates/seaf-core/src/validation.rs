@@ -4,7 +4,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ReleaseCapsule, SeafEvent, TicketSpec,
+    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ProjectConfig, ReleaseCapsule, SeafEvent,
+    TicketSpec,
 };
 
 pub type ValidationResult<T> = Result<T, ValidationReport>;
@@ -70,6 +71,20 @@ pub fn load_policy_file(path: &Path) -> ValidationResult<Policy> {
         Ok(policy)
     } else {
         Err(ValidationReport::invalid("policy", Some(path), errors))
+    }
+}
+
+pub fn load_project_config_file(path: &Path) -> ValidationResult<ProjectConfig> {
+    let config = load_struct::<ProjectConfig>("project_config", path)?;
+    let errors = validate_project_config(&config);
+    if errors.is_empty() {
+        Ok(config)
+    } else {
+        Err(ValidationReport::invalid(
+            "project_config",
+            Some(path),
+            errors,
+        ))
     }
 }
 
@@ -192,6 +207,12 @@ pub fn validate_policy(policy: &Policy) -> Vec<FieldError> {
         "must include low-risk change types or be intentionally omitted in a later schema",
     );
 
+    errors
+}
+
+pub fn validate_project_config(config: &ProjectConfig) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    validate_safe_relative_path(&mut errors, "policy_path", &config.policy_path);
     errors
 }
 
@@ -337,6 +358,21 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
     require_non_empty(&mut errors, "goal_id", &run.goal_id);
     require_non_empty(&mut errors, "provider", &run.provider);
     require_non_empty(&mut errors, "model", &run.model);
+    validate_lowercase_sha256_digest(
+        &mut errors,
+        "input_digests.ticket",
+        &run.input_digests.ticket,
+    );
+    validate_lowercase_sha256_digest(
+        &mut errors,
+        "input_digests.policy",
+        &run.input_digests.policy,
+    );
+    validate_lowercase_sha256_digest(
+        &mut errors,
+        "input_digests.config",
+        &run.input_digests.config,
+    );
     require_non_empty(&mut errors, "started_at", &run.started_at);
     require_non_empty(&mut errors, "updated_at", &run.updated_at);
 
@@ -426,6 +462,33 @@ fn require_non_empty(errors: &mut Vec<FieldError>, field: impl Into<String>, val
     }
 }
 
+fn validate_safe_relative_path(errors: &mut Vec<FieldError>, field: &str, value: &str) {
+    if value.trim().is_empty() {
+        errors.push(FieldError::new(field, "must not be empty"));
+        return;
+    }
+
+    if value != value.trim() || value.chars().any(char::is_control) {
+        errors.push(FieldError::new(
+            field,
+            "must be an unambiguous relative path",
+        ));
+        return;
+    }
+
+    let portable = value.replace('\\', "/");
+    let bytes = portable.as_bytes();
+    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if portable.starts_with('/') || has_windows_prefix {
+        errors.push(FieldError::new(field, "must be a relative path"));
+        return;
+    }
+
+    if portable.split('/').any(|component| component == "..") {
+        errors.push(FieldError::new(field, "must not contain parent traversal"));
+    }
+}
+
 fn validate_non_empty_list(
     errors: &mut Vec<FieldError>,
     field: &str,
@@ -464,6 +527,19 @@ fn validate_sha256_digest(errors: &mut Vec<FieldError>, field: &str, value: &str
     }
 }
 
+fn validate_lowercase_sha256_digest(errors: &mut Vec<FieldError>, field: &str, value: &str) {
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|item| item.is_ascii_digit() || matches!(item, 'a'..='f'))
+    {
+        errors.push(FieldError::new(
+            field,
+            "must be a lowercase 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+}
+
 fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
@@ -471,6 +547,8 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{canonical_json_bytes, canonical_sha256_digest};
+    use serde::ser::{SerializeMap, Serializer};
 
     const POLICY_GATE_REVIEW_CATEGORIES: &[&str] = &[
         "dependency_changes",
@@ -799,6 +877,167 @@ rollout: canary
     }
 
     #[test]
+    fn valid_project_config_fixture_loads() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-loop/project-configs/valid-project-config.json");
+        let config =
+            load_project_config_file(&config_path).expect("project config fixture should load");
+
+        assert_eq!(config.policy_path, "seaf.policy.json");
+        assert!(validate_project_config(&config).is_empty());
+    }
+
+    #[test]
+    fn project_config_unknown_fields_fail_closed() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-loop/project-configs/invalid-unknown-field.json");
+        let report = load_project_config_file(&config_path).unwrap_err();
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.field == "file" && error.message.contains("unexpected_escape")));
+    }
+
+    #[test]
+    fn project_config_rejects_empty_absolute_and_parent_traversal_policy_paths() {
+        let fixtures = [
+            "invalid-empty-policy-path.json",
+            "invalid-absolute-policy-path.json",
+            "invalid-parent-traversal-policy-path.json",
+        ];
+
+        for fixture in fixtures {
+            let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/local-loop/project-configs")
+                .join(fixture);
+            let report = load_project_config_file(&config_path).unwrap_err();
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.field == "policy_path"),
+                "{fixture} should fail policy_path validation: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn project_config_runtime_and_schema_reject_control_characters() {
+        let fixtures = [
+            "invalid-newline-policy-path.json",
+            "invalid-nul-policy-path.json",
+            "invalid-control-policy-path.json",
+        ];
+
+        for fixture in fixtures {
+            let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/local-loop/project-configs")
+                .join(fixture);
+            let report = load_project_config_file(&config_path).unwrap_err();
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.field == "policy_path"),
+                "{fixture} should fail policy_path validation: {:?}",
+                report.errors
+            );
+        }
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/project-config.schema.json"))
+                .expect("project config schema");
+        let pattern = schema["properties"]["policy_path"]["pattern"]
+            .as_str()
+            .expect("policy_path pattern");
+        assert!(
+            pattern.contains(r"\u0000-\u001F") && pattern.contains(r"\u007F-\u009F"),
+            "schema must reject the same control-character ranges as Rust: {pattern}"
+        );
+    }
+
+    #[test]
+    fn canonical_typed_serialization_and_digest_are_deterministic() {
+        let config = ProjectConfig {
+            policy_path: "seaf.policy.json".to_string(),
+        };
+
+        let canonical = canonical_json_bytes(&config).expect("canonical config");
+        let digest = canonical_sha256_digest(&config).expect("canonical config digest");
+
+        assert_eq!(
+            canonical,
+            b"{\n  \"policy_path\": \"seaf.policy.json\"\n}".to_vec()
+        );
+        assert_eq!(
+            digest,
+            "a4e211c86b6ca52f6b08601a02dc523fe1d4c8dd0a5ab1a68bf1e7fab9bb1be5"
+        );
+    }
+
+    #[test]
+    fn canonical_serialization_recursively_sorts_semantically_equivalent_objects() {
+        let ascending = OrderedObject { reverse: false };
+        let descending = OrderedObject { reverse: true };
+
+        let ascending_bytes = canonical_json_bytes(&ascending).expect("ascending canonical JSON");
+        let descending_bytes =
+            canonical_json_bytes(&descending).expect("descending canonical JSON");
+
+        assert_eq!(ascending_bytes, descending_bytes);
+        assert_eq!(
+            canonical_sha256_digest(&ascending).expect("ascending digest"),
+            canonical_sha256_digest(&descending).expect("descending digest")
+        );
+    }
+
+    struct OrderedObject {
+        reverse: bool,
+    }
+
+    impl Serialize for OrderedObject {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            if self.reverse {
+                map.serialize_entry("zeta", &3)?;
+                map.serialize_entry("nested", &OrderedNested { reverse: true })?;
+            } else {
+                map.serialize_entry("nested", &OrderedNested { reverse: false })?;
+                map.serialize_entry("zeta", &3)?;
+            }
+            map.end()
+        }
+    }
+
+    struct OrderedNested {
+        reverse: bool,
+    }
+
+    impl Serialize for OrderedNested {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            if self.reverse {
+                map.serialize_entry("beta", &2)?;
+                map.serialize_entry("alpha", &1)?;
+            } else {
+                map.serialize_entry("alpha", &1)?;
+                map.serialize_entry("beta", &2)?;
+            }
+            map.end()
+        }
+    }
+
+    #[test]
     fn invalid_ticket_reports_contract_fields() {
         let ticket_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/local-loop/tickets/invalid-empty-ticket.yaml");
@@ -863,6 +1102,69 @@ unexpected_escape: true
     }
 
     #[test]
+    fn loop_run_requires_effective_input_digests() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let run_path = temp_dir.path().join("loop-run.json");
+        std::fs::write(
+            &run_path,
+            r#"{
+  "run_id": "loop_20260701_001",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "ollama",
+  "model": "gemma4:e4b-mlx",
+  "status": "running",
+  "current_step": "development",
+  "started_at": "2026-07-01T12:00:00Z",
+  "updated_at": "2026-07-01T12:12:00Z",
+  "steps": [],
+  "policy_decisions": [],
+  "eval_report_path": null
+}"#,
+        )
+        .expect("write loop run");
+
+        let report = load_loop_run_file(&run_path).unwrap_err();
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.field == "file" && error.message.contains("input_digests")));
+    }
+
+    #[test]
+    fn loop_run_rejects_malformed_effective_input_digests() {
+        let run: LoopRun = serde_json::from_str(
+            r#"{
+  "run_id": "loop_20260701_001",
+  "ticket_id": "T-LOCAL-001",
+  "goal_id": "local_agent_loop_mvp",
+  "provider": "ollama",
+  "model": "gemma4:e4b-mlx",
+  "input_digests": {
+    "ticket": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "policy": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccc"
+  },
+  "status": "running",
+  "current_step": "development",
+  "started_at": "2026-07-01T12:00:00Z",
+  "updated_at": "2026-07-01T12:12:00Z",
+  "steps": [],
+  "policy_decisions": [],
+  "eval_report_path": null
+}"#,
+        )
+        .expect("loop run should parse");
+        let errors = validate_loop_run(&run);
+        let fields: Vec<&str> = errors.iter().map(|error| error.field.as_str()).collect();
+
+        assert!(fields.contains(&"input_digests.ticket"));
+        assert!(fields.contains(&"input_digests.policy"));
+        assert!(fields.contains(&"input_digests.config"));
+    }
+
+    #[test]
     fn invalid_loop_run_reports_contract_fields() {
         let run: LoopRun = serde_json::from_str(
             r#"{
@@ -871,6 +1173,11 @@ unexpected_escape: true
   "goal_id": "",
   "provider": "",
   "model": "",
+  "input_digests": {
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
   "status": "running",
   "current_step": "development",
   "started_at": "",
@@ -913,6 +1220,11 @@ unexpected_escape: true
   "goal_id": "local_agent_loop_mvp",
   "provider": "ollama",
   "model": "gemma4:e4b-mlx",
+  "input_digests": {
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
   "status": "running",
   "current_step": "development",
   "started_at": "2026-07-01T12:00:00Z",
@@ -944,6 +1256,11 @@ unexpected_escape: true
   "goal_id": "local_agent_loop_mvp",
   "provider": "ollama",
   "model": "gemma4:e4b-mlx",
+  "input_digests": {
+    "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
   "status": "running",
   "current_step": "development",
   "started_at": "2026-07-01T12:00:00Z",

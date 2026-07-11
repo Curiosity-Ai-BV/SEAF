@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-01 - Authoritative project configuration.
+M1-01b - Authoritative configuration discovery and snapshots.
