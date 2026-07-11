@@ -6,8 +6,8 @@ use std::{
 };
 
 use seaf_core::{
-    validate_loop_run, LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepRecord,
-    LoopStepStatus,
+    validate_loop_run, LoopExecutionMode, LoopInputDigests, LoopRun, LoopStatus, LoopStepName,
+    LoopStepRecord, LoopStepStatus,
 };
 use serde_json::Value;
 
@@ -43,6 +43,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
         provider: config.provider,
         model: config.model,
         input_digests: config.input_digests,
+        execution_mode: LoopExecutionMode::LegacyProposalOnly,
         status: LoopStatus::Pending,
         current_step: LOOP_STEPS[0],
         started_at: now.clone(),

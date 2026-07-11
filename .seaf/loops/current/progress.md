@@ -19,7 +19,10 @@
 - [x] M1-04b2b: Bounded live context orchestration.
 - [x] M1-04b2c: Context round recovery and CLI integration.
 - [x] M1-05a: Candidate workspace lifecycle contract.
-- [ ] M1-05b: Candidate provider and CLI integration (active).
+- [x] M1-05b1: Indexed candidate patch transaction.
+- [ ] M1-05b2: Provider start/resume candidate authority (active).
+- [ ] M1-05b3: Development/output-review candidate integration.
+- [ ] M1-05b4: Explicit candidate cleanup CLI.
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
@@ -49,6 +52,7 @@
 
 ## Current Gate
 
-M1-05a is complete and M1-05b is active. Milestone 1 remains active. The
-pre-apply candidate lifecycle is independently approved and fully gated; the
-provider, indexed patch, resume, evidence, and CLI seams remain M1-05b.
+M1-05b1 is complete and M1-05b2 is active. Milestone 1 remains active. The
+candidate lifecycle and indexed patch transaction are fully gated; provider
+start/resume, candidate-native context, output integration, and CLI cleanup
+remain M1-05b2 through M1-05b4.

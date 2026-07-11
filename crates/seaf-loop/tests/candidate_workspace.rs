@@ -4,10 +4,11 @@ use std::{
     process::Command,
 };
 
-use seaf_core::{validate_loop_run, LoopInputDigests, LoopStatus};
+use seaf_core::{canonical_json_bytes, validate_loop_run, LoopInputDigests, LoopStatus};
 use seaf_loop::{
-    cleanup_candidate_workspace, create_candidate_workspace, validate_candidate_workspace,
-    LoopWorkspace,
+    apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
+    patch_digest, validate_candidate_workspace, DeveloperResponse, DeveloperStatus,
+    DevelopmentEvidence, LoopWorkspace, PatchDecisionKind, PolicyDecision, Role,
 };
 use sha2::{Digest, Sha256};
 
@@ -422,7 +423,12 @@ fn preapply_candidate_rejects_staged_new_files_until_m1_05b_binds_them() {
     git_ok(Path::new(&candidate.path), &["add", "new.txt"]);
     let error = validate_candidate_workspace(&run_dir, &source, &candidate)
         .expect_err("M1-05a must reject staged patch bytes");
-    assert!(error.to_string().contains("starting tree"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match its patch transaction phase"),
+        "{error}"
+    );
     assert!(!source.join("new.txt").exists());
     remove_worktree(&source, Path::new(&candidate.path));
 }
@@ -775,7 +781,9 @@ fn candidate_validation_rejects_missing_symlinked_wrong_head_and_tampered_diff_s
     let error = validate_candidate_workspace(&run_tamper, &source, &tampered)
         .expect_err("tampered diff evidence rejected");
     assert!(
-        error.to_string().contains("starting tree and empty diff"),
+        error
+            .to_string()
+            .contains("does not match its patch transaction phase"),
         "{error}"
     );
     remove_worktree(&source, Path::new(&candidate.path));
@@ -839,6 +847,7 @@ fn candidate_contract_is_closed_and_rust_schema_invariants_stay_aligned() {
         },
     });
     run.candidate_workspace = Some(candidate.clone());
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     assert!(validate_loop_run(&run).is_empty());
 
     let mut invalid = run.clone();
@@ -877,13 +886,19 @@ fn candidate_contract_is_closed_and_rust_schema_invariants_stay_aligned() {
     .expect("loop schema");
     let contract = &schema["properties"]["candidate_workspace"]["anyOf"][0];
     assert_eq!(contract["additionalProperties"], false);
+    let active_lifecycle = contract["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["if"]["properties"]["lifecycle"]["const"] == "active")
+        .expect("active lifecycle branch");
     assert_eq!(
-        contract["allOf"][0]["then"]["properties"]["cleaned_at"]["type"],
+        active_lifecycle["then"]["properties"]["cleaned_at"]["type"],
         "null"
     );
     assert_eq!(
-        contract["properties"]["candidate_diff_digest"]["const"],
-        empty_sha256()
+        contract["properties"]["candidate_diff_digest"]["pattern"],
+        "^[a-f0-9]{64}$"
     );
     for field in [
         "path",
@@ -903,6 +918,771 @@ fn candidate_contract_is_closed_and_rust_schema_invariants_stay_aligned() {
             .any(|item| item == field));
     }
     remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn loop_execution_mode_defaults_legacy_and_accepts_only_isolated_candidate_opt_in() {
+    let fixture = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/local-loop/runs/valid-loop-run.json"
+    ));
+    let legacy: seaf_core::LoopRun = serde_json::from_str(fixture).expect("legacy loop run");
+    let legacy_json = serde_json::to_value(&legacy).expect("legacy run JSON");
+    assert_eq!(
+        legacy_json["execution_mode"],
+        serde_json::json!("legacy_proposal_only"),
+        "missing execution mode must deserialize to the explicit legacy proposal-only authority"
+    );
+
+    let mut isolated_json: serde_json::Value = serde_json::from_str(fixture).expect("fixture JSON");
+    isolated_json["execution_mode"] = serde_json::json!("isolated_candidate");
+    let isolated: seaf_core::LoopRun =
+        serde_json::from_value(isolated_json).expect("isolated candidate mode");
+    assert_eq!(
+        serde_json::to_value(isolated).expect("isolated run JSON")["execution_mode"],
+        serde_json::json!("isolated_candidate")
+    );
+    let mut explicit_null: serde_json::Value = serde_json::from_str(fixture).expect("fixture JSON");
+    explicit_null["execution_mode"] = serde_json::Value::Null;
+    assert!(
+        serde_json::from_value::<seaf_core::LoopRun>(explicit_null).is_err(),
+        "explicit null is not the same as a missing legacy execution mode"
+    );
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../specs/loop-run.schema.json"
+    )))
+    .expect("loop schema");
+    assert_eq!(
+        schema["properties"]["execution_mode"]["enum"],
+        serde_json::json!(["legacy_proposal_only", "isolated_candidate"])
+    );
+    assert_eq!(
+        schema["properties"]["execution_mode"]["default"],
+        "legacy_proposal_only"
+    );
+    let mode_branch = schema["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| {
+            branch["if"]["properties"]["execution_mode"]["const"] == "isolated_candidate"
+        })
+        .expect("execution mode candidate-presence branch");
+    assert_eq!(
+        mode_branch["then"]["properties"]["candidate_workspace"]["type"],
+        "object"
+    );
+    let legacy_branch = schema["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| {
+            branch["if"]["properties"]["execution_mode"]["const"] == "legacy_proposal_only"
+        })
+        .expect("explicit legacy candidate-absence branch");
+    assert_eq!(
+        legacy_branch["then"]["properties"]["candidate_workspace"]["type"],
+        "null"
+    );
+}
+
+#[test]
+fn pre_b1_candidate_run_without_execution_mode_migrates_and_remains_cleanup_safe() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let (workspace, _) = persisted_candidate_workspace(
+        temp.path(),
+        &source,
+        "pre-b1-candidate",
+        LoopStatus::Completed,
+    );
+    let mut legacy_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.run_file()).expect("current run bytes"))
+            .expect("current run JSON");
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_mode");
+    fs::write(
+        workspace.run_file(),
+        serde_json::to_vec_pretty(&legacy_json).unwrap(),
+    )
+    .expect("pre-B1 run JSON");
+
+    let migrated = seaf_loop::state::load_run(&workspace).expect("migrated candidate run");
+    assert_eq!(
+        migrated.execution_mode,
+        seaf_core::LoopExecutionMode::IsolatedCandidate
+    );
+    assert!(validate_loop_run(&migrated).is_empty());
+    assert_eq!(
+        serde_json::to_value(&migrated).unwrap()["execution_mode"],
+        "isolated_candidate"
+    );
+    assert_eq!(
+        cleanup_candidate_workspace(&workspace, &source)
+            .expect("migrated cleanup")
+            .lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Cleaned
+    );
+}
+
+#[test]
+fn applying_candidate_patch_transaction_is_closed_and_keeps_parent_evidence_pristine() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let digest = identity_digest(&source);
+    let run_dir = temp.path().join("runs/run-applying-contract");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    let candidate = create_candidate_workspace(&run_dir, &source, &digest).expect("candidate");
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "run-applying-contract".to_string(),
+        ticket_id: "T-1".to_string(),
+        goal_id: "goal".to_string(),
+        provider: "fake".to_string(),
+        model: "model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: identity_digest(Path::new("ticket")),
+            policy: identity_digest(Path::new("policy")),
+            config: identity_digest(Path::new("config")),
+            repository: digest,
+        },
+    });
+    run.candidate_workspace = Some(candidate.clone());
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    let mut json = serde_json::to_value(&run).expect("run JSON");
+    json["execution_mode"] = serde_json::json!("isolated_candidate");
+    json["candidate_workspace"]["patch_transaction"] = serde_json::json!({
+        "schema_version": 1,
+        "phase": "applying",
+        "intent": {
+            "path": "artifacts/candidate-patch-intent.json",
+            "digest": "a".repeat(64)
+        },
+        "started_at": "1"
+    });
+
+    let applying: seaf_core::LoopRun =
+        serde_json::from_value(json).expect("closed applying transaction contract");
+    assert!(
+        validate_loop_run(&applying).is_empty(),
+        "Applying must retain the pristine parent candidate tree and diff evidence"
+    );
+    let mut legacy_with_candidate = applying.clone();
+    legacy_with_candidate.execution_mode = seaf_core::LoopExecutionMode::LegacyProposalOnly;
+    assert!(validate_loop_run(&legacy_with_candidate)
+        .iter()
+        .any(|error| error.field == "candidate_workspace"));
+
+    let mut applied_without_material_effect = applying.clone();
+    let transaction = applied_without_material_effect
+        .candidate_workspace
+        .as_mut()
+        .unwrap()
+        .patch_transaction
+        .as_mut()
+        .unwrap();
+    transaction.phase = seaf_core::CandidatePatchPhase::Applied;
+    transaction.applied_evidence = Some(seaf_core::ArtifactReference {
+        path: "artifacts/candidate-patch-applied.json".to_string(),
+        digest: "b".repeat(64),
+    });
+    transaction.applied_at = Some("2".to_string());
+    let fields = validate_loop_run(&applied_without_material_effect)
+        .into_iter()
+        .map(|error| error.field)
+        .collect::<Vec<_>>();
+    assert!(
+        fields.contains(&"candidate_workspace.candidate_tree".to_string()),
+        "Applied cannot retain the starting tree"
+    );
+    assert!(
+        fields.contains(&"candidate_workspace.candidate_diff_digest".to_string()),
+        "Applied cannot retain an empty staged diff"
+    );
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../specs/loop-run.schema.json"
+    )))
+    .expect("loop schema");
+    let transaction = &schema["properties"]["candidate_workspace"]["anyOf"][0]["properties"]
+        ["patch_transaction"]["anyOf"][0];
+    assert_eq!(transaction["additionalProperties"], false);
+    assert_eq!(
+        transaction["properties"]["phase"]["enum"],
+        serde_json::json!(["applying", "applied"])
+    );
+    let phase_branches = transaction["allOf"].as_array().expect("phase branches");
+    let applying_branch = phase_branches
+        .iter()
+        .find(|branch| branch["if"]["properties"]["phase"]["const"] == "applying")
+        .expect("Applying branch");
+    assert_eq!(
+        applying_branch["then"]["properties"]["applied_evidence"]["type"],
+        "null"
+    );
+    let applied_branch = phase_branches
+        .iter()
+        .find(|branch| branch["if"]["properties"]["phase"]["const"] == "applied")
+        .expect("Applied branch");
+    assert_eq!(
+        applied_branch["then"]["required"],
+        serde_json::json!(["applied_evidence", "applied_at"])
+    );
+    remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn candidate_patch_application_persists_intent_before_mutating_only_the_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    fs::write(source.join("unrelated.txt"), "stable\n").expect("unrelated fixture");
+    git_ok(&source, &["add", "unrelated.txt"]);
+    git_ok(&source, &["commit", "-qm", "add unrelated fixture"]);
+    let source_head = git(&source, &["rev-parse", "HEAD"]);
+    let source_status = git(
+        &source,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let source_bytes = fs::read(source.join("tracked.txt")).expect("source bytes");
+    let (workspace, candidate) =
+        persisted_candidate_workspace(temp.path(), &source, "run-apply", LoopStatus::Running);
+    let patch = "diff --git a/tracked.txt b/tracked.txt\nindex 1f7391f..39c5733 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-source\n+candidate\n";
+    let decision = PolicyDecision {
+        patch_id: "run-apply".to_string(),
+        patch_sha256: patch_digest(patch),
+        changed_paths: vec!["tracked.txt".to_string()],
+        decision: PatchDecisionKind::Allowed,
+        reasons: Vec::new(),
+        requires_human_review: false,
+        apply_requested: false,
+        applied: false,
+    };
+    let evidence = DevelopmentEvidence::new(
+        "run-apply",
+        DeveloperResponse {
+            role: Role::Developer,
+            status: DeveloperStatus::PatchProposed,
+            summary: "change only the candidate".to_string(),
+            changed_files: vec!["tracked.txt".to_string()],
+            requires_human_review: false,
+            patch: Some(patch.to_string()),
+            context_request: None,
+        },
+        patch,
+        decision,
+    )
+    .expect("Development evidence");
+    let artifact_path = "artifacts/05-development.json";
+    fs::create_dir_all(workspace.run_directory().join("artifacts")).expect("artifact dir");
+    fs::write(
+        workspace.run_directory().join(artifact_path),
+        evidence.canonical_bytes().expect("canonical evidence"),
+    )
+    .expect("Development evidence artifact");
+    let mut authoritative = seaf_loop::state::load_run(&workspace).expect("authoritative run");
+    let development = authoritative
+        .steps
+        .iter_mut()
+        .find(|step| step.name == seaf_core::LoopStepName::Development)
+        .expect("Development step");
+    development.artifact_path = Some(artifact_path.to_string());
+    development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
+    development.status = seaf_core::LoopStepStatus::Completed;
+    authoritative.current_step = seaf_core::LoopStepName::OutputReview;
+    authoritative.policy_decisions.push(
+        serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
+    );
+    seaf_loop::state::save_run(&workspace, &authoritative).expect("Development authority");
+
+    let applied =
+        apply_candidate_development_evidence(&workspace, &source).expect("apply exact evidence");
+
+    assert_eq!(
+        applied.patch_transaction.as_ref().unwrap().phase,
+        seaf_core::CandidatePatchPhase::Applied
+    );
+    assert_ne!(applied.candidate_tree, applied.starting_tree);
+    assert_ne!(applied.candidate_diff_digest, empty_sha256());
+    assert_eq!(
+        fs::read_to_string(Path::new(&candidate.path).join("tracked.txt")).unwrap(),
+        "candidate\n"
+    );
+    assert_eq!(git(&source, &["rev-parse", "HEAD"]), source_head);
+    assert_eq!(
+        git(
+            &source,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        source_status
+    );
+    assert_eq!(fs::read(source.join("tracked.txt")).unwrap(), source_bytes);
+    let persisted = seaf_loop::state::load_run(&workspace).expect("persisted run");
+    assert_eq!(persisted.candidate_workspace.as_ref(), Some(&applied));
+    let replayed = apply_candidate_development_evidence(&workspace, &source)
+        .expect("exact Applied replay is idempotent");
+    assert_eq!(replayed, applied);
+    let transaction = applied.patch_transaction.as_ref().unwrap();
+    let applied_evidence_path = workspace
+        .run_directory()
+        .join(&transaction.applied_evidence.as_ref().unwrap().path);
+    let applied_evidence_bytes = fs::read(&applied_evidence_path).expect("applied evidence bytes");
+    fs::write(
+        &applied_evidence_path,
+        [applied_evidence_bytes.as_slice(), b"\n"].concat(),
+    )
+    .expect("tamper applied evidence");
+    assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+    fs::write(&applied_evidence_path, &applied_evidence_bytes).expect("restore applied evidence");
+
+    let applied_evidence: serde_json::Value =
+        serde_json::from_slice(&applied_evidence_bytes).expect("applied evidence JSON");
+    let applied_diff_path = workspace.run_directory().join(
+        applied_evidence["observed_candidate_diff"]["path"]
+            .as_str()
+            .expect("observed diff path"),
+    );
+    let applied_diff_bytes = fs::read(&applied_diff_path).expect("applied diff bytes");
+    fs::write(
+        &applied_diff_path,
+        [applied_diff_bytes.as_slice(), b"tampered"].concat(),
+    )
+    .expect("tamper applied diff");
+    assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+    fs::write(&applied_diff_path, applied_diff_bytes).expect("restore applied diff");
+    assert_eq!(
+        apply_candidate_development_evidence(&workspace, &source).expect("restored Applied replay"),
+        applied
+    );
+    synthesize_interrupted_applying(&workspace, false);
+    let recovered_staged = apply_candidate_development_evidence(&workspace, &source)
+        .expect("recover exact staged state after index mutation");
+    assert_same_applied_candidate(&recovered_staged, &applied);
+    synthesize_interrupted_applying(&workspace, true);
+    let recovered_pristine = apply_candidate_development_evidence(&workspace, &source)
+        .expect("recover pristine state after Applying intent");
+    assert_same_applied_candidate(&recovered_pristine, &applied);
+
+    synthesize_interrupted_applying(&workspace, false);
+    fs::write(Path::new(&candidate.path).join("unrelated.txt"), "drift\n")
+        .expect("unrelated drift");
+    assert!(
+        apply_candidate_development_evidence(&workspace, &source).is_err(),
+        "Applying recovery must reject unrelated worktree drift"
+    );
+    fs::write(Path::new(&candidate.path).join("unrelated.txt"), "stable\n")
+        .expect("restore unrelated file");
+    apply_candidate_development_evidence(&workspace, &source)
+        .expect("recover after unrelated drift is removed");
+
+    synthesize_interrupted_applying(&workspace, false);
+    fs::write(Path::new(&candidate.path).join("rogue.txt"), "rogue\n").expect("rogue file");
+    git_ok(Path::new(&candidate.path), &["add", "rogue.txt"]);
+    assert!(
+        apply_candidate_development_evidence(&workspace, &source).is_err(),
+        "Applying recovery must reject a partial or extra index tree"
+    );
+    git_ok(
+        Path::new(&candidate.path),
+        &["reset", "--hard", "-q", "HEAD"],
+    );
+    apply_candidate_development_evidence(&workspace, &source)
+        .expect("recover after partial index is removed");
+
+    synthesize_interrupted_applying(&workspace, false);
+    let candidate_path = Path::new(&candidate.path);
+    fs::write(candidate_path.join("tracked.txt"), "coherent tamper\n")
+        .expect("tampered changed path");
+    git_ok(candidate_path, &["add", "tracked.txt"]);
+    let tampered_tree = git(candidate_path, &["write-tree"]);
+    let tampered_diff = git_bytes(
+        candidate_path,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    );
+    let mut tampered_run = seaf_loop::state::load_run(&workspace).expect("Applying run");
+    let transaction = tampered_run
+        .candidate_workspace
+        .as_mut()
+        .unwrap()
+        .patch_transaction
+        .as_mut()
+        .unwrap();
+    let intent_path = workspace.run_directory().join(&transaction.intent.path);
+    let mut intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(&intent_path).unwrap()).unwrap();
+    let expected_diff_path = workspace
+        .run_directory()
+        .join(intent["expected_candidate_diff"]["path"].as_str().unwrap());
+    fs::write(&expected_diff_path, &tampered_diff).expect("coherent expected diff tamper");
+    intent["expected_candidate_tree"] = serde_json::json!(tampered_tree);
+    intent["expected_candidate_diff"]["digest"] =
+        serde_json::json!(hex::encode(Sha256::digest(&tampered_diff)));
+    let intent_bytes = canonical_json_bytes(&intent).expect("canonical tampered intent");
+    fs::write(&intent_path, &intent_bytes).expect("coherent intent tamper");
+    transaction.intent.digest = hex::encode(Sha256::digest(&intent_bytes));
+    seaf_loop::state::save_run(&workspace, &tampered_run).expect("coherent tampered authority");
+    assert!(
+        apply_candidate_development_evidence(&workspace, &source).is_err(),
+        "coherently rewritten intent/diff/index must not replace authoritative Development"
+    );
+    remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn candidate_patch_application_enforces_policy_decision_semantics_before_mutation() {
+    for (suffix, decision, apply_requested, already_applied, should_materialize) in [
+        (
+            "allowed-no-intent",
+            PatchDecisionKind::Allowed,
+            false,
+            false,
+            true,
+        ),
+        (
+            "allowed-intent",
+            PatchDecisionKind::Allowed,
+            true,
+            false,
+            true,
+        ),
+        (
+            "review-no-intent",
+            PatchDecisionKind::RequiresHumanReview,
+            false,
+            false,
+            true,
+        ),
+        (
+            "review-intent",
+            PatchDecisionKind::RequiresHumanReview,
+            true,
+            false,
+            true,
+        ),
+        ("rejected", PatchDecisionKind::Rejected, true, false, false),
+        (
+            "already-applied",
+            PatchDecisionKind::Allowed,
+            true,
+            true,
+            false,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        init_repo(&source);
+        let run_id = format!("run-policy-{suffix}");
+        let (workspace, candidate) =
+            persisted_candidate_workspace(temp.path(), &source, &run_id, LoopStatus::Running);
+        let patch = "diff --git a/tracked.txt b/tracked.txt\nindex 1f7391f..39c5733 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-source\n+candidate\n";
+        persist_development_authority(
+            &workspace,
+            &run_id,
+            patch,
+            vec!["tracked.txt".to_string()],
+            apply_requested,
+            decision,
+            already_applied,
+        );
+        let result = apply_candidate_development_evidence(&workspace, &source);
+        if should_materialize {
+            let applied = result.expect("RequiresHumanReview may materialize candidate-only");
+            assert_eq!(
+                fs::read_to_string(Path::new(&candidate.path).join("tracked.txt")).unwrap(),
+                "candidate\n"
+            );
+            assert_eq!(
+                applied.patch_transaction.as_ref().unwrap().phase,
+                seaf_core::CandidatePatchPhase::Applied
+            );
+        } else {
+            assert!(result.is_err(), "unsafe policy state must fail closed");
+            assert_eq!(
+                fs::read_to_string(Path::new(&candidate.path).join("tracked.txt")).unwrap(),
+                "source\n"
+            );
+            assert_eq!(
+                git(Path::new(&candidate.path), &["write-tree"]),
+                candidate.starting_tree
+            );
+            assert!(seaf_loop::state::load_run(&workspace)
+                .unwrap()
+                .candidate_workspace
+                .unwrap()
+                .patch_transaction
+                .is_none());
+        }
+        remove_worktree(&source, Path::new(&candidate.path));
+    }
+}
+
+#[test]
+fn candidate_patch_application_requires_completed_development_on_a_running_run() {
+    for (suffix, development_status, run_status) in [
+        (
+            "pending-development",
+            seaf_core::LoopStepStatus::Pending,
+            LoopStatus::Running,
+        ),
+        (
+            "running-development",
+            seaf_core::LoopStepStatus::Running,
+            LoopStatus::Running,
+        ),
+        (
+            "terminal-run",
+            seaf_core::LoopStepStatus::Completed,
+            LoopStatus::Completed,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        init_repo(&source);
+        let run_id = format!("run-authority-{suffix}");
+        let (workspace, candidate) =
+            persisted_candidate_workspace(temp.path(), &source, &run_id, LoopStatus::Running);
+        let patch = "diff --git a/tracked.txt b/tracked.txt\nindex 1f7391f..39c5733 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-source\n+candidate\n";
+        persist_development_authority(
+            &workspace,
+            &run_id,
+            patch,
+            vec!["tracked.txt".to_string()],
+            false,
+            PatchDecisionKind::Allowed,
+            false,
+        );
+        let mut run = seaf_loop::state::load_run(&workspace).expect("run");
+        run.status = run_status;
+        run.steps
+            .iter_mut()
+            .find(|step| step.name == seaf_core::LoopStepName::Development)
+            .unwrap()
+            .status = development_status;
+        seaf_loop::state::save_run(&workspace, &run).expect("invalid application authority");
+
+        assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+        assert_eq!(
+            git(Path::new(&candidate.path), &["write-tree"]),
+            candidate.starting_tree
+        );
+        assert_eq!(
+            fs::read(Path::new(&candidate.path).join("tracked.txt")).unwrap(),
+            b"source\n"
+        );
+        assert!(seaf_loop::state::load_run(&workspace)
+            .unwrap()
+            .candidate_workspace
+            .unwrap()
+            .patch_transaction
+            .is_none());
+        remove_worktree(&source, Path::new(&candidate.path));
+    }
+}
+
+#[test]
+fn candidate_patch_application_handles_exact_directory_file_transitions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    fs::create_dir(source.join("directory")).expect("directory fixture");
+    fs::write(source.join("directory/child.txt"), "child\n").expect("directory child");
+    fs::write(source.join("flat"), "flat\n").expect("flat fixture");
+    git_ok(&source, &["add", "directory/child.txt", "flat"]);
+    git_ok(&source, &["commit", "-qm", "add transition fixtures"]);
+    let source_head = git(&source, &["rev-parse", "HEAD"]);
+
+    fs::remove_file(source.join("directory/child.txt")).unwrap();
+    fs::remove_dir(source.join("directory")).unwrap();
+    fs::write(source.join("directory"), "directory became file\n").unwrap();
+    fs::remove_file(source.join("flat")).unwrap();
+    fs::create_dir(source.join("flat")).unwrap();
+    fs::write(source.join("flat/child.txt"), "file became directory\n").unwrap();
+    git_ok(&source, &["add", "-A"]);
+    let patch = String::from_utf8(git_bytes(
+        &source,
+        &["diff", "--cached", "--binary", "--full-index", "HEAD", "--"],
+    ))
+    .unwrap();
+    git_ok(&source, &["reset", "--hard", "-q", "HEAD"]);
+    let (workspace, candidate) = persisted_candidate_workspace(
+        temp.path(),
+        &source,
+        "run-path-transition",
+        LoopStatus::Running,
+    );
+    let changed_paths = seaf_loop::parse_unified_diff(&patch)
+        .expect("transition patch")
+        .changed_paths;
+    persist_development_authority(
+        &workspace,
+        "run-path-transition",
+        &patch,
+        changed_paths,
+        false,
+        PatchDecisionKind::Allowed,
+        false,
+    );
+
+    apply_candidate_development_evidence(&workspace, &source)
+        .expect("exact directory/file transitions");
+    let candidate_path = Path::new(&candidate.path);
+    assert_eq!(
+        fs::read(candidate_path.join("directory")).unwrap(),
+        b"directory became file\n"
+    );
+    assert_eq!(
+        fs::read(candidate_path.join("flat/child.txt")).unwrap(),
+        b"file became directory\n"
+    );
+    assert_eq!(git(&source, &["rev-parse", "HEAD"]), source_head);
+    assert!(source.join("directory/child.txt").is_file());
+    assert!(source.join("flat").is_file());
+    remove_worktree(&source, candidate_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_patch_application_preserves_raw_add_delete_mode_symlink_and_filter_semantics() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    fs::write(source.join("delete.txt"), "delete me\n").expect("delete fixture");
+    fs::write(source.join("mode.txt"), "mode\n").expect("mode fixture");
+    fs::write(source.join("ident.txt"), "$Id$\n").expect("ident fixture");
+    fs::write(source.join("filtered.txt"), "raw filter\n").expect("filter fixture");
+    fs::write(
+        source.join(".gitattributes"),
+        "ident.txt ident\nfiltered.txt filter=hostile\n",
+    )
+    .expect("attributes");
+    git_ok(
+        &source,
+        &[
+            "add",
+            "delete.txt",
+            "mode.txt",
+            "ident.txt",
+            "filtered.txt",
+            ".gitattributes",
+        ],
+    );
+    git_ok(&source, &["commit", "-qm", "add patch fixtures"]);
+
+    fs::remove_file(source.join("delete.txt")).expect("delete fixture");
+    fs::set_permissions(source.join("mode.txt"), fs::Permissions::from_mode(0o755))
+        .expect("mode change");
+    symlink("tracked.txt", source.join("added-link")).expect("symlink fixture");
+    git_ok(&source, &["add", "-N", "added-link"]);
+    fs::write(source.join("ident.txt"), "$Id$\nraw ident change\n").expect("ident change");
+    fs::write(source.join("filtered.txt"), "raw filter changed\n").expect("filter change");
+    let patch = String::from_utf8(git_bytes(
+        &source,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    ))
+    .expect("UTF-8 patch");
+    git_ok(&source, &["reset", "--hard", "-q", "HEAD"]);
+    if source.join("added-link").exists() {
+        fs::remove_file(source.join("added-link")).expect("remove untracked link");
+    }
+
+    let source_head = git(&source, &["rev-parse", "HEAD"]);
+    let source_status = git(
+        &source,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let marker = temp.path().join("filter-ran");
+    let filter = format!("touch {}; cat", marker.display());
+    git_ok(&source, &["config", "filter.hostile.clean", &filter]);
+    git_ok(&source, &["config", "filter.hostile.smudge", &filter]);
+    git_ok(&source, &["config", "filter.hostile.required", "true"]);
+    let (workspace, candidate) =
+        persisted_candidate_workspace(temp.path(), &source, "run-raw-apply", LoopStatus::Running);
+    let changed_paths = seaf_loop::parse_unified_diff(&patch)
+        .expect("generated patch")
+        .changed_paths;
+    persist_development_authority(
+        &workspace,
+        "run-raw-apply",
+        &patch,
+        changed_paths,
+        false,
+        PatchDecisionKind::Allowed,
+        false,
+    );
+
+    let applied = apply_candidate_development_evidence(&workspace, &source)
+        .expect("raw candidate application");
+    let candidate_path = Path::new(&candidate.path);
+    assert!(!candidate_path.join("delete.txt").exists());
+    assert_eq!(
+        fs::metadata(candidate_path.join("mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+    assert_eq!(
+        fs::read_link(candidate_path.join("added-link")).unwrap(),
+        Path::new("tracked.txt")
+    );
+    assert_eq!(
+        fs::read(candidate_path.join("ident.txt")).unwrap(),
+        b"$Id$\nraw ident change\n"
+    );
+    assert_eq!(
+        fs::read(candidate_path.join("filtered.txt")).unwrap(),
+        b"raw filter changed\n"
+    );
+    assert!(
+        !marker.exists(),
+        "configured filter helper must never execute"
+    );
+    git_ok(&source, &["config", "--unset-all", "filter.hostile.clean"]);
+    git_ok(&source, &["config", "--unset-all", "filter.hostile.smudge"]);
+    git_ok(
+        &source,
+        &["config", "--unset-all", "filter.hostile.required"],
+    );
+    assert_eq!(git(&source, &["rev-parse", "HEAD"]), source_head);
+    assert_eq!(
+        git(
+            &source,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        source_status
+    );
+    assert_eq!(
+        validate_candidate_workspace(workspace.run_directory(), &source, &applied)
+            .expect("applied candidate validates"),
+        applied
+    );
+    remove_worktree(&source, candidate_path);
 }
 
 fn init_repo(path: &Path) {
@@ -941,8 +1721,106 @@ fn persisted_candidate_workspace(
     });
     run.status = status;
     run.candidate_workspace = Some(candidate.clone());
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     seaf_loop::state::save_run(&workspace, &run).expect("persist candidate run");
     (workspace, candidate)
+}
+
+fn persist_development_authority(
+    workspace: &LoopWorkspace,
+    run_id: &str,
+    patch: &str,
+    changed_paths: Vec<String>,
+    apply_requested: bool,
+    decision_kind: PatchDecisionKind,
+    applied: bool,
+) -> DevelopmentEvidence {
+    let decision = PolicyDecision {
+        patch_id: run_id.to_string(),
+        patch_sha256: patch_digest(patch),
+        changed_paths: changed_paths.clone(),
+        decision: decision_kind,
+        reasons: Vec::new(),
+        requires_human_review: decision_kind == PatchDecisionKind::RequiresHumanReview,
+        apply_requested,
+        applied,
+    };
+    let evidence = DevelopmentEvidence::new(
+        run_id,
+        DeveloperResponse {
+            role: Role::Developer,
+            status: DeveloperStatus::PatchProposed,
+            summary: "candidate-only patch".to_string(),
+            changed_files: changed_paths,
+            requires_human_review: decision_kind == PatchDecisionKind::RequiresHumanReview,
+            patch: Some(patch.to_string()),
+            context_request: None,
+        },
+        patch,
+        decision,
+    )
+    .expect("Development evidence");
+    let artifact_path = "artifacts/05-development.json";
+    fs::create_dir_all(workspace.run_directory().join("artifacts")).expect("artifact dir");
+    fs::write(
+        workspace.run_directory().join(artifact_path),
+        evidence.canonical_bytes().expect("canonical evidence"),
+    )
+    .expect("Development evidence artifact");
+    let mut authoritative = seaf_loop::state::load_run(workspace).expect("authoritative run");
+    let development = authoritative
+        .steps
+        .iter_mut()
+        .find(|step| step.name == seaf_core::LoopStepName::Development)
+        .expect("Development step");
+    development.artifact_path = Some(artifact_path.to_string());
+    development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
+    development.status = seaf_core::LoopStepStatus::Completed;
+    authoritative.current_step = seaf_core::LoopStepName::OutputReview;
+    authoritative.policy_decisions.push(
+        serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
+    );
+    seaf_loop::state::save_run(workspace, &authoritative).expect("Development authority");
+    evidence
+}
+
+fn synthesize_interrupted_applying(workspace: &LoopWorkspace, reset_physical: bool) {
+    let mut run = seaf_loop::state::load_run(workspace).expect("Applied run");
+    let candidate = run.candidate_workspace.as_mut().expect("candidate");
+    let candidate_path = PathBuf::from(&candidate.path);
+    if reset_physical {
+        git_ok(&candidate_path, &["reset", "--hard", "-q", "HEAD"]);
+    }
+    candidate.candidate_tree = candidate.starting_tree.clone();
+    candidate.candidate_diff_digest = empty_sha256().to_string();
+    let transaction = candidate
+        .patch_transaction
+        .as_mut()
+        .expect("patch transaction");
+    transaction.phase = seaf_core::CandidatePatchPhase::Applying;
+    transaction.applied_evidence = None;
+    transaction.applied_at = None;
+    seaf_loop::state::save_run(workspace, &run).expect("synthesized Applying authority");
+}
+
+fn assert_same_applied_candidate(
+    actual: &seaf_core::CandidateWorkspaceState,
+    expected: &seaf_core::CandidateWorkspaceState,
+) {
+    assert_eq!(actual.candidate_tree, expected.candidate_tree);
+    assert_eq!(actual.candidate_diff_digest, expected.candidate_diff_digest);
+    assert_eq!(
+        actual.patch_transaction.as_ref().unwrap().intent,
+        expected.patch_transaction.as_ref().unwrap().intent
+    );
+    assert_eq!(
+        actual.patch_transaction.as_ref().unwrap().applied_evidence,
+        expected
+            .patch_transaction
+            .as_ref()
+            .unwrap()
+            .applied_evidence
+    );
 }
 
 fn git_ok(path: &Path, args: &[&str]) {

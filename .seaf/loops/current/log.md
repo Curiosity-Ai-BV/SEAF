@@ -1223,3 +1223,43 @@ tests, 38 provider-runner tests, 33 seaf-core tests, and the complete locked
 Rust workspace. Workspace Clippy with warnings denied, Rust and Prettier
 formatting, package lint, typecheck, 8 SDK tests, SDK build, and diff check all
 passed. M1-05a is complete and M1-05b is active.
+
+## 2026-07-12 implementation | M1-05b1 indexed candidate patch transaction
+
+M1-05b is split into four reviewable boundaries. M1-05b1 closes the durable
+candidate mutation contract; M1-05b2 is now active for provider start/resume,
+followed by Development/OutputReview integration and explicit CLI cleanup.
+
+LoopRun now has a backward-compatible execution mode: missing state defaults to
+legacy proposal-only and cannot carry candidate authority, while explicit
+isolated-candidate runs require it. Candidate patch state is a closed Applying
+or Applied transaction. Its create-only canonical intent binds the exact
+Development artifact, policy digest, changed paths, starting identity, planned
+tree, and expected staged-diff artifact. Full-state compare-and-swap persists
+Applying before the real candidate index changes and Applied only after exact
+tree/diff verification and create-only observed evidence.
+
+Application plans through a private index, applies to the real candidate index,
+and raw-rematerializes only changed paths from exact index blobs. Configured
+filters are neutralized, ident bytes remain raw, and add/delete/executable/
+symlink transitions are preserved. Resume accepts pristine Applying, exact
+staged Applying, or fully verified Applied replay. It rejects partial indexes,
+unrelated drift, artifact tampering, and coherent rewritten intent/diff/index
+state by recomputing the plan from authoritative Development evidence. Allowed
+and RequiresHumanReview decisions materialize candidate-only regardless of
+apply-request audit intent; Rejected and already-applied evidence never mutate.
+
+Candidate artifacts use the shared atomic create-only publisher, including file
+and parent-directory durability on fresh publication and exact retry. Private
+planning indexes use unique names so crash orphans never block another attempt.
+Genuine fault hooks prove stale pre-Applying CAS, durable Applying before index
+mutation, exact materialized Applying before Applied publication, and post-
+Applied replay without pre-created future evidence. Materialization requires
+completed Development on a running run, handles exact directory/file
+transitions, and refuses unrelated directory contents. A narrow decode
+migration keeps pre-B1 M1-05a candidate runs usable while explicit legacy mode
+still forbids candidate authority.
+
+Focused candidate tests pass 31/31 with 6 candidate-specific unit/fault tests;
+core passes 33/33, provider exchange 22/22, provider step runner 38/38, and the
+complete locked Rust workspace passes.

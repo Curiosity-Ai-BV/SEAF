@@ -120,7 +120,7 @@ Terminal legacy `needs_context` history stays inert until that explicit rerun.
 Real CLI tests cover default resume, repository changes, cap exhaustion, and
 request, response, expansion, and record tampering.
 
-M1-05a now defines the candidate lifecycle boundary independently of provider
+M1-05a defines the candidate lifecycle boundary independently of provider
 integration. A detached worktree lives at a deterministic absolute path outside
 the source checkout and is bound to the exact source/common-directory identity,
 starting HEAD/tree, empty pre-apply candidate tree/diff, and lifecycle in closed
@@ -132,10 +132,25 @@ index/worktree, extra bytes, digest, lifecycle, or helper/config injection
 drift. Creation is serialized and Unix authority directories are private.
 Cleanup uses full-LoopRun compare-and-swap, durably records intent, and
 reconciles post-removal interruption. Independent spec and quality review plus
-the full repository gate accepted M1-05a on 2026-07-11. M1-05b still owns
-provider context, indexed patch application, typed patch/policy/candidate-tree
-evidence, resume, and explicit CLI cleanup integration; the loop remains
-proposal-only until that slice is accepted.
+the full repository gate accepted M1-05a on 2026-07-11.
+
+M1-05b1 now adds the candidate-only indexed patch transaction. Explicit
+isolated execution binds canonical Development and policy evidence to a planned
+tree and staged diff, persists Applying before index mutation, raw-materializes
+the exact resulting index objects, and persists Applied evidence afterward.
+Recovery recomputes the authoritative plan and accepts only pristine or exact
+planned state; coherent tampering, partial indexes, unrelated drift, configured
+filters, ident expansion, and source-checkout mutation are covered. M1-05b2 is
+active for provider start/resume and candidate-native context; provider/output
+integration and explicit cleanup remain M1-05b3/M1-05b4. The production loop
+remains proposal-only until those boundaries are accepted.
+
+The B1 boundary also preserves pre-B1 candidate runs through a narrow
+missing-mode migration, atomically publishes and directory-syncs immutable
+artifacts, skips orphaned private planning indexes, requires completed
+Development on a running run, and proves real interruption recovery at every
+Applying/Applied publication cut. Exact directory/file transitions are raw-
+materialized safely; unrelated contents remain a hard stop.
 
 ## Production-Use Acceptance Scenario
 

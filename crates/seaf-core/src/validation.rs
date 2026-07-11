@@ -436,6 +436,17 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
             ));
         }
     }
+    match (run.execution_mode, run.candidate_workspace.is_some()) {
+        (crate::LoopExecutionMode::LegacyProposalOnly, true) => errors.push(FieldError::new(
+            "candidate_workspace",
+            "must be absent for legacy_proposal_only execution",
+        )),
+        (crate::LoopExecutionMode::IsolatedCandidate, false) => errors.push(FieldError::new(
+            "candidate_workspace",
+            "is required for isolated_candidate execution",
+        )),
+        _ => {}
+    }
 
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
@@ -547,16 +558,92 @@ fn validate_candidate_workspace_state(
         ));
     }
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    match &candidate.patch_transaction {
+        None => require_pristine_candidate_evidence(errors, candidate, EMPTY_SHA256),
+        Some(transaction) => {
+            if transaction.schema_version != 1 {
+                errors.push(FieldError::new(
+                    "candidate_workspace.patch_transaction.schema_version",
+                    "must be 1",
+                ));
+            }
+            validate_artifact_reference(
+                errors,
+                "candidate_workspace.patch_transaction.intent",
+                &transaction.intent,
+            );
+            require_non_empty(
+                errors,
+                "candidate_workspace.patch_transaction.started_at",
+                &transaction.started_at,
+            );
+            match transaction.phase {
+                crate::CandidatePatchPhase::Applying => {
+                    require_pristine_candidate_evidence(errors, candidate, EMPTY_SHA256);
+                    if transaction.applied_evidence.is_some() || transaction.applied_at.is_some() {
+                        errors.push(FieldError::new(
+                            "candidate_workspace.patch_transaction.applied_evidence",
+                            "must be absent while patch application is in progress",
+                        ));
+                    }
+                }
+                crate::CandidatePatchPhase::Applied => {
+                    match &transaction.applied_evidence {
+                        Some(reference) => validate_artifact_reference(
+                            errors,
+                            "candidate_workspace.patch_transaction.applied_evidence",
+                            reference,
+                        ),
+                        None => errors.push(FieldError::new(
+                            "candidate_workspace.patch_transaction.applied_evidence",
+                            "is required after patch application",
+                        )),
+                    }
+                    if transaction
+                        .applied_at
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    {
+                        errors.push(FieldError::new(
+                            "candidate_workspace.patch_transaction.applied_at",
+                            "is required after patch application",
+                        ));
+                    }
+                    if candidate.candidate_tree == candidate.starting_tree {
+                        errors.push(FieldError::new(
+                            "candidate_workspace.candidate_tree",
+                            "must differ from starting_tree after patch application",
+                        ));
+                    }
+                    if candidate.candidate_diff_digest == EMPTY_SHA256 {
+                        errors.push(FieldError::new(
+                            "candidate_workspace.candidate_diff_digest",
+                            "must be non-empty after patch application",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn require_pristine_candidate_evidence(
+    errors: &mut Vec<FieldError>,
+    candidate: &crate::CandidateWorkspaceState,
+    empty_sha256: &str,
+) {
     if candidate.candidate_tree != candidate.starting_tree {
         errors.push(FieldError::new(
             "candidate_workspace.candidate_tree",
-            "must equal starting_tree until M1-05b binds an applied patch",
+            "must equal starting_tree before patch application completes",
         ));
     }
-    if candidate.candidate_diff_digest != EMPTY_SHA256 {
+    if candidate.candidate_diff_digest != empty_sha256 {
         errors.push(FieldError::new(
             "candidate_workspace.candidate_diff_digest",
-            "must be the empty SHA-256 until M1-05b binds an applied patch",
+            "must be the empty SHA-256 before patch application completes",
         ));
     }
 }

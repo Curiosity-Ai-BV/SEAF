@@ -96,6 +96,7 @@ fn verify_existing_winner(target: &Path, bytes: &[u8]) -> Result<(), ImmutableAr
         ));
     }
     if fs::read(target)? == bytes {
+        fs::File::open(target)?.sync_all()?;
         Ok(())
     } else {
         Err(ImmutableArtifactError::Collision(

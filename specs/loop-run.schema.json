@@ -23,6 +23,10 @@
     "goal_id": { "type": "string", "minLength": 1 },
     "provider": { "type": "string", "minLength": 1 },
     "model": { "type": "string", "minLength": 1 },
+    "execution_mode": {
+      "enum": ["legacy_proposal_only", "isolated_candidate"],
+      "default": "legacy_proposal_only"
+    },
     "input_digests": {
       "type": "object",
       "required": ["ticket", "policy", "config", "repository"],
@@ -326,7 +330,89 @@
             },
             "candidate_diff_digest": {
               "type": "string",
-              "const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "patch_transaction": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "phase",
+                    "intent",
+                    "started_at"
+                  ],
+                  "properties": {
+                    "schema_version": { "const": 1 },
+                    "phase": { "enum": ["applying", "applied"] },
+                    "intent": {
+                      "type": "object",
+                      "required": ["path", "digest"],
+                      "properties": {
+                        "path": { "type": "string", "minLength": 1 },
+                        "digest": {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "applied_evidence": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": ["path", "digest"],
+                          "properties": {
+                            "path": { "type": "string", "minLength": 1 },
+                            "digest": {
+                              "type": "string",
+                              "pattern": "^[a-f0-9]{64}$"
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "started_at": { "type": "string", "minLength": 1 },
+                    "applied_at": {
+                      "anyOf": [
+                        { "type": "string", "minLength": 1 },
+                        { "type": "null" }
+                      ]
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "required": ["phase"],
+                        "properties": { "phase": { "const": "applying" } }
+                      },
+                      "then": {
+                        "properties": {
+                          "applied_evidence": { "type": "null" },
+                          "applied_at": { "type": "null" }
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "required": ["phase"],
+                        "properties": { "phase": { "const": "applied" } }
+                      },
+                      "then": {
+                        "required": ["applied_evidence", "applied_at"],
+                        "properties": {
+                          "applied_evidence": { "type": "object" },
+                          "applied_at": { "type": "string", "minLength": 1 }
+                        }
+                      }
+                    }
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
             },
             "lifecycle": { "enum": ["active", "cleaning", "cleaned"] },
             "cleanup_started_at": {
@@ -343,6 +429,34 @@
             }
           },
           "allOf": [
+            {
+              "if": {
+                "required": ["patch_transaction"],
+                "properties": {
+                  "patch_transaction": {
+                    "type": "object",
+                    "required": ["phase"],
+                    "properties": { "phase": { "const": "applied" } }
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "candidate_diff_digest": {
+                    "not": {
+                      "const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    }
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "candidate_diff_digest": {
+                    "const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  }
+                }
+              }
+            },
             {
               "if": { "properties": { "lifecycle": { "const": "active" } } },
               "then": {
@@ -382,5 +496,26 @@
       "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["execution_mode"],
+        "properties": { "execution_mode": { "const": "isolated_candidate" } }
+      },
+      "then": {
+        "required": ["candidate_workspace"],
+        "properties": { "candidate_workspace": { "type": "object" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["execution_mode"],
+        "properties": { "execution_mode": { "const": "legacy_proposal_only" } }
+      },
+      "then": {
+        "properties": { "candidate_workspace": { "type": "null" } }
+      }
+    }
+  ],
   "additionalProperties": false
 }

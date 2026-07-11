@@ -347,7 +347,7 @@ pub enum LoopStepName {
     EvalReport,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopRun {
     pub run_id: String,
@@ -356,6 +356,8 @@ pub struct LoopRun {
     pub provider: String,
     pub model: String,
     pub input_digests: LoopInputDigests,
+    #[serde(default)]
+    pub execution_mode: LoopExecutionMode,
     pub status: LoopStatus,
     pub current_step: LoopStepName,
     pub started_at: String,
@@ -368,6 +370,89 @@ pub struct LoopRun {
     pub candidate_workspace: Option<CandidateWorkspaceState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopRunWire {
+    run_id: String,
+    ticket_id: String,
+    goal_id: String,
+    provider: String,
+    model: String,
+    input_digests: LoopInputDigests,
+    #[serde(default)]
+    execution_mode: DecodedExecutionMode,
+    status: LoopStatus,
+    current_step: LoopStepName,
+    started_at: String,
+    updated_at: String,
+    steps: Vec<LoopStepRecord>,
+    policy_decisions: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    provider_exchange_records: Vec<ProviderExchangeRecordReference>,
+    #[serde(default)]
+    candidate_workspace: Option<CandidateWorkspaceState>,
+    #[serde(default)]
+    eval_report_path: Option<String>,
+}
+
+#[derive(Default)]
+enum DecodedExecutionMode {
+    #[default]
+    Missing,
+    Present(LoopExecutionMode),
+}
+
+impl<'de> Deserialize<'de> for DecodedExecutionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        LoopExecutionMode::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl<'de> Deserialize<'de> for LoopRun {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = LoopRunWire::deserialize(deserializer)?;
+        let execution_mode = match wire.execution_mode {
+            DecodedExecutionMode::Present(mode) => mode,
+            DecodedExecutionMode::Missing if wire.candidate_workspace.is_some() => {
+                LoopExecutionMode::IsolatedCandidate
+            }
+            DecodedExecutionMode::Missing => LoopExecutionMode::LegacyProposalOnly,
+        };
+        Ok(Self {
+            run_id: wire.run_id,
+            ticket_id: wire.ticket_id,
+            goal_id: wire.goal_id,
+            provider: wire.provider,
+            model: wire.model,
+            input_digests: wire.input_digests,
+            execution_mode,
+            status: wire.status,
+            current_step: wire.current_step,
+            started_at: wire.started_at,
+            updated_at: wire.updated_at,
+            steps: wire.steps,
+            policy_decisions: wire.policy_decisions,
+            provider_exchange_records: wire.provider_exchange_records,
+            candidate_workspace: wire.candidate_workspace,
+            eval_report_path: wire.eval_report_path,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopExecutionMode {
+    #[default]
+    LegacyProposalOnly,
+    IsolatedCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,11 +468,33 @@ pub struct CandidateWorkspaceState {
     pub candidate_head: String,
     pub candidate_tree: String,
     pub candidate_diff_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_transaction: Option<CandidatePatchTransaction>,
     pub lifecycle: CandidateWorkspaceLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleaned_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidatePatchTransaction {
+    pub schema_version: u32,
+    pub phase: CandidatePatchPhase,
+    pub intent: ArtifactReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_evidence: Option<ArtifactReference>,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidatePatchPhase {
+    Applying,
+    Applied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

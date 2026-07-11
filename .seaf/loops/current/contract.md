@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-05b - Candidate provider and CLI integration.
+M1-05b2 - Provider start and resume candidate authority.

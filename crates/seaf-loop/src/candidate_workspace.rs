@@ -1,17 +1,28 @@
 use std::{
+    collections::HashSet,
     env,
     error::Error,
     fmt, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use seaf_core::{CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopStatus};
+use seaf_core::{
+    canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CandidatePatchPhase,
+    CandidatePatchTransaction, CandidateWorkspaceLifecycle, CandidateWorkspaceState,
+    LoopExecutionMode, LoopStatus, LoopStepName,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::workspace::LoopWorkspace;
+use crate::{
+    immutable_artifact::{publish_create_only, read_verified_regular_file},
+    workspace::{LoopWorkspace, ARTIFACTS_DIR},
+    DevelopmentEvidence, PatchDecisionKind, PolicyDecision,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -19,6 +30,715 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 pub const CANDIDATE_WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const CANDIDATE_ROOT_DIR: &str = "seaf-candidates";
 const CANDIDATE_LOCK_FILE: &str = ".candidate-workspace.lock";
+const PATCH_INTENT_PATH: &str = "artifacts/candidate-patch.intent.json";
+const PATCH_EXPECTED_DIFF_PATH: &str = "artifacts/candidate-patch.expected.diff";
+const PATCH_APPLIED_DIFF_PATH: &str = "artifacts/candidate-patch.applied.diff";
+const PATCH_APPLIED_EVIDENCE_PATH: &str = "artifacts/candidate-patch.applied.json";
+static PATCH_PLAN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidatePatchIntent {
+    schema_version: u32,
+    run_id: String,
+    candidate_path: String,
+    source_worktree_root: String,
+    git_common_dir: String,
+    repository_identity_digest: String,
+    starting_head: String,
+    starting_tree: String,
+    development_evidence: ArtifactReference,
+    patch_digest: String,
+    policy_decision_digest: String,
+    changed_paths: Vec<String>,
+    expected_candidate_tree: String,
+    expected_candidate_diff: ArtifactReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidatePatchAppliedEvidence {
+    schema_version: u32,
+    run_id: String,
+    intent: ArtifactReference,
+    observed_candidate_tree: String,
+    observed_candidate_diff: ArtifactReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidatePatchApplicationPhase {
+    BeforeApplyingPersisted,
+    ApplyingPersisted,
+    Materialized,
+    AppliedPersisted,
+}
+
+pub fn apply_candidate_development_evidence(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    apply_candidate_development_evidence_with_hook(workspace, source_worktree_root, |_| Ok(()))
+}
+
+fn apply_candidate_development_evidence_with_hook<F>(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    mut hook: F,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError>
+where
+    F: FnMut(CandidatePatchApplicationPhase) -> Result<(), CandidateWorkspaceError>,
+{
+    let lock = acquire_candidate_lock(workspace)?;
+    let result =
+        apply_candidate_development_evidence_locked(workspace, source_worktree_root, &mut hook);
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn apply_candidate_development_evidence_locked(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    hook: &mut dyn FnMut(CandidatePatchApplicationPhase) -> Result<(), CandidateWorkspaceError>,
+) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    let mut run = crate::state::load_run(workspace)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if run.execution_mode != LoopExecutionMode::IsolatedCandidate {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate patch application requires isolated_candidate execution".to_string(),
+        ));
+    }
+    if run.status != LoopStatus::Running {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate patch application requires a running LoopRun".to_string(),
+        ));
+    }
+    let candidate = run.candidate_workspace.clone().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "isolated candidate run has no candidate workspace authority".to_string(),
+        )
+    })?;
+    if candidate.lifecycle != CandidateWorkspaceLifecycle::Active {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch application requires an active candidate".to_string(),
+        ));
+    }
+    validate_candidate_application_identity(
+        workspace.run_directory(),
+        source_worktree_root,
+        &candidate,
+    )?;
+
+    let development_reference = development_evidence_reference(&run)?;
+    let evidence = DevelopmentEvidence::load(
+        workspace,
+        &development_reference.path,
+        &development_reference.digest,
+        &run.run_id,
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    let policy = authoritative_policy_decision(&run, &evidence)?;
+    if policy.applied
+        || !matches!(
+            policy.decision,
+            PatchDecisionKind::Allowed | PatchDecisionKind::RequiresHumanReview
+        )
+    {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "only an unapplied Allowed or RequiresHumanReview policy decision may materialize in the candidate"
+                .to_string(),
+        ));
+    }
+
+    let (intent_reference, intent, applying_run) = match &candidate.patch_transaction {
+        None => {
+            validate_candidate_physical(
+                workspace.run_directory(),
+                source_worktree_root,
+                &candidate,
+                true,
+            )?;
+            let plan = plan_candidate_patch(workspace, &candidate, &evidence)?;
+            let expected_diff = write_create_only_artifact(
+                workspace,
+                PATCH_EXPECTED_DIFF_PATH,
+                &plan.expected_diff,
+            )?;
+            let intent = CandidatePatchIntent {
+                schema_version: 1,
+                run_id: run.run_id.clone(),
+                candidate_path: candidate.path.clone(),
+                source_worktree_root: candidate.source_worktree_root.clone(),
+                git_common_dir: candidate.git_common_dir.clone(),
+                repository_identity_digest: candidate.repository_identity_digest.clone(),
+                starting_head: candidate.starting_head.clone(),
+                starting_tree: candidate.starting_tree.clone(),
+                development_evidence: development_reference.clone(),
+                patch_digest: evidence.patch_digest.clone(),
+                policy_decision_digest: canonical_sha256_digest(&policy)
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?,
+                changed_paths: evidence.changed_paths.clone(),
+                expected_candidate_tree: plan.expected_tree,
+                expected_candidate_diff: expected_diff,
+            };
+            let intent_reference = write_create_only_artifact(
+                workspace,
+                PATCH_INTENT_PATH,
+                &canonical_json_bytes(&intent)
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?,
+            )?;
+            let expected = run.clone();
+            let mut applying_candidate = candidate.clone();
+            applying_candidate.patch_transaction = Some(CandidatePatchTransaction {
+                schema_version: 1,
+                phase: CandidatePatchPhase::Applying,
+                intent: intent_reference.clone(),
+                applied_evidence: None,
+                started_at: now_timestamp(),
+                applied_at: None,
+            });
+            run.candidate_workspace = Some(applying_candidate);
+            hook(CandidatePatchApplicationPhase::BeforeApplyingPersisted)?;
+            persist_candidate_run(workspace, &expected, &run)?;
+            hook(CandidatePatchApplicationPhase::ApplyingPersisted)?;
+            (intent_reference, intent, run.clone())
+        }
+        Some(transaction) if transaction.phase == CandidatePatchPhase::Applying => {
+            let intent: CandidatePatchIntent =
+                load_canonical_artifact(workspace, &transaction.intent)?;
+            validate_patch_intent(
+                workspace,
+                &run,
+                &candidate,
+                &development_reference,
+                &evidence,
+                &policy,
+                &intent,
+            )?;
+            (transaction.intent.clone(), intent, run.clone())
+        }
+        Some(transaction) => {
+            let intent: CandidatePatchIntent =
+                load_canonical_artifact(workspace, &transaction.intent)?;
+            validate_candidate_physical(
+                workspace.run_directory(),
+                source_worktree_root,
+                &candidate,
+                true,
+            )?;
+            validate_patch_intent(
+                workspace,
+                &run,
+                &candidate,
+                &development_reference,
+                &evidence,
+                &policy,
+                &intent,
+            )?;
+            validate_applied_patch_evidence(workspace, &run, &candidate, transaction, &intent)?;
+            return Ok(candidate);
+        }
+    };
+
+    materialize_planned_candidate_patch(&candidate, &evidence, &intent)?;
+    hook(CandidatePatchApplicationPhase::Materialized)?;
+    let observed_tree = git_text(Path::new(&candidate.path), &["write-tree"])?;
+    let observed_diff = staged_diff(Path::new(&candidate.path))?;
+    let observed_digest = sha256_bytes(&observed_diff);
+    if observed_tree != intent.expected_candidate_tree
+        || observed_digest != intent.expected_candidate_diff.digest
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "materialized candidate tree or staged diff differs from immutable patch intent"
+                .to_string(),
+        ));
+    }
+    let applied_diff =
+        write_create_only_artifact(workspace, PATCH_APPLIED_DIFF_PATH, &observed_diff)?;
+    let applied_evidence = CandidatePatchAppliedEvidence {
+        schema_version: 1,
+        run_id: applying_run.run_id.clone(),
+        intent: intent_reference.clone(),
+        observed_candidate_tree: observed_tree.clone(),
+        observed_candidate_diff: applied_diff,
+    };
+    let applied_reference = write_create_only_artifact(
+        workspace,
+        PATCH_APPLIED_EVIDENCE_PATH,
+        &canonical_json_bytes(&applied_evidence)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?,
+    )?;
+    let mut applied_run = applying_run.clone();
+    let applied_candidate = applied_run.candidate_workspace.as_mut().ok_or_else(|| {
+        CandidateWorkspaceError::State("Applying run lost candidate authority".to_string())
+    })?;
+    applied_candidate.candidate_tree = observed_tree;
+    applied_candidate.candidate_diff_digest = observed_digest;
+    let transaction = applied_candidate
+        .patch_transaction
+        .as_mut()
+        .ok_or_else(|| {
+            CandidateWorkspaceError::State("Applying run lost patch transaction".to_string())
+        })?;
+    transaction.phase = CandidatePatchPhase::Applied;
+    transaction.applied_evidence = Some(applied_reference);
+    transaction.applied_at = Some(now_timestamp());
+    let applied_candidate = applied_candidate.clone();
+    persist_candidate_run(workspace, &applying_run, &applied_run)?;
+    hook(CandidatePatchApplicationPhase::AppliedPersisted)?;
+    Ok(applied_candidate)
+}
+
+struct CandidatePatchPlan {
+    expected_tree: String,
+    expected_diff: Vec<u8>,
+}
+
+fn validate_candidate_application_identity(
+    run_directory: &Path,
+    source_worktree_root: &Path,
+    state: &CandidateWorkspaceState,
+) -> Result<(), CandidateWorkspaceError> {
+    let (source, persisted) =
+        validate_static_authority(run_directory, source_worktree_root, state, true)?;
+    let candidate = canonical_real_directory(&persisted, "candidate worktree")?;
+    if candidate != persisted || candidate.starts_with(&source) {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate path is symlinked, substituted, or inside the source worktree".to_string(),
+        ));
+    }
+    validate_private_directory(&candidate)?;
+    if !worktree_registered(&source, &candidate)? {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "active candidate is not registered in the authoritative repository".to_string(),
+        ));
+    }
+    require_detached_head(&candidate)?;
+    if git_common_dir(&candidate)? != Path::new(&state.git_common_dir)
+        || git_text(&candidate, &["rev-parse", "HEAD"])? != state.starting_head
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate Git identity differs from patch authority".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn development_evidence_reference(
+    run: &seaf_core::LoopRun,
+) -> Result<ArtifactReference, CandidateWorkspaceError> {
+    let record = run
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::Development)
+        .ok_or_else(|| {
+            CandidateWorkspaceError::State("LoopRun has no Development step".to_string())
+        })?;
+    if record.status != seaf_core::LoopStepStatus::Completed {
+        return Err(CandidateWorkspaceError::State(
+            "candidate patch application requires completed Development evidence".to_string(),
+        ));
+    }
+    match (&record.artifact_path, &record.artifact_digest) {
+        (Some(path), Some(digest)) => Ok(ArtifactReference {
+            path: path.clone(),
+            digest: digest.clone(),
+        }),
+        _ => Err(CandidateWorkspaceError::State(
+            "candidate patch application requires authoritative Development evidence".to_string(),
+        )),
+    }
+}
+
+fn authoritative_policy_decision(
+    run: &seaf_core::LoopRun,
+    evidence: &DevelopmentEvidence,
+) -> Result<PolicyDecision, CandidateWorkspaceError> {
+    let mut matching = run.policy_decisions.iter().filter(|entry| {
+        entry.get("patch_id").and_then(serde_json::Value::as_str) == Some(run.run_id.as_str())
+    });
+    let entry = matching.next().ok_or_else(|| {
+        CandidateWorkspaceError::State(
+            "Development evidence is missing its authoritative policy decision".to_string(),
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(CandidateWorkspaceError::State(
+            "Development evidence has multiple authoritative policy decisions".to_string(),
+        ));
+    }
+    let decision: PolicyDecision = serde_json::from_value(
+        serde_json::to_value(entry)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?,
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if decision != evidence.policy_decision {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "Development evidence policy decision differs from authoritative run state".to_string(),
+        ));
+    }
+    Ok(decision)
+}
+
+fn plan_candidate_patch(
+    workspace: &LoopWorkspace,
+    candidate: &CandidateWorkspaceState,
+    evidence: &DevelopmentEvidence,
+) -> Result<CandidatePatchPlan, CandidateWorkspaceError> {
+    let index_path = unique_patch_plan_index(workspace.run_directory())?;
+    let candidate_path = Path::new(&candidate.path);
+    let result = (|| {
+        git_success_with_index(candidate_path, &["read-tree", "HEAD"], &index_path)?;
+        git_apply_cached(
+            candidate_path,
+            &evidence.patch,
+            Some(&index_path),
+            &evidence.changed_paths,
+        )?;
+        let expected_tree = git_text_with_index(candidate_path, &["write-tree"], &index_path)?;
+        validate_object_id(&expected_tree, "planned candidate tree")?;
+        let expected_diff = git_bytes_with_index(
+            candidate_path,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+            ],
+            &index_path,
+        )?;
+        if expected_tree == candidate.starting_tree || expected_diff.is_empty() {
+            return Err(CandidateWorkspaceError::Mismatch(
+                "Development patch produced no candidate tree transition".to_string(),
+            ));
+        }
+        Ok(CandidatePatchPlan {
+            expected_tree,
+            expected_diff,
+        })
+    })();
+    match fs::remove_file(&index_path) {
+        Ok(()) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
+        Err(error) => Err(CandidateWorkspaceError::Io(error)),
+    }
+}
+
+fn unique_patch_plan_index(run_directory: &Path) -> Result<PathBuf, CandidateWorkspaceError> {
+    loop {
+        let sequence = PATCH_PLAN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = run_directory.join(format!(
+            ".candidate-patch-plan.index-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => continue,
+            Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+        }
+    }
+}
+
+fn validate_patch_intent(
+    workspace: &LoopWorkspace,
+    run: &seaf_core::LoopRun,
+    candidate: &CandidateWorkspaceState,
+    development_reference: &ArtifactReference,
+    evidence: &DevelopmentEvidence,
+    policy: &PolicyDecision,
+    intent: &CandidatePatchIntent,
+) -> Result<(), CandidateWorkspaceError> {
+    let expected_policy_digest = canonical_sha256_digest(policy)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if intent.schema_version != 1
+        || intent.run_id != run.run_id
+        || intent.candidate_path != candidate.path
+        || intent.source_worktree_root != candidate.source_worktree_root
+        || intent.git_common_dir != candidate.git_common_dir
+        || intent.repository_identity_digest != candidate.repository_identity_digest
+        || intent.starting_head != candidate.starting_head
+        || intent.starting_tree != candidate.starting_tree
+        || &intent.development_evidence != development_reference
+        || intent.patch_digest != evidence.patch_digest
+        || intent.policy_decision_digest != expected_policy_digest
+        || intent.changed_paths != evidence.changed_paths
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch intent differs from authoritative run, candidate, Development, or policy evidence"
+                .to_string(),
+        ));
+    }
+    validate_object_id(&intent.expected_candidate_tree, "expected candidate tree")?;
+    validate_digest(
+        &intent.expected_candidate_diff.digest,
+        "expected candidate diff",
+    )?;
+    let expected_diff = load_artifact_bytes(workspace, &intent.expected_candidate_diff)?;
+    if expected_diff.is_empty() {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch intent expected diff is empty".to_string(),
+        ));
+    }
+    let plan = plan_candidate_patch(workspace, candidate, evidence)?;
+    if plan.expected_tree != intent.expected_candidate_tree || plan.expected_diff != expected_diff {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch intent does not derive from the authoritative Development patch"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_applied_patch_evidence(
+    workspace: &LoopWorkspace,
+    run: &seaf_core::LoopRun,
+    candidate: &CandidateWorkspaceState,
+    transaction: &CandidatePatchTransaction,
+    intent: &CandidatePatchIntent,
+) -> Result<(), CandidateWorkspaceError> {
+    if transaction.phase != CandidatePatchPhase::Applied {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch evidence is not in Applied phase".to_string(),
+        ));
+    }
+    let reference = transaction.applied_evidence.as_ref().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "Applied candidate transaction has no applied evidence".to_string(),
+        )
+    })?;
+    let evidence: CandidatePatchAppliedEvidence = load_canonical_artifact(workspace, reference)?;
+    if evidence.schema_version != 1
+        || evidence.run_id != run.run_id
+        || evidence.intent != transaction.intent
+        || evidence.observed_candidate_tree != candidate.candidate_tree
+        || evidence.observed_candidate_tree != intent.expected_candidate_tree
+        || evidence.observed_candidate_diff.digest != candidate.candidate_diff_digest
+        || evidence.observed_candidate_diff.digest != intent.expected_candidate_diff.digest
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "Applied candidate evidence differs from its run, intent, tree, or diff authority"
+                .to_string(),
+        ));
+    }
+    let expected_diff = load_artifact_bytes(workspace, &intent.expected_candidate_diff)?;
+    let observed_diff = load_artifact_bytes(workspace, &evidence.observed_candidate_diff)?;
+    if observed_diff != expected_diff || staged_diff(Path::new(&candidate.path))? != observed_diff {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "Applied candidate staged diff bytes differ from immutable intent evidence".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_planned_candidate_patch(
+    candidate: &CandidateWorkspaceState,
+    evidence: &DevelopmentEvidence,
+    intent: &CandidatePatchIntent,
+) -> Result<(), CandidateWorkspaceError> {
+    let candidate_path = Path::new(&candidate.path);
+    let current_tree = git_text(candidate_path, &["write-tree"])?;
+    if current_tree == candidate.starting_tree {
+        verify_worktree_matches_index(candidate_path)?;
+        git_apply_cached(
+            candidate_path,
+            &evidence.patch,
+            None,
+            &evidence.changed_paths,
+        )?;
+    } else if current_tree != intent.expected_candidate_tree {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate index is neither pristine nor the exact planned patch state".to_string(),
+        ));
+    }
+    let planned_diff = staged_diff(candidate_path)?;
+    if sha256_bytes(&planned_diff) != intent.expected_candidate_diff.digest {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate staged diff differs from immutable patch intent".to_string(),
+        ));
+    }
+    raw_rematerialize_changed_paths(candidate_path, &evidence.changed_paths)?;
+    verify_worktree_matches_index(candidate_path)?;
+    let untracked = git_bytes(candidate_path, &["ls-files", "--others", "-z"])?;
+    if !untracked.is_empty() {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate contains untracked files after patch materialization".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn raw_rematerialize_changed_paths(
+    candidate: &Path,
+    changed_paths: &[String],
+) -> Result<(), CandidateWorkspaceError> {
+    let changed = changed_paths
+        .iter()
+        .map(|path| index_relative_path(path.as_bytes()))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let mut removals = changed.iter().cloned().collect::<Vec<_>>();
+    removals.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| right.cmp(left))
+    });
+    for relative in &removals {
+        let path = candidate.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+                fs::remove_file(path)?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                fs::remove_dir(&path).map_err(|error| {
+                    CandidateWorkspaceError::Mismatch(format!(
+                        "changed candidate directory is not empty and cannot be safely replaced: {}: {error}",
+                        relative.display()
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                return Err(CandidateWorkspaceError::Unsafe(format!(
+                    "changed candidate path has an unsupported file type: {}",
+                    relative.display()
+                )));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+        }
+    }
+    let entries = load_index_entries(candidate)?
+        .into_iter()
+        .filter(|entry| {
+            index_relative_path(&entry.path)
+                .map(|path| changed.contains(&path))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    stream_index_blobs(candidate, &entries, |entry, size, reader| {
+        materialize_index_entry(candidate, entry, size, reader)
+    })
+}
+
+fn staged_diff(candidate: &Path) -> Result<Vec<u8>, CandidateWorkspaceError> {
+    git_bytes(
+        candidate,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    )
+}
+
+fn write_create_only_artifact(
+    workspace: &LoopWorkspace,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<ArtifactReference, CandidateWorkspaceError> {
+    safe_artifact_relative_path(relative)?;
+    let artifact_dir = workspace.run_directory().join(ARTIFACTS_DIR);
+    let artifact_dir_created = match fs::symlink_metadata(&artifact_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CandidateWorkspaceError::Unsafe(
+                "candidate artifact directory is not a real directory".to_string(),
+            ));
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&artifact_dir)?;
+            true
+        }
+        Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+    };
+    if artifact_dir_created {
+        fs::File::open(workspace.run_directory())?.sync_all()?;
+    }
+    let digest = sha256_bytes(bytes);
+    publish_create_only(workspace.run_directory(), relative, bytes)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    Ok(ArtifactReference {
+        path: relative.to_string(),
+        digest,
+    })
+}
+
+fn load_canonical_artifact<T>(
+    workspace: &LoopWorkspace,
+    reference: &ArtifactReference,
+) -> Result<T, CandidateWorkspaceError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let bytes = load_artifact_bytes(workspace, reference)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if canonical_json_bytes(&value)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?
+        != bytes
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate evidence artifact is not canonical JSON".to_string(),
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| CandidateWorkspaceError::State(error.to_string()))
+}
+
+fn load_artifact_bytes(
+    workspace: &LoopWorkspace,
+    reference: &ArtifactReference,
+) -> Result<Vec<u8>, CandidateWorkspaceError> {
+    validate_digest(&reference.digest, "candidate artifact")?;
+    safe_artifact_relative_path(&reference.path)?;
+    let bytes = read_verified_regular_file(
+        workspace.run_directory(),
+        &reference.path,
+        "candidate artifact",
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if sha256_bytes(&bytes) != reference.digest {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate artifact digest mismatch".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn safe_artifact_relative_path(relative: &str) -> Result<PathBuf, CandidateWorkspaceError> {
+    let path = Path::new(relative);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || path
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            != Some(ARTIFACTS_DIR)
+    {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate artifact path is not a safe artifacts-relative path".to_string(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
 
 pub fn create_candidate_workspace(
     run_directory: &Path,
@@ -124,6 +844,7 @@ fn create_candidate_workspace_locked(
             candidate_head: starting_head.clone(),
             candidate_tree: starting_tree.clone(),
             candidate_diff_digest: sha256_bytes(&[]),
+            patch_transaction: None,
             lifecycle: CandidateWorkspaceLifecycle::Active,
             cleanup_started_at: None,
             cleaned_at: None,
@@ -604,6 +1325,7 @@ fn adopt_existing_candidate(
         candidate_head: starting_head.to_string(),
         candidate_tree: starting_tree.to_string(),
         candidate_diff_digest: sha256_bytes(&[]),
+        patch_transaction: None,
         lifecycle: CandidateWorkspaceLifecycle::Active,
         cleanup_started_at: None,
         cleaned_at: None,
@@ -784,6 +1506,159 @@ fn git_success(worktree: &Path, args: &[&str]) -> Result<(), CandidateWorkspaceE
         )));
     }
     Ok(())
+}
+
+fn git_success_with_index(
+    worktree: &Path,
+    args: &[&str],
+    index_path: &Path,
+) -> Result<(), CandidateWorkspaceError> {
+    let output = sanitized_git_command()
+        .args(args)
+        .env("GIT_INDEX_FILE", index_path)
+        .current_dir(worktree)
+        .output()
+        .map_err(CandidateWorkspaceError::Io)?;
+    if !output.status.success() {
+        return Err(CandidateWorkspaceError::Git(format!(
+            "git {} with private index failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn git_text_with_index(
+    worktree: &Path,
+    args: &[&str],
+    index_path: &Path,
+) -> Result<String, CandidateWorkspaceError> {
+    let bytes = git_bytes_with_index(worktree, args, index_path)?;
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| CandidateWorkspaceError::Git(format!("Git output was not UTF-8: {error}")))
+}
+
+fn git_bytes_with_index(
+    worktree: &Path,
+    args: &[&str],
+    index_path: &Path,
+) -> Result<Vec<u8>, CandidateWorkspaceError> {
+    let output = sanitized_git_command()
+        .args(args)
+        .env("GIT_INDEX_FILE", index_path)
+        .current_dir(worktree)
+        .output()
+        .map_err(CandidateWorkspaceError::Io)?;
+    if !output.status.success() {
+        return Err(CandidateWorkspaceError::Git(format!(
+            "git {} with private index failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn git_apply_cached(
+    worktree: &Path,
+    patch: &str,
+    index_path: Option<&Path>,
+    changed_paths: &[String],
+) -> Result<(), CandidateWorkspaceError> {
+    let overrides = filter_driver_overrides(worktree, changed_paths)?;
+    let mut command = sanitized_git_command();
+    for (key, value) in &overrides {
+        command.arg("-c").arg(format!("{key}={value}"));
+    }
+    command
+        .args(["apply", "--cached", "--whitespace=nowarn", "-"])
+        .current_dir(worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(index_path) = index_path {
+        command.env("GIT_INDEX_FILE", index_path);
+    }
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        CandidateWorkspaceError::Git("git apply stdin was unavailable".to_string())
+    })?;
+    stdin.write_all(patch.as_bytes())?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(CandidateWorkspaceError::Git(format!(
+            "git apply --cached failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn filter_driver_overrides(
+    worktree: &Path,
+    changed_paths: &[String],
+) -> Result<Vec<(String, String)>, CandidateWorkspaceError> {
+    if changed_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = sanitized_git_command()
+        .args(["check-attr", "-z", "filter", "--"])
+        .args(changed_paths)
+        .current_dir(worktree)
+        .output()?;
+    if !output.status.success() {
+        return Err(CandidateWorkspaceError::Git(format!(
+            "git check-attr filter failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let fields = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() % 3 != 0 {
+        return Err(CandidateWorkspaceError::Git(
+            "git check-attr returned malformed filter metadata".to_string(),
+        ));
+    }
+    let mut drivers = Vec::new();
+    for triple in fields.chunks_exact(3) {
+        if triple[1] != b"filter" {
+            return Err(CandidateWorkspaceError::Git(
+                "git check-attr returned unexpected attribute metadata".to_string(),
+            ));
+        }
+        let value = std::str::from_utf8(triple[2]).map_err(|_| {
+            CandidateWorkspaceError::Unsafe("filter driver name is not UTF-8".to_string())
+        })?;
+        if matches!(value, "unspecified" | "unset" | "set") {
+            continue;
+        }
+        if value.is_empty()
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+        {
+            return Err(CandidateWorkspaceError::Unsafe(
+                "filter driver name is unsafe for isolated configuration".to_string(),
+            ));
+        }
+        if !drivers.iter().any(|driver| driver == value) {
+            drivers.push(value.to_string());
+        }
+    }
+    let mut overrides = Vec::new();
+    for driver in drivers {
+        overrides.push((format!("filter.{driver}.clean"), String::new()));
+        overrides.push((format!("filter.{driver}.smudge"), String::new()));
+        overrides.push((format!("filter.{driver}.process"), String::new()));
+        overrides.push((format!("filter.{driver}.required"), "false".to_string()));
+    }
+    Ok(overrides)
 }
 
 #[derive(Debug)]
@@ -1252,12 +2127,27 @@ fn validate_bound_evidence(state: &CandidateWorkspaceState) -> Result<(), Candid
         ));
     }
     let empty = sha256_bytes(&[]);
-    if state.candidate_tree == state.starting_tree && state.candidate_diff_digest == empty {
-        Ok(())
-    } else {
-        Err(CandidateWorkspaceError::Mismatch(
-            "M1-05a candidate evidence must bind the starting tree and empty diff".to_string(),
-        ))
+    match state
+        .patch_transaction
+        .as_ref()
+        .map(|transaction| transaction.phase)
+    {
+        None | Some(CandidatePatchPhase::Applying)
+            if state.candidate_tree == state.starting_tree
+                && state.candidate_diff_digest == empty =>
+        {
+            Ok(())
+        }
+        Some(CandidatePatchPhase::Applied)
+            if state.candidate_tree != state.starting_tree
+                && state.candidate_diff_digest != empty =>
+        {
+            Ok(())
+        }
+        _ => Err(CandidateWorkspaceError::Mismatch(
+            "candidate parent tree/diff evidence does not match its patch transaction phase"
+                .to_string(),
+        )),
     }
 }
 
@@ -1382,6 +2272,7 @@ mod tests {
         });
         run.status = LoopStatus::Completed;
         run.candidate_workspace = Some(candidate.clone());
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
         crate::state::save_run(&workspace, &run).expect("run");
 
         let error = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
@@ -1460,6 +2351,7 @@ mod tests {
         });
         run.status = LoopStatus::Completed;
         run.candidate_workspace = Some(candidate.clone());
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
         crate::state::save_run(&workspace, &run).expect("run");
 
         let error = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
@@ -1487,6 +2379,332 @@ mod tests {
             &source,
             &["worktree", "remove", "--force", candidate.path.as_str()],
         );
+    }
+
+    #[test]
+    fn candidate_application_stale_pre_intent_cas_keeps_candidate_pristine() {
+        let fixture = application_fixture("application-stale-cas");
+        let error = apply_candidate_development_evidence_with_hook(
+            &fixture.workspace,
+            &fixture.source,
+            |phase| {
+                if phase == CandidatePatchApplicationPhase::BeforeApplyingPersisted {
+                    let mut concurrent = crate::state::load_run(&fixture.workspace)
+                        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+                    concurrent.updated_at = "concurrent-application-change".to_string();
+                    crate::state::write_run_file(&fixture.workspace.run_file(), &concurrent)
+                        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("stale Applying CAS must fail");
+        assert!(error.to_string().contains("compare-and-swap"), "{error}");
+        let run = crate::state::load_run(&fixture.workspace).expect("concurrent run");
+        assert!(run
+            .candidate_workspace
+            .as_ref()
+            .unwrap()
+            .patch_transaction
+            .is_none());
+        assert_eq!(
+            git_text(Path::new(&fixture.candidate.path), &["write-tree"]).unwrap(),
+            fixture.candidate.starting_tree
+        );
+        assert_eq!(
+            fs::read(Path::new(&fixture.candidate.path).join("tracked.txt")).unwrap(),
+            b"source\n"
+        );
+        assert!(fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_INTENT_PATH)
+            .is_file());
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_APPLIED_EVIDENCE_PATH)
+            .exists());
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn candidate_patch_planning_skips_an_orphaned_private_index_name() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sequence = PATCH_PLAN_SEQUENCE.load(Ordering::Relaxed);
+        let orphan = temp.path().join(format!(
+            ".candidate-patch-plan.index-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::write(&orphan, b"orphan").expect("orphaned index");
+
+        let reserved = unique_patch_plan_index(temp.path()).expect("unique planning index");
+
+        assert_ne!(reserved, orphan);
+        assert!(!reserved.exists());
+        assert_eq!(fs::read(orphan).unwrap(), b"orphan");
+    }
+
+    #[test]
+    fn raw_directory_transition_refuses_unrelated_contents() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(temp.path().join("directory")).expect("directory");
+        fs::write(temp.path().join("directory/changed.txt"), b"changed").expect("changed child");
+        fs::write(temp.path().join("directory/unrelated.txt"), b"unrelated")
+            .expect("unrelated child");
+
+        let error = raw_rematerialize_changed_paths(
+            temp.path(),
+            &["directory/changed.txt".to_string(), "directory".to_string()],
+        )
+        .expect_err("unrelated directory contents must fail closed");
+
+        assert!(error.to_string().contains("not empty"), "{error}");
+        assert_eq!(
+            fs::read(temp.path().join("directory/unrelated.txt")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    #[test]
+    fn candidate_application_recovers_from_each_real_publication_cut() {
+        let before_index = application_fixture("application-before-index");
+        let error = apply_candidate_development_evidence_with_hook(
+            &before_index.workspace,
+            &before_index.source,
+            |phase| {
+                if phase == CandidatePatchApplicationPhase::ApplyingPersisted {
+                    return Err(CandidateWorkspaceError::State(
+                        "injected before index mutation".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("inject before index mutation");
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert_applying_without_future_evidence(&before_index, false);
+        let recovered =
+            apply_candidate_development_evidence(&before_index.workspace, &before_index.source)
+                .expect("recover pristine Applying");
+        assert_eq!(
+            recovered.patch_transaction.as_ref().unwrap().phase,
+            CandidatePatchPhase::Applied
+        );
+        before_index.cleanup();
+
+        let after_materialize = application_fixture("application-after-materialize");
+        let error = apply_candidate_development_evidence_with_hook(
+            &after_materialize.workspace,
+            &after_materialize.source,
+            |phase| {
+                if phase == CandidatePatchApplicationPhase::Materialized {
+                    return Err(CandidateWorkspaceError::State(
+                        "injected after materialization".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("inject after materialization");
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert_applying_without_future_evidence(&after_materialize, true);
+        apply_candidate_development_evidence(
+            &after_materialize.workspace,
+            &after_materialize.source,
+        )
+        .expect("recover exact materialized Applying");
+        after_materialize.cleanup();
+
+        let after_applied = application_fixture("application-after-applied");
+        let error = apply_candidate_development_evidence_with_hook(
+            &after_applied.workspace,
+            &after_applied.source,
+            |phase| {
+                if phase == CandidatePatchApplicationPhase::AppliedPersisted {
+                    return Err(CandidateWorkspaceError::State(
+                        "injected after Applied publication".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("inject after Applied publication");
+        assert!(error.to_string().contains("injected"), "{error}");
+        let applied_run = crate::state::load_run(&after_applied.workspace).expect("Applied run");
+        assert_eq!(
+            applied_run
+                .candidate_workspace
+                .as_ref()
+                .unwrap()
+                .patch_transaction
+                .as_ref()
+                .unwrap()
+                .phase,
+            CandidatePatchPhase::Applied
+        );
+        assert!(after_applied
+            .workspace
+            .run_directory()
+            .join(PATCH_APPLIED_EVIDENCE_PATH)
+            .is_file());
+        apply_candidate_development_evidence(&after_applied.workspace, &after_applied.source)
+            .expect("replay exact Applied publication");
+        after_applied.cleanup();
+    }
+
+    struct ApplicationFixture {
+        _temp: tempfile::TempDir,
+        source: PathBuf,
+        workspace: LoopWorkspace,
+        candidate: CandidateWorkspaceState,
+    }
+
+    impl ApplicationFixture {
+        fn cleanup(self) {
+            test_git(
+                &self.source,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    self.candidate.path.as_str(),
+                ],
+            );
+        }
+    }
+
+    fn application_fixture(run_id: &str) -> ApplicationFixture {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).expect("source");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "seaf@example.invalid"],
+            vec!["config", "user.name", "SEAF Test"],
+        ] {
+            test_git(&source, &args);
+        }
+        fs::write(source.join("tracked.txt"), "source\n").expect("tracked");
+        test_git(&source, &["add", "tracked.txt"]);
+        test_git(&source, &["commit", "-qm", "initial"]);
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), run_id).expect("workspace");
+        let repository_identity_digest = sha256_bytes(source.as_os_str().as_encoded_bytes());
+        let candidate = create_candidate_workspace(
+            workspace.run_directory(),
+            &source,
+            &repository_identity_digest,
+        )
+        .expect("candidate");
+        let mut run = crate::state::create_run(crate::state::NewLoopRun {
+            run_id: run_id.to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "goal".to_string(),
+            provider: "fake".to_string(),
+            model: "model".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "1".repeat(64),
+                policy: "2".repeat(64),
+                config: "3".repeat(64),
+                repository: repository_identity_digest,
+            },
+        });
+        run.status = LoopStatus::Running;
+        run.current_step = LoopStepName::Development;
+        run.candidate_workspace = Some(candidate.clone());
+        run.execution_mode = LoopExecutionMode::IsolatedCandidate;
+        let patch = "diff --git a/tracked.txt b/tracked.txt\nindex 1f7391f..39c5733 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-source\n+candidate\n";
+        let decision = PolicyDecision {
+            patch_id: run_id.to_string(),
+            patch_sha256: crate::patch_digest(patch),
+            changed_paths: vec!["tracked.txt".to_string()],
+            decision: PatchDecisionKind::Allowed,
+            reasons: Vec::new(),
+            requires_human_review: false,
+            apply_requested: false,
+            applied: false,
+        };
+        let evidence = DevelopmentEvidence::new(
+            run_id,
+            crate::DeveloperResponse {
+                role: crate::Role::Developer,
+                status: crate::DeveloperStatus::PatchProposed,
+                summary: "candidate patch".to_string(),
+                changed_files: vec!["tracked.txt".to_string()],
+                requires_human_review: false,
+                patch: Some(patch.to_string()),
+                context_request: None,
+            },
+            patch,
+            decision.clone(),
+        )
+        .expect("evidence");
+        fs::create_dir_all(workspace.run_directory().join(ARTIFACTS_DIR)).expect("artifacts");
+        let evidence_path = "artifacts/05-development.json";
+        fs::write(
+            workspace.run_directory().join(evidence_path),
+            evidence.canonical_bytes().expect("canonical evidence"),
+        )
+        .expect("evidence artifact");
+        let development = run
+            .steps
+            .iter_mut()
+            .find(|step| step.name == LoopStepName::Development)
+            .unwrap();
+        development.artifact_path = Some(evidence_path.to_string());
+        development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
+        development.status = seaf_core::LoopStepStatus::Completed;
+        run.current_step = LoopStepName::OutputReview;
+        run.policy_decisions
+            .push(serde_json::from_value(serde_json::to_value(decision).unwrap()).unwrap());
+        crate::state::save_run(&workspace, &run).expect("run");
+        ApplicationFixture {
+            _temp: temp,
+            source,
+            workspace,
+            candidate,
+        }
+    }
+
+    fn assert_applying_without_future_evidence(fixture: &ApplicationFixture, materialized: bool) {
+        let run = crate::state::load_run(&fixture.workspace).expect("Applying run");
+        let candidate = run.candidate_workspace.as_ref().unwrap();
+        assert_eq!(
+            candidate.patch_transaction.as_ref().unwrap().phase,
+            CandidatePatchPhase::Applying
+        );
+        assert_eq!(candidate.candidate_tree, candidate.starting_tree);
+        assert_eq!(candidate.candidate_diff_digest, sha256_bytes(&[]));
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["write-tree"]).unwrap()
+                != candidate.starting_tree,
+            materialized
+        );
+        assert_eq!(
+            fs::read(Path::new(&candidate.path).join("tracked.txt")).unwrap() == b"candidate\n",
+            materialized
+        );
+        assert!(fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_INTENT_PATH)
+            .is_file());
+        assert!(fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_EXPECTED_DIFF_PATH)
+            .is_file());
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_APPLIED_DIFF_PATH)
+            .exists());
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join(PATCH_APPLIED_EVIDENCE_PATH)
+            .exists());
     }
 
     fn test_git(path: &Path, args: &[&str]) {

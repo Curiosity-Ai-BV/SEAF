@@ -23,8 +23,8 @@ pub use bench::{
     AgentBenchFixture, AgentBenchResult, AgentBenchSummary, BenchError, ZeroToleranceError,
 };
 pub use candidate_workspace::{
-    cleanup_candidate_workspace, create_candidate_workspace, validate_candidate_workspace,
-    CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
+    apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
+    validate_candidate_workspace, CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
 };
 pub use context::{
     pack_context, pack_context_for_ticket, pack_live_context, ContextBundle, ContextError,

@@ -769,11 +769,77 @@ same-user directory-entry races remain M1-10/M1-11 hardening scope.
 
 ### M1-05b - Candidate Provider And CLI Integration
 
-Status: active. Dependencies: M1-05a (complete).
+Status: active. Dependencies: M1-05a (complete). Split into four reviewable
+boundaries: M1-05b1 is complete and M1-05b2 is active.
 
 Roadmap: U3. Dependencies: M1-04b.
 
 Objective: apply and inspect the candidate outside the user's source checkout.
+
+#### M1-05b1 - Indexed Candidate Patch Transaction
+
+Status: complete on 2026-07-12. Dependencies: M1-05a.
+
+- `LoopExecutionMode` defaults old runs to `legacy_proposal_only`; only explicit
+  `isolated_candidate` runs may carry candidate authority. A narrow decode
+  migration recognizes pre-B1 M1-05a runs that already carried candidate state
+  without the new mode and reserializes them explicitly as isolated.
+- A closed, versioned candidate patch transaction binds immutable canonical
+  Development evidence, policy digest, changed paths, planned index tree, and
+  expected staged-diff bytes. `Applying` is durably published by full-LoopRun
+  compare-and-swap before the real candidate index changes; `Applied` binds the
+  exact observed tree and create-only staged-diff evidence.
+- Recovery accepts only the pristine pre-apply state or the exact planned
+  staged state. It recomputes the plan from authoritative Development evidence,
+  rejects partial/coherent substitution, and validates exact Applied evidence
+  on replay.
+- Indexed application uses a private planning index and the real candidate
+  index, then raw-rematerializes only changed paths from exact index objects.
+  This preserves executable, delete, symlink, ident, and filter-independent raw
+  semantics without touching the source checkout.
+- Candidate artifacts use the shared atomic create-only publisher with file and
+  parent-directory durability. Unique private planning indexes ensure a crash
+  orphan cannot block retry. Real fault cuts cover stale pre-intent CAS,
+  durable Applying before index mutation, materialized Applying before Applied
+  evidence, and post-Applied replay.
+- Materialization requires completed Development evidence on a running LoopRun.
+  Exact file-to-directory and directory-to-file transitions are supported;
+  unrelated directory contents fail closed.
+- Allowed and RequiresHumanReview decisions may materialize in the isolated
+  candidate. Rejected or already-applied policy evidence cannot mutate it;
+  `apply_requested` remains audit-only.
+
+Verification: 31 candidate lifecycle/transaction integration tests, 6 focused
+candidate fault/unit tests, 33 core tests, 22 provider-exchange tests, 38
+provider-step tests, and the full locked Rust workspace. Existing full-CAS
+fault tests continue to prove stale candidate publication cannot replace newer
+authoritative run state.
+
+Commit boundary: typed execution/transaction authority and candidate-only
+indexed materialization; no provider, CLI, approval, eval, or promotion wiring.
+
+#### M1-05b2 - Provider Start And Resume Candidate Authority
+
+Status: active. Dependencies: M1-05b1.
+
+Create and atomically persist the exact candidate before context, provider, or
+log side effects. Resume must validate that authority before mutation and route
+initial/additive repository context through the candidate.
+
+#### M1-05b3 - Development And Output-Review Integration
+
+Status: pending. Dependencies: M1-05b2.
+
+Wire policy-gated Development evidence into the candidate transaction and make
+OutputReview consume the verified candidate tree/diff evidence.
+
+#### M1-05b4 - Explicit Candidate Cleanup CLI
+
+Status: pending. Dependencies: M1-05b3.
+
+Expose explicit cleanup through the existing authoritative
+Active-to-Cleaning-to-Cleaned primitive and close end-to-end source immutability
+coverage.
 
 Acceptance criteria:
 

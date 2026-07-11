@@ -1554,10 +1554,12 @@ mod tests {
             candidate_tree: "f".repeat(40),
             candidate_diff_digest:
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            patch_transaction: None,
             lifecycle: CandidateWorkspaceLifecycle::Active,
             cleanup_started_at: None,
             cleaned_at: None,
         });
+        authoritative.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
         state::save_run(&workspace, &authoritative).expect("authoritative run");
         crate::artifacts::write_step_request(&workspace, LoopStepName::Research, 1, "research")
             .expect("conventional request");
