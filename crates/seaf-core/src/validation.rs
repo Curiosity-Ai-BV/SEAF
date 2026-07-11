@@ -373,6 +373,11 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         "input_digests.config",
         &run.input_digests.config,
     );
+    validate_lowercase_sha256_digest(
+        &mut errors,
+        "input_digests.repository",
+        &run.input_digests.repository,
+    );
     require_non_empty(&mut errors, "started_at", &run.started_at);
     require_non_empty(&mut errors, "updated_at", &run.updated_at);
 
@@ -1098,6 +1103,7 @@ unexpected_escape: true
         let run = load_loop_run_file(&run_path).expect("loop run fixture should load");
 
         assert_eq!(run.run_id, "loop_20260701_001");
+        assert_eq!(run.input_digests.repository, "d".repeat(64));
         assert!(validate_loop_run(&run).is_empty());
     }
 
@@ -1144,7 +1150,8 @@ unexpected_escape: true
   "input_digests": {
     "ticket": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "policy": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccc"
+    "config": "cccc",
+    "repository": "dddd"
   },
   "status": "running",
   "current_step": "development",
@@ -1162,6 +1169,7 @@ unexpected_escape: true
         assert!(fields.contains(&"input_digests.ticket"));
         assert!(fields.contains(&"input_digests.policy"));
         assert!(fields.contains(&"input_digests.config"));
+        assert!(fields.contains(&"input_digests.repository"));
     }
 
     #[test]
@@ -1176,7 +1184,8 @@ unexpected_escape: true
   "input_digests": {
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "status": "running",
   "current_step": "development",
@@ -1223,7 +1232,8 @@ unexpected_escape: true
   "input_digests": {
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "status": "running",
   "current_step": "development",
@@ -1259,7 +1269,8 @@ unexpected_escape: true
   "input_digests": {
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "status": "running",
   "current_step": "development",

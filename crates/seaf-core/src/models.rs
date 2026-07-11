@@ -372,6 +372,7 @@ pub struct LoopInputDigests {
     pub ticket: String,
     pub policy: String,
     pub config: String,
+    pub repository: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

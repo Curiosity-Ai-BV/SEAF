@@ -9,8 +9,8 @@
 
 - [x] M1-01a: Project configuration and input digest contracts.
 - [x] M1-01b: Authoritative configuration discovery and snapshots.
-- [ ] M1-02: Resume configuration integrity (active).
-- [ ] M1-03: Validated role artifact chain.
+- [x] M1-02: Resume configuration integrity.
+- [ ] M1-03: Validated role artifact chain (active).
 - [ ] M1-04: Bounded additional context.
 - [ ] M1-05: Isolated candidate workspace.
 - [ ] M1-06: Human approval state.
@@ -42,5 +42,5 @@
 
 ## Current Gate
 
-M1-01b is complete. M1-02 is the next dependency-ready slice. Milestone 1
-remains active; resume digest enforcement has not started.
+M1-02 is complete. M1-03 is the next dependency-ready slice. Milestone 1
+remains active; validated role artifact dataflow has not started.

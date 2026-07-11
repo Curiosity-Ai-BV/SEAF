@@ -74,10 +74,15 @@ An explicit config is always loaded and validated even when `--policy`
 overrides its policy choice.
 
 Before the first provider request, the run writes canonical effective
-`ticket.json`, `policy.json`, and `config.json` snapshots under `inputs/`. The
-three SHA-256 values in `run.json` digest those exact typed inputs. The effective
-config snapshot records the winning policy path for explicit-policy and
-root-policy fallback runs as well as config-backed runs.
+`ticket.json`, `policy.json`, `config.json`, and `repository.json` snapshots
+under `inputs/`. The four SHA-256 values in `run.json` digest those exact typed
+inputs. The repository identity digest and snapshot bind the canonical worktree
+root and Git common directory. The effective config snapshot records the
+winning policy path for explicit-policy and root-policy fallback runs as well
+as config-backed runs.
+
+M1-02 resume configuration integrity is complete. M1-03 validated role artifact
+dataflow is the next dependency-ready slice.
 
 ## Failed-Run Recovery
 
@@ -95,12 +100,21 @@ open next. For a failed run, inspect `log.md`, the failed step response under
 Resume only after the blocker is understood:
 
 ```bash
-cargo run -p seaf-cli -- loop resume --run-id p2-011-demo --json
+cargo run -p seaf-cli -- loop resume --run-id p2-011-demo --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --json
 ```
 
 `loop resume` validates the persisted `run.json` before scaffolding or mutating
 a workspace. Invalid JSON, missing run files, invalid run IDs, and mismatched
-run IDs fail closed.
+run IDs fail closed. An incomplete provider run also requires the original
+ticket and the same effective config/policy authority used by `loop run`. Pass
+matching `--config` or `--policy` arguments when the run used explicit
+authority; discovered Git-root authority needs no extra flag.
+
+Resume canonically verifies all four input snapshots, the four `LoopRun`
+digests, and repository identity before appending the run log, contacting a
+provider, rebuilding context, or applying a patch. Missing, noncanonical,
+tampered, changed, unsafe, or cross-repository inputs are rejected with
+guidance to supply the matching inputs or start a new run.
 
 ## Local Model Smoke
 
@@ -136,6 +150,6 @@ Ollama smoke returned `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
 
 ## Pending Work
 
-New runs now bind their effective inputs. The next production-use slice is
-resume integrity: resuming a provider run must verify those persisted inputs
-before rebuilding provider context or patch-gate state.
+M1-02 resume configuration integrity is complete: incomplete provider resumes
+verify their persisted inputs before rebuilding provider context or patch-gate
+state. M1-03 validated role artifact dataflow is the next production-use slice.

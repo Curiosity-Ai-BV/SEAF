@@ -949,6 +949,18 @@ fn loop_run_persists_canonical_effective_inputs_and_matching_digests() {
         );
         assert_eq!(run["input_digests"][kind], digest);
     }
+    let repository_snapshot =
+        fs::read(run_dir.join("inputs/repository.json")).expect("repository identity snapshot");
+    let repository_identity: serde_json::Value =
+        serde_json::from_slice(&repository_snapshot).expect("repository identity");
+    assert_eq!(
+        repository_snapshot,
+        canonical_json_bytes(&repository_identity).expect("canonical repository identity")
+    );
+    assert_eq!(
+        run["input_digests"]["repository"],
+        canonical_sha256_digest(&repository_identity).expect("repository identity digest")
+    );
 }
 
 #[test]
@@ -1394,6 +1406,416 @@ fn loop_resume_provider_run_rejects_unverifiable_ticket_snapshot() {
         "",
         "unverifiable ticket content must not let resume mutate the worktree"
     );
+}
+
+#[test]
+fn loop_resume_rejects_mutated_same_path_policy_before_any_side_effect() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-mutated-policy";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let policy_path = repo.join("explicit-policy.json");
+    write_policy(&policy_path, &[], &["dependency_changes"]);
+    let base_url = start_fake_ollama_server_sequence(provider_loop_model_responses());
+
+    let run = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &base_url,
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("start explicit-policy run");
+    assert!(run.status.success(), "{run:?}");
+
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    write_policy(
+        &policy_path,
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    let before = read_tree_bytes(&run_dir);
+    let worktree_before = git_status_porcelain(&repo);
+    let (probe, probe_url) = provider_call_probe();
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--base-url",
+            &probe_url,
+        ])
+        .output()
+        .expect("resume with mutated policy");
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("policy") && stderr.contains("start a new run"),
+        "policy mismatch must give actionable recovery guidance, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(git_status_porcelain(&repo), worktree_before);
+    assert_no_provider_call(&probe);
+}
+
+#[test]
+fn loop_resume_rejects_mutated_config_even_when_effective_policy_is_unchanged() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("policies")).expect("policies dir");
+    init_git_repo(&repo);
+    let policy_a = repo.join("policies/a.json");
+    let policy_b = repo.join("policies/b.json");
+    write_policy(&policy_a, &[], &[]);
+    fs::copy(&policy_a, &policy_b).expect("copy identical policy");
+    let config_path = repo.join("seaf.config.json");
+    fs::write(&config_path, r#"{"policy_path":"policies/a.json"}"#).expect("config");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-mutated-config";
+
+    run_fake_provider(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--config", config_path.to_str().unwrap()],
+    );
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    fs::write(&config_path, r#"{"policy_path":"policies/b.json"}"#).expect("mutated config");
+    let before = read_tree_bytes(&run_dir);
+
+    let resume = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--config", config_path.to_str().unwrap()],
+    );
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("config") && stderr.contains("start a new run"),
+        "config mismatch must give actionable recovery guidance, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
+fn loop_resume_rejects_missing_or_noncanonical_input_snapshots_without_mutation() {
+    for case in ["missing-policy", "noncanonical-config"] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        init_git_repo(&repo);
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+        let runs_root = repo.join("runs");
+
+        run_fake_provider(&repo, &ticket_path, &runs_root, case, &[]);
+        let run_dir = runs_root.join(case);
+        mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+        match case {
+            "missing-policy" => {
+                fs::remove_file(run_dir.join("inputs/policy.json")).expect("remove policy snapshot")
+            }
+            "noncanonical-config" => {
+                let path = run_dir.join("inputs/config.json");
+                let mut bytes = fs::read(&path).expect("config snapshot");
+                bytes.push(b'\n');
+                fs::write(path, bytes).expect("tamper config snapshot");
+            }
+            _ => unreachable!(),
+        }
+        let before = read_tree_bytes(&run_dir);
+
+        let resume = resume_provider_run(&repo, &ticket_path, &runs_root, case, &[]);
+
+        assert!(!resume.status.success(), "{case} must fail closed");
+        let stderr = String::from_utf8(resume.stderr).expect("stderr");
+        assert!(
+            stderr.contains("snapshot") && stderr.contains("start a new run"),
+            "{case} must identify an unverifiable snapshot, got {stderr}"
+        );
+        assert_eq!(read_tree_bytes(&run_dir), before);
+    }
+}
+
+#[test]
+fn loop_resume_rejects_input_digest_mismatch_without_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-run-digest-mismatch";
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    let mut run = read_run_json(&run_dir);
+    run["input_digests"]["policy"] = serde_json::json!("0".repeat(64));
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&run).expect("serialize run"),
+    )
+    .expect("write mismatched digest");
+    let before = read_tree_bytes(&run_dir);
+
+    let resume = resume_provider_run(&repo, &ticket_path, &runs_root, run_id, &[]);
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("policy digest") && stderr.contains("start a new run"),
+        "run digest mismatch must be actionable, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
+fn loop_resume_accepts_matching_explicit_policy_authority() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let policy_path = repo.join("explicit-policy.json");
+    write_policy(
+        &policy_path,
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-explicit-policy";
+    let authority = ["--policy", policy_path.to_str().unwrap()];
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &authority);
+    mark_loop_run_pending_from_analysis(&runs_root.join(run_id).join("run.json"));
+
+    let resume = resume_provider_run(&repo, &ticket_path, &runs_root, run_id, &authority);
+
+    assert!(resume.status.success(), "{resume:?}");
+    assert_eq!(
+        read_run_json(&runs_root.join(run_id))["policy_decisions"][0]["decision"],
+        "rejected",
+        "resume must keep using the verified explicit policy"
+    );
+}
+
+#[test]
+fn loop_resume_mocked_ollama_uses_verified_project_policy() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("policies")).expect("policies dir");
+    init_git_repo(&repo);
+    let policy_path = repo.join("policies/reject-smoke.json");
+    write_policy(
+        &policy_path,
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    fs::write(
+        repo.join("seaf.config.json"),
+        r#"{"policy_path":"policies/reject-smoke.json"}"#,
+    )
+    .expect("project config");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-ollama-verified-policy";
+    let initial_url = start_fake_ollama_server_sequence(provider_loop_model_responses());
+    let run = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &initial_url,
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("initial Ollama run");
+    assert!(run.status.success(), "{run:?}");
+    mark_loop_run_pending_from_step(&runs_root.join(run_id).join("run.json"), "development");
+    let resume_url = start_fake_ollama_server_sequence(
+        provider_loop_model_responses()
+            .into_iter()
+            .skip(4)
+            .collect(),
+    );
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--base-url",
+            &resume_url,
+        ])
+        .output()
+        .expect("resume Ollama run");
+
+    assert!(resume.status.success(), "{resume:?}");
+    assert_eq!(
+        read_run_json(&runs_root.join(run_id))["policy_decisions"][0]["decision"],
+        "rejected",
+        "mocked Ollama resume must gate with the verified project policy, not a compiled fallback"
+    );
+}
+
+#[test]
+fn loop_resume_rejects_policy_path_outside_repository_without_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let outside_policy = temp_dir.path().join("outside-policy.json");
+    write_policy(&outside_policy, &[], &[]);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-unsafe-policy";
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    let before = read_tree_bytes(&run_dir);
+
+    let resume = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--policy", outside_policy.to_str().unwrap()],
+    );
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(stderr.contains("outside the git repository"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
+fn loop_resume_rejects_run_copied_to_another_repository_without_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source_repo = temp_dir.path().join("source");
+    let destination_repo = temp_dir.path().join("destination");
+    fs::create_dir_all(&source_repo).expect("source repo");
+    fs::create_dir_all(&destination_repo).expect("destination repo");
+    init_git_repo(&source_repo);
+    init_git_repo(&destination_repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let source_runs = source_repo.join("runs");
+    let destination_runs = destination_repo.join("runs");
+    let run_id = "resume-copied-repository";
+    run_fake_provider(&source_repo, &ticket_path, &source_runs, run_id, &[]);
+    let source_run = source_runs.join(run_id);
+    assert!(
+        source_run.join("inputs/repository.json").is_file(),
+        "new runs must persist repository identity"
+    );
+    mark_loop_run_pending_from_analysis(&source_run.join("run.json"));
+    copy_directory(&source_run, &destination_runs.join(run_id));
+    let destination_run = destination_runs.join(run_id);
+    let before = read_tree_bytes(&destination_run);
+
+    let resume = resume_provider_run(
+        &destination_repo,
+        &ticket_path,
+        &destination_runs,
+        run_id,
+        &[],
+    );
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("repository identity") && stderr.contains("start a new run"),
+        "copied run must explain repository binding, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&destination_run), before);
+}
+
+#[test]
+fn loop_resume_rejects_copied_run_when_repository_snapshot_is_rewritten_for_destination() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source_repo = temp_dir.path().join("source");
+    let destination_repo = temp_dir.path().join("destination");
+    fs::create_dir_all(&source_repo).expect("source repo");
+    fs::create_dir_all(&destination_repo).expect("destination repo");
+    init_git_repo(&source_repo);
+    init_git_repo(&destination_repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let source_runs = source_repo.join("runs");
+    let destination_runs = destination_repo.join("runs");
+    let run_id = "resume-rewritten-repository-snapshot";
+    run_fake_provider(&source_repo, &ticket_path, &source_runs, run_id, &[]);
+    let source_run = source_runs.join(run_id);
+    mark_loop_run_pending_from_analysis(&source_run.join("run.json"));
+    copy_directory(&source_run, &destination_runs.join(run_id));
+    let destination_run = destination_runs.join(run_id);
+    fs::write(
+        destination_run.join("inputs/repository.json"),
+        canonical_json_bytes(&repository_identity_json(&destination_repo))
+            .expect("canonical destination repository identity"),
+    )
+    .expect("rewrite repository snapshot for destination");
+    let before = read_tree_bytes(&destination_run);
+
+    let resume = resume_provider_run(
+        &destination_repo,
+        &ticket_path,
+        &destination_runs,
+        run_id,
+        &[],
+    );
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("repository") && stderr.contains("digest"),
+        "rewritten repository snapshot must not sever the run binding, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&destination_run), before);
 }
 
 #[test]
@@ -3613,6 +4035,145 @@ fn read_run_json(run_dir: &Path) -> serde_json::Value {
         .expect("valid run json")
 }
 
+fn run_fake_provider(
+    repo: &Path,
+    ticket_path: &Path,
+    runs_root: &Path,
+    run_id: &str,
+    extra_args: &[&str],
+) {
+    let mut command = seaf_in(repo);
+    command.args([
+        "loop",
+        "run",
+        "--ticket",
+        ticket_path.to_str().unwrap(),
+        "--runs-root",
+        runs_root.to_str().unwrap(),
+        "--run-id",
+        run_id,
+        "--provider",
+        "fake",
+        "--model",
+        "fake-model",
+        "--allow-dirty",
+    ]);
+    command.args(extra_args);
+    let output = command.output().expect("run fake provider");
+    assert!(output.status.success(), "{output:?}");
+}
+
+fn resume_provider_run(
+    repo: &Path,
+    ticket_path: &Path,
+    runs_root: &Path,
+    run_id: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let mut command = seaf_in(repo);
+    command.args([
+        "loop",
+        "resume",
+        "--ticket",
+        ticket_path.to_str().unwrap(),
+        "--runs-root",
+        runs_root.to_str().unwrap(),
+        "--run-id",
+        run_id,
+    ]);
+    command.args(extra_args);
+    command.output().expect("resume provider run")
+}
+
+fn read_tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read run directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("run directory entries");
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .expect("relative run path")
+                        .to_path_buf(),
+                    fs::read(path).expect("read run file"),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create destination directory");
+    for entry in fs::read_dir(source).expect("read source directory") {
+        let entry = entry.expect("source entry");
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &destination_path);
+        } else {
+            fs::copy(source_path, destination_path).expect("copy run file");
+        }
+    }
+}
+
+fn repository_identity_json(repository_root: &Path) -> serde_json::Value {
+    let worktree_root = repository_root
+        .canonicalize()
+        .expect("canonical worktree root");
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(&worktree_root)
+        .output()
+        .expect("inspect Git common directory");
+    assert!(output.status.success(), "git common dir failed: {output:?}");
+    let common_dir = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Git common directory UTF-8")
+            .trim(),
+    );
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        worktree_root.join(common_dir)
+    }
+    .canonicalize()
+    .expect("canonical Git common directory");
+
+    serde_json::json!({
+        "worktree_root": worktree_root.to_str().expect("worktree root UTF-8"),
+        "git_common_dir": common_dir.to_str().expect("Git common directory UTF-8")
+    })
+}
+
+fn provider_call_probe() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider probe");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking provider probe");
+    let url = format!(
+        "http://{}/api",
+        listener.local_addr().expect("probe address")
+    );
+    (listener, url)
+}
+
+fn assert_no_provider_call(listener: &TcpListener) {
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "resume preflight failure must happen before contacting the provider"
+    );
+}
+
 fn write_provider_loop_mutated_same_identity_ticket(root: &Path) -> PathBuf {
     let ticket_path = root.join("provider-loop-mutated-same-identity-ticket.yaml");
     fs::write(
@@ -4011,7 +4572,8 @@ fn write_loop_run_file(path: &Path, run_id: &str) {
   "input_digests": {{
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   }},
   "status": "completed",
   "current_step": "eval_report",
@@ -4038,7 +4600,8 @@ fn write_passing_loop_run_file(path: &Path, run_id: &str) {
   "input_digests": {{
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   }},
   "status": "completed",
   "current_step": "eval_report",

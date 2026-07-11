@@ -27,7 +27,7 @@ use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
     OllamaConfig, OllamaProvider, DEFAULT_OLLAMA_BASE_URL,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(name = "seaf")]
@@ -295,6 +295,12 @@ struct LoopResumeArgs {
     /// Ticket file required when resuming incomplete provider-backed runs.
     #[arg(long)]
     ticket: Option<PathBuf>,
+    /// Project configuration file. Must resolve to the inputs used when the run was created.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Policy file that overrides project configuration and must match the original run input.
+    #[arg(long)]
+    policy: Option<PathBuf>,
     /// Ollama API base URL.
     #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
     base_url: String,
@@ -777,6 +783,7 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
         args.policy.as_deref(),
         args.json,
     )?;
+    let repository_identity = current_repository_identity(&repository_root)?;
     let worktree_clean = ensure_clean_git_worktree(args.allow_dirty)?;
     let run = match args.provider.as_str() {
         "fake" => {
@@ -795,8 +802,9 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     timeout_ms: args.timeout_ms,
                     repository_root: &repository_root,
                     worktree_clean,
-                    policy: Some(&effective_inputs.policy),
-                    project_config: Some(&effective_inputs.config),
+                    policy: &effective_inputs.policy,
+                    project_config: &effective_inputs.config,
+                    repository_identity: &repository_identity,
                 },
                 &args.provider,
                 &provider,
@@ -816,8 +824,9 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     timeout_ms: args.timeout_ms,
                     repository_root: &repository_root,
                     worktree_clean,
-                    policy: Some(&effective_inputs.policy),
-                    project_config: Some(&effective_inputs.config),
+                    policy: &effective_inputs.policy,
+                    project_config: &effective_inputs.config,
+                    repository_identity: &repository_identity,
                 },
                 &args.provider,
                 &provider,
@@ -851,9 +860,26 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         };
         let ticket = seaf_core::load_ticket_file(ticket_path)
             .map_err(|report| CliFailure::validation(report, args.json))?;
-        let ticket = resume_provider_ticket(&existing, &ticket, &args.runs_root)?;
         let repository_root = current_repository_root()?;
-        match existing.provider.as_str() {
+        let effective_inputs = resolve_effective_project_inputs(
+            &repository_root,
+            args.config.as_deref(),
+            args.policy.as_deref(),
+            args.json,
+        )?;
+        let repository_identity = current_repository_identity(&repository_root)?;
+        validate_resume_ticket_identity(&existing, &ticket)?;
+        verify_resume_authoritative_inputs(
+            &args.runs_root,
+            &existing,
+            &ticket,
+            &effective_inputs.policy,
+            &effective_inputs.config,
+            &repository_identity,
+        )?;
+        let ticket = resume_provider_ticket(&existing, &ticket, &args.runs_root)?;
+        let provider_name = existing.provider.clone();
+        match provider_name.as_str() {
             "fake" => {
                 if args.base_url != DEFAULT_OLLAMA_BASE_URL {
                     return Err(CliFailure::message(
@@ -864,18 +890,21 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     next_pending_model_step(&existing).unwrap_or(LoopStepName::Research);
                 let provider = FakeProvider::new(fake_provider_script_from(next_step));
                 let worktree_clean = ensure_clean_git_worktree(true)?;
+                let model = existing.model.clone();
                 resume_provider_loop_to_completion(
                     ProviderLoopConfig {
                         runs_root: &args.runs_root,
                         run_id: &args.run_id,
                         ticket: &ticket,
-                        model: &existing.model,
+                        model: &model,
                         timeout_ms: args.timeout_ms,
                         repository_root: &repository_root,
                         worktree_clean,
-                        policy: None,
-                        project_config: None,
+                        policy: &effective_inputs.policy,
+                        project_config: &effective_inputs.config,
+                        repository_identity: &repository_identity,
                     },
+                    existing,
                     &provider,
                 )?
             }
@@ -885,18 +914,21 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     ..OllamaConfig::default()
                 });
                 let worktree_clean = ensure_clean_git_worktree(true)?;
+                let model = existing.model.clone();
                 resume_provider_loop_to_completion(
                     ProviderLoopConfig {
                         runs_root: &args.runs_root,
                         run_id: &args.run_id,
                         ticket: &ticket,
-                        model: &existing.model,
+                        model: &model,
                         timeout_ms: args.timeout_ms,
                         repository_root: &repository_root,
                         worktree_clean,
-                        policy: None,
-                        project_config: None,
+                        policy: &effective_inputs.policy,
+                        project_config: &effective_inputs.config,
+                        repository_identity: &repository_identity,
                     },
+                    existing,
                     &provider,
                 )?
             }
@@ -1098,8 +1130,9 @@ struct ProviderLoopConfig<'a> {
     timeout_ms: u64,
     repository_root: &'a Path,
     worktree_clean: bool,
-    policy: Option<&'a Policy>,
-    project_config: Option<&'a ProjectConfig>,
+    policy: &'a Policy,
+    project_config: &'a ProjectConfig,
+    repository_identity: &'a RepositoryIdentity,
 }
 
 fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
@@ -1107,13 +1140,14 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     provider_name: &str,
     provider: &P,
 ) -> Result<LoopRun, CliFailure> {
-    let policy = config
-        .policy
-        .expect("new provider runs require preflighted policy authority");
-    let project_config = config
-        .project_config
-        .expect("new provider runs require an effective project config");
-    let input_digests = current_input_digests(config.ticket, policy, project_config)?;
+    let policy = config.policy;
+    let project_config = config.project_config;
+    let input_digests = current_input_digests(
+        config.ticket,
+        policy,
+        project_config,
+        config.repository_identity,
+    )?;
     let context_request = provider_context_request(config.repository_root, config.ticket, policy);
     let patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
@@ -1128,7 +1162,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     let runs_root = config.runs_root;
     let run_id = config.run_id;
     let ticket = config.ticket;
-    let config = LoopRunnerConfig::for_ticket(
+    let runner_config = LoopRunnerConfig::for_ticket(
         config.runs_root,
         config.run_id,
         ticket,
@@ -1136,8 +1170,10 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         config.model.to_string(),
         input_digests,
     );
-    let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
+    let mut runner =
+        LoopRunner::start(runner_config, &mut step_runner).map_err(loop_runner_failure)?;
     persist_effective_input_snapshots(runs_root, run_id, ticket, policy, project_config)?;
+    persist_repository_identity_snapshot(runs_root, run_id, config.repository_identity)?;
     persist_provider_ticket_snapshot(runs_root, run_id, ticket)?;
     runner
         .run_to_completion()
@@ -1147,26 +1183,24 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
 
 fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     config: ProviderLoopConfig<'_>,
+    verified_run: LoopRun,
     provider: &P,
 ) -> Result<LoopRun, CliFailure> {
-    let policy = match config.policy {
-        Some(policy) => policy.clone(),
-        None => default_policy()?,
-    };
-    let context_request = provider_context_request(config.repository_root, config.ticket, &policy);
+    let policy = config.policy;
+    let context_request = provider_context_request(config.repository_root, config.ticket, policy);
     let patch_gate_config = ProviderPatchGateConfig::for_ticket(
         config.repository_root,
         config.ticket,
-        policy,
+        policy.clone(),
         config.worktree_clean,
     );
     let mut patch_runner = GitCommandRunner;
     let mut step_runner = ProviderStepRunner::new(provider, config.model, config.timeout_ms)
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
-    let mut runner = LoopRunner::resume(
+    let mut runner = LoopRunner::resume_verified(
         config.runs_root.to_path_buf(),
-        config.run_id,
+        verified_run,
         &mut step_runner,
     )
     .map_err(loop_runner_failure)?;
@@ -1201,6 +1235,13 @@ fn default_policy() -> Result<Policy, CliFailure> {
 struct EffectiveProjectInputs {
     policy: Policy,
     config: ProjectConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryIdentity {
+    worktree_root: String,
+    git_common_dir: String,
 }
 
 fn resolve_effective_project_inputs(
@@ -1354,16 +1395,19 @@ fn repository_relative_path(
     Ok(relative.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
-fn current_input_digests<T: Serialize>(
+fn current_input_digests<T: Serialize, R: Serialize>(
     ticket: &TicketSpec,
     policy: &Policy,
     project_config: &T,
+    repository_identity: &R,
 ) -> Result<LoopInputDigests, CliFailure> {
     Ok(LoopInputDigests {
         ticket: canonical_sha256_digest(ticket).map_err(canonical_digest_failure("ticket"))?,
         policy: canonical_sha256_digest(policy).map_err(canonical_digest_failure("policy"))?,
         config: canonical_sha256_digest(project_config)
             .map_err(canonical_digest_failure("config"))?,
+        repository: canonical_sha256_digest(repository_identity)
+            .map_err(canonical_digest_failure("repository identity"))?,
     })
 }
 
@@ -1385,6 +1429,187 @@ fn persist_effective_input_snapshots(
     persist_canonical_input(&inputs_dir.join("policy.json"), "policy", policy)?;
     persist_canonical_input(&inputs_dir.join("config.json"), "config", project_config)?;
     Ok(())
+}
+
+fn persist_repository_identity_snapshot(
+    runs_root: &Path,
+    run_id: &str,
+    repository_identity: &RepositoryIdentity,
+) -> Result<(), CliFailure> {
+    persist_canonical_input(
+        &runs_root.join(run_id).join("inputs/repository.json"),
+        "repository identity",
+        repository_identity,
+    )
+}
+
+fn verify_resume_authoritative_inputs(
+    runs_root: &Path,
+    run: &LoopRun,
+    ticket: &TicketSpec,
+    policy: &Policy,
+    project_config: &ProjectConfig,
+    repository_identity: &RepositoryIdentity,
+) -> Result<(), CliFailure> {
+    let current_digests =
+        current_input_digests(ticket, policy, project_config, repository_identity)?;
+    verify_current_digest("ticket", &run.input_digests.ticket, &current_digests.ticket)?;
+    verify_current_digest("policy", &run.input_digests.policy, &current_digests.policy)?;
+    verify_current_digest("config", &run.input_digests.config, &current_digests.config)?;
+    verify_current_digest(
+        "repository",
+        &run.input_digests.repository,
+        &current_digests.repository,
+    )?;
+
+    verify_typed_input_snapshot(runs_root, run, "ticket", ticket, &run.input_digests.ticket)?;
+    verify_typed_input_snapshot(runs_root, run, "policy", policy, &run.input_digests.policy)?;
+    verify_typed_input_snapshot(
+        runs_root,
+        run,
+        "config",
+        project_config,
+        &run.input_digests.config,
+    )?;
+    verify_typed_input_snapshot(
+        runs_root,
+        run,
+        "repository",
+        repository_identity,
+        &run.input_digests.repository,
+    )?;
+    Ok(())
+}
+
+fn verify_current_digest(
+    kind: &str,
+    persisted_digest: &str,
+    current_digest: &str,
+) -> Result<(), CliFailure> {
+    if persisted_digest == current_digest {
+        return Ok(());
+    }
+
+    let detail = match kind {
+        "ticket" => {
+            "does not match the original provider run ticket snapshot; use the matching --ticket input or start a new run"
+        }
+        "repository" => {
+            "does not match the persisted run; resume from the original repository or start a new run"
+        }
+        _ => {
+            "does not match the persisted run; use matching --config/--policy inputs or start a new run"
+        }
+    };
+    let kind = if kind == "repository" {
+        "repository identity"
+    } else {
+        kind
+    };
+    Err(CliFailure::message(format!(
+        "resume {kind} digest {detail}"
+    )))
+}
+
+fn verify_typed_input_snapshot<T>(
+    runs_root: &Path,
+    run: &LoopRun,
+    kind: &str,
+    current: &T,
+    expected_digest: &str,
+) -> Result<(), CliFailure>
+where
+    T: DeserializeOwned + PartialEq + Serialize,
+{
+    let relative_path = PathBuf::from("inputs").join(format!("{kind}.json"));
+    let (path, bytes) = read_safe_run_snapshot(runs_root, &run.run_id, &relative_path, kind)?;
+    let persisted: T = serde_json::from_slice(&bytes).map_err(|error| {
+        resume_snapshot_failure(
+            kind,
+            &path,
+            format!("snapshot is not valid JSON for its input type: {error}"),
+        )
+    })?;
+    let canonical = canonical_json_bytes(&persisted).map_err(|error| {
+        resume_snapshot_failure(
+            kind,
+            &path,
+            format!("snapshot could not be canonically serialized: {error}"),
+        )
+    })?;
+    if bytes != canonical {
+        return Err(resume_snapshot_failure(
+            kind,
+            &path,
+            "snapshot bytes are not canonical".to_string(),
+        ));
+    }
+    let digest = canonical_sha256_digest(&persisted).map_err(|error| {
+        resume_snapshot_failure(
+            kind,
+            &path,
+            format!("snapshot could not be digested: {error}"),
+        )
+    })?;
+    if digest != expected_digest {
+        return Err(resume_snapshot_failure(
+            kind,
+            &path,
+            "snapshot digest does not match the persisted run".to_string(),
+        ));
+    }
+    if &persisted != current {
+        return Err(resume_snapshot_failure(
+            kind,
+            &path,
+            "snapshot does not match the current effective input".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_safe_run_snapshot(
+    runs_root: &Path,
+    run_id: &str,
+    relative_path: &Path,
+    kind: &str,
+) -> Result<(PathBuf, Vec<u8>), CliFailure> {
+    let run_dir = runs_root.join(run_id).canonicalize().map_err(|error| {
+        CliFailure::message(format!(
+            "could not verify persisted run directory for resume: {error}; start a new run"
+        ))
+    })?;
+    let path = run_dir.join(relative_path);
+    let canonical_path = path.canonicalize().map_err(|error| {
+        resume_snapshot_failure(
+            kind,
+            &path,
+            format!("snapshot is missing or unsafe: {error}"),
+        )
+    })?;
+    if !canonical_path.starts_with(&run_dir) || !canonical_path.is_file() {
+        return Err(resume_snapshot_failure(
+            kind,
+            &path,
+            "snapshot resolves outside the run directory or is not a file".to_string(),
+        ));
+    }
+    let bytes = fs::read(&canonical_path).map_err(|error| {
+        resume_snapshot_failure(kind, &path, format!("snapshot could not be read: {error}"))
+    })?;
+    Ok((path, bytes))
+}
+
+fn resume_snapshot_failure(kind: &str, path: &Path, detail: String) -> CliFailure {
+    let kind = if kind == "repository" {
+        "repository identity"
+    } else {
+        kind
+    };
+    CliFailure::message(format!(
+        "resume {kind} snapshot {} is unverifiable: {detail}; restore the original immutable snapshot or start a new run",
+        path.display()
+    ))
 }
 
 fn persist_canonical_input<T: Serialize>(
@@ -1470,6 +1695,49 @@ fn current_repository_root() -> Result<PathBuf, CliFailure> {
     })
 }
 
+fn current_repository_identity(repository_root: &Path) -> Result<RepositoryIdentity, CliFailure> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repository_root)
+        .output()
+        .map_err(|error| {
+            CliFailure::message(format!("could not inspect Git common directory: {error}"))
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(CliFailure::message(format!(
+            "could not inspect Git common directory: {}",
+            detail.trim()
+        )));
+    }
+    let common_dir = String::from_utf8(output.stdout).map_err(|error| {
+        CliFailure::message(format!("Git common directory was not UTF-8: {error}"))
+    })?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repository_root.join(common_dir)
+    };
+    let common_dir = common_dir.canonicalize().map_err(|error| {
+        CliFailure::message(format!(
+            "could not canonicalize Git common directory {}: {error}",
+            common_dir.display()
+        ))
+    })?;
+
+    Ok(RepositoryIdentity {
+        worktree_root: utf8_repository_identity_path(repository_root, "worktree root")?,
+        git_common_dir: utf8_repository_identity_path(&common_dir, "Git common directory")?,
+    })
+}
+
+fn utf8_repository_identity_path(path: &Path, kind: &str) -> Result<String, CliFailure> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| CliFailure::message(format!("{kind} {} is not UTF-8", path.display())))
+}
+
 fn loop_run_needs_provider_resume(run: &LoopRun) -> bool {
     matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
 }
@@ -1479,6 +1747,17 @@ fn resume_provider_ticket(
     ticket: &TicketSpec,
     runs_root: &Path,
 ) -> Result<TicketSpec, CliFailure> {
+    validate_resume_ticket_identity(run, ticket)?;
+    compare_provider_ticket_snapshot(runs_root, run, ticket)?;
+    let has_apply_authority = persisted_apply_authority(run);
+    let mut ticket = ticket.clone();
+    if !has_apply_authority {
+        ticket.autonomy.apply_patch = false;
+    }
+    Ok(ticket)
+}
+
+fn validate_resume_ticket_identity(run: &LoopRun, ticket: &TicketSpec) -> Result<(), CliFailure> {
     let mut mismatches = Vec::new();
     if run.ticket_id != ticket.ticket_id {
         mismatches.push(format!(
@@ -1494,18 +1773,11 @@ fn resume_provider_ticket(
     }
     if !mismatches.is_empty() {
         return Err(CliFailure::message(format!(
-            "resume ticket does not match persisted run: {}",
+            "resume ticket does not match persisted run: {}; use the matching --ticket input or start a new run",
             mismatches.join("; ")
         )));
     }
-
-    compare_provider_ticket_snapshot(runs_root, run, ticket)?;
-    let has_apply_authority = persisted_apply_authority(run);
-    let mut ticket = ticket.clone();
-    if !has_apply_authority {
-        ticket.autonomy.apply_patch = false;
-    }
-    Ok(ticket)
+    Ok(())
 }
 
 fn persist_provider_ticket_snapshot(
@@ -1525,16 +1797,27 @@ fn compare_provider_ticket_snapshot(
     ticket: &TicketSpec,
 ) -> Result<(), CliFailure> {
     let path = provider_ticket_snapshot_path(runs_root, &run.run_id);
-    let persisted = fs::read(&path).map_err(|err| {
+    let persisted = read_safe_run_snapshot(
+        runs_root,
+        &run.run_id,
+        Path::new("ticket.snapshot.json"),
+        "ticket",
+    )
+    .map(|(_, bytes)| bytes)
+    .map_err(|error| {
+        let detail = error
+            .message
+            .as_deref()
+            .unwrap_or("snapshot verification failed");
         CliFailure::message(format!(
-            "could not read original provider ticket snapshot {}: {err}; refusing to resume with unverifiable ticket content",
+            "could not verify original provider ticket snapshot {}: {detail}; refusing to resume with unverifiable ticket content; restore the matching snapshot or start a new run",
             path.display()
         ))
     })?;
     let candidate = canonical_ticket_snapshot(ticket)?;
     if persisted != candidate {
         return Err(CliFailure::message(
-            "resume ticket content does not match the original provider run ticket snapshot; refusing to rebuild context or patch gate from changed ticket"
+            "resume ticket content does not match the original provider run ticket snapshot; refusing to rebuild context or patch gate from changed ticket; use the matching --ticket input or start a new run"
                 .to_string(),
         ));
     }
@@ -1714,13 +1997,15 @@ fn start_deterministic_loop_to_completion(
     let mut step_runner = DeterministicStepRunner;
     let policy = default_policy()?;
     let no_project_config = Option::<ProjectConfig>::None;
+    let repository_root = current_repository_root()?;
+    let repository_identity = current_repository_identity(&repository_root)?;
     let config = LoopRunnerConfig::for_ticket(
         runs_root,
         run_id,
         ticket,
         provider.to_string(),
         model.to_string(),
-        current_input_digests(ticket, &policy, &no_project_config)?,
+        current_input_digests(ticket, &policy, &no_project_config, &repository_identity)?,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
     let run = runner

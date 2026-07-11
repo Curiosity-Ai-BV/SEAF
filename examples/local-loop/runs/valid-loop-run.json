@@ -7,7 +7,8 @@
   "input_digests": {
     "ticket": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "policy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "config": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "repository": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "status": "running",
   "current_step": "development",

@@ -49,21 +49,19 @@ features:
 3. The loop's Testing and EvalReport steps are explicit no-ops. The real eval
    runner is a separate manual command, `ticket.eval.config` is not consumed by
    `loop run`, and the report is not attached to the `LoopRun`.
-4. `seaf init` writes a project policy, but `loop run` ignores it and loads the
-   compiled default. Resume binds the ticket snapshot but not an effective
-   project configuration snapshot.
-5. Blocked and failed runs are terminal. `loop resume` cannot revise them even
+4. Blocked and failed runs are terminal. `loop resume` cannot revise them even
    though the docs say it can, and there is no audited CLI rerun-from-step flow.
-6. External adoption is unsupported: no released CLI binary or documented
+5. External adoption is unsupported: no released CLI binary or documented
    install path, no `--version`, Adaptive Notes-specific initialization, and no
    end-to-end test in a repository outside SEAF.
-7. The SDK defaults to an HTTP endpoint for which SEAF ships no server. Release
+6. The SDK defaults to an HTTP endpoint for which SEAF ships no server. Release
    capsules are unsigned development metadata. Both surfaces currently
    overstate their usable lifecycle.
 
-M1-01b resolves the new-run half of item 4: provider runs now resolve explicit
-or Git-root project authority and persist canonical effective input snapshots.
-Resume integrity remains tracked separately by M1-02.
+M1-01b and M1-02 resolved the former project-authority gap: provider runs use
+explicit or Git-root project authority, persist canonical effective inputs and
+repository identity, and verify them before an incomplete resume can mutate
+run state or contact the provider.
 
 ## Production-Use Acceptance Scenario
 
@@ -109,9 +107,9 @@ Goal: one command produces a reviewable candidate and trustworthy evidence.
 
 - **U1 - Make project inputs authoritative.** Add explicit project config and
   policy discovery with documented precedence. Snapshot the complete ticket,
-  effective policy, config, and their digests into the run. Resume must fail
-  closed if those inputs have changed unless the user starts a new audited
-  attempt.
+  effective policy, config, repository identity, and their digests into the
+  run. Resume must fail closed if those inputs have changed unless the user
+  starts a new audited attempt.
 - **U2 - Pass validated state between roles.** Research receives the ticket;
   analysis receives research; spec creation receives both; spec review receives
   the proposed spec; development receives the approved spec; output review

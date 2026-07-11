@@ -92,6 +92,7 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
     workspace: LoopWorkspace,
     run: LoopRun,
     step_runner: &'a mut R,
+    next_attempt: Option<(LoopStepName, u32)>,
 }
 
 impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
@@ -115,6 +116,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             workspace,
             run,
             step_runner,
+            next_attempt: None,
         })
     }
 
@@ -126,6 +128,27 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let runs_root = runs_root.into();
         let workspace = LoopWorkspace::open(&runs_root, run_id)?;
         let run = state::load_run(&workspace)?;
+        Self::resume_with_workspace(workspace, run, step_runner)
+    }
+
+    pub fn resume_verified(
+        runs_root: impl Into<PathBuf>,
+        run: LoopRun,
+        step_runner: &'a mut R,
+    ) -> Result<Self, RunnerError> {
+        let runs_root = runs_root.into();
+        let workspace = LoopWorkspace::open(&runs_root, &run.run_id)?;
+        Self::resume_with_workspace(workspace, run, step_runner)
+    }
+
+    fn resume_with_workspace(
+        workspace: LoopWorkspace,
+        run: LoopRun,
+        step_runner: &'a mut R,
+    ) -> Result<Self, RunnerError> {
+        let next_attempt = state::next_runnable_step(&run)
+            .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
+            .transpose()?;
         step_runner.prepare_run(&workspace, &run.run_id)?;
         workspace.append_log("resumed run")?;
 
@@ -133,10 +156,12 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             workspace,
             run,
             step_runner,
+            next_attempt,
         })
     }
 
     pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
+        self.next_attempt = None;
         state::reset_from_step(&mut self.run, step)?;
         clear_current_run_policy_decisions_from_step(&mut self.run, step)?;
         state::save_run(&self.workspace, &self.run)?;
@@ -160,13 +185,16 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let Some(step) = state::next_runnable_step(&self.run) else {
             return Ok(false);
         };
+        let attempt = match self.next_attempt.take() {
+            Some((cached_step, attempt)) if cached_step == step => attempt,
+            Some(_) | None => next_step_attempt(&self.workspace, step)?,
+        };
 
         state::mark_step_running(&mut self.run, step)?;
         state::save_run(&self.workspace, &self.run)?;
         self.workspace
             .append_log(&format!("started step {step:?}"))?;
 
-        let attempt = next_step_attempt(&self.workspace, step)?;
         let request = self.step_runner.step_request(step)?;
         write_step_request(&self.workspace, step, attempt, &request)?;
 

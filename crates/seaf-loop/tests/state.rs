@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{fs, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 use seaf_core::{
     LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, TicketContext, TicketSpec,
@@ -6,8 +9,8 @@ use seaf_core::{
 };
 use seaf_loop::{
     state::{create_run, NewLoopRun},
-    ArtifactContent, ContextManifest, LoopRunner, LoopRunnerConfig, StepOutput, StepRunner,
-    UNTRUSTED_CONTEXT_MARKER,
+    ArtifactContent, ContextManifest, LoopRunner, LoopRunnerConfig, LoopWorkspace, StepOutput,
+    StepRunner, UNTRUSTED_CONTEXT_MARKER,
 };
 
 #[test]
@@ -16,6 +19,7 @@ fn state_creation_preserves_exact_effective_input_digests() {
         ticket: "a".repeat(64),
         policy: "b".repeat(64),
         config: "c".repeat(64),
+        repository: "d".repeat(64),
     };
 
     let run = create_run(NewLoopRun {
@@ -485,7 +489,208 @@ fn state_resume_missing_run_directory_reports_clear_error() {
     );
 }
 
+#[test]
+fn state_resume_verified_uses_preflight_run_when_disk_run_changes() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "resume-verified-state";
+    let mut initial_runner = RecordingStepRunner::with_prefix("initial");
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut initial_runner,
+    )
+    .expect("start run");
+    runner.run_next_step().expect("finish research");
+    drop(runner);
+
+    let run_dir = runs_root.join(run_id);
+    let verified = read_run(&run_dir);
+    let mut replacement = verified.clone();
+    replacement.ticket_id = "replacement-ticket".to_string();
+    replacement.steps[0].status = LoopStepStatus::Pending;
+    write_run(&run_dir, &replacement);
+
+    let mut resumed_runner = RecordingStepRunner::with_prefix("resumed");
+    let resumed = LoopRunner::resume_verified(&runs_root, verified.clone(), &mut resumed_runner)
+        .expect("resume verified run");
+
+    assert_eq!(resumed.run(), &verified);
+    assert_eq!(resumed.run().ticket_id, ticket().ticket_id);
+    assert_eq!(resumed.run().steps[0].status, LoopStepStatus::Completed);
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_rejects_symlinked_run_directory_without_touching_external_target() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let external_runs = temp_dir.path().join("external-runs");
+    let run_id = "symlinked-run-directory";
+    create_test_run(&external_runs, run_id);
+    fs::create_dir(&runs_root).expect("runs root");
+    symlink(external_runs.join(run_id), runs_root.join(run_id)).expect("run directory symlink");
+    let external_run = external_runs.join(run_id);
+    let before = read_tree_bytes(&external_run);
+    let mut step_runner = RecordingStepRunner::new();
+
+    let result = LoopRunner::resume(&runs_root, run_id, &mut step_runner);
+
+    let error = result.expect_err("symlinked run directory must fail closed");
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(read_tree_bytes(&external_run), before);
+    assert!(step_runner.calls.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_rejects_symlinked_workspace_files_without_touching_external_targets() {
+    for relative_path in ["run.json", "log.md", "context-manifest.json"] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = "symlinked-workspace-file";
+        create_test_run(&runs_root, run_id);
+        let run_dir = runs_root.join(run_id);
+        let local_path = run_dir.join(relative_path);
+        let external_path = temp_dir.path().join(format!("external-{}", relative_path));
+        let original = fs::read(&local_path).expect("workspace file");
+        fs::write(&external_path, &original).expect("external file");
+        fs::remove_file(&local_path).expect("remove workspace file");
+        symlink(&external_path, &local_path).expect("workspace file symlink");
+        let mut step_runner = RecordingStepRunner::new();
+
+        let result = LoopRunner::resume(&runs_root, run_id, &mut step_runner);
+
+        let error = result.expect_err("symlinked workspace file must fail closed");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(fs::read(&external_path).expect("external bytes"), original);
+        assert!(step_runner.calls.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_rejects_symlinked_layout_directories_without_touching_external_targets() {
+    for directory in ["prompts", "responses", "artifacts"] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = "symlinked-layout-directory";
+        create_test_run(&runs_root, run_id);
+        let run_dir = runs_root.join(run_id);
+        let external_dir = temp_dir.path().join(format!("external-{directory}"));
+        fs::create_dir(&external_dir).expect("external layout dir");
+        fs::write(external_dir.join("sentinel"), b"unchanged").expect("external sentinel");
+        fs::remove_dir(run_dir.join(directory)).expect("remove empty layout dir");
+        symlink(&external_dir, run_dir.join(directory)).expect("layout directory symlink");
+        let mut step_runner = RecordingStepRunner::new();
+
+        let result = LoopRunner::resume(&runs_root, run_id, &mut step_runner);
+
+        let error = result.expect_err("symlinked layout directory must fail closed");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            fs::read(external_dir.join("sentinel")).expect("external sentinel"),
+            b"unchanged"
+        );
+        assert!(step_runner.calls.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_verified_rejects_symlinked_prompt_child_before_prepare() {
+    assert_resume_verified_child_symlink_is_rejected("prompts/01-research.prompt.md");
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_verified_rejects_symlinked_response_child_before_prepare() {
+    assert_resume_verified_child_symlink_is_rejected("responses/01-research.raw.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_verified_rejects_symlinked_artifact_child_before_prepare() {
+    assert_resume_verified_child_symlink_is_rejected("artifacts/01-research.md");
+}
+
+#[test]
+fn state_step_rejects_exhausted_prompt_attempts_before_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "exhausted-prompt-attempts";
+    let mut step_runner = RecordingStepRunner::with_prefix("must-not-run");
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut step_runner,
+    )
+    .expect("start run");
+    let run_dir = runs_root.join(run_id);
+    fs::write(
+        run_dir.join("prompts/01-research.attempt-4294967295.prompt.md"),
+        b"highest possible prompt attempt",
+    )
+    .expect("maximum prompt attempt");
+    let before = read_tree_bytes(&run_dir);
+
+    let error = runner
+        .run_next_step()
+        .expect_err("exhausted prompt attempts must fail closed");
+
+    assert!(
+        error.to_string().contains("prompt attempt") && error.to_string().contains("exhausted"),
+        "overflow error must be actionable, got {error}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    drop(runner);
+    assert!(step_runner.request_calls.is_empty());
+    assert!(step_runner.calls.is_empty());
+}
+
+#[test]
+fn state_resume_verified_rejects_exhausted_next_attempt_before_prepare_or_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "resume-exhausted-prompt-attempts";
+    create_test_run(&runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    fs::write(
+        run_dir.join("prompts/01-research.attempt-4294967295.prompt.md"),
+        b"highest possible prompt attempt",
+    )
+    .expect("maximum prompt attempt");
+    let verified = read_run(&run_dir);
+    let before = read_tree_bytes(&run_dir);
+    let mut step_runner = RecordingStepRunner::with_prefix("must-not-prepare");
+
+    let error = LoopRunner::resume_verified(&runs_root, verified, &mut step_runner)
+        .expect_err("resume must preflight exhausted attempts");
+
+    assert!(
+        error.to_string().contains("prompt attempt") && error.to_string().contains("exhausted"),
+        "overflow error must be actionable, got {error}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(step_runner.prepare_calls, 0);
+    assert!(step_runner.request_calls.is_empty());
+    assert!(step_runner.calls.is_empty());
+}
+
 struct RecordingStepRunner {
+    prepare_calls: usize,
     calls: Vec<LoopStepName>,
     request_calls: Vec<LoopStepName>,
     prefix: &'static str,
@@ -502,6 +707,7 @@ impl RecordingStepRunner {
 
     fn with_prefix(prefix: &'static str) -> Self {
         Self {
+            prepare_calls: 0,
             calls: Vec::new(),
             request_calls: Vec::new(),
             prefix,
@@ -534,6 +740,15 @@ impl RecordingStepRunner {
 }
 
 impl StepRunner for RecordingStepRunner {
+    fn prepare_run(
+        &mut self,
+        _workspace: &LoopWorkspace,
+        _run_id: &str,
+    ) -> Result<(), seaf_loop::RunnerError> {
+        self.prepare_calls += 1;
+        Ok(())
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, seaf_loop::RunnerError> {
         self.request_calls.push(step);
         Ok(format!("{} request for {}", self.prefix, step_label(step)))
@@ -642,7 +857,82 @@ fn test_input_digests() -> LoopInputDigests {
         ticket: "a".repeat(64),
         policy: "b".repeat(64),
         config: "c".repeat(64),
+        repository: "d".repeat(64),
     }
+}
+
+fn create_test_run(runs_root: &Path, run_id: &str) {
+    let mut step_runner = RecordingStepRunner::new();
+    let runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut step_runner,
+    )
+    .expect("create test run");
+    drop(runner);
+}
+
+fn read_tree_bytes(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, current: &Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read tree")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("tree entries");
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .expect("relative path")
+                        .to_path_buf(),
+                    fs::read(path).expect("tree file"),
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[cfg(unix)]
+fn assert_resume_verified_child_symlink_is_rejected(relative_path: &str) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "symlinked-step-child";
+    create_test_run(&runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let external_path = temp_dir.path().join("external-target");
+    let original = b"external target must stay unchanged";
+    fs::write(&external_path, original).expect("external target");
+    symlink(&external_path, run_dir.join(relative_path)).expect("step child symlink");
+    let verified = read_run(&run_dir);
+    let before = read_tree_bytes(&run_dir);
+    let mut step_runner = RecordingStepRunner::with_prefix("symlink-guard");
+
+    let error = LoopRunner::resume_verified(&runs_root, verified, &mut step_runner)
+        .expect_err("resume must reject symlinked child before prepare");
+
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(
+        fs::read(&external_path).expect("external target bytes"),
+        original,
+        "{relative_path} must not be followed"
+    );
+    assert_eq!(step_runner.prepare_calls, 0);
+    assert!(step_runner.request_calls.is_empty());
+    assert!(step_runner.calls.is_empty());
 }
 
 fn assert_file_contains(path: &Path, expected: &str) {

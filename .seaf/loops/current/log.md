@@ -368,3 +368,155 @@ failed with project-config validation. GREEN: discovery is now skipped when an
 explicit policy is supplied without `--config`; an explicitly supplied config
 is still loaded and validated before the policy override. The new regression,
 the explicit-invalid-config guard, and all 13 focused `loop_run_` tests passed.
+
+## 2026-07-11 act | M1-02 resume configuration integrity
+
+Added `loop resume --config` and `--policy` with the same authority precedence
+as new runs. New provider runs now persist canonical repository identity beside
+the ticket, policy, and config inputs. Incomplete resume verifies current typed
+inputs, every canonical input snapshot, all three `LoopRun` digests, canonical
+worktree root, and Git common directory before opening mutable loop state or
+constructing a provider runner. Verified policy/config now drives resumed fake
+and Ollama context and patch gating; the compiled default-policy fallback was
+removed. Existing ticket apply-authority downgrade behavior remains unchanged.
+M1-02 is complete and M1-03 is active.
+
+## 2026-07-11 verify | M1-02 witnessed TDD and full gates
+
+RED: `cargo test -p seaf-cli --test cli --locked loop_resume_ -- --nocapture`
+ran 15 tests with 7 passing and 8 expected failures. Resume rejected the new
+flags, accepted missing/noncanonical snapshots and a mismatched run digest,
+used the compiled policy for mocked Ollama, and did not persist repository
+identity. GREEN: the same focused command passed all 15 tests, covering
+same-path policy mutation, config mutation with unchanged effective policy,
+missing/noncanonical snapshots, run-digest mismatch, matching explicit
+authority, unsafe authority paths, copied-repository rejection, byte-for-byte
+zero run-directory mutation, zero provider calls, recovery behavior, and
+verified-policy Ollama gating. All 13 focused `loop_run_` tests and all 4
+existing provider-resume recovery tests also passed.
+
+Final verification passed: `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace`, `corepack pnpm format:check`, and
+`git diff --check`.
+
+## 2026-07-11 verify | M1-02 repository-digest spec review fix
+
+Spec review found that repository identity was compared only with the mutable
+`inputs/repository.json` snapshot. A copied run could therefore rewrite that
+snapshot canonically for the destination repository and sever the original
+binding. RED: the exact copied-run regression failed because resume succeeded
+after that rewrite. The core fixture test also failed to compile because
+`LoopInputDigests` had no `repository` field.
+
+GREEN: `LoopInputDigests`, runtime validation, public schema, valid fixture,
+state tests, and all call sites now require a lowercase 64-hex repository
+digest. New provider runs hash the canonical repository identity into immutable
+`run.json`. Resume compares the run-bound digest with both the canonical
+snapshot and current repository before mutation or provider calls. The focused
+core LoopRun tests passed 6/6, state digest propagation passed, canonical CLI
+snapshot/digest persistence passed, and all 16 resume tests passed, including
+the rewritten-snapshot attack.
+
+Full verification passed after the fix: `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace`, `corepack pnpm format:check`, and
+`git diff --check`. M1-02 remains complete and M1-03 remains the next active
+slice.
+
+## 2026-07-11 verify | M1-02 workspace and verified-state quality fixes
+
+Quality review found two remaining resume seams. First, `LoopWorkspace::open`
+called `ensure_layout`, so a symlinked run directory, audit file, or layout
+directory could be followed and resume could write before rejecting it. Second,
+CLI preflight validated one `LoopRun`, but `LoopRunner::resume` reread
+`run.json`, discarding that verified instance before execution.
+
+RED was witnessed in two stages. The exact verified-state seam test first
+failed to compile because `LoopRunner::resume_verified` did not exist. After
+adding only that handoff, all three symlink groups failed because resume
+accepted a symlinked run directory, symlinked `run.json`, `log.md`, and
+`context-manifest.json`, and symlinked `prompts`, `responses`, and `artifacts`
+directories.
+
+GREEN: existing workspace open is now read-only validation. It rejects a
+symlinked or non-directory run root, canonical containment outside the
+canonical runs root, non-regular or symlinked audit files, and non-directory or
+symlinked layout directories before `prepare_run` or log append. External
+targets remain byte-for-byte unchanged. `LoopRunner::resume_verified` consumes
+the exact preflight `LoopRun`, and CLI provider resume now uses that API instead
+of rereading `run.json`. Seven focused state-resume tests and all 16 CLI resume
+tests passed.
+
+Full verification passed after both fixes: `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace`, `corepack pnpm format:check`, and
+`git diff --check`. No locking or atomic-write behavior from M1-10 was added.
+
+## 2026-07-11 verify | M1-02 child artifact symlink quality fix
+
+The remaining quality review finding was that real top-level layout directories
+could still contain symlinked child targets. `fs::write` followed those links
+when persisting the next prompt, deterministic response, or step artifact.
+RED: three separate regressions all failed because `run_next_step` succeeded
+with symlinked `prompts/01-research.prompt.md`,
+`responses/01-research.raw.txt`, and `artifacts/01-research.md` targets.
+
+GREEN: prompt attempt discovery rejects symlinked and non-regular matching
+entries. The shared artifact writer now accepts only safe relative paths,
+requires a real run directory, canonically contains the existing parent inside
+that run directory, rejects symlinked/non-regular targets, creates absent files
+with create-new semantics, and truncates only a validated regular file. This
+preserves legitimate context-manifest and rerun artifact replacement behavior.
+All three focused child-target regressions passed with external target bytes
+unchanged, followed by the complete `seaf-loop` suite and all 16 CLI resume
+tests.
+
+Full verification passed after the fix: `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace`, `corepack pnpm format:check`, and
+`git diff --check`. No locking or atomic-write behavior from M1-10 was added.
+
+## 2026-07-11 verify | M1-02 exhausted prompt-attempt quality fix
+
+Final quality review found unchecked `highest_attempt + 1` arithmetic. A
+persisted `u32::MAX` prompt-attempt filename caused a debug overflow after the
+runner had already marked the step running, saved `run.json`, and appended the
+log. RED: the exact maximum-attempt regression panicked in `artifacts.rs` and
+could not return the required no-mutation error.
+
+GREEN: prompt attempt allocation now uses `checked_add` and returns an
+actionable exhausted-sequence error that recommends starting a new run.
+Read-only attempt allocation now happens before step-state transition, run save,
+log append, request creation, or artifact writes. The regression verifies the
+entire run tree is byte-for-byte unchanged and the step runner receives no
+request or execution call. The exact regression and all 21 state tests passed.
+
+Full verification passed after the fix: `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace`, `corepack pnpm format:check`, and
+`git diff --check`. No locking or atomic-write behavior from M1-10 was added.
+
+## 2026-07-11 verify | M1-02 resume child preflight and cached-attempt fix
+
+Follow-up quality review found resume still prepared provider state and appended
+the resume log before child-file or next-attempt validation. RED: four
+`resume_verified` regressions all returned a runner instead of failing before
+prepare. The cases covered a regular maximum-`u32` prompt attempt plus
+symlinked prompt, response, and artifact children; each test snapshots the
+entire run tree and asserts zero prepare, request, and execution calls.
+
+GREEN: existing workspace open now preflights every child entry under
+`prompts`, `responses`, and `artifacts` as a canonically contained regular
+non-symlink file. Resume computes and caches the persisted next step's checked
+attempt before `prepare_run` or log append, and `run_next_step` consumes that
+attempt once. New and rerun runners retain on-demand attempt calculation before
+state mutation. All four focused preflight tests, all 22 state tests, the full
+`seaf-loop` suite, and all 16 CLI resume tests passed.
+
+The first full workspace gate hit the existing timing-sensitive
+`eval_run_cleans_up_descendants_that_keep_pipes_open` threshold at 1.0499
+seconds. Its exact rerun passed, and the complete locked workspace rerun passed
+all 213 tests. Final formatting, locked Clippy, `corepack pnpm format:check`, and
+`git diff --check` passed. No locking or atomic-write behavior from M1-10 was
+added.

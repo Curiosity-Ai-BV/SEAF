@@ -25,11 +25,12 @@
     "model": { "type": "string", "minLength": 1 },
     "input_digests": {
       "type": "object",
-      "required": ["ticket", "policy", "config"],
+      "required": ["ticket", "policy", "config", "repository"],
       "properties": {
         "ticket": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "policy": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-        "config": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        "config": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "repository": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       },
       "additionalProperties": false
     },

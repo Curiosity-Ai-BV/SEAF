@@ -103,7 +103,7 @@ pub fn next_step_attempt(
         return Ok(1);
     }
 
-    for entry in fs::read_dir(prompts_dir)? {
+    for entry in fs::read_dir(&prompts_dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
@@ -115,11 +115,23 @@ pub fn next_step_attempt(
         };
 
         if let Some(attempt) = attempt {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(WorkspaceError::UnsafeExistingLayout(
+                    entry.path(),
+                    "prompt attempt is not a real regular file or is a symlink".to_string(),
+                ));
+            }
             highest_attempt = highest_attempt.max(attempt);
         }
     }
 
-    Ok(highest_attempt + 1)
+    highest_attempt.checked_add(1).ok_or_else(|| {
+        WorkspaceError::UnsafeExistingLayout(
+            prompts_dir,
+            format!("prompt attempt sequence is exhausted for {stem}; start a new run"),
+        )
+    })
 }
 
 fn request_file_name(stem: String, attempt: u32) -> String {
