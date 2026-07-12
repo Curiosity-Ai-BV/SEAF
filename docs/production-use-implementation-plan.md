@@ -1632,6 +1632,10 @@ Commit boundary: atomic persistence and locking only.
 
 Roadmap: U5. Dependencies: M1-10.
 
+Status: active. Split into M1-11a private run artifacts, M1-11b bounded
+artifact storage, and M1-11c bounded secret redaction. M1-11a is complete and
+M1-11b is active.
+
 Objective: make local run artifacts safe enough for live provider use.
 
 Acceptance criteria:
@@ -1652,6 +1656,91 @@ Clippy, and diff check.
 Docs/tracker: artifact safety and M1-11 status.
 
 Commit boundary: permissions, caps, and redaction only.
+
+#### M1-11a - Private Run Artifacts
+
+Status: complete on 2026-07-12. Dependencies: M1-10 (complete). M1-11b is
+active.
+
+Objective: make every run-owned directory and file private from its first
+published byte without changing source or candidate Git modes.
+
+Delivered: supported Unix run roots and subdirectories are created as `0700`;
+run state, locks, prompts, responses, logs, immutable evidence, temporary
+files, and final files are created as `0600`. Existing broader modes fail
+closed with an explicit `chmod` remedy and are never silently migrated.
+Standalone evaluation and release artifacts remain outside this boundary.
+
+Publication no longer depends on a previously checked pathname. A pinned
+private directory handle owns create, link, rename, unlink, identity, and sync
+operations. Parent substitution, symlinks, non-regular files, name traversal,
+lock replacement, target replacement, and operation-owned temporary-file races
+fail closed. Workspace scaffolding revalidates retained existing entries and
+directories before creating any missing default, preserves valid populated
+files, and does not mutate either the original or substituted tree after a
+race. Non-Unix loop workspaces return unsupported before creating a run leaf.
+
+Focused regressions cover zero-umask creation, broad existing modes, exact
+retry, immutable and state publication cuts, workspace preflight ordering,
+candidate and repository lock substitution, and parent-directory replacement.
+Independent specification and quality reviews approved the final slice with no
+remaining P0/P1/P2 findings. The complete Rust workspace, strict all-target and
+all-feature Clippy, Rust and Prettier formatting, package lint/typecheck, eight
+SDK tests, SDK build, and diff checks pass.
+
+Commit boundary: private permissions and pinned-directory publication only.
+
+#### M1-11b - Bounded Artifact Storage
+
+Status: active. Dependencies: M1-11a (complete).
+
+Objective: reject oversized run artifacts before partial or misleading
+authority, provider calls, or evaluation commands can consume an unrecordable
+storage commitment.
+
+Acceptance criteria:
+
+- Provider prompts/requests are capped at 2 MiB, canonical provider response
+  audits at 1 MiB, exchange records at 64 KiB, evaluation logs at 1 MiB, and
+  other generated evidence/input artifacts at 2 MiB.
+- The durable run tree has a 32 MiB aggregate cap. Exact-cap publication is
+  accepted; one byte over is rejected. Exact immutable retries consume no new
+  budget, while replacement accounts for the old and intended sizes safely.
+- Aggregate accounting and reservation reuse the M1-10 per-run lock and do not
+  introduce a competing lock or change candidate/repository/run lock order.
+- Every external provider call and evaluation command either has sufficient
+  durable capacity reserved for its authoritative result or is refused before
+  the side effect.
+
+RED: per-artifact exact-cap and cap-plus-one, aggregate exhaustion, exact
+retry, replacement, concurrency, crash, provider pre-call, and evaluation
+pre-spawn tests.
+
+Commit boundary: per-artifact and aggregate storage limits only.
+
+#### M1-11c - Bounded Secret Redaction
+
+Status: pending. Dependencies: M1-11b.
+
+Objective: prevent configured and obvious credentials from escaping their one
+private authoritative input snapshot into provider requests or derived run
+evidence while keeping redaction output bounded.
+
+Acceptance criteria:
+
+- Sensitive evaluation environment values may remain only in the exact private
+  `inputs/eval-config.json`; derived prompts, requests, responses, logs, and
+  evidence redact configured and obvious credential forms before persistence.
+- At most 64 configured secret values are accepted, each at most 4 KiB and
+  together at most 64 KiB; oversized redaction input or output fails closed.
+- A clean provider result remains exact. A secret-bearing or oversized response
+  becomes a small safe non-retryable audited failure without raw bytes or a raw
+  digest, preserving existing request-only recovery semantics.
+
+RED: configured-value, obvious-pattern, overlap, cap, provider-response,
+request-only crash recovery, and no-raw-leak tests.
+
+Commit boundary: bounded secret derivation and redaction only.
 
 ### M1-12 - Interruption Recovery Acceptance
 

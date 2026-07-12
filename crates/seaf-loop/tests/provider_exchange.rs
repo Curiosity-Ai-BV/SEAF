@@ -1,5 +1,5 @@
-use std::fs;
 use std::sync::{Arc, Barrier};
+use std::{fs, path::Path};
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -199,9 +199,7 @@ fn loop_run_validation_rejects_exchange_gaps_reordering_identity_and_malformed_p
 fn exchange_artifacts_and_records_are_create_only_and_canonical() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let coordinates = coordinates(1);
 
     let request =
@@ -302,9 +300,7 @@ fn context_retry_requires_a_distinct_round_and_matching_canonical_expansion() {
 fn json_repair_coordinates_reject_a_zero_context_round() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let coordinates = ProviderExchangeCoordinates {
         run_id: "zero-round".to_string(),
         step: LoopStepName::Research,
@@ -438,11 +434,10 @@ fn append_transitions_follow_the_prior_parsed_outcome() {
         path: "artifacts/01-research.attempt-001.context-round-001.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(expansion_bytes)),
     };
-    fs::write(
+    write_private_fixture_file(
         workspace.run_directory().join(&expansion.path),
         expansion_bytes,
-    )
-    .expect("existing M1-04b1 expansion");
+    );
     let retry_record = request_record(
         2,
         Some(response_reference.digest),
@@ -459,9 +454,7 @@ fn append_transitions_follow_the_prior_parsed_outcome() {
 fn record_loading_rejects_tampered_bound_request_bytes() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let request =
         write_provider_exchange_request(&run_dir, &coordinates(1), b"request").expect("request");
     let record = request_record(1, None, request.clone(), None);
@@ -474,9 +467,7 @@ fn record_loading_rejects_tampered_bound_request_bytes() {
 fn staging_rejects_tampered_bound_bytes_before_record_publication() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let request =
         write_provider_exchange_request(&run_dir, &coordinates(1), b"request").expect("request");
     let record = request_record(1, None, request.clone(), None);
@@ -829,13 +820,12 @@ fn repair_after_context_retry_must_inherit_the_exact_round_and_expansion_authori
         path: "artifacts/01-research.attempt-001.context-round-002.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(substitute_bytes)),
     };
-    fs::write(
+    write_private_fixture_file(
         substituted_workspace
             .run_directory()
             .join(&substitute_expansion.path),
         substitute_bytes,
-    )
-    .expect("substitute expansion");
+    );
     let substituted_record = repair_request_record(
         substituted,
         substituted_head.digest,
@@ -942,9 +932,7 @@ fn response_outcome_is_derived_from_the_canonical_audit_not_the_record_claim() {
     ] {
         let temp = tempfile::tempdir().expect("temp");
         let run_dir = temp.path().join("run");
-        fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-        fs::create_dir_all(run_dir.join("responses")).expect("responses");
-        fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+        create_private_run_layout(&run_dir);
         let coordinates = ProviderExchangeCoordinates {
             kind,
             exchange_index: if kind == ProviderExchangeKind::Initial {
@@ -1006,9 +994,7 @@ fn response_outcome_is_derived_from_the_canonical_audit_not_the_record_claim() {
 fn loading_response_record_rejects_a_tampered_canonical_response_audit() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let coordinates = coordinates(1);
     let request =
         write_provider_exchange_request(&run_dir, &coordinates, b"request").expect("request");
@@ -1356,11 +1342,10 @@ fn seeded_context_invalid_response_run(
         path: "artifacts/01-research.attempt-001.context-round-001.json".to_string(),
         digest: hex::encode(sha2::Sha256::digest(expansion_bytes)),
     };
-    fs::write(
+    write_private_fixture_file(
         workspace.run_directory().join(&expansion.path),
         expansion_bytes,
-    )
-    .expect("trusted expansion");
+    );
     let mut request_record = request_record(
         2,
         Some(needs_context_head.digest),
@@ -1539,13 +1524,46 @@ fn staged_request_for_group(
 }
 
 #[cfg(unix)]
+fn create_private_run_layout(run_dir: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+
+    for path in [
+        run_dir.to_path_buf(),
+        run_dir.join("prompts"),
+        run_dir.join("responses"),
+        run_dir.join("artifacts"),
+    ] {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path).unwrap();
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_run_layout(_run_dir: &Path) {
+    panic!("private loop workspace tests require Unix")
+}
+
+#[cfg(unix)]
+fn write_private_fixture_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+#[cfg(not(unix))]
+fn write_private_fixture_file(_path: impl AsRef<Path>, _bytes: &[u8]) {
+    panic!("private loop workspace tests require Unix")
+}
+
+#[cfg(unix)]
 #[test]
 fn exchange_writer_rejects_symlink_and_non_file_collisions() {
     let temp = tempfile::tempdir().expect("temp");
     let run_dir = temp.path().join("run");
-    fs::create_dir_all(run_dir.join("prompts")).expect("prompts");
-    fs::create_dir_all(run_dir.join("responses")).expect("responses");
-    fs::create_dir_all(run_dir.join("artifacts")).expect("artifacts");
+    create_private_run_layout(&run_dir);
     let coordinates = coordinates(1);
     let expected = run_dir.join("prompts/01-research.attempt-001.exchange-001.initial.request.md");
     let outside = temp.path().join("outside");

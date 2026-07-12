@@ -1992,3 +1992,37 @@ and doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
 formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
 through the pinned pnpm runtime. M1-10 is accepted and M1-11 minimum artifact
 protection is active.
+
+## 2026-07-12 implementation | M1-11a private run artifacts
+
+Added one Unix private-artifact publication seam backed by pinned directory
+handles. Supported run roots and subdirectories are created as `0700`; run
+state, locks, prompts, provider exchanges, logs, evidence, temporary files, and
+final files are created as `0600` independently of process umask. Existing
+broader permissions fail closed with exact `chmod` guidance rather than silent
+migration. Source and candidate Git modes, standalone evaluation, and release
+artifacts remain unchanged. Non-Unix loop workspace creation returns
+unsupported before publishing a run leaf.
+
+Create, link, rename, unlink, identity validation, and directory sync now use
+the pinned parent rather than a later pathname lookup. Raw child names reject
+absolute, nested, dot, traversal, slash, and NUL forms. Candidate and repository
+operation locks retain and revalidate their pinned parent and file identity;
+state and immutable publication remove only an operation-owned temporary inode.
+Workspace scaffolding authenticates retained existing files and directories
+before creating missing defaults and again before success, preserving valid
+populated logs and context manifests while refusing file, directory, parent,
+lock, target, symlink, and temporary-entry substitution without modifying the
+substituted tree.
+
+Independent specification and quality reviews iteratively closed
+truncate-before-authentication, immutable retry following, non-Unix compile,
+parent-component, validated-parent pathname, lock-parent, scaffold ordering,
+raw-name, standalone-policy-parent, and partial-scaffold race gaps. Both final
+reviews approve with no remaining P0/P1/P2 findings. A definitive full Rust
+workspace run passes, including CLI 137, loop library 161, candidate 40,
+provider-candidate 53, state 38, provider-exchange 22, and testing-evidence 8
+tests. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
+package lint/typecheck, eight SDK tests, SDK build, and diff checks pass through
+the pinned pnpm runtime. M1-11a is accepted; M1-11b bounded artifact storage is
+active and M1-11c bounded secret redaction remains pending.

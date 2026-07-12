@@ -2756,7 +2756,7 @@ mod live_context_cap_tests {
             timeout_ms: 30_000,
         };
         let bytes = serde_json::to_vec_pretty(&request).expect("request bytes");
-        std::fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace
                 .run_directory()
                 .join("prompts/06-output-review.attempt-002.prompt.md"),

@@ -38,7 +38,10 @@
 - [x] M1-09c2b: Zero-command adoption transaction.
 - [x] M1-09c3: Evaluation invalidation and rerun.
 - [x] M1-10: Atomic state and run locking.
-- [ ] M1-11: Minimum artifact protection (active).
+- [ ] M1-11: Minimum artifact protection.
+  - [x] M1-11a: Private run artifacts.
+  - [ ] M1-11b: Bounded artifact storage (active).
+  - [ ] M1-11c: Bounded secret redaction.
 - [ ] M1-12: Interruption recovery acceptance.
 
 ## Milestone 2 - Consumable Loop
@@ -62,7 +65,7 @@
 
 ## Current Gate
 
-M1-06 through M1-10 are complete; M1-11 is active. Public run/status output supplies
+M1-06 through M1-10 and M1-11a are complete; M1-11b is active. Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -145,4 +148,11 @@ and lock-order constraints remain intact. Resume validates the human-review
 barrier before resync, authenticates frozen terminal authority before returning
 inert, and still subjects ordinary terminal provider history to recovery
 validation. Full Rust, strict Clippy, formatting, package, SDK, and diff gates
-pass. M1-11 minimum artifact protection is active.
+pass. M1-11a now creates supported Unix run directories as `0700` and every
+run-owned file as `0600`, rejects existing broader modes with explicit repair
+guidance, and publishes through pinned directory handles with identity-checked
+create/link/rename/unlink operations. Parent, path, symlink, lock, target, and
+temporary-file substitution fail closed without touching the substituted tree;
+valid existing scaffold content remains intact. Source/candidate Git modes and
+standalone eval/release artifacts are unchanged. M1-11b per-artifact and
+aggregate storage limits is active; M1-11c bounded secret redaction is pending.

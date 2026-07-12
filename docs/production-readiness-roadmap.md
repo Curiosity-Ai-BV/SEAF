@@ -239,7 +239,13 @@ cuts. Reads and replacements reject symlink or target-identity substitution;
 bounded contention fails closed; exact retries reauthenticate and close
 post-publication durability uncertainty. Provider history, candidate,
 recovery, approval, evaluation, and promotion authority retain their narrower
-transition guards and lock order. M1-11 minimum artifact protection is active.
+transition guards and lock order. M1-11a private run artifacts is also
+complete: supported Unix run trees are private from creation, existing broad
+modes fail closed with remediation, and pinned directory-handle publication
+protects run files, locks, temporaries, and final artifacts from pathname and
+parent-substitution races. Source/candidate Git modes and standalone eval or
+release files are unchanged. M1-11b bounded artifact storage is active;
+M1-11c bounded secret redaction remains pending, so M1-11 is not yet complete.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF

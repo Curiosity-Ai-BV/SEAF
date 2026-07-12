@@ -493,6 +493,7 @@ mod recovery_authority_tests {
     #[test]
     fn public_direct_writer_cannot_mint_change_or_clear_recovery_authority() {
         let temp = tempfile::tempdir().unwrap();
+        crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let path = temp.path().join("run.json");
         let run = run_with_candidate();
         write_run_file(&path, &run).unwrap();
@@ -521,6 +522,7 @@ mod recovery_authority_tests {
     #[test]
     fn new_run_file_cannot_begin_with_recovery_authority() {
         let temp = tempfile::tempdir().unwrap();
+        crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let path = temp.path().join("run.json");
         let mut run = run_with_candidate();
         run.latest_recovery = Some(recovery(1, '6'));

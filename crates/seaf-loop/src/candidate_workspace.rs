@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     env,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -32,7 +33,7 @@ use crate::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 pub const CANDIDATE_WORKSPACE_SCHEMA_VERSION: u32 = 2;
 const CANDIDATE_ROOT_DIR: &str = "seaf-candidates";
@@ -1348,9 +1349,12 @@ fn write_create_only_artifact(
                 "candidate artifact directory is not a real directory".to_string(),
             ));
         }
-        Ok(_) => false,
+        Ok(_) => {
+            crate::artifact_safety::validate_private_directory(&artifact_dir)?;
+            false
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&artifact_dir)?;
+            crate::artifact_safety::ensure_private_child_directory(&artifact_dir)?;
             true
         }
         Err(error) => return Err(CandidateWorkspaceError::Io(error)),
@@ -2103,92 +2107,88 @@ fn run_directory_digest(run_directory: &Path) -> Result<String, CandidateWorkspa
 
 pub(crate) fn acquire_candidate_lock(
     workspace: &LoopWorkspace,
-) -> Result<fs::File, CandidateWorkspaceError> {
+) -> Result<CandidateDirectoryLock, CandidateWorkspaceError> {
     acquire_candidate_directory_lock(workspace.run_directory())
 }
 
 fn acquire_candidate_directory_lock(
     run_directory: &Path,
-) -> Result<fs::File, CandidateWorkspaceError> {
-    let metadata = fs::symlink_metadata(run_directory)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CandidateWorkspaceError::Unsafe(
-            "candidate run directory must be a real directory".to_string(),
-        ));
+) -> Result<CandidateDirectoryLock, CandidateWorkspaceError> {
+    acquire_candidate_directory_lock_with_hook(run_directory, || Ok(()))
+}
+
+fn acquire_candidate_directory_lock_with_hook<F>(
+    run_directory: &Path,
+    before_open: F,
+) -> Result<CandidateDirectoryLock, CandidateWorkspaceError>
+where
+    F: FnOnce() -> Result<(), CandidateWorkspaceError>,
+{
+    acquire_pinned_lock(run_directory, OsStr::new(CANDIDATE_LOCK_FILE), before_open)
+}
+
+#[derive(Debug)]
+pub(crate) struct CandidateDirectoryLock {
+    directory: crate::artifact_safety::PinnedPrivateDirectory,
+    file: fs::File,
+    name: OsString,
+}
+
+impl CandidateDirectoryLock {
+    pub(crate) fn unlock(self) -> std::io::Result<()> {
+        self.directory.validate_identity()?;
+        self.directory
+            .validate_single_link_file(&self.name, &self.file.metadata()?)?;
+        self.file.unlock()
     }
-    let path = run_directory.join(CANDIDATE_LOCK_FILE);
+}
+
+fn acquire_pinned_lock<F>(
+    parent: &Path,
+    name: &OsStr,
+    before_open: F,
+) -> Result<CandidateDirectoryLock, CandidateWorkspaceError>
+where
+    F: FnOnce() -> Result<(), CandidateWorkspaceError>,
+{
+    let directory = crate::artifact_safety::PinnedPrivateDirectory::open(parent)?;
+    before_open()?;
+    directory.validate_identity()?;
     let mut created = false;
-    let file = match inspect_candidate_lock_path(&path) {
-        Ok(()) => open_candidate_lock(&path, false)?,
+    let file = match directory.open_existing_file(name, true, true) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match open_candidate_lock(&path, true) {
+            match directory.create_file(name) {
                 Ok(file) => {
                     created = true;
                     file
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    inspect_candidate_lock_path(&path)?;
-                    open_candidate_lock(&path, false)?
+                    directory.open_existing_file(name, true, true)?
                 }
                 Err(error) => return Err(CandidateWorkspaceError::Io(error)),
             }
         }
         Err(error) => return Err(CandidateWorkspaceError::Io(error)),
     };
-    validate_candidate_lock_file(&file, &path)?;
+    directory.validate_single_link_file(name, &file.metadata()?)?;
     if created {
         file.sync_all()?;
-        fs::File::open(run_directory)?.sync_all()?;
+        directory.sync_all()?;
     }
     file.lock().map_err(CandidateWorkspaceError::Io)?;
-    if let Err(error) = validate_candidate_lock_file(&file, &path) {
+    if let Err(error) = directory
+        .validate_identity()
+        .and_then(|()| directory.validate_single_link_file(name, &file.metadata()?))
+    {
         let _ = file.unlock();
         return Err(CandidateWorkspaceError::Io(error));
     }
-    Ok(file)
-}
-
-fn inspect_candidate_lock_path(path: &Path) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "candidate cleanup lock is not a regular file",
-        ));
-    }
-    Ok(())
-}
-
-fn open_candidate_lock(path: &Path, create: bool) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    if create {
-        options.create_new(true);
-    }
-    #[cfg(target_os = "macos")]
-    options.custom_flags(0x100);
-    #[cfg(target_os = "linux")]
-    options.custom_flags(0x20000);
-    options.open(path)
-}
-
-fn validate_candidate_lock_file(file: &fs::File, path: &Path) -> std::io::Result<()> {
-    let opened = file.metadata()?;
-    let current = fs::symlink_metadata(path)?;
-    if current.file_type().is_symlink() || !opened.is_file() || !current.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "candidate cleanup lock identity is unsafe",
-        ));
-    }
-    #[cfg(unix)]
-    if opened.dev() != current.dev() || opened.ino() != current.ino() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "candidate cleanup lock was replaced",
-        ));
-    }
-    Ok(())
+    Ok(CandidateDirectoryLock {
+        directory,
+        file,
+        name: name.to_os_string(),
+    })
 }
 
 fn validate_static_authority(
@@ -2411,7 +2411,7 @@ fn repository_operation_lock_path(
 
 pub(crate) fn acquire_repository_operation_lock(
     git_common_dir: &Path,
-) -> Result<fs::File, CandidateWorkspaceError> {
+) -> Result<CandidateDirectoryLock, CandidateWorkspaceError> {
     let path = repository_operation_lock_path(git_common_dir)?;
     let candidate_root = path
         .parent()
@@ -2435,25 +2435,11 @@ pub(crate) fn acquire_repository_operation_lock(
     ensure_private_authority_directory(candidate_root)?;
     ensure_private_authority_directory(lock_namespace)?;
     ensure_private_authority_directory(lock_parent)?;
-    let file = match open_candidate_lock(&path, true) {
-        Ok(file) => {
-            file.sync_all()?;
-            fs::File::open(lock_parent)?.sync_all()?;
-            file
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            inspect_candidate_lock_path(&path)?;
-            open_candidate_lock(&path, false)?
-        }
-        Err(error) => return Err(CandidateWorkspaceError::Io(error)),
-    };
-    validate_candidate_lock_file(&file, &path)?;
-    file.lock().map_err(CandidateWorkspaceError::Io)?;
-    if let Err(error) = validate_candidate_lock_file(&file, &path) {
-        let _ = file.unlock();
-        return Err(CandidateWorkspaceError::Io(error));
-    }
-    Ok(file)
+    acquire_pinned_lock(
+        lock_parent,
+        OsStr::new(REPOSITORY_OPERATION_LOCK_FILE),
+        || Ok(()),
+    )
 }
 
 fn set_and_validate_private_directory(path: &Path) -> Result<(), CandidateWorkspaceError> {
@@ -3302,6 +3288,30 @@ mod tests {
     use super::*;
     use seaf_core::LoopInputDigests;
     use std::process::Command;
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_lock_parent_substitution_before_open_cannot_create_external_lock() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&run).unwrap();
+        let parked = temp.path().join("parked-run");
+        let outside = temp.path().join("outside");
+        crate::artifact_safety::create_private_directory(&outside).unwrap();
+        let error = acquire_candidate_directory_lock_with_hook(&run, || {
+            fs::rename(&run, &parked)?;
+            symlink(&outside, &run)?;
+            Ok(())
+        })
+        .expect_err("candidate lock must reject substituted parent");
+        assert!(error.to_string().contains("directory"), "{error}");
+        assert!(!outside.join(CANDIDATE_LOCK_FILE).exists());
+        assert!(!parked.join(CANDIDATE_LOCK_FILE).exists());
+        fs::remove_file(&run).unwrap();
+        fs::rename(parked, run).unwrap();
+    }
 
     #[test]
     fn linked_worktree_authorities_share_the_git_common_directory_operation_lock() {

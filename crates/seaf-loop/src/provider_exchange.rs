@@ -2178,14 +2178,14 @@ mod tests {
         )
         .unwrap();
         let review_path = "artifacts/06-output-review.md";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(review_path),
             review_artifact.canonical_bytes().unwrap(),
         )
         .unwrap();
         let candidate_diff_path = "artifacts/candidate-patch.applied.diff";
         let candidate_diff = b"candidate diff";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(candidate_diff_path),
             candidate_diff,
         )
@@ -2272,8 +2272,11 @@ mod tests {
             "evals:\n  allow_commands: [true]\n  required:\n    - name: unit\n      command: true\n",
         )
         .unwrap();
-        fs::create_dir_all(workspace.run_directory().join("inputs")).unwrap();
-        fs::write(
+        crate::artifact_safety::ensure_private_child_directory(
+            &workspace.run_directory().join("inputs"),
+        )
+        .unwrap();
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join("inputs/eval-config.json"),
             canonical_json_bytes(&eval_config).unwrap(),
         )
@@ -2298,8 +2301,16 @@ mod tests {
         let stderr = b"unit stderr\n";
         let stdout_path = "artifacts/07-testing.check-001.stdout.log";
         let stderr_path = "artifacts/07-testing.check-001.stderr.log";
-        fs::write(workspace.run_directory().join(stdout_path), stdout).unwrap();
-        fs::write(workspace.run_directory().join(stderr_path), stderr).unwrap();
+        crate::artifact_safety::write_private_fixture(
+            workspace.run_directory().join(stdout_path),
+            stdout,
+        )
+        .unwrap();
+        crate::artifact_safety::write_private_fixture(
+            workspace.run_directory().join(stderr_path),
+            stderr,
+        )
+        .unwrap();
         let check = EvalCheck {
             name: "unit".to_string(),
             status: if passed {
@@ -2347,7 +2358,7 @@ mod tests {
             candidate_diff: approval.candidate_diff.clone(),
             planned_checks: eval_config.evals.required,
         };
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace
                 .run_directory()
                 .join("artifacts/07-testing.execution-intent.json"),
@@ -2358,7 +2369,7 @@ mod tests {
             path: format!("artifacts/07-testing{suffix}.json"),
             digest: testing.artifact_digest().unwrap(),
         };
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(&testing_reference.path),
             testing.canonical_bytes().unwrap(),
         )
@@ -2402,7 +2413,7 @@ mod tests {
             path: format!("artifacts/08-eval-report{suffix}.json"),
             digest: canonical_sha256_digest(&report).unwrap(),
         };
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(&report_reference.path),
             canonical_json_bytes(&report).unwrap(),
         )

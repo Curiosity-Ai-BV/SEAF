@@ -101,7 +101,8 @@ impl ModelProvider for InspectingProvider {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("collision parent");
             }
-            std::fs::write(path, b"occupied durable target").expect("inject collision");
+            crate::artifact_safety::write_private_fixture(path, b"occupied durable target")
+                .expect("inject collision");
         }
         for (path, content) in &self.mutations_before_return[call] {
             std::fs::write(path, content).expect("mutate live repository source");
@@ -683,9 +684,9 @@ fn resume_rejects_a_skipped_conventional_prompt_attempt_before_any_exchange_writ
     std::fs::remove_file(run_directory.join(exchange_request)).expect("remove cut");
     let exact =
         std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("attempt one");
-    std::fs::write(
+    crate::artifact_safety::write_private_fixture(
         run_directory.join("prompts/01-research.attempt-999.prompt.md"),
-        exact,
+        &exact,
     )
     .expect("inject skipped prompt");
     let before = snapshot_tree(&run_directory);
@@ -756,13 +757,16 @@ fn recovery_rejects_a_staged_initial_request_without_its_exact_conventional_prom
         )
         .expect("stage request");
         if case == "substituted" {
-            std::fs::write(
+            crate::artifact_safety::write_private_fixture(
                 run_directory.join("prompts/01-research.prompt.md"),
                 b"substituted conventional prompt",
             )
             .expect("substituted prompt");
         }
-        std::fs::write(run_directory.join("provider-exchange.lock"), b"")
+        crate::artifact_safety::write_private_fixture(
+            run_directory.join("provider-exchange.lock"),
+            b"",
+        )
             .expect("stable lock file");
         let before = snapshot_tree(&run_directory);
 
@@ -821,9 +825,9 @@ fn resume_rejects_expected_attempt_two_without_matching_rerun_authorization() {
         .expect("write unauthorized running state");
     let attempt_one =
         std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("attempt one");
-    std::fs::write(
+    crate::artifact_safety::write_private_fixture(
         run_directory.join("prompts/01-research.attempt-002.prompt.md"),
-        attempt_one,
+        &attempt_one,
     )
     .expect("unauthorized attempt two prompt");
     let before = snapshot_tree(&run_directory);
@@ -1180,11 +1184,11 @@ fn resume_rejects_standalone_or_tampered_expansions_before_provider_invocation()
         if case == "tampered-referenced" {
             std::fs::remove_file(runs_root.join(&run_id).join(collision))
                 .expect("remove collision");
-            std::fs::write(
+            crate::artifact_safety::write_private_fixture(
                 runs_root
                     .join(&run_id)
                     .join("artifacts/01-research.attempt-001.context-round-001.json"),
-                "tampered",
+                b"tampered",
             )
             .expect("tamper expansion");
         }

@@ -1,4 +1,5 @@
 pub mod approved_eval;
+mod artifact_safety;
 pub mod artifacts;
 pub mod bench;
 pub mod candidate_workspace;

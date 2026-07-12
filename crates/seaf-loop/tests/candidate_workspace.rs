@@ -1217,6 +1217,32 @@ fn cleanup_rejects_a_symlinked_candidate_lock_before_state_or_worktree_mutation(
     remove_worktree(&source, Path::new(&candidate.path));
 }
 
+#[cfg(unix)]
+#[test]
+fn cleanup_rejects_a_broad_candidate_lock_without_mutation() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let (workspace, candidate) = persisted_candidate_workspace(
+        temp.path(),
+        &source,
+        "run-broad-cleanup-lock",
+        LoopStatus::Completed,
+    );
+    let lock = workspace.run_directory().join(".candidate-workspace.lock");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = fs::read(workspace.run_file()).unwrap();
+    let error = cleanup_candidate_workspace(&workspace, &source)
+        .expect_err("broad candidate lock must fail closed");
+    assert!(error.to_string().contains("chmod 600"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+    assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o777, 0o644);
+    assert!(Path::new(&candidate.path).is_dir());
+    remove_worktree(&source, Path::new(&candidate.path));
+}
+
 #[test]
 fn active_candidate_must_remain_registered_and_detached() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1739,12 +1765,11 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     )
     .expect("Development evidence");
     let artifact_path = "artifacts/05-development.json";
-    fs::create_dir_all(workspace.run_directory().join("artifacts")).expect("artifact dir");
-    fs::write(
-        workspace.run_directory().join(artifact_path),
-        evidence.canonical_bytes().expect("canonical evidence"),
-    )
-    .expect("Development evidence artifact");
+    write_private_artifact_fixture(
+        &workspace,
+        artifact_path,
+        &evidence.canonical_bytes().expect("canonical evidence"),
+    );
     let mut authoritative = seaf_loop::state::load_run(&workspace).expect("authoritative run");
     let development = authoritative
         .steps
@@ -2313,6 +2338,13 @@ fn sha256_path(path: &Path) -> String {
 
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir(destination).expect("copy destination");
+    fs::set_permissions(
+        destination,
+        fs::symlink_metadata(source)
+            .expect("source mode")
+            .permissions(),
+    )
+    .expect("copy directory mode");
     for entry in fs::read_dir(source).expect("copy source") {
         let entry = entry.expect("copy entry");
         let source_path = entry.path();
@@ -2321,8 +2353,28 @@ fn copy_directory(source: &Path, destination: &Path) {
             copy_directory(&source_path, &destination_path);
         } else {
             fs::copy(&source_path, &destination_path).expect("copy file");
+            fs::set_permissions(
+                &destination_path,
+                fs::symlink_metadata(&source_path)
+                    .expect("source file mode")
+                    .permissions(),
+            )
+            .expect("copy file mode");
         }
     }
+}
+
+fn write_private_artifact_fixture(workspace: &LoopWorkspace, relative: &str, bytes: &[u8]) {
+    let artifacts = workspace.run_directory().join("artifacts");
+    if !artifacts.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&artifacts).unwrap();
+        }
+    }
+    seaf_loop::workspace::write_artifact(workspace.run_directory(), relative, bytes).unwrap();
 }
 
 fn prepare_candidate_workspace(
@@ -2420,12 +2472,11 @@ fn persist_development_authority(
     )
     .expect("Development evidence");
     let artifact_path = "artifacts/05-development.json";
-    fs::create_dir_all(workspace.run_directory().join("artifacts")).expect("artifact dir");
-    fs::write(
-        workspace.run_directory().join(artifact_path),
-        evidence.canonical_bytes().expect("canonical evidence"),
-    )
-    .expect("Development evidence artifact");
+    write_private_artifact_fixture(
+        workspace,
+        artifact_path,
+        &evidence.canonical_bytes().expect("canonical evidence"),
+    );
     let mut authoritative = seaf_loop::state::load_run(workspace).expect("authoritative run");
     let development = authoritative
         .steps

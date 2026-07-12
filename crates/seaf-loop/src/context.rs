@@ -425,7 +425,7 @@ mod tests {
         std::fs::create_dir_all(repo.join("src")).expect("src dir");
         std::fs::create_dir_all(repo.join("secrets")).expect("secrets dir");
         std::fs::create_dir_all(repo.join("node_modules/pkg")).expect("node_modules dir");
-        std::fs::create_dir_all(&run_dir).expect("run dir");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
         std::fs::write(repo.join("src/lib.rs"), "pub fn safe() {}\n").expect("safe file");
         std::fs::write(repo.join(".env.local"), "TOKEN=secret\n").expect("env file");
         std::fs::write(repo.join("secrets/api.key"), "secret\n").expect("secret file");
@@ -485,7 +485,7 @@ mod tests {
         let generated_artifact = ".seaf/loops/runs/run-001/context.md";
         let generated_content = "generated loop context must not be repacked\n";
         std::fs::create_dir_all(repo.join(".seaf/loops/runs/run-001")).expect("generated run dir");
-        std::fs::create_dir_all(&run_dir).expect("run dir");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
         std::fs::write(repo.join(generated_artifact), generated_content)
             .expect("generated context artifact");
 
@@ -527,6 +527,7 @@ mod tests {
         let repo = temp_dir.path().join("repo");
         let run_dir = temp_dir.path().join("run");
         std::fs::create_dir_all(repo.join("src")).expect("src dir");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
         let first_content = "abcdefghij";
         let second_content = "klmnopqrst";
         std::fs::write(repo.join("src/first.txt"), first_content).expect("first file");
@@ -585,6 +586,7 @@ mod tests {
         let repo = temp_dir.path().join("repo");
         let run_dir = temp_dir.path().join("run");
         std::fs::create_dir_all(repo.join("docs")).expect("docs dir");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
         std::fs::write(repo.join("docs/public.md"), "public context\n").expect("public file");
         std::fs::write(repo.join("docs/private.md"), "private context\n").expect("private file");
 

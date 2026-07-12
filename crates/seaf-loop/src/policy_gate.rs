@@ -1,10 +1,13 @@
 use std::{
     error::Error,
-    fmt, fs,
+    fmt,
     io::Write,
     path::Path,
     process::{Command, Stdio},
 };
+
+#[cfg(test)]
+use std::fs;
 
 use seaf_core::Policy;
 use serde::{Deserialize, Serialize};
@@ -165,7 +168,10 @@ fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
     execute_apply: bool,
     artifact_attempt: u32,
 ) -> Result<PolicyDecision, PatchGateError> {
-    fs::create_dir_all(request.artifact_dir).map_err(PatchGateError::Io)?;
+    // Standalone policy gating is also public outside a LoopWorkspace. Its artifact directory is
+    // private, but an arbitrary repository/temp parent is not required to be a private run root.
+    crate::artifact_safety::ensure_private_standalone_directory(request.artifact_dir)
+        .map_err(PatchGateError::Io)?;
 
     let artifact_stem = match artifact_attempt {
         attempt if attempt > 1 => {
@@ -655,6 +661,7 @@ mod attempt_artifact_tests {
     #[test]
     fn later_attempt_policy_outputs_are_create_only_exact_and_collision_safe() {
         let temp = tempfile::tempdir().unwrap();
+        crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let artifacts = temp.path().join("artifacts");
         let policy = policy();
         let patch = "diff --git a/blocked.txt b/blocked.txt\nnew file mode 100644\n--- /dev/null\n+++ b/blocked.txt\n@@ -0,0 +1 @@\n+blocked\n";
@@ -684,10 +691,25 @@ mod attempt_artifact_tests {
         let error = gate_patch_proposal_attempt(request(&substituted), &mut runner, 2)
             .expect_err("different bytes cannot replace attempt-two evidence");
         assert!(error.to_string().contains("collision"), "{error}");
-        assert_eq!(fs::read(diff_path).unwrap(), diff_bytes);
+        assert_eq!(fs::read(&diff_path).unwrap(), diff_bytes);
 
         let error = gate_patch_proposal_attempt(request(patch), &mut runner, 0)
             .expect_err("attempt zero cannot alias fixed attempt-one evidence");
         assert!(error.to_string().contains("positive"), "{error}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o755)).unwrap();
+            let before = fs::read(&diff_path).unwrap();
+            let error = gate_patch_proposal_attempt(request(patch), &mut runner, 2)
+                .expect_err("broad policy artifact directory must fail closed");
+            assert!(error.to_string().contains("chmod 700"), "{error}");
+            assert_eq!(fs::read(&diff_path).unwrap(), before);
+            assert_eq!(
+                fs::symlink_metadata(&artifacts).unwrap().mode() & 0o777,
+                0o755
+            );
+        }
     }
 }

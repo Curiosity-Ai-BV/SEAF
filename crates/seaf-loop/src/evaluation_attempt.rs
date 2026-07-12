@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn write(workspace: &LoopWorkspace, name: &str, bytes: &[u8]) {
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join("artifacts").join(name),
             bytes,
         )

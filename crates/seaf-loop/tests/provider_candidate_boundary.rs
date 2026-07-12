@@ -4,6 +4,9 @@ use std::{
     process::Command,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CheckStatus, EvalCheck,
     EvalDecision, EvalLoopEvidence, EvalReport, LoopInputDigests, LoopStepName, Policy,
@@ -321,11 +324,7 @@ fn evaluation_invalidation_recovers_create_only_publication_cuts_and_exact_retry
     write_raw_run(&fixture.workspace, &approved);
     fs::remove_file(fixture.workspace.run_directory().join(&source_path)).unwrap();
     fs::remove_file(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
-    fs::write(
-        fixture.workspace.run_directory().join(&source_path),
-        &source_bytes,
-    )
-    .unwrap();
+    write_private_run_fixture(&fixture.workspace, &source_path, &source_bytes);
     let after_source = invalidate_approved_evaluation(&fixture.workspace, actor, reason).unwrap();
     assert_eq!(after_source, first);
 
@@ -371,7 +370,7 @@ fn evaluation_rerun_rejects_authoritative_input_drift_before_attempt_publication
             "authorize drift-checked rerun",
         )
         .unwrap();
-        fs::write(fixture.workspace.run_directory().join(path), b"substituted").unwrap();
+        write_private_run_fixture(&fixture.workspace, path, b"substituted");
 
         rerun_invalidated_evaluation(
             &fixture.workspace,
@@ -493,14 +492,11 @@ fn evaluation_invalidation_keeps_eval_passed_and_promotion_intent_frozen() {
     ] {
         fs::remove_file(intent_fixture.workspace.run_directory().join(path)).unwrap();
     }
-    fs::write(
-        intent_fixture
-            .workspace
-            .run_directory()
-            .join("artifacts/09-promotion.intent.json"),
+    write_private_run_fixture(
+        &intent_fixture.workspace,
+        "artifacts/09-promotion.intent.json",
         b"{}",
-    )
-    .unwrap();
+    );
     let before = directory_snapshot(intent_fixture.workspace.run_directory());
     let error = invalidate_approved_evaluation(
         &intent_fixture.workspace,
@@ -597,25 +593,19 @@ fn invalidation_v3_rejects_recomputed_prior_final_reference_substitution() {
     source.prior_final.as_mut().unwrap().testing_evidence =
         source.evaluation_prefix.present_artifacts[0].clone();
     let source_bytes = canonical_json_bytes(&source).unwrap();
-    fs::write(
-        fixture
-            .workspace
-            .run_directory()
-            .join(&outcome.recovery.source_run.path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        &outcome.recovery.source_run.path,
         &source_bytes,
-    )
-    .unwrap();
+    );
     let mut recovery: EvaluationInvalidationAttemptV3 = outcome.recovery.clone();
     recovery.source_run.digest = format!("{:x}", Sha256::digest(&source_bytes));
     let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
-    fs::write(
-        fixture
-            .workspace
-            .run_directory()
-            .join(&outcome.reference.artifact.path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        &outcome.reference.artifact.path,
         &recovery_bytes,
-    )
-    .unwrap();
+    );
     let mut tampered_run = outcome.run;
     tampered_run
         .latest_recovery
@@ -1483,11 +1473,7 @@ fn evaluation_adoption_rejects_input_and_report_drift_before_recovery_publicatio
             "attempt2" => "artifacts/07-testing.attempt-002.execution-intent.json".to_string(),
             _ => unreachable!(),
         };
-        fs::write(
-            fixture.workspace.run_directory().join(&path),
-            b"substituted",
-        )
-        .unwrap();
+        write_private_run_fixture(&fixture.workspace, &path, b"substituted");
         let before = directory_snapshot(fixture.workspace.run_directory());
 
         let error = adopt_approved_evaluation(
@@ -1609,11 +1595,11 @@ fn evaluation_adoption_rejects_noncanonical_source_orphan_timestamp_before_later
     )
     .unwrap();
     source.created_at = "01".to_string();
-    fs::write(
-        fixture.workspace.run_directory().join(&source_path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        &source_path,
         canonical_json_bytes(&source).unwrap(),
-    )
-    .unwrap();
+    );
     let before = directory_snapshot(fixture.workspace.run_directory());
 
     let error = adopt_approved_evaluation(
@@ -1731,14 +1717,11 @@ fn evaluation_adoption_rejects_unrelated_terminal_promotion_and_retry_drift() {
     )
     .expect_err("ordinary terminal evaluation cannot be relabelled adopted");
     write_raw_run(&fixture.workspace, &approved);
-    fs::write(
-        fixture
-            .workspace
-            .run_directory()
-            .join("artifacts/09-promotion.intent.json"),
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/09-promotion.intent.json",
         b"promotion intent",
-    )
-    .unwrap();
+    );
     let before = directory_snapshot(fixture.workspace.run_directory());
     adopt_approved_evaluation(
         &fixture.workspace,
@@ -1765,27 +1748,21 @@ fn evaluation_adoption_exact_retry_rejects_post_cas_input_promotion_and_attempt_
         )
         .unwrap();
         match drift {
-            "input" => fs::write(
-                fixture.workspace.run_directory().join("inputs/ticket.json"),
+            "input" => write_private_run_fixture(
+                &fixture.workspace,
+                "inputs/ticket.json",
                 b"substituted ticket",
-            )
-            .unwrap(),
-            "promotion" => fs::write(
-                fixture
-                    .workspace
-                    .run_directory()
-                    .join("artifacts/09-promotion.intent.json"),
+            ),
+            "promotion" => write_private_run_fixture(
+                &fixture.workspace,
+                "artifacts/09-promotion.intent.json",
                 b"promotion intent",
-            )
-            .unwrap(),
-            "future-attempt" => fs::write(
-                fixture
-                    .workspace
-                    .run_directory()
-                    .join("artifacts/07-testing.attempt-002.execution-intent.json"),
+            ),
+            "future-attempt" => write_private_run_fixture(
+                &fixture.workspace,
+                "artifacts/07-testing.attempt-002.execution-intent.json",
                 b"future attempt",
-            )
-            .unwrap(),
+            ),
             _ => unreachable!(),
         }
         let before = directory_snapshot(fixture.workspace.run_directory());
@@ -2095,18 +2072,15 @@ fn evaluation_recovery_v2_rejects_source_prefix_disposition_projection_and_desce
                 })
             }
             "log" => {
-                fs::write(
-                    fixture
-                        .workspace
-                        .run_directory()
-                        .join("artifacts/07-testing.attempt-001.check-001.stdout.log"),
+                write_private_run_fixture(
+                    &fixture.workspace,
+                    "artifacts/07-testing.attempt-001.check-001.stdout.log",
                     b"substituted log\n",
-                )
-                .unwrap();
+                );
             }
             "provider" => {
                 let path = &approved.provider_exchange_records.last().unwrap().path;
-                fs::write(fixture.workspace.run_directory().join(path), b"substituted").unwrap();
+                write_private_run_fixture(&fixture.workspace, path, b"substituted");
             }
             "descendant" => recovered.updated_at = "99".to_string(),
             _ => unreachable!(),
@@ -2217,11 +2191,11 @@ fn testing_evidence_binding_rejects_every_approved_authority_substitution() {
         path: "artifacts/testing-binding.json".to_string(),
         digest: exact.artifact_digest().unwrap(),
     };
-    fs::write(
-        fixture.workspace.run_directory().join(&reference.path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        &reference.path,
         exact.canonical_bytes().unwrap(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         TestingEvidence::load_for_approved_run(&fixture.workspace, &reference, &approved).unwrap(),
         exact
@@ -2413,25 +2387,22 @@ fn final_authority_loader_rejects_log_incomplete_testing_evidence() {
         path: "artifacts/07-testing.json".to_string(),
         digest: canonical_sha256_digest(&testing).unwrap(),
     };
-    fs::write(
-        fixture
-            .workspace
-            .run_directory()
-            .join(&testing_reference.path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        &testing_reference.path,
         canonical_json_bytes(&testing).unwrap(),
-    )
-    .unwrap();
+    );
     let mut report = verified.eval_report().clone();
     report.loop_evidence.as_mut().unwrap().testing_evidence = testing_reference.clone();
     let mut run = final_run;
     run.steps[6].artifact_path = Some(testing_reference.path);
     run.steps[6].artifact_digest = Some(testing_reference.digest);
     let report_path = "artifacts/08-eval-report.json";
-    fs::write(
-        fixture.workspace.run_directory().join(report_path),
+    write_private_run_fixture(
+        &fixture.workspace,
+        report_path,
         canonical_json_bytes(&report).unwrap(),
-    )
-    .unwrap();
+    );
     run.steps[7].artifact_path = Some(report_path.to_string());
     run.steps[7].artifact_digest = Some(canonical_sha256_digest(&report).unwrap());
     run.eval_report_path = Some(report_path.to_string());
@@ -3437,8 +3408,8 @@ fn publish_final_eval_artifacts(
     let stderr = b"fixture stderr\n";
     let stdout_path = "artifacts/07-testing.check-001.stdout.log";
     let stderr_path = "artifacts/07-testing.check-001.stderr.log";
-    fs::write(workspace.run_directory().join(stdout_path), stdout).unwrap();
-    fs::write(workspace.run_directory().join(stderr_path), stderr).unwrap();
+    write_private_run_fixture(workspace, stdout_path, stdout);
+    write_private_run_fixture(workspace, stderr_path, stderr);
     let check = EvalCheck {
         name: "unit".to_string(),
         status: if passed {
@@ -3485,22 +3456,20 @@ fn publish_final_eval_artifacts(
         "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
         "planned_checks": eval_config["evals"]["required"],
     });
-    fs::write(
-        workspace
-            .run_directory()
-            .join("artifacts/07-testing.execution-intent.json"),
+    write_private_run_fixture(
+        workspace,
+        "artifacts/07-testing.execution-intent.json",
         canonical_json_bytes(&intent).unwrap(),
-    )
-    .unwrap();
+    );
     let testing_reference = ArtifactReference {
         path: "artifacts/07-testing.json".to_string(),
         digest: testing_evidence.artifact_digest().unwrap(),
     };
-    fs::write(
-        workspace.run_directory().join(&testing_reference.path),
+    write_private_run_fixture(
+        workspace,
+        &testing_reference.path,
         testing_evidence.canonical_bytes().unwrap(),
-    )
-    .unwrap();
+    );
 
     let approval = approved.human_approval.as_ref().unwrap();
     let eval_config_digest = approved.input_digests.eval_config.as_ref().unwrap();
@@ -3546,11 +3515,11 @@ fn publish_final_eval_artifacts(
         path: "artifacts/08-eval-report.json".to_string(),
         digest: canonical_sha256_digest(&report).unwrap(),
     };
-    fs::write(
-        workspace.run_directory().join(&report_reference.path),
+    write_private_run_fixture(
+        workspace,
+        &report_reference.path,
         canonical_json_bytes(&report).unwrap(),
-    )
-    .unwrap();
+    );
 
     let mut run = approved.clone();
     run.status = if passed {
@@ -3674,7 +3643,7 @@ fn publish_evaluation_recovery_v2(
         path: source_path.clone(),
         digest: format!("{:x}", Sha256::digest(&source_bytes)),
     };
-    fs::write(workspace.run_directory().join(source_path), source_bytes).unwrap();
+    write_private_run_fixture(workspace, source_path, source_bytes);
     let recovery_path = format!("artifacts/recovery-{recovery_id:03}.json");
     let zero_reference = RecoveryReference {
         recovery_id,
@@ -3720,11 +3689,7 @@ fn publish_evaluation_recovery_v2(
             digest: format!("{:x}", Sha256::digest(&recovery_bytes)),
         },
     };
-    fs::write(
-        workspace.run_directory().join(recovery_path),
-        recovery_bytes,
-    )
-    .unwrap();
+    write_private_run_fixture(workspace, recovery_path, recovery_bytes);
     final_run.latest_recovery = Some(recovery_reference);
     final_run
 }
@@ -3792,7 +3757,7 @@ fn publish_indexed_final_eval_artifacts(
     });
     let intent_path = "artifacts/07-testing.attempt-001.execution-intent.json";
     let intent_bytes = canonical_json_bytes(&intent).unwrap();
-    fs::write(workspace.run_directory().join(intent_path), &intent_bytes).unwrap();
+    write_private_run_fixture(workspace, intent_path, &intent_bytes);
     let intent_reference = ArtifactReference {
         path: intent_path.to_string(),
         digest: format!("{:x}", Sha256::digest(&intent_bytes)),
@@ -3803,7 +3768,7 @@ fn publish_indexed_final_eval_artifacts(
     testing.execution_intent = Some(intent_reference);
     let testing_path = "artifacts/07-testing.attempt-001.json";
     let testing_bytes = canonical_json_bytes(&testing).unwrap();
-    fs::write(workspace.run_directory().join(testing_path), &testing_bytes).unwrap();
+    write_private_run_fixture(workspace, testing_path, &testing_bytes);
     let testing_reference = ArtifactReference {
         path: testing_path.to_string(),
         digest: format!("{:x}", Sha256::digest(&testing_bytes)),
@@ -3811,7 +3776,7 @@ fn publish_indexed_final_eval_artifacts(
     report.loop_evidence.as_mut().unwrap().testing_evidence = testing_reference.clone();
     let report_path = "artifacts/08-eval-report.attempt-001.json";
     let report_bytes = canonical_json_bytes(&report).unwrap();
-    fs::write(workspace.run_directory().join(report_path), &report_bytes).unwrap();
+    write_private_run_fixture(workspace, report_path, &report_bytes);
     let report_reference = ArtifactReference {
         path: report_path.to_string(),
         digest: format!("{:x}", Sha256::digest(&report_bytes)),
@@ -3853,7 +3818,7 @@ fn rewrite_evaluation_recovery(
         serde_json::from_slice(&fs::read(workspace.run_directory().join(&path)).unwrap()).unwrap();
     mutate(&mut recovery);
     let bytes = canonical_json_bytes(&recovery).unwrap();
-    fs::write(workspace.run_directory().join(&path), &bytes).unwrap();
+    write_private_run_fixture(workspace, &path, &bytes);
     run.latest_recovery.as_mut().unwrap().artifact.digest = format!("{:x}", Sha256::digest(&bytes));
 }
 
@@ -3873,19 +3838,11 @@ fn rewrite_evaluation_recovery_source(
     .unwrap();
     mutate(&mut source);
     let source_bytes = canonical_json_bytes(&source).unwrap();
-    fs::write(
-        workspace.run_directory().join(&recovery.source_run.path),
-        &source_bytes,
-    )
-    .unwrap();
+    write_private_run_fixture(workspace, &recovery.source_run.path, &source_bytes);
     recovery.source_run.digest = format!("{:x}", Sha256::digest(&source_bytes));
     recovery.source_run_digest = canonical_sha256_digest(&source.run).unwrap();
     let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
-    fs::write(
-        workspace.run_directory().join(recovery_path),
-        &recovery_bytes,
-    )
-    .unwrap();
+    write_private_run_fixture(workspace, recovery_path, &recovery_bytes);
     run.latest_recovery.as_mut().unwrap().artifact.digest =
         format!("{:x}", Sha256::digest(&recovery_bytes));
 }
@@ -3910,7 +3867,7 @@ fn publish_report_variant(
     } else {
         format!("{:x}", Sha256::digest(&bytes))
     };
-    fs::write(workspace.run_directory().join(&path), bytes).unwrap();
+    write_private_run_fixture(workspace, &path, bytes);
     let mut run = base_run.clone();
     let record = run
         .steps
@@ -4202,6 +4159,35 @@ fn source_evidence(root: &Path) -> (String, String, Vec<u8>) {
         git(root, &["status", "--porcelain=v1"]),
         fs::read(root.join("src/lib.rs")).unwrap(),
     )
+}
+
+#[cfg(unix)]
+fn write_private_run_fixture(
+    workspace: &LoopWorkspace,
+    relative: impl AsRef<Path>,
+    bytes: impl AsRef<[u8]>,
+) {
+    use std::io::Write;
+
+    let path = workspace.run_directory().join(relative);
+    let bytes = bytes.as_ref();
+    if path.exists() {
+        fs::write(path, bytes).unwrap();
+        return;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+#[cfg(not(unix))]
+fn write_private_run_fixture(
+    _workspace: &LoopWorkspace,
+    _relative: impl AsRef<Path>,
+    _bytes: impl AsRef<[u8]>,
+) {
+    panic!("private loop workspace tests require Unix")
 }
 fn remove_candidate(source: &Path, candidate: &Path) {
     git_ok(

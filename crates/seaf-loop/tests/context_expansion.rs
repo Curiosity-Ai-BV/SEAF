@@ -1,7 +1,11 @@
 use std::{
     io::{Seek, SeekFrom, Write},
+    path::Path,
     sync::{Arc, Barrier},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use seaf_core::LoopStepName;
 use seaf_loop::{
@@ -16,16 +20,16 @@ fn fixture() -> (tempfile::TempDir, ContextExpansionRequest) {
     let repo = temp.path().join("repo");
     let run = temp.path().join("run");
     std::fs::create_dir_all(repo.join("src")).expect("repo");
-    std::fs::create_dir_all(run.join("artifacts")).expect("run");
-    std::fs::create_dir_all(run.join("prompts")).expect("prompts");
+    create_private_directory(&run);
+    create_private_directory(&run.join("artifacts"));
+    create_private_directory(&run.join("prompts"));
     std::fs::write(repo.join("src/a.rs"), "alpha\n").expect("a");
     std::fs::write(repo.join("src/b.rs"), "beta\n").expect("b");
     let initial_request_bytes = b"immutable provider request";
-    std::fs::write(
+    write_private_file(
         run.join("prompts/01-research.attempt-002.prompt.md"),
         initial_request_bytes,
-    )
-    .expect("initial request audit");
+    );
     (
         temp,
         ContextExpansionRequest {
@@ -59,6 +63,35 @@ fn fixture() -> (tempfile::TempDir, ContextExpansionRequest) {
     )
 }
 
+#[cfg(unix)]
+fn create_private_directory(path: &Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path).unwrap();
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(_path: &Path) {
+    panic!("private loop workspace tests require Unix")
+}
+
+#[cfg(unix)]
+fn write_private_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    let path = path.as_ref();
+    if path.exists() {
+        std::fs::write(path, bytes).unwrap();
+        return;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+#[cfg(not(unix))]
+fn write_private_file(_path: impl AsRef<Path>, _bytes: &[u8]) {
+    panic!("private loop workspace tests require Unix")
+}
+
 #[test]
 fn expansion_rejects_initial_request_from_a_different_candidate_authority() {
     let (_temp, mut request) = fixture();
@@ -80,13 +113,12 @@ fn expansion_rejects_initial_request_from_a_different_candidate_authority() {
         "messages": [{ "content": role_input }]
     }))
     .unwrap();
-    std::fs::write(
+    write_private_file(
         request
             .run_directory
             .join(&request.initial_provider_request.path),
         &bytes,
-    )
-    .unwrap();
+    );
     request.initial_provider_request.digest = hex::encode(Sha256::digest(&bytes));
 
     let error = create_context_expansion(&request)
@@ -184,13 +216,12 @@ fn expansion_accepts_fresh_live_exchange_request_authority_without_breaking_lega
     let bytes = std::fs::read(&legacy).expect("legacy request bytes");
     request.initial_provider_request.path =
         "prompts/01-research.attempt-002.exchange-001.initial.request.md".to_string();
-    std::fs::write(
+    write_private_file(
         request
             .run_directory
             .join(&request.initial_provider_request.path),
         &bytes,
-    )
-    .expect("exchange request audit");
+    );
 
     create_context_expansion(&request).expect("fresh exchange authority is accepted");
 }
@@ -418,7 +449,7 @@ fn expansion_rejects_a_symlinked_artifact_parent_even_when_it_stays_inside_the_r
     let artifacts = request.run_directory.join("artifacts");
     let real_artifacts = request.run_directory.join("real-artifacts");
     std::fs::remove_dir(&artifacts).expect("remove artifacts");
-    std::fs::create_dir(&real_artifacts).expect("real artifacts");
+    create_private_directory(&real_artifacts);
     std::os::unix::fs::symlink(&real_artifacts, &artifacts).expect("artifact parent symlink");
 
     assert!(create_context_expansion(&request).is_err());
@@ -433,7 +464,7 @@ fn expansion_rejects_a_symlinked_artifact_parent_even_when_it_stays_inside_the_r
 fn expansion_rejects_a_symlinked_existing_artifact_target() {
     let (_temp, request) = fixture();
     let outside = request.run_directory.join("outside.json");
-    std::fs::write(&outside, b"outside").expect("outside target");
+    write_private_file(&outside, b"outside");
     let artifact = request
         .run_directory
         .join("artifacts/01-research.attempt-002.context-round-001.json");
@@ -481,7 +512,7 @@ fn orphaned_partial_temp_file_is_never_consumed_as_the_final_artifact() {
     let orphan = request
         .run_directory
         .join("artifacts/.01-research.attempt-002.context-round-001.json.tmp-orphan");
-    std::fs::write(&orphan, b"{\"partial\":").expect("orphan temp");
+    write_private_file(&orphan, b"{\"partial\":");
 
     let created = create_context_expansion(&request).expect("publish final artifact");
     assert!(orphan.is_file());

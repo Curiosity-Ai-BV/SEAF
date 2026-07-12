@@ -44,22 +44,22 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-11 - Minimum artifact protection. Make local run evidence safe enough for
-live provider use without changing the M1-10 state transaction or broadening
-into retention, distribution, or release work.
+M1-11b - Bounded artifact storage. Enforce per-artifact and aggregate run-tree
+limits without changing immutable identities, M1-10 persistence semantics, or
+the candidate/repository/run lock order.
 
-On supported Unix platforms, every run directory, mutation lock, state file,
-prompt, provider response, log, and generated evidence file must be private at
-creation and remain private through retry or replacement. Provider response,
-prompt, exchange, log, and aggregate run storage must have explicit byte caps;
-oversize input must fail closed before partial or misleading authority is
-published. Configured secrets and obvious credential patterns must be redacted
-before persistence, and redaction itself must stay bounded.
+Provider prompts/requests are capped at 2 MiB, canonical provider response
+audits at 1 MiB, exchange records at 64 KiB, evaluation logs at 1 MiB, and all
+other generated evidence/input artifacts at 2 MiB. The aggregate durable run
+tree is capped at 32 MiB. Exact cap is valid and cap plus one is rejected.
+Exact immutable retries cost zero; replacements account for both the observed
+old size and intended new size without allowing concurrent oversubscription.
 
-Start with an inventory of every run-directory and artifact creation seam,
-existing output/redaction limits, and the order in which immutable provider
-audits become authoritative. Witness permission, oversize response, cumulative
-budget, retry, and secret-leak failures before implementation. Preserve
-M1-10's one-lock publication semantics, all immutable artifact identities, and
-the candidate/repository/run lock order. Do not add purge/retention policy,
-format migration, packaging, or release behavior.
+Reuse the permanent M1-10 per-run lock for aggregate accounting and reservation;
+do not add a competing lock. Before an external provider call or evaluation
+command, prove or reserve enough durable capacity for the authoritative audit
+that must follow. A refused or failed reservation executes no external side
+effect and publishes no partial or misleading authority. Preserve standalone
+policy/evaluation behavior where no run root exists. Do not add secret
+redaction, retention/purge, format migration, packaging, or release behavior in
+this slice.

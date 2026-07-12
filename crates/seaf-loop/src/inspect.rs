@@ -1153,7 +1153,7 @@ mod tests {
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), "ambiguous").expect("workspace");
         let bytes = b"historical role artifact";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join("artifacts/01-research.json"),
             bytes,
         )
@@ -1224,12 +1224,12 @@ mod tests {
             LoopWorkspace::create(&temp.path().join("runs"), "mismatched").expect("workspace");
         let fixed = b"attempt one";
         let selected = b"untrusted attempt three";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join("artifacts/01-research.json"),
             fixed,
         )
         .unwrap();
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace
                 .run_directory()
                 .join("artifacts/01-research.attempt-003.json"),
@@ -1336,9 +1336,9 @@ mod tests {
             } else {
                 format!("01-research.attempt-{attempt:03}.json")
             };
-            fs::write(
+            crate::artifact_safety::write_private_fixture(
                 workspace.run_directory().join("artifacts").join(name),
-                format!("attempt {attempt}"),
+                format!("attempt {attempt}").as_bytes(),
             )
             .unwrap();
         }

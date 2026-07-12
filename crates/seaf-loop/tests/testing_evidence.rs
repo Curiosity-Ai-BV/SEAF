@@ -127,7 +127,8 @@ fn testing_evidence_loads_only_canonical_digest_bound_run_evidence() {
         path: "artifacts/07-testing.json".to_string(),
         digest: evidence.artifact_digest().unwrap(),
     };
-    std::fs::write(workspace.run_directory().join(&reference.path), &bytes).unwrap();
+    seaf_loop::workspace::write_artifact(workspace.run_directory(), &reference.path, &bytes)
+        .unwrap();
 
     let loaded = TestingEvidence::load(&workspace, &reference, "run-1").unwrap();
     assert_eq!(loaded, evidence);

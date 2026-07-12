@@ -495,9 +495,8 @@ fn ensure_authoritative_run_inputs(
     preflight_authoritative_snapshot_prefix(workspace, run, snapshots)?;
 
     let inputs = workspace.run_directory().join("inputs");
-    if !inputs.exists() {
-        fs::create_dir(&inputs).map_err(|error| RunnerError::Step(error.to_string()))?;
-    }
+    crate::artifact_safety::ensure_private_child_directory(&inputs)
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
     fs::File::open(workspace.run_directory())
         .and_then(|directory| directory.sync_all())
         .map_err(|error| RunnerError::Step(error.to_string()))?;

@@ -12,7 +12,7 @@ use std::{
 use seaf_core::{canonical_json_bytes, canonical_sha256_digest, templates, Policy, ProjectConfig};
 
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 
 #[test]
 fn validates_goal_json_output() {
@@ -2481,11 +2481,10 @@ fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands(
                 .expect("candidate path"),
         );
         match pre_mutation {
-            "partial" => fs::write(
+            "partial" => write_private_run_fixture(
                 run_dir.join("artifacts/07-testing.attempt-001.execution-intent.json"),
                 b"partial-attempt-bytes",
-            )
-            .expect("partial intent"),
+            ),
             "approval" => {
                 let relative = approved["human_approval"]["candidate_diff"]["path"]
                     .as_str()
@@ -2663,7 +2662,7 @@ fn approved_eval_physical_tamper_or_publication_collision_never_claims_terminal_
         ),
         (
             "publication-collision",
-            "printf collision > \"$1/artifacts/07-testing.attempt-001.json\"\n",
+            "printf collision > \"$1/artifacts/07-testing.attempt-001.json\"\nchmod 600 \"$1/artifacts/07-testing.attempt-001.json\"\n",
             "different bytes",
         ),
     ] {
@@ -6183,7 +6182,7 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
     assert!(!stderr.contains("--ticket is required"), "{stderr}");
 
     let attempt_two_prompt = run_dir.join("prompts/06-output-review.attempt-002.prompt.md");
-    fs::write(&attempt_two_prompt, b"substituted prompt").unwrap();
+    write_private_run_fixture(&attempt_two_prompt, b"substituted prompt");
     let substituted_prompt = seaf_in(&repo)
         .args([
             "loop",
@@ -6499,11 +6498,10 @@ fn loop_revise_rejects_applied_earlier_steps_and_any_factual_evaluation_prefix()
     assert!(!applied_earlier_step.status.success());
     assert_eq!(read_tree_bytes(&run_dir), before);
 
-    fs::write(
+    write_private_run_fixture(
         run_dir.join("artifacts/07-testing.orphan.json"),
         b"factual evaluation prefix",
-    )
-    .unwrap();
+    );
     let run_before_prefix_rejection = fs::read(run_dir.join("run.json")).unwrap();
     let evaluation_prefix = seaf_in(&repo)
         .args([
@@ -9591,6 +9589,13 @@ fn git_worktree_registration(root: &Path) -> Vec<u8> {
 
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create destination directory");
+    fs::set_permissions(
+        destination,
+        fs::symlink_metadata(source)
+            .expect("source directory mode")
+            .permissions(),
+    )
+    .expect("copy directory mode");
     for entry in fs::read_dir(source).expect("read source directory") {
         let entry = entry.expect("source entry");
         let source_path = entry.path();
@@ -9598,9 +9603,29 @@ fn copy_directory(source: &Path, destination: &Path) {
         if source_path.is_dir() {
             copy_directory(&source_path, &destination_path);
         } else {
-            fs::copy(source_path, destination_path).expect("copy run file");
+            fs::copy(&source_path, &destination_path).expect("copy run file");
+            fs::set_permissions(
+                &destination_path,
+                fs::symlink_metadata(&source_path)
+                    .expect("source file mode")
+                    .permissions(),
+            )
+            .expect("copy file mode");
         }
     }
+}
+
+#[cfg(unix)]
+fn write_private_run_fixture(path: impl AsRef<Path>, bytes: &[u8]) {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).expect("create private run fixture");
+    file.write_all(bytes).expect("write private run fixture");
+}
+
+#[cfg(not(unix))]
+fn write_private_run_fixture(_path: impl AsRef<Path>, _bytes: &[u8]) {
+    panic!("private loop workspace tests require Unix")
 }
 
 fn repository_identity_json(repository_root: &Path) -> serde_json::Value {

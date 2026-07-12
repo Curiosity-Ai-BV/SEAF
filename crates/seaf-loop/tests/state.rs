@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
 use seaf_core::{
     LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, ProviderExchangeKind,
@@ -15,6 +15,168 @@ use seaf_loop::{
     ContextManifest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
     ProviderExchangeCoordinates, StepOutput, StepRunner, UNTRUSTED_CONTEXT_MARKER,
 };
+
+#[cfg(unix)]
+#[test]
+fn run_tree_is_private_even_when_process_umask_is_zero() {
+    const CHILD: &str = "SEAF_PRIVATE_RUN_TREE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("run_tree_is_private_even_when_process_umask_is_zero")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn isolated umask child");
+        assert!(status.success(), "private run-tree child failed");
+        return;
+    }
+
+    // SAFETY: this branch runs in a dedicated child process because umask is process-global.
+    unsafe { libc::umask(0) };
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let workspace = LoopWorkspace::create(&runs_root, "private-run").unwrap();
+    let run = create_run(NewLoopRun {
+        run_id: "private-run".to_string(),
+        ticket_id: "ticket-private".to_string(),
+        goal_id: "goal-private".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: test_input_digests(),
+    });
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    workspace.append_log("private line").unwrap();
+    seaf_loop::workspace::write_artifact(
+        workspace.run_directory(),
+        "prompts/request.md",
+        b"private prompt",
+    )
+    .unwrap();
+
+    for directory in ["", "prompts", "responses", "artifacts"] {
+        let mode = fs::symlink_metadata(workspace.run_directory().join(directory))
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "directory {directory:?} mode");
+    }
+    for file in [
+        "run.json",
+        "provider-exchange.lock",
+        "context-manifest.json",
+        "log.md",
+        "prompts/request.md",
+    ] {
+        let mode = fs::symlink_metadata(workspace.run_directory().join(file))
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "file {file} mode");
+    }
+
+    let (source, initialized, snapshots) = isolated_fixture(temp.path(), "private-isolated");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let private_run = initialized
+        .scaffold()
+        .unwrap()
+        .publish_authoritative_inputs(snapshots)
+        .unwrap();
+    for directory in ["inputs", "prompts", "responses", "artifacts"] {
+        assert_eq!(
+            fs::symlink_metadata(private_run.workspace().run_directory().join(directory))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700,
+            "isolated directory {directory} mode"
+        );
+    }
+    for file in [
+        ".candidate-workspace.lock",
+        "inputs/ticket.json",
+        "inputs/policy.json",
+        "inputs/config.json",
+        "inputs/repository.json",
+        "inputs/eval-config.json",
+        "ticket.snapshot.json",
+    ] {
+        assert_eq!(
+            fs::symlink_metadata(private_run.workspace().run_directory().join(file))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600,
+            "isolated file {file} mode"
+        );
+    }
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[cfg(unix)]
+#[test]
+fn broad_existing_run_permissions_fail_closed_without_mutating_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let workspace = LoopWorkspace::create(&runs_root, "broad-run").unwrap();
+    let run = create_run(NewLoopRun {
+        run_id: "broad-run".to_string(),
+        ticket_id: "ticket-broad".to_string(),
+        goal_id: "goal-broad".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: test_input_digests(),
+    });
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    let run_path = workspace.run_file();
+    let before = fs::read(&run_path).unwrap();
+    fs::set_permissions(&run_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let error = seaf_loop::state::load_run(&workspace).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("chmod 600"), "{message}");
+    assert_eq!(fs::read(&run_path).unwrap(), before);
+    assert_eq!(
+        fs::symlink_metadata(&run_path).unwrap().mode() & 0o777,
+        0o644
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn broad_existing_run_and_scaffold_directory_modes_fail_with_chmod_guidance() {
+    for relative in ["", "prompts"] {
+        let temp = tempfile::tempdir().unwrap();
+        let runs_root = temp.path().join("runs");
+        let workspace = LoopWorkspace::create(&runs_root, "broad-directory").unwrap();
+        let run = create_run(NewLoopRun {
+            run_id: "broad-directory".to_string(),
+            ticket_id: "ticket-broad-directory".to_string(),
+            goal_id: "goal-broad-directory".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: test_input_digests(),
+        });
+        seaf_loop::state::save_run(&workspace, &run).unwrap();
+        let before = read_tree_bytes(workspace.run_directory());
+        let path = workspace.run_directory().join(relative);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = if relative.is_empty() {
+            LoopWorkspace::open_minimal(&runs_root, "broad-directory").unwrap_err()
+        } else {
+            LoopWorkspace::open(&runs_root, "broad-directory").unwrap_err()
+        };
+        assert!(error.to_string().contains("chmod 700"), "{error}");
+        assert_eq!(read_tree_bytes(workspace.run_directory()), before);
+        assert_eq!(fs::symlink_metadata(path).unwrap().mode() & 0o777, 0o755);
+    }
+}
 
 #[test]
 fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_prepare() {
@@ -194,8 +356,8 @@ fn scaffold_recovers_an_exact_prefix_but_rejects_a_collision_before_new_entries(
         .path
         .clone();
     let run_dir = initialized.workspace().run_directory().to_path_buf();
-    fs::create_dir(run_dir.join("prompts")).unwrap();
-    fs::write(run_dir.join("log.md"), "# Loop run log\n").unwrap();
+    create_private_fixture_directory(&run_dir.join("prompts"));
+    write_private_fixture_file(run_dir.join("log.md"), b"# Loop run log\n");
     initialized.scaffold().expect("exact prefix is retryable");
     assert!(run_dir.join("responses").is_dir());
     assert!(run_dir.join("artifacts").is_dir());
@@ -211,7 +373,7 @@ fn scaffold_recovers_an_exact_prefix_but_rejects_a_collision_before_new_entries(
         .path
         .clone();
     let run_dir = initialized.workspace().run_directory().to_path_buf();
-    fs::write(run_dir.join("log.md"), "partial").unwrap();
+    write_private_fixture_file(run_dir.join("log.md"), b"partial");
     let error = initialized
         .scaffold()
         .expect_err("partial final must collide");
@@ -236,8 +398,8 @@ fn input_snapshots_recover_exact_prefix_and_preflight_collision_before_new_publi
         .clone();
     let scaffolded = initialized.scaffold().unwrap();
     let run_dir = scaffolded.workspace().run_directory().to_path_buf();
-    fs::create_dir(run_dir.join("inputs")).unwrap();
-    fs::write(run_dir.join("inputs/ticket.json"), &snapshots.ticket).unwrap();
+    create_private_fixture_directory(&run_dir.join("inputs"));
+    write_private_fixture_file(run_dir.join("inputs/ticket.json"), &snapshots.ticket);
     scaffolded
         .publish_authoritative_inputs(snapshots)
         .expect("exact snapshot prefix is retryable");
@@ -1065,11 +1227,10 @@ fn public_legacy_rerun_api_is_retired_without_mutation() {
     runner.run_next_step().unwrap();
     drop(runner);
     let run_dir = runs_root.join(run_id);
-    fs::write(
+    write_private_fixture_file(
         run_dir.join("prompts/01-research.attempt-002.prompt.md"),
-        "historical second attempt",
-    )
-    .unwrap();
+        b"historical second attempt",
+    );
     let mut historical = read_run(&run_dir);
     historical.status = LoopStatus::Blocked;
     historical.current_step = LoopStepName::Research;
@@ -1295,11 +1456,10 @@ fn state_step_rejects_exhausted_prompt_attempts_before_mutation() {
     )
     .expect("start run");
     let run_dir = runs_root.join(run_id);
-    fs::write(
+    write_private_fixture_file(
         run_dir.join("prompts/01-research.attempt-4294967295.prompt.md"),
         b"highest possible prompt attempt",
-    )
-    .expect("maximum prompt attempt");
+    );
     let before = read_tree_bytes(&run_dir);
 
     let error = runner
@@ -1323,11 +1483,10 @@ fn state_resume_verified_rejects_exhausted_next_attempt_before_prepare_or_mutati
     let run_id = "resume-exhausted-prompt-attempts";
     create_test_run(&runs_root, run_id);
     let run_dir = runs_root.join(run_id);
-    fs::write(
+    write_private_fixture_file(
         run_dir.join("prompts/01-research.attempt-4294967295.prompt.md"),
         b"highest possible prompt attempt",
-    )
-    .expect("maximum prompt attempt");
+    );
     let verified = read_run(&run_dir);
     let before = read_tree_bytes(&run_dir);
     let mut step_runner = RecordingStepRunner::with_prefix("must-not-prepare");
@@ -1725,6 +1884,32 @@ fn write_run(run_dir: &Path, run: &LoopRun) {
     let mut json = serde_json::to_vec_pretty(run).expect("run json");
     json.push(b'\n');
     std::fs::write(run_dir.join("run.json"), json).expect("write run json");
+}
+
+#[cfg(unix)]
+fn create_private_fixture_directory(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path).unwrap();
+}
+
+#[cfg(not(unix))]
+fn create_private_fixture_directory(_path: &Path) {
+    panic!("private loop workspace tests require Unix")
+}
+
+#[cfg(unix)]
+fn write_private_fixture_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).unwrap();
+    std::io::Write::write_all(&mut file, bytes).unwrap();
+}
+
+#[cfg(not(unix))]
+fn write_private_fixture_file(_path: impl AsRef<Path>, _bytes: &[u8]) {
+    panic!("private loop workspace tests require Unix")
 }
 
 fn step_label(step: LoopStepName) -> &'static str {
