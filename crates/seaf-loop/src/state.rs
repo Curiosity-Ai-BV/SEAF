@@ -11,7 +11,10 @@ use seaf_core::{
 };
 use serde_json::Value;
 
-use crate::workspace::LoopWorkspace;
+use crate::{
+    run_persistence::{self, RunMutationGuard},
+    workspace::LoopWorkspace,
+};
 
 pub const LOOP_STEPS: [LoopStepName; 8] = [
     LoopStepName::Research,
@@ -83,8 +86,8 @@ pub(crate) fn load_run_before_provider_reconciliation(
         return Err(StateError::MissingRunFile(path));
     }
 
-    let content = fs::read_to_string(&path)?;
-    let run = serde_json::from_str(&content)?;
+    let content = run_persistence::read_regular_file(&path)?;
+    let run = serde_json::from_slice(&content)?;
     validate_run_integrity(&run)?;
     Ok(run)
 }
@@ -95,12 +98,74 @@ pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateErr
 
 pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
     validate_run_integrity(run)?;
-    if guard_frozen_authority_direct_write(path, run)? {
-        return Ok(());
-    }
     let mut json = serde_json::to_vec_pretty(run)?;
     json.push(b'\n');
-    fs::write(path, json)?;
+    let run_directory = path
+        .parent()
+        .ok_or_else(|| StateError::InvalidRun("run file has no parent directory".to_string()))?;
+    let lock = RunMutationGuard::acquire(run_directory)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let current_bytes = run_persistence::read_regular_file(path)?;
+            let current = serde_json::from_slice::<LoopRun>(&current_bytes).ok();
+            guard_frozen_authority_direct_write(path, run)?;
+            if current.as_ref() != Some(run) || current_bytes != json {
+                return Err(StateError::InvalidRun(
+                    "public state writer only permits an exact idempotent retry for an existing run file"
+                        .to_string(),
+                ));
+            }
+            run_persistence::sync_existing(&lock, path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            guard_frozen_authority_direct_write(path, run)?;
+            run_persistence::publish_create_only(&lock, path, &json)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Publishes a legitimate state transition only when `expected` is still authoritative.
+pub(crate) fn compare_and_swap_run(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+) -> Result<(), StateError> {
+    crate::provider_exchange::persist_ordinary_run_with_full_compare(workspace, expected, intended)
+        .map_err(|error| StateError::InvalidRun(error.to_string()))
+}
+
+/// Re-authenticates an exact persisted run and closes a prior directory-sync uncertainty.
+pub(crate) fn resync_exact_run(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+) -> Result<(), StateError> {
+    validate_run_integrity(expected)?;
+    let mut expected_bytes = serde_json::to_vec_pretty(expected)?;
+    expected_bytes.push(b'\n');
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
+    let current = load_run(workspace)?;
+    let current_bytes = run_persistence::read_regular_file(&workspace.run_file())?;
+    if current != *expected || current_bytes != expected_bytes {
+        return Err(StateError::InvalidRun(
+            "exact run resync requires byte-identical canonical authority".to_string(),
+        ));
+    }
+    run_persistence::sync_existing(&lock, &workspace.run_file())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_raw_canonical_run_fixture(
+    path: &Path,
+    run: &LoopRun,
+) -> Result<(), StateError> {
+    validate_run_integrity(run)?;
+    let mut bytes = serde_json::to_vec_pretty(run)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -363,6 +428,12 @@ impl From<serde_json::Error> for StateError {
     }
 }
 
+impl From<run_persistence::RunPersistenceError> for StateError {
+    fn from(error: run_persistence::RunPersistenceError) -> Self {
+        Self::InvalidRun(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod recovery_authority_tests {
     use super::*;
@@ -370,6 +441,7 @@ mod recovery_authority_tests {
         ArtifactReference, CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopExecutionMode,
         RecoveryReference,
     };
+    use std::sync::{Arc, Barrier};
 
     fn run_with_candidate() -> LoopRun {
         let mut run = create_run(NewLoopRun {
@@ -455,5 +527,95 @@ mod recovery_authority_tests {
         let error = write_run_file(&path, &run).unwrap_err();
         assert!(error.to_string().contains("cannot begin"), "{error}");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn public_direct_writer_only_allows_exact_idempotent_existing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let runs_root = temp.path().join("runs");
+        let workspace = LoopWorkspace::create(&runs_root, "direct-writer-cas").unwrap();
+        let run = run_with_candidate();
+        let mut run = LoopRun {
+            run_id: "direct-writer-cas".to_string(),
+            ..run
+        };
+        save_run(&workspace, &run).unwrap();
+        let original = fs::read(workspace.run_file()).unwrap();
+
+        save_run(&workspace, &run).expect("an exact retry is idempotent");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), original);
+
+        fs::write(
+            workspace.run_file(),
+            serde_json::to_vec(&run).expect("same struct with noncanonical bytes"),
+        )
+        .unwrap();
+        let noncanonical = fs::read(workspace.run_file()).unwrap();
+        let error = save_run(&workspace, &run)
+            .expect_err("semantic equality cannot replace noncanonical existing bytes");
+        assert!(error.to_string().contains("exact idempotent"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), noncanonical);
+        fs::write(workspace.run_file(), &original).unwrap();
+
+        run.updated_at = "different-state".to_string();
+        let error = save_run(&workspace, &run)
+            .expect_err("a public writer must not replace an existing state");
+        assert!(error.to_string().contains("exact idempotent"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), original);
+    }
+
+    #[test]
+    fn competing_ordinary_full_compare_allows_exactly_one_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let runs_root = temp.path().join("runs");
+        let workspace = LoopWorkspace::create(&runs_root, "ordinary-cas-race").unwrap();
+        let mut expected = run_with_candidate();
+        expected.run_id = "ordinary-cas-race".to_string();
+        save_run(&workspace, &expected).unwrap();
+        let mut left_intended = expected.clone();
+        left_intended.updated_at = "left-transition".to_string();
+        let mut right_intended = expected.clone();
+        right_intended.updated_at = "right-transition".to_string();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let left_workspace = workspace.clone();
+        let left_expected = expected.clone();
+        let left_barrier = Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            left_barrier.wait();
+            compare_and_swap_run(&left_workspace, &left_expected, &left_intended)
+        });
+        let right_workspace = workspace.clone();
+        let right_expected = expected.clone();
+        let right_barrier = Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            right_barrier.wait();
+            compare_and_swap_run(&right_workspace, &right_expected, &right_intended)
+        });
+        barrier.wait();
+        let results = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+        let persisted = load_run(&workspace).unwrap();
+        assert!(matches!(
+            persisted.updated_at.as_str(),
+            "left-transition" | "right-transition"
+        ));
+        compare_and_swap_run(&workspace, &expected, &persisted)
+            .expect("exact intended retry reauthenticates and resyncs");
+    }
+
+    #[test]
+    fn exact_resync_rejects_semantically_equal_noncanonical_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "resync-bytes").unwrap();
+        let mut run = run_with_candidate();
+        run.run_id = "resync-bytes".to_string();
+        save_run(&workspace, &run).unwrap();
+        resync_exact_run(&workspace, &run).expect("canonical authority resyncs");
+        fs::write(workspace.run_file(), serde_json::to_vec(&run).unwrap()).unwrap();
+        let error = resync_exact_run(&workspace, &run).unwrap_err();
+        assert!(error.to_string().contains("byte-identical"), "{error}");
     }
 }

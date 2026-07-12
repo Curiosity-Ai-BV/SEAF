@@ -356,7 +356,9 @@ fn state_append_is_ordered_durable_and_distinguishes_staged_records() {
         classify_provider_exchange_record(&workspace, &updated, &staged).expect("classify"),
         ProviderExchangeRecordState::Referenced { position: 0 }
     );
-    assert!(persist_provider_exchange_record_reference(&workspace, staged).is_err());
+    let retried = persist_provider_exchange_record_reference(&workspace, staged)
+        .expect("exact current-tail retry converges without duplication");
+    assert_eq!(retried, updated);
 }
 
 #[test]
@@ -1102,7 +1104,7 @@ fn append_rejects_a_symlinked_stable_exchange_lock_without_changing_run_state() 
 }
 
 #[test]
-fn concurrent_appenders_never_lose_an_update_and_one_stale_head_is_rejected() {
+fn concurrent_identical_appenders_converge_on_the_exact_tail() {
     let (_temp, workspace, head) =
         seeded_response_run("concurrent-append", ProviderExchangeOutcome::Passed);
     let analysis_attempt_one = staged_request_for_group(
@@ -1135,8 +1137,7 @@ fn concurrent_appenders_never_lose_an_update_and_one_stale_head_is_rejected() {
     barrier.wait();
     let results = [left.join().expect("left"), right.join().expect("right")];
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
     let persisted = seaf_loop::state::load_run(&workspace).expect("valid persisted run");
     assert_eq!(persisted.provider_exchange_records.len(), 3);
 }

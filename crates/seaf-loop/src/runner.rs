@@ -212,9 +212,15 @@ impl InitializedLoopRun {
         let result =
             Self::create_isolated_in_workspace(workspace.clone(), config, source_worktree_root);
         if result.is_err() && !workspace.run_file().exists() {
-            let empty = fs::read_dir(workspace.run_directory())
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(false);
+            let entries = fs::read_dir(workspace.run_directory())
+                .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let lock_only = entries.len() == 1
+                && entries[0].file_name() == crate::run_persistence::RUN_MUTATION_LOCK_FILE;
+            if lock_only {
+                fs::remove_file(entries[0].path()).map_err(WorkspaceError::Io)?;
+            }
+            let empty = entries.is_empty() || lock_only;
             if empty {
                 fs::remove_dir(workspace.run_directory()).map_err(WorkspaceError::Io)?;
                 fs::File::open(
@@ -252,16 +258,7 @@ impl InitializedLoopRun {
             )
             .map_err(|error| RunnerError::Step(error.to_string()))?,
         );
-        let mut bytes = serde_json::to_vec_pretty(&run).map_err(|error| {
-            RunnerError::Step(format!("failed to serialize provisioning run: {error}"))
-        })?;
-        bytes.push(b'\n');
-        crate::immutable_artifact::publish_create_only(
-            workspace.run_directory(),
-            crate::workspace::RUN_FILE,
-            &bytes,
-        )
-        .map_err(|error| {
+        state::save_run(&workspace, &run).map_err(|error| {
             RunnerError::Step(format!("failed to publish provisioning run: {error}"))
         })?;
         crate::candidate_workspace::provision_candidate_workspace(&workspace)
@@ -865,7 +862,9 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         if let Err(error) = step_runner.prepare_fresh_run(&workspace, &run) {
             return Err(cleanup_failed_start_workspace(&workspace, error));
         }
-        state::save_run(&workspace, &run)?;
+        if let Err(error) = state::save_run(&workspace, &run) {
+            return Err(cleanup_failed_start_workspace(&workspace, error.into()));
+        }
         workspace.append_log("started run")?;
 
         Ok(Self {
@@ -902,6 +901,8 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         run: LoopRun,
         step_runner: &'a mut R,
     ) -> Result<Self, RunnerError> {
+        validate_human_review_execution_barrier(&run)?;
+        state::resync_exact_run(&workspace, &run)?;
         if state::is_frozen_review_or_evaluation_authority(&run) {
             return Ok(Self {
                 workspace,
@@ -910,7 +911,6 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
                 next_attempt: None,
             });
         }
-        validate_human_review_execution_barrier(&run)?;
         let filesystem_next_attempt = state::next_runnable_step(&run)
             .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
             .transpose()?;
@@ -978,8 +978,9 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         self.step_runner
             .prepare_step_attempt(&self.workspace, &self.run, step, attempt)?;
 
+        let pending = self.run.clone();
         state::mark_step_running(&mut self.run, step)?;
-        self.persist_run_state()?;
+        self.persist_run_state(&pending)?;
         self.workspace
             .append_log(&format!("started step {step:?}"))?;
 
@@ -997,6 +998,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             }
         };
         self.import_durable_provider_exchange_records()?;
+        let running_with_provider_history = self.run.clone();
         write_step_response(&self.workspace, step, attempt, &output.response)?;
         validate_step_output(&output)?;
         append_policy_decisions(&mut self.run, self.step_runner.drain_policy_decisions()?)?;
@@ -1020,7 +1022,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             artifact_path,
             artifact_digest,
         )?;
-        self.persist_run_state()?;
+        self.persist_run_state(&running_with_provider_history)?;
         if self.run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate
             && step == LoopStepName::Development
             && output.status == LoopStepStatus::Completed
@@ -1091,12 +1093,20 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         Ok(())
     }
 
-    fn persist_run_state(&self) -> Result<(), RunnerError> {
-        crate::provider_exchange::persist_run_with_provider_exchange_compare(
-            &self.workspace,
-            &self.run,
-        )
-        .map_err(|error| RunnerError::Step(format!("failed to publish loop state: {error}")))?;
+    fn persist_run_state(&self, expected: &LoopRun) -> Result<(), RunnerError> {
+        let result = if state::is_frozen_review_or_evaluation_authority(&self.run) {
+            crate::provider_exchange::persist_run_with_full_compare(
+                &self.workspace,
+                expected,
+                &self.run,
+            )
+            .map_err(|error| error.to_string())
+        } else {
+            crate::state::compare_and_swap_run(&self.workspace, expected, &self.run)
+                .map_err(|error| error.to_string())
+        };
+        result
+            .map_err(|error| RunnerError::Step(format!("failed to publish loop state: {error}")))?;
         Ok(())
     }
 }

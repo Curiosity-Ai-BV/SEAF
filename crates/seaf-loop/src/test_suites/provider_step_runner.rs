@@ -2640,7 +2640,7 @@ fn rewrite_artifact_and_verified_digest(
 }
 
 fn persist_verified_resume_authority(run_dir: &Path, verified: &LoopRun) {
-    seaf_loop::state::write_run_file(&run_dir.join("run.json"), verified)
+    crate::state::write_raw_canonical_run_fixture(&run_dir.join("run.json"), verified)
         .expect("persist exact verified resume authority");
 }
 

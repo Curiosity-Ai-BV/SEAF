@@ -37,8 +37,8 @@
 - [x] M1-09c2a: Versioned evaluation recovery authority.
 - [x] M1-09c2b: Zero-command adoption transaction.
 - [x] M1-09c3: Evaluation invalidation and rerun.
-- [ ] M1-10: Atomic state and run locking (active).
-- [ ] M1-11: Minimum artifact protection.
+- [x] M1-10: Atomic state and run locking.
+- [ ] M1-11: Minimum artifact protection (active).
 - [ ] M1-12: Interruption recovery acceptance.
 
 ## Milestone 2 - Consumable Loop
@@ -62,7 +62,7 @@
 
 ## Current Gate
 
-M1-06 through M1-08 are complete; M1-09 is active. Public run/status output supplies
+M1-06 through M1-10 are complete; M1-11 is active. Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -134,5 +134,15 @@ partial attempts cannot replay and require another invalidation, while complete
 prefixes use zero-command adoption. Iterative mixed v1/v2/v3 lineage, all-six
 inputs, candidate/source/provider state, prior final references, crash cuts,
 tamper, competition, repeated attempts, pre-spawn drift abort, final failure,
-passing promotion, and frozen states are covered. M1-09 is complete and M1-10
-atomic state and run locking is active.
+passing promotion, and frozen states are covered. M1-09 is complete. M1-10 now
+serializes every cooperative run-state mutation through the permanent bounded
+per-run lock. Create-only state, exact canonical retry, and authenticated
+expected-to-intended CAS share durable same-directory publication; write,
+sync, rename/link, parent-sync, contention, symlink, lock replacement, target
+replacement, concurrency, and post-publication retry cuts retain or converge
+to one complete valid state. Narrow provider/candidate/recovery/final authority
+and lock-order constraints remain intact. Resume validates the human-review
+barrier before resync, authenticates frozen terminal authority before returning
+inert, and still subjects ordinary terminal provider history to recovery
+validation. Full Rust, strict Clippy, formatting, package, SDK, and diff gates
+pass. M1-11 minimum artifact protection is active.

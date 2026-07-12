@@ -513,6 +513,7 @@ fn validate_exact_retry(
         verified.applied_diff_content.as_bytes(),
         &verified,
     )?;
+    state::resync_exact_run(workspace, &run).map_err(PromotionError::wrapped)?;
     Ok(PromotionOutcome { run, evidence })
 }
 

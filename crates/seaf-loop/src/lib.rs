@@ -20,6 +20,7 @@ pub mod provider_exchange;
 pub mod recovery;
 pub mod role_artifact;
 pub mod role_response;
+mod run_persistence;
 pub mod runner;
 pub mod state;
 pub mod testing_evidence;

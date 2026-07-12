@@ -614,10 +614,24 @@ fn loop_run_accepts_valid_stable_run_id() {
         .output()
         .expect("run loop");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"run_id\": \"stable_123-run\""));
-    assert!(runs_root.join("stable_123-run/run.json").exists());
+    let run_dir = runs_root.join("stable_123-run");
+    let persisted = read_run_json(&run_dir);
+    assert_eq!(persisted["policy_decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        persisted["policy_decisions"][0]["patch_id"],
+        "stable_123-run"
+    );
+    assert!(
+        run_dir.join("provider-exchange.lock").is_file(),
+        "deterministic policy evidence must use the shared durable run-state lock"
+    );
 }
 
 #[test]
@@ -4490,11 +4504,7 @@ fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tamp
     fs::remove_file(run_dir.join(response_audit_path)).expect("remove uncommitted response audit");
     fs::remove_file(run_dir.join(response_record_path))
         .expect("remove uncommitted response record");
-    fs::write(
-        run_dir.join("run.json"),
-        serde_json::to_vec_pretty(&interrupted).expect("interrupted run"),
-    )
-    .expect("write interrupted run");
+    write_raw_canonical_run_fixture(&run_dir.join("run.json"), &interrupted);
 
     let exact_output_review = provider_loop_model_responses()
         .pop()
@@ -4680,11 +4690,7 @@ fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_ch
             .expect("step")
             .remove("artifact_digest");
     }
-    fs::write(
-        run_dir.join("run.json"),
-        serde_json::to_vec_pretty(&interrupted).expect("interrupted run"),
-    )
-    .expect("write interrupted run");
+    write_raw_canonical_run_fixture(&run_dir.join("run.json"), &interrupted);
     fs::write(&context_path, "changed live repository bytes\n").expect("mutate repository");
     let mut resume_responses = vec![agent_response(
         "researcher",
@@ -9929,11 +9935,15 @@ fn mark_loop_run_pending_from_step(run_path: &Path, pending_from: &str) {
         }
     }
 
-    fs::write(
-        run_path,
-        serde_json::to_string_pretty(&run).expect("serialize interrupted run"),
-    )
-    .expect("write interrupted run");
+    write_raw_canonical_run_fixture(run_path, &run);
+}
+
+fn write_raw_canonical_run_fixture(run_path: &Path, run: &serde_json::Value) {
+    let typed: seaf_core::LoopRun =
+        serde_json::from_value(run.clone()).expect("decode typed raw run fixture");
+    let mut bytes = serde_json::to_vec_pretty(&typed).expect("serialize raw run fixture");
+    bytes.push(b'\n');
+    fs::write(run_path, bytes).expect("write raw canonical run fixture");
 }
 
 fn write_bench_fixture_with_violation(root: &Path) {

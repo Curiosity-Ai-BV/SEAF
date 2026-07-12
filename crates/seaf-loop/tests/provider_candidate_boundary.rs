@@ -2947,7 +2947,7 @@ fn pre_b3_completed_development_with_output_review_history_is_rejected_before_sc
     output.status = seaf_core::LoopStepStatus::Pending;
     output.artifact_path = None;
     output.artifact_digest = None;
-    seaf_loop::state::save_run(&workspace, &legacy).unwrap();
+    write_raw_run(&workspace, &legacy);
     let before = snapshot_files(workspace.run_directory());
 
     let error = InitializedLoopRun::resume_isolated(&fixture.runs_root, legacy)

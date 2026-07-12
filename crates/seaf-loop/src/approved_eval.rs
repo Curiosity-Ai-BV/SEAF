@@ -83,6 +83,7 @@ pub fn rerun_invalidated_evaluation(
                     "final evaluation is not the exact active descendant of requested invalidation recovery",
                 ));
             }
+            state::resync_exact_run(workspace, &run).map_err(ApprovedEvaluationError::wrapped)?;
             return Ok(run);
         }
         let (reference, attempt) = crate::recovery::validate_requested_evaluation_invalidation(
@@ -116,6 +117,7 @@ fn execute_approved_evaluation_locked(
     {
         crate::load_verified_final_evaluation_authority(workspace, &approved)
             .map_err(ApprovedEvaluationError::wrapped)?;
+        state::resync_exact_run(workspace, &approved).map_err(ApprovedEvaluationError::wrapped)?;
         return Ok(approved);
     }
     if approved.status != LoopStatus::Approved {

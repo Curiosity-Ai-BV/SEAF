@@ -2709,7 +2709,7 @@ fn start_deterministic_loop_to_completion(
     provider: &str,
     model: &str,
 ) -> Result<LoopRun, CliFailure> {
-    let mut step_runner = DeterministicStepRunner;
+    let mut step_runner = DeterministicStepRunner::default();
     let policy = default_policy()?;
     let no_project_config = Option::<ProjectConfig>::None;
     let repository_root = current_repository_root()?;
@@ -2733,39 +2733,7 @@ fn start_deterministic_loop_to_completion(
         .run_to_completion()
         .map_err(loop_runner_failure)?
         .clone();
-    let mut run = run;
-    persist_deterministic_policy_evidence(runs_root, &mut run)?;
     Ok(run)
-}
-
-fn persist_deterministic_policy_evidence(
-    runs_root: &Path,
-    run: &mut LoopRun,
-) -> Result<(), CliFailure> {
-    if !run.policy_decisions.is_empty() {
-        return Ok(());
-    }
-
-    let decision = PolicyDecision {
-        patch_id: run.run_id.clone(),
-        patch_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .to_string(),
-        changed_paths: Vec::new(),
-        decision: PatchDecisionKind::Allowed,
-        reasons: Vec::new(),
-        requires_human_review: false,
-        apply_requested: false,
-        applied: false,
-    };
-    let value = serde_json::to_value(decision).map_err(|err| {
-        CliFailure::message(format!("could not serialize policy decision: {err}"))
-    })?;
-    let entry = serde_json::from_value(value)
-        .map_err(|err| CliFailure::message(format!("could not encode policy decision: {err}")))?;
-    run.policy_decisions.push(entry);
-
-    seaf_loop::state::write_run_file(&runs_root.join(&run.run_id).join("run.json"), run)
-        .map_err(|err| CliFailure::message(format!("could not persist loop run: {err}")))
 }
 
 fn load_persisted_loop_run(
@@ -3072,9 +3040,21 @@ fn smoke_ticket() -> TicketSpec {
 }
 
 #[derive(Debug, Default)]
-struct DeterministicStepRunner;
+struct DeterministicStepRunner {
+    run_id: Option<String>,
+    policy_decision_ready: bool,
+}
 
 impl StepRunner for DeterministicStepRunner {
+    fn prepare_fresh_run(
+        &mut self,
+        _workspace: &LoopWorkspace,
+        run: &LoopRun,
+    ) -> Result<(), RunnerError> {
+        self.run_id = Some(run.run_id.clone());
+        Ok(())
+    }
+
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
         Ok(format!(
             "# {:?}\n\nDeterministic local-loop request for CI smoke execution.\n",
@@ -3083,6 +3063,9 @@ impl StepRunner for DeterministicStepRunner {
     }
 
     fn run_step(&mut self, step: LoopStepName, _request: &str) -> Result<StepOutput, RunnerError> {
+        if step == LoopStepName::Development {
+            self.policy_decision_ready = true;
+        }
         Ok(
             StepOutput::completed(format!("deterministic local-loop response for {:?}", step))
                 .with_artifact(ArtifactContent::markdown(format!(
@@ -3090,6 +3073,26 @@ impl StepRunner for DeterministicStepRunner {
                     step
                 ))),
         )
+    }
+
+    fn drain_policy_decisions(&mut self) -> Result<Vec<PolicyDecision>, RunnerError> {
+        if !std::mem::take(&mut self.policy_decision_ready) {
+            return Ok(Vec::new());
+        }
+        let run_id = self.run_id.clone().ok_or_else(|| {
+            RunnerError::Step("deterministic runner lost run identity".to_string())
+        })?;
+        Ok(vec![PolicyDecision {
+            patch_id: run_id,
+            patch_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            changed_paths: Vec::new(),
+            decision: PatchDecisionKind::Allowed,
+            reasons: Vec::new(),
+            requires_human_review: false,
+            apply_requested: false,
+            applied: false,
+        }])
     }
 }
 

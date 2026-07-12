@@ -230,7 +230,17 @@ authorizes one recovery-bound indexed attempt without replaying a partial
 attempt. Repeated invalidation, zero-command adoption of complete recovered
 prefixes, exact retry, promotion, drift, tamper, crash, and concurrent-winner
 paths fail closed or converge as specified. M1-10 atomic state and run locking
-is active. Authoritative input changes still require a new run;
+is complete. One permanent per-run lock now serializes every cooperative
+`run.json` mutation, while create-only publication, byte-exact retry, and
+expected-to-intended compare-and-swap distinguish initialization, recovery,
+and ordinary updates. Same-directory synced temporary files keep the old or
+complete intended state across write, sync, link, rename, and directory-sync
+cuts. Reads and replacements reject symlink or target-identity substitution;
+bounded contention fails closed; exact retries reauthenticate and close
+post-publication durability uncertainty. Provider history, candidate,
+recovery, approval, evaluation, and promotion authority retain their narrower
+transition guards and lock order. M1-11 minimum artifact protection is active.
+Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not

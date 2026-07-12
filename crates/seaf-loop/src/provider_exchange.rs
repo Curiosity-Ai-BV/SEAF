@@ -2,13 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
-    io::Write,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, validate_provider_exchange_record,
@@ -25,14 +20,13 @@ use crate::{
         parse_role_response, AgentStatus, DeveloperStatus, ReviewDecision, Role, RoleResponse,
         RoleResponseError,
     },
+    run_persistence::{self, RunMutationGuard},
     state::{self, step_file_stem},
     LoopWorkspace,
 };
 
 pub const PROVIDER_EXCHANGE_SCHEMA_VERSION: u32 = 1;
 const PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
-const PROVIDER_EXCHANGE_LOCK_FILE: &str = "provider-exchange.lock";
-static RUN_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderExchangeCoordinates {
@@ -125,7 +119,7 @@ fn persist_provider_rerun_reset_with_hook<F>(
 where
     F: FnOnce() -> Result<(), ProviderExchangeError>,
 {
-    let lock = acquire_provider_exchange_lock(workspace)?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let result = (|| {
         let current = state::load_run(workspace)?;
         validate_authoritative_provider_exchange_records(workspace, &current)?;
@@ -187,14 +181,12 @@ where
 
         let mut run_bytes = serde_json::to_vec_pretty(reset)?;
         run_bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&workspace.run_file(), &run_bytes, || {
-            before_run_publish()?;
-            validate_opened_lock_file(
-                &lock,
-                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
-            )?;
-            Ok(())
-        })
+        replace_run_file_atomically_with_hook(
+            &lock,
+            &workspace.run_file(),
+            &run_bytes,
+            before_run_publish,
+        )
     })();
     let unlock = lock.unlock();
     match (result, unlock) {
@@ -401,7 +393,7 @@ pub(crate) fn persist_provider_exchange_record_reference_with_validator<F>(
 where
     F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
 {
-    let lock = acquire_provider_exchange_lock(workspace)?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let result = (|| {
         let mut run = state::load_run(workspace)?;
         if state::is_frozen_review_or_evaluation_authority(&run) {
@@ -409,6 +401,12 @@ where
                 "provider exchange history is frozen by human review or final evaluation authority"
                     .to_string(),
             ));
+        }
+        if run.provider_exchange_records.last() == Some(&reference) {
+            validate_prospective(&run)?;
+            validate_run_for_atomic_publication(workspace, &run)?;
+            run_persistence::sync_existing(&lock, &workspace.run_file())?;
+            return Ok(run);
         }
         if run.provider_exchange_records.contains(&reference) {
             return Err(ProviderExchangeError::Invalid(
@@ -421,13 +419,7 @@ where
         validate_run_for_atomic_publication(workspace, &run)?;
         let mut bytes = serde_json::to_vec_pretty(&run)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
-            validate_opened_lock_file(
-                &lock,
-                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
-            )?;
-            Ok(())
-        })?;
+        replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
         Ok(run)
     })();
     let unlock = lock.unlock();
@@ -438,45 +430,60 @@ where
     }
 }
 
-pub(crate) fn persist_run_with_provider_exchange_compare(
+pub(crate) fn persist_ordinary_run_with_full_compare(
     workspace: &LoopWorkspace,
+    expected: &LoopRun,
     intended: &LoopRun,
 ) -> Result<(), ProviderExchangeError> {
-    let lock = acquire_provider_exchange_lock(workspace)?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let result = (|| {
         let current = state::load_run(workspace)?;
+        if expected.latest_recovery != intended.latest_recovery {
+            return Err(ProviderExchangeError::Invalid(
+                "ordinary state publication cannot mint, replace, or clear recovery authority"
+                    .to_string(),
+            ));
+        }
+        if expected.provider_exchange_records != intended.provider_exchange_records {
+            return Err(ProviderExchangeError::Invalid(
+                "ordinary state publication cannot append or replace provider exchange history"
+                    .to_string(),
+            ));
+        }
+        if expected.candidate_workspace != intended.candidate_workspace {
+            return Err(ProviderExchangeError::Invalid(
+                "ordinary state publication cannot replace candidate workspace authority"
+                    .to_string(),
+            ));
+        }
+        if current == *intended {
+            validate_run_for_atomic_publication(workspace, intended)?;
+            run_persistence::sync_existing(&lock, &workspace.run_file())?;
+            return Ok(());
+        }
+        if current != *expected {
+            return Err(ProviderExchangeError::Invalid(
+                "LoopRun changed before ordinary compare-and-swap publication".to_string(),
+            ));
+        }
         if state::is_frozen_review_or_evaluation_authority(&current) && &current != intended {
             return Err(ProviderExchangeError::Invalid(
                 "ordinary state publication cannot replace awaiting human review, approved authority, or final evaluation authority"
                     .to_string(),
             ));
         }
-        if current.provider_exchange_records != intended.provider_exchange_records {
+        if state::is_frozen_review_or_evaluation_authority(intended) {
             return Err(ProviderExchangeError::Invalid(
-                "provider exchange head changed before state publication".to_string(),
-            ));
-        }
-        if current.candidate_workspace != intended.candidate_workspace {
-            return Err(ProviderExchangeError::Invalid(
-                "candidate workspace changed before ordinary state publication".to_string(),
-            ));
-        }
-        if current.latest_recovery != intended.latest_recovery {
-            return Err(ProviderExchangeError::Invalid(
-                "ordinary state publication cannot mint, replace, or clear recovery authority"
+                "ordinary state publication cannot mint human review or final evaluation authority"
                     .to_string(),
             ));
         }
+        validate_final_authority_cas_relation(workspace, &current, intended)?;
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
-            validate_opened_lock_file(
-                &lock,
-                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
-            )?;
-            Ok(())
-        })
+        run_persistence::publish_replacement(&lock, &workspace.run_file(), &bytes)?;
+        Ok(())
     })();
     let unlock = lock.unlock();
     match (result, unlock) {
@@ -655,7 +662,7 @@ fn persist_run_with_full_compare_and_validator_mode<F>(
 where
     F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
 {
-    let lock = acquire_provider_exchange_lock(workspace)?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let result = (|| {
         let current = state::load_run(workspace)?;
         if &current != expected {
@@ -676,13 +683,7 @@ where
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
-            validate_opened_lock_file(
-                &lock,
-                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
-            )?;
-            Ok(())
-        })
+        replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))
     })();
     let unlock = lock.unlock();
     match (result, unlock) {
@@ -700,35 +701,31 @@ pub(crate) fn reconcile_provider_exchange_state_with_validator<F>(
 where
     F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
 {
-    let lock = acquire_provider_exchange_lock(workspace)?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
+        if persisted != *authoritative {
+            return Err(ProviderExchangeError::Invalid(
+                "persisted LoopRun differs from the verified reconciliation authority".to_string(),
+            ));
+        }
         if state::is_frozen_review_or_evaluation_authority(&persisted) {
             return Err(ProviderExchangeError::Invalid(
                 "provider exchange reconciliation is frozen by human review or final evaluation authority"
                     .to_string(),
             ));
         }
-        if persisted != *authoritative {
-            return Err(ProviderExchangeError::Invalid(
-                "persisted LoopRun differs from the verified reconciliation authority".to_string(),
-            ));
-        }
         let prospective = preflight_provider_exchange_reconciliation(workspace, authoritative)?;
         validate_prospective(&prospective)?;
         if prospective.provider_exchange_records == authoritative.provider_exchange_records {
+            validate_run_for_atomic_publication(workspace, authoritative)?;
+            run_persistence::sync_existing(&lock, &workspace.run_file())?;
             return Ok(authoritative.clone());
         }
         validate_run_for_atomic_publication(workspace, &prospective)?;
         let mut bytes = serde_json::to_vec_pretty(&prospective)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&workspace.run_file(), &bytes, || {
-            validate_opened_lock_file(
-                &lock,
-                &workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE),
-            )?;
-            Ok(())
-        })?;
+        replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
         Ok(prospective)
     })();
     let unlock = lock.unlock();
@@ -901,104 +898,6 @@ pub fn validate_provider_exchange_record_append(
                 .join("; "),
         ))
     }
-}
-
-fn acquire_provider_exchange_lock(
-    workspace: &LoopWorkspace,
-) -> Result<fs::File, ProviderExchangeError> {
-    let path = workspace.run_directory().join(PROVIDER_EXCHANGE_LOCK_FILE);
-    let mut created = false;
-    let file = match inspect_lock_path(&path) {
-        Ok(()) => open_existing_lock_file(&path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match create_lock_file(&path) {
-                Ok(file) => {
-                    created = true;
-                    file
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    inspect_lock_path(&path)?;
-                    open_existing_lock_file(&path)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    validate_opened_lock_file(&file, &path)?;
-    if created {
-        file.sync_all()?;
-        fs::File::open(workspace.run_directory())?.sync_all()?;
-    }
-    file.lock()?;
-    if let Err(error) = validate_opened_lock_file(&file, &path) {
-        let _ = file.unlock();
-        return Err(error.into());
-    }
-    Ok(file)
-}
-
-fn create_lock_file(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    set_no_follow(&mut options);
-    options.open(path)
-}
-
-fn open_existing_lock_file(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    set_no_follow(&mut options);
-    options.open(path)
-}
-
-#[cfg(target_os = "macos")]
-fn set_no_follow(options: &mut fs::OpenOptions) {
-    options.custom_flags(0x100);
-}
-
-#[cfg(target_os = "linux")]
-fn set_no_follow(options: &mut fs::OpenOptions) {
-    options.custom_flags(0x20_000);
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn set_no_follow(_options: &mut fs::OpenOptions) {}
-
-fn inspect_lock_path(path: &Path) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "provider exchange lock must be a real regular file",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_opened_lock_file(file: &fs::File, path: &Path) -> std::io::Result<()> {
-    inspect_lock_path(path)?;
-    let opened = file.metadata()?;
-    let current = fs::metadata(path)?;
-    if !metadata_identity_matches(&opened, &current) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "provider exchange lock path changed while it was opened",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn metadata_identity_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn metadata_identity_matches(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    false
 }
 
 pub(crate) fn validate_run_for_atomic_publication(
@@ -1433,6 +1332,7 @@ fn validate_approved_publication_evidence(
 }
 
 fn replace_run_file_atomically_with_hook<F>(
+    lock: &RunMutationGuard,
     run_file: &Path,
     bytes: &[u8],
     before_publish: F,
@@ -1440,63 +1340,17 @@ fn replace_run_file_atomically_with_hook<F>(
 where
     F: FnOnce() -> Result<(), ProviderExchangeError>,
 {
-    let parent = run_file.parent().ok_or_else(|| {
-        ProviderExchangeError::Invalid("run file has no parent directory".to_string())
-    })?;
-    let file_name = run_file
-        .file_name()
-        .ok_or_else(|| ProviderExchangeError::Invalid("run file has no file name".to_string()))?;
-    let (temp_path, mut temp) = create_run_state_temp(parent, file_name, &RUN_TEMP_SEQUENCE)?;
-    let result = (|| {
-        temp.write_all(bytes)?;
-        temp.sync_all()?;
-        drop(temp);
-        before_publish()?;
-        atomic_replace(&temp_path, run_file)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
-fn create_run_state_temp(
-    parent: &Path,
-    file_name: &std::ffi::OsStr,
-    sequence: &AtomicU64,
-) -> std::io::Result<(std::path::PathBuf, fs::File)> {
-    loop {
-        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".{}.exchange-state.tmp-{}-{sequence}",
-            file_name.to_string_lossy(),
-            std::process::id()
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((candidate, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    fs::rename(source, target)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn atomic_replace(_source: &Path, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic provider exchange state replacement requires macOS or Linux",
-    ))
+    run_persistence::publish_replacement_with_hooks(
+        lock,
+        run_file,
+        bytes,
+        || {
+            before_publish()
+                .map_err(|error| run_persistence::RunPersistenceError::Invalid(error.to_string()))
+        },
+        || Ok(()),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn validate_authoritative_provider_exchange_records(
@@ -2195,6 +2049,12 @@ impl From<std::io::Error> for ProviderExchangeError {
     }
 }
 
+impl From<run_persistence::RunPersistenceError> for ProviderExchangeError {
+    fn from(error: run_persistence::RunPersistenceError) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn persist_test_output_review_ledger(
     workspace: &LoopWorkspace,
@@ -2584,8 +2444,8 @@ mod tests {
         output_review.artifact_digest = None;
         state::save_run(workspace, &pre_review).unwrap();
         let with_ledger = persist_test_output_review_ledger(workspace, &awaiting.run_id);
-        awaiting.provider_exchange_records = with_ledger.provider_exchange_records;
-        persist_run_with_provider_exchange_compare(workspace, &awaiting).unwrap();
+        awaiting.provider_exchange_records = with_ledger.provider_exchange_records.clone();
+        persist_run_with_full_compare(workspace, &with_ledger, &awaiting).unwrap();
 
         let policy_decision_digest =
             canonical_sha256_digest(&awaiting.policy_decisions[0]).unwrap();
@@ -2816,14 +2676,19 @@ mod tests {
         output_review.artifact_digest = None;
         state::save_run(&workspace, &pre_review).expect("pre-review run");
         let with_ledger = persist_test_output_review_ledger(&workspace, &run.run_id);
-        run.provider_exchange_records = with_ledger.provider_exchange_records;
-        persist_run_with_provider_exchange_compare(&workspace, &run)
+        run.provider_exchange_records = with_ledger.provider_exchange_records.clone();
+        let before = fs::read(workspace.run_file()).unwrap();
+        let error = persist_ordinary_run_with_full_compare(&workspace, &with_ledger, &run)
+            .expect_err("ordinary CAS must not mint AwaitingHumanReview authority");
+        assert!(error.to_string().contains("cannot mint"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+        persist_run_with_full_compare(&workspace, &with_ledger, &run)
             .expect("locked waiting publication");
         let run_bytes = fs::read(workspace.run_file()).unwrap();
 
         let mut stale = run.clone();
         stale.status = LoopStatus::Running;
-        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+        let error = persist_ordinary_run_with_full_compare(&workspace, &run, &stale)
             .expect_err("ordinary stale state cannot replace waiting authority");
         assert!(
             error.to_string().contains("awaiting human review"),
@@ -2935,7 +2800,7 @@ mod tests {
         let mut stale = approved.clone();
         stale.status = LoopStatus::Running;
         stale.human_approval = None;
-        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+        let error = persist_ordinary_run_with_full_compare(&workspace, &approved, &stale)
             .expect_err("ordinary publication cannot replace Approved");
         assert!(error.to_string().contains("approved authority"), "{error}");
         let mut reset = approved.clone();
@@ -2998,7 +2863,7 @@ mod tests {
                 .unwrap()
                 .clone(),
         )
-        .expect_err("EvalPassed must freeze provider append");
+        .expect_err("EvalPassed must freeze provider append retries");
         assert!(error.to_string().contains("frozen"), "{error}");
         let error =
             reconcile_provider_exchange_state_with_validator(&workspace, &eval_passed, |_| Ok(()))
@@ -3007,7 +2872,7 @@ mod tests {
         let mut stale = eval_passed.clone();
         stale.status = LoopStatus::Completed;
         stale.human_approval = None;
-        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+        let error = persist_ordinary_run_with_full_compare(&workspace, &eval_passed, &stale)
             .expect_err("ordinary publication cannot replace EvalPassed");
         assert!(error.to_string().contains("final evaluation"), "{error}");
         let mut reset = eval_passed.clone();
@@ -3117,9 +2982,9 @@ mod tests {
             &workspace,
             promoted.provider_exchange_records.last().unwrap().clone(),
         )
-        .expect_err("provider append cannot replace Promoted");
+        .expect_err("provider append cannot retry against Promoted");
         reconcile_provider_exchange_state_with_validator(&workspace, &promoted, |_| Ok(()))
-            .expect_err("provider reconciliation cannot replace Promoted");
+            .expect_err("provider reconciliation cannot retry against Promoted");
         crate::validate_rerun_eligibility(&promoted, LoopStepName::OutputReview)
             .expect_err("runner rerun cannot replace Promoted");
         assert_eq!(fs::read(workspace.run_file()).unwrap(), promoted_bytes);
@@ -3347,7 +3212,8 @@ mod tests {
         let candidate = persisted.candidate_workspace.as_mut().unwrap();
         candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaning;
         candidate.cleanup_started_at = Some("cleanup-intent".to_string());
-        state::save_run(&workspace, &persisted).expect("persisted Cleaning state");
+        persist_run_with_full_compare(&workspace, &authoritative, &persisted)
+            .expect("persisted Cleaning state");
         let before = std::fs::read(workspace.run_file()).expect("before bytes");
 
         let error = reconcile_provider_exchange_state_with_validator(
@@ -3372,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_and_publish_rejects_a_concurrent_suffix_for_nonempty_intended_state() {
+    fn ordinary_full_compare_racing_provider_append_never_loses_the_suffix() {
         let temp = tempfile::tempdir().expect("temp");
         let workspace = LoopWorkspace::create(&temp.path().join("runs"), "state-compare-race")
             .expect("workspace");
@@ -3457,6 +3323,7 @@ mod tests {
         persist_provider_exchange_record_reference(&workspace, response_reference.clone())
             .expect("append research response");
         let mut intended = state::load_run(&workspace).expect("intended state");
+        let expected = intended.clone();
         intended.updated_at = "intended-terminal-state".to_string();
 
         let analysis = ProviderExchangeCoordinates {
@@ -3490,16 +3357,52 @@ mod tests {
         let concurrent =
             stage_provider_exchange_record(workspace.run_directory(), &analysis_record)
                 .expect("stage concurrent suffix");
-        persist_provider_exchange_record_reference(&workspace, concurrent.clone())
-            .expect("append concurrent suffix");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let append_workspace = workspace.clone();
+        let append_barrier = std::sync::Arc::clone(&barrier);
+        let append_reference = concurrent.clone();
+        let append = std::thread::spawn(move || {
+            append_barrier.wait();
+            persist_provider_exchange_record_reference(&append_workspace, append_reference)
+        });
+        let ordinary_workspace = workspace.clone();
+        let ordinary_barrier = std::sync::Arc::clone(&barrier);
+        let intended_for_thread = intended.clone();
+        let expected_for_thread = expected.clone();
+        let ordinary = std::thread::spawn(move || {
+            ordinary_barrier.wait();
+            persist_ordinary_run_with_full_compare(
+                &ordinary_workspace,
+                &expected_for_thread,
+                &intended_for_thread,
+            )
+        });
+        barrier.wait();
+        append
+            .join()
+            .unwrap()
+            .expect("provider append remains valid");
+        let ordinary = ordinary.join().unwrap();
 
-        let error = persist_run_with_provider_exchange_compare(&workspace, &intended)
-            .expect_err("stale state must not erase suffix");
-
-        assert!(error.to_string().contains("exchange head changed"));
         let current = state::load_run(&workspace).expect("current run");
-        assert_eq!(current.provider_exchange_records.last(), Some(&concurrent));
-        assert_ne!(current.updated_at, intended.updated_at);
+        let mut append_after_ordinary = intended.clone();
+        append_after_ordinary
+            .provider_exchange_records
+            .push(concurrent.clone());
+        let mut append_before_ordinary = expected.clone();
+        append_before_ordinary
+            .provider_exchange_records
+            .push(concurrent.clone());
+        match ordinary {
+            Ok(()) => assert_eq!(current, append_after_ordinary),
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("changed before ordinary"),
+                    "{error}"
+                );
+                assert_eq!(current, append_before_ordinary);
+            }
+        }
     }
 
     #[test]
@@ -3528,13 +3431,18 @@ mod tests {
         let mut replacement = serde_json::to_vec_pretty(&changed_run).expect("replacement");
         replacement.push(b'\n');
 
-        let error =
-            replace_run_file_atomically_with_hook(&workspace.run_file(), &replacement, || {
+        let lock = RunMutationGuard::acquire(workspace.run_directory()).expect("lock");
+        let error = replace_run_file_atomically_with_hook(
+            &lock,
+            &workspace.run_file(),
+            &replacement,
+            || {
                 Err(ProviderExchangeError::Invalid(
                     "injected pre-publish failure".to_string(),
                 ))
-            })
-            .expect_err("injected failure");
+            },
+        )
+        .expect_err("injected failure");
 
         assert!(error.to_string().contains("injected"));
         assert_eq!(
@@ -3595,28 +3503,5 @@ mod tests {
             .expect("retry identical locked transaction");
 
         assert_eq!(state::load_run(&workspace).expect("reset run"), reset);
-    }
-
-    #[test]
-    fn atomic_temp_reservation_skips_an_orphaned_name_collision() {
-        let temp = tempfile::tempdir().expect("temp");
-        let sequence = AtomicU64::new(0);
-        let file_name = std::ffi::OsStr::new("run.json");
-        let orphan = temp.path().join(format!(
-            ".run.json.exchange-state.tmp-{}-0",
-            std::process::id()
-        ));
-        std::fs::write(&orphan, b"orphan").expect("orphan");
-
-        let (reserved, file) =
-            create_run_state_temp(temp.path(), file_name, &sequence).expect("next temp");
-        drop(file);
-
-        assert!(reserved.ends_with(format!(
-            ".run.json.exchange-state.tmp-{}-1",
-            std::process::id()
-        )));
-        assert_eq!(std::fs::read(orphan).expect("orphan bytes"), b"orphan");
-        std::fs::remove_file(reserved).expect("cleanup reservation");
     }
 }

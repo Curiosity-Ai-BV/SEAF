@@ -2827,7 +2827,7 @@ mod live_context_cap_tests {
         let mut prepared_run = run.clone();
         prepared_run.input_digests.ticket =
             canonical_sha256_digest(&ticket).expect("ticket digest");
-        crate::state::save_run(&workspace, &prepared_run)
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &prepared_run)
             .expect("persist the exact verified resume authority");
         let provider = seaf_models::FakeProvider::new(Vec::new());
         let mut provider_runner =
@@ -2955,7 +2955,8 @@ mod live_context_cap_tests {
             .expect("request");
         let mut running = run;
         crate::state::mark_step_running(&mut running, LoopStepName::Research).expect("running");
-        crate::state::save_run(&workspace, &running).expect("save running");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &running)
+            .expect("save running");
 
         let output = runner
             .run_step(LoopStepName::Research, &request)

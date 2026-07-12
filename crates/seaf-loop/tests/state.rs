@@ -73,6 +73,10 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
     );
     let run_dir = runs_root.join("isolated-init");
     assert!(run_dir.join("run.json").is_file());
+    assert!(
+        run_dir.join("provider-exchange.lock").is_file(),
+        "isolated initialization must use the shared durable run-state publisher"
+    );
     for absent in [
         "artifacts",
         "prompts",
@@ -353,7 +357,7 @@ fn state_save_with_stale_empty_exchange_vector_cannot_erase_first_concurrent_req
         .run_next_step()
         .expect_err("stale empty state must not erase the first exchange");
 
-    assert!(error.to_string().contains("exchange head changed"));
+    assert!(error.to_string().contains("changed before ordinary"));
     let workspace = LoopWorkspace::open(&runs_root, "first-exchange-race").expect("workspace");
     let persisted = seaf_loop::state::load_run(&workspace).expect("persisted run");
     assert_eq!(persisted.provider_exchange_records.len(), 1);
@@ -637,6 +641,72 @@ fn state_start_rejects_duplicate_run_id_without_touching_audit_files() {
         "duplicate start must not create a second prompt attempt"
     );
     assert!(duplicate_runner.calls.is_empty());
+}
+
+#[test]
+fn legacy_start_cleans_a_fresh_workspace_when_initial_state_publication_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let run_id = "initial-publication-failure";
+    let mut step_runner = InitialLockCollisionRunner;
+
+    let error = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut step_runner,
+    )
+    .expect_err("invalid fresh lock must fail initial state publication");
+
+    assert!(error.to_string().contains("regular file"), "{error}");
+    assert!(
+        !runs_root.join(run_id).exists(),
+        "a failed fresh start must not strand its lock-only workspace"
+    );
+}
+
+#[test]
+fn terminal_resume_reauthenticates_the_stable_run_lock_before_returning() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let run_id = "terminal-resume-lock";
+    let mut initial = RecordingStepRunner::new();
+    let runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut initial,
+    )
+    .unwrap();
+    drop(runner);
+    let run_dir = runs_root.join(run_id);
+    let mut terminal = read_run(&run_dir);
+    terminal.status = LoopStatus::Blocked;
+    terminal.current_step = LoopStepName::Research;
+    terminal.steps[0].status = LoopStepStatus::Blocked;
+    write_run(&run_dir, &terminal);
+    let lock = run_dir.join("provider-exchange.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let before = read_tree_bytes(&run_dir);
+    let mut resumed_runner = RecordingStepRunner::new();
+
+    let error = LoopRunner::resume(&runs_root, run_id, &mut resumed_runner)
+        .expect_err("terminal resume must resync through the stable lock");
+
+    assert!(error.to_string().contains("regular file"), "{error}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert!(resumed_runner.calls.is_empty());
 }
 
 #[test]
@@ -940,11 +1010,7 @@ fn state_second_attempt_preserves_first_artifact_and_selects_new_exact_extension
     let mut persisted = read_run(&run_dir);
     seaf_loop::state::reset_from_step(&mut persisted, LoopStepName::Research)
         .expect("reset test fixture");
-    seaf_loop::state::save_run(
-        &LoopWorkspace::open(&runs_root, run_id).expect("workspace"),
-        &persisted,
-    )
-    .expect("save reset fixture");
+    write_run(&run_dir, &persisted);
 
     let mut second_runner = RecordingStepRunner::with_prefix("second")
         .with_artifact(ArtifactContent::new("yaml", b"second artifact"));
@@ -1008,11 +1074,7 @@ fn public_legacy_rerun_api_is_retired_without_mutation() {
     historical.status = LoopStatus::Blocked;
     historical.current_step = LoopStepName::Research;
     historical.steps[0].status = LoopStepStatus::Blocked;
-    seaf_loop::state::save_run(
-        &LoopWorkspace::open(&runs_root, run_id).unwrap(),
-        &historical,
-    )
-    .unwrap();
+    write_run(&run_dir, &historical);
     let mut resumed_runner = RecordingStepRunner::with_prefix("must-not-run");
     let resumed = LoopRunner::resume(&runs_root, run_id, &mut resumed_runner).unwrap();
     let before = read_tree_bytes(&run_dir);
@@ -1045,7 +1107,7 @@ fn state_resume_missing_run_directory_reports_clear_error() {
 }
 
 #[test]
-fn state_resume_verified_uses_preflight_run_when_disk_run_changes() {
+fn state_resume_verified_rejects_when_disk_run_changes_before_resync() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
     let run_id = "resume-verified-state";
@@ -1071,14 +1133,15 @@ fn state_resume_verified_uses_preflight_run_when_disk_run_changes() {
     replacement.ticket_id = "replacement-ticket".to_string();
     replacement.steps[0].status = LoopStepStatus::Pending;
     write_run(&run_dir, &replacement);
+    let before = read_tree_bytes(&run_dir);
 
     let mut resumed_runner = RecordingStepRunner::with_prefix("resumed");
-    let resumed = LoopRunner::resume_verified(&runs_root, verified.clone(), &mut resumed_runner)
-        .expect("resume verified run");
+    let error = LoopRunner::resume_verified(&runs_root, verified, &mut resumed_runner)
+        .expect_err("verified token must not bypass changed durable run authority");
 
-    assert_eq!(resumed.run(), &verified);
-    assert_eq!(resumed.run().ticket_id, ticket().ticket_id);
-    assert_eq!(resumed.run().steps[0].status, LoopStepStatus::Completed);
+    assert!(error.to_string().contains("exact run resync"), "{error}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert!(resumed_runner.calls.is_empty());
 }
 
 #[cfg(unix)]
@@ -1101,6 +1164,44 @@ fn state_resume_rejects_symlinked_run_directory_without_touching_external_target
     assert!(error.to_string().contains("symlink"), "{error}");
     assert_eq!(read_tree_bytes(&external_run), before);
     assert!(step_runner.calls.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn state_resume_rejects_symlinked_run_file_without_touching_external_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    let run_id = "symlinked-run-file";
+    let mut initial = RecordingStepRunner::new();
+    let runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut initial,
+    )
+    .unwrap();
+    drop(runner);
+    let run_path = runs_root.join(run_id).join("run.json");
+    let outside = temp.path().join("outside-run.json");
+    let outside_bytes = fs::read(&run_path).unwrap();
+    fs::write(&outside, &outside_bytes).unwrap();
+    fs::remove_file(&run_path).unwrap();
+    symlink(&outside, &run_path).unwrap();
+    let mut resumed = RecordingStepRunner::new();
+
+    let error = LoopRunner::resume(&runs_root, run_id, &mut resumed)
+        .expect_err("run.json symlink must fail closed");
+
+    assert!(error.to_string().contains("regular file"), "{error}");
+    assert_eq!(fs::read(outside).unwrap(), outside_bytes);
+    assert!(resumed.calls.is_empty());
 }
 
 #[cfg(unix)]
@@ -1242,6 +1343,31 @@ fn state_resume_verified_rejects_exhausted_next_attempt_before_prepare_or_mutati
     assert_eq!(step_runner.prepare_calls, 0);
     assert!(step_runner.request_calls.is_empty());
     assert!(step_runner.calls.is_empty());
+}
+
+struct InitialLockCollisionRunner;
+
+impl StepRunner for InitialLockCollisionRunner {
+    fn prepare_fresh_run(
+        &mut self,
+        workspace: &LoopWorkspace,
+        _run: &LoopRun,
+    ) -> Result<(), seaf_loop::RunnerError> {
+        fs::create_dir(workspace.run_directory().join("provider-exchange.lock"))
+            .map_err(|error| seaf_loop::RunnerError::Step(error.to_string()))
+    }
+
+    fn step_request(&mut self, _step: LoopStepName) -> Result<String, seaf_loop::RunnerError> {
+        unreachable!("initial publication fails before any step")
+    }
+
+    fn run_step(
+        &mut self,
+        _step: LoopStepName,
+        _request: &str,
+    ) -> Result<StepOutput, seaf_loop::RunnerError> {
+        unreachable!("initial publication fails before any step")
+    }
 }
 
 struct RecordingStepRunner {

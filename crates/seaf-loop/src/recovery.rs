@@ -269,6 +269,7 @@ fn invalidate_approved_evaluation_locked(
     let source = state::load_run(workspace).map_err(RecoveryError::wrapped)?;
     ensure_no_promotion_intent(workspace)?;
     if let Some(retry) = exact_evaluation_invalidation_retry(workspace, &source, actor, reason)? {
+        state::resync_exact_run(workspace, &retry.run).map_err(RecoveryError::wrapped)?;
         return Ok(retry);
     }
     let approved = match source.status {
@@ -874,6 +875,7 @@ fn exact_evaluation_adoption_retry(
             "source worktree authority changed after evaluation adoption",
         ));
     }
+    state::resync_exact_run(workspace, &run).map_err(RecoveryError::wrapped)?;
     Ok(EvaluationAdoptionOutcome {
         run,
         recovery,
@@ -1812,6 +1814,7 @@ fn revise_provider_step_locked(
                         reference.recovery_id,
                     )?;
                     validate_pending_adoption(workspace, &source, step, &recovery)?;
+                    state::resync_exact_run(workspace, &source).map_err(RecoveryError::wrapped)?;
                     return Ok(RecoveryRevisionOutcome {
                         run: source,
                         recovery,

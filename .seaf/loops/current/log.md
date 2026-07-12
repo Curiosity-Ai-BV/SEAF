@@ -1948,3 +1948,47 @@ Ollama 8, and all doc tests. Strict all-target/all-feature Clippy, Rust and
 Prettier formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff
 checks pass through pinned pnpm 11.7.0. M1-09 is accepted and M1-10 atomic state
 and run locking is active.
+
+## 2026-07-12 implementation | M1-10 atomic state and run locking
+
+Generalized the existing permanent `provider-exchange.lock` into the one
+bounded cooperative mutation lock for every `run.json` writer. Initialization
+uses create-only publication; the public state writer accepts only exact
+canonical retry; ordinary runner transitions use crate-private full-state
+expected-to-intended CAS. Provider append/reconcile and the approval,
+candidate, cleanup, promotion, and evaluation v1/v2/v3 recovery paths keep
+their narrower authorization checks while sharing the same physical lock and
+durable publication core.
+
+Replacement now writes and syncs a unique same-directory temporary file,
+revalidates both the stable lock and opened current target, atomically renames,
+and syncs the parent. Creation uses a synced temporary hard link and parent
+sync. Pre-publication write/sync/publish failures retain old or absent state;
+post-link/rename directory-sync uncertainty leaves complete intended bytes and
+an exact retry resyncs the file and directory. Lock contention is bounded,
+advisory ownership releases on process exit, and the permanent lock is never
+deleted by PID or age. Reads and replacements reject symlinks, non-files, and
+path identity substitution.
+
+Independent review found and closed four production gaps: a public generic CAS
+that could bypass audited recovery, missing terminal durability resync, failed
+fresh-start cleanup, and `run.json` symlink/target substitution. The first full
+workspace gate then exposed stale noncanonical crash fixtures and a terminal
+legacy resume regression. Test fixtures now use one `cfg(test)` typed canonical
+raw writer, while production resume preserves the human-review
+fail-before-mutation barrier, exact-resyncs authority, returns inert only for
+frozen states, and sends ordinary terminal provider history through recovery
+preparation. Re-review approved both corrections with no remaining P0/P1/P2
+findings.
+
+Coverage includes partial write, temp sync, link/rename, temp unlink, parent
+sync, stable-lock replacement, target replacement, symlink/non-file collision,
+bounded contention, create/retry, ordinary-vs-provider competition, all M1-09
+recovery exact retries, terminal resume, failed-start cleanup, and legacy
+provider rejection. Controller verification passes the full Rust workspace:
+CLI 137, core 51, local runtime 5, loop library 147, provider-candidate 53,
+candidate 39, state 35, provider-exchange 22, and every remaining integration
+and doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
+formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
+through the pinned pnpm runtime. M1-10 is accepted and M1-11 minimum artifact
+protection is active.

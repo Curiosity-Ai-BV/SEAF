@@ -1569,7 +1569,8 @@ Commit boundary: evaluation invalidation and fresh rerun only.
 
 Roadmap: U5. Dependencies: M1-09.
 
-Status: active. Dependencies: M1-09 (complete).
+Status: complete on 2026-07-12. Dependencies: M1-09 (complete). M1-11 is
+active.
 
 Objective: prevent corrupt or concurrently mutated run state.
 
@@ -1591,6 +1592,37 @@ RED: concurrent mutation, partial-write, failed-rename, and stale-lock tests.
 
 Verification: state/workspace suites, full workspace tests, format, Clippy, and
 diff check.
+
+Delivered: the existing permanent `provider-exchange.lock` is now the single
+bounded per-run mutation lock rather than a second competing lock. Initial
+state uses create-only hard-link publication; public direct writes permit only
+byte-identical canonical retry; legitimate changes use complete
+expected-to-intended compare-and-swap with the provider, candidate, recovery,
+human-review, evaluation, and promotion transition guards preserved. Every
+replacement writes and syncs a unique same-directory temporary file,
+revalidates the stable lock and opened `run.json` identity immediately before
+atomic rename, and syncs the parent directory. Pre-publication faults retain
+old or absent state; post-publication directory-sync uncertainty leaves the
+complete intended bytes, and exact retry reauthenticates and resyncs them.
+Symlink, non-file, replaced-lock, replaced-target, competing-writer, partial
+write, sync, publish, unlink, and parent-sync regressions fail closed or
+converge to one legal state.
+
+Every ordinary runner, provider append/reconcile, candidate lifecycle,
+approval, evaluation v1/v2/v3 recovery, cleanup, and promotion retry now uses
+the shared seam without changing candidate-to-repository-to-run lock order.
+Resume preserves the historical human-review fail-before-mutation barrier,
+then exact-resyncs durable authority; frozen review/final states return inert,
+while ordinary terminal provider history still passes recovery validation.
+The generic ordinary CAS and exact-resync operations remain crate-private.
+
+Verification: independent contract and quality reviews approved with no
+remaining P0/P1/P2 findings. Controller gates pass the full Rust workspace,
+including CLI 137, loop library 147, provider-candidate 53, candidate 39, state
+35, and provider-exchange 22 tests, plus all remaining integration and doc
+suites. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
+package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass through the
+pinned pnpm runtime.
 
 Docs/tracker: persistence/lock behavior and M1-10 status.
 

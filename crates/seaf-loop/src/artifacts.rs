@@ -619,7 +619,7 @@ mod tests {
 
         run.steps[0].artifact_path = None;
         run.steps[0].artifact_digest = None;
-        save_run(&workspace, &run).unwrap();
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).unwrap();
         write_step_request(&workspace, LoopStepName::Research, 3, "attempt three").unwrap();
         let before_attempt_three = snapshot(&workspace);
 

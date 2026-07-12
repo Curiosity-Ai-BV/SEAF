@@ -44,21 +44,22 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-10 - Atomic state and run locking. Generalize the narrow provider-ledger
-lock and atomic replacement guarantees to every remaining run-state mutation
-and recovery operation without weakening or replacing the existing
-ledger-specific guard.
+M1-11 - Minimum artifact protection. Make local run evidence safe enough for
+live provider use without changing the M1-10 state transaction or broadening
+into retention, distribution, or release work.
 
-Every run-state writer must use durable same-directory temporary publication
-and atomic replacement. Exactly one cooperative SEAF process may mutate a run
-at a time; stale-lock behavior must be explicit, bounded, and safe. Concurrent
-writers must either serialize against the latest authenticated state or fail
-closed before mutation, never publish a hybrid of two intended states. Failed
-write, sync, or rename cuts must retain the last valid parseable `run.json` and
-leave a deterministic retry or cleanup path.
+On supported Unix platforms, every run directory, mutation lock, state file,
+prompt, provider response, log, and generated evidence file must be private at
+creation and remain private through retry or replacement. Provider response,
+prompt, exchange, log, and aggregate run storage must have explicit byte caps;
+oversize input must fail closed before partial or misleading authority is
+published. Configured secrets and obvious credential patterns must be redacted
+before persistence, and redaction itself must stay bounded.
 
-Start with an inventory of every state/workspace writer and the existing lock
-orders. Add focused fault-injection and competing-writer tests before changing
-production code. Preserve candidate, repository-operation, and provider lock
-ordering and all M1-09 recovery CAS semantics. Do not add M1-11 artifact
-permissions, retention, distribution, or release work.
+Start with an inventory of every run-directory and artifact creation seam,
+existing output/redaction limits, and the order in which immutable provider
+audits become authoritative. Witness permission, oversize response, cumulative
+budget, retry, and secret-leak failures before implementation. Preserve
+M1-10's one-lock publication semantics, all immutable artifact identities, and
+the candidate/repository/run lock order. Do not add purge/retention policy,
+format migration, packaging, or release behavior.

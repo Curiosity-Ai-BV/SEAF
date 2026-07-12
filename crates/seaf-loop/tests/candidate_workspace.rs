@@ -86,7 +86,7 @@ fn candidate_plan_is_durable_authority_before_provisioning_creates_the_worktree(
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     run.candidate_workspace = Some(planned.clone());
-    seaf_loop::state::save_run(&workspace, &run).expect("persist provisioning authority");
+    persist_run_fixture(&workspace, &run).expect("persist provisioning authority");
 
     let active = provision_candidate_workspace(&workspace).expect("provision exact plan");
     assert_eq!(
@@ -253,7 +253,7 @@ fn copied_or_moved_runs_cannot_operate_on_the_original_candidate() {
     assert!(seaf_loop::verify_candidate_patch_evidence(&copied, &source).is_err());
     let mut copied_run = seaf_loop::state::load_run(&copied).unwrap();
     copied_run.status = LoopStatus::Completed;
-    seaf_loop::state::save_run(&copied, &copied_run).unwrap();
+    persist_run_fixture(&copied, &copied_run).unwrap();
     let cleanup_before = fs::read(copied.run_file()).unwrap();
     assert!(cleanup_candidate_workspace(&copied, &source).is_err());
     assert_eq!(fs::read(copied.run_file()).unwrap(), cleanup_before);
@@ -311,7 +311,7 @@ fn legacy_candidate_authority_is_read_only_and_rejected_before_lock_or_git_mutat
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     run.candidate_workspace = Some(planned.clone());
-    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    persist_run_fixture(&workspace, &run).unwrap();
     let before = fs::read(workspace.run_file()).unwrap();
     let lock = workspace.run_directory().join(".candidate-workspace.lock");
 
@@ -343,7 +343,7 @@ fn legacy_active_cleaning_and_cleaned_authority_rejects_every_candidate_operatio
     authority.schema_version = 1;
     authority.run_directory_digest = None;
     let legacy_active = authority.clone();
-    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    persist_run_fixture(&workspace, &run).unwrap();
     let running_before = fs::read(workspace.run_file()).unwrap();
 
     assert!(
@@ -371,7 +371,7 @@ fn legacy_active_cleaning_and_cleaned_authority_rejects_every_candidate_operatio
         .then(|| "started".to_string());
         authority.cleaned_at = (lifecycle == seaf_core::CandidateWorkspaceLifecycle::Cleaned)
             .then(|| "cleaned".to_string());
-        seaf_loop::state::save_run(&workspace, &terminal).unwrap();
+        persist_run_fixture(&workspace, &terminal).unwrap();
         let before = fs::read(workspace.run_file()).unwrap();
         assert!(cleanup_candidate_workspace(&workspace, &source).is_err());
         assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
@@ -410,7 +410,7 @@ fn copied_provisioning_authority_cannot_create_or_adopt_a_crash_remnant() {
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     run.candidate_workspace = Some(planned.clone());
-    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    persist_run_fixture(&workspace, &run).unwrap();
 
     let copied_root = temp.path().join("copied-runs");
     fs::create_dir(&copied_root).unwrap();
@@ -437,7 +437,7 @@ fn copied_provisioning_authority_cannot_create_or_adopt_a_crash_remnant() {
     let remnant = create_candidate_workspace(workspace.run_directory(), &source, &digest).unwrap();
     let mut interrupted = seaf_loop::state::load_run(&workspace).unwrap();
     interrupted.candidate_workspace = Some(planned.clone());
-    seaf_loop::state::save_run(&workspace, &interrupted).unwrap();
+    persist_run_fixture(&workspace, &interrupted).unwrap();
     assert!(provision_candidate_workspace(&copied).is_err());
     assert_eq!(fs::read(copied.run_file()).unwrap(), copied_before);
     assert!(!copied_lock.exists());
@@ -475,7 +475,7 @@ fn provisioning_uses_the_persisted_starting_head_instead_of_resnapshotting_sourc
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     run.candidate_workspace = Some(planned.clone());
-    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    persist_run_fixture(&workspace, &run).unwrap();
     fs::write(source.join("tracked.txt"), "new source commit\n").unwrap();
     git_ok(&source, &["add", "tracked.txt"]);
     git_ok(&source, &["commit", "-qm", "advance source"]);
@@ -1027,7 +1027,7 @@ fn cleanup_refuses_active_runs_and_removes_only_the_verified_bound_worktree() {
     for status in [LoopStatus::Pending, LoopStatus::Running] {
         let mut run = seaf_loop::state::load_run(&workspace).expect("run");
         run.status = status;
-        seaf_loop::state::save_run(&workspace, &run).expect("persist active status");
+        persist_run_fixture(&workspace, &run).expect("persist active status");
         let error = cleanup_candidate_workspace(&workspace, &source)
             .expect_err("active runs retain their candidate");
         assert!(error.to_string().contains("active"), "{error}");
@@ -1036,7 +1036,7 @@ fn cleanup_refuses_active_runs_and_removes_only_the_verified_bound_worktree() {
 
     let mut run = seaf_loop::state::load_run(&workspace).expect("run");
     run.status = LoopStatus::Completed;
-    seaf_loop::state::save_run(&workspace, &run).expect("persist terminal status");
+    persist_run_fixture(&workspace, &run).expect("persist terminal status");
     let cleaned =
         cleanup_candidate_workspace(&workspace, &source).expect("explicit terminal cleanup");
     assert!(!Path::new(&candidate_path).exists());
@@ -1059,9 +1059,9 @@ fn cleanup_refuses_active_runs_and_removes_only_the_verified_bound_worktree() {
     tampered_cleaned.path = temp.path().join("not-the-candidate").display().to_string();
     let mut tampered_run = authoritative.clone();
     tampered_run.candidate_workspace = Some(tampered_cleaned);
-    seaf_loop::state::save_run(&workspace, &tampered_run).expect("persist tampered authority");
+    persist_run_fixture(&workspace, &tampered_run).expect("persist tampered authority");
     assert!(cleanup_candidate_workspace(&workspace, &source).is_err());
-    seaf_loop::state::save_run(&workspace, &authoritative).expect("restore authority");
+    persist_run_fixture(&workspace, &authoritative).expect("restore authority");
     fs::create_dir(&cleaned.path).expect("reappearing cleaned candidate path");
     assert!(cleanup_candidate_workspace(&workspace, &source).is_err());
     fs::remove_dir(&cleaned.path).expect("remove reappearing path");
@@ -1118,7 +1118,7 @@ fn cleanup_reconciles_durable_intent_after_the_bound_worktree_was_removed() {
     let authority = interrupted.candidate_workspace.as_mut().unwrap();
     authority.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaning;
     authority.cleanup_started_at = Some("cleanup-intent".to_string());
-    seaf_loop::state::save_run(&workspace, &interrupted).expect("durable cleanup intent");
+    persist_run_fixture(&workspace, &interrupted).expect("durable cleanup intent");
     remove_worktree(&source, Path::new(&candidate.path));
     fs::write(source.join("after-intent.txt"), "source advances\n").unwrap();
     git_ok(&source, &["add", "after-intent.txt"]);
@@ -1183,7 +1183,7 @@ fn cleanup_rejects_tampered_authoritative_candidate_before_removal() {
     let mut run = seaf_loop::state::load_run(&workspace).expect("run");
     run.candidate_workspace.as_mut().unwrap().path =
         temp.path().join("substituted").display().to_string();
-    seaf_loop::state::save_run(&workspace, &run).expect("tampered run fixture");
+    persist_run_fixture(&workspace, &run).expect("tampered run fixture");
     assert!(cleanup_candidate_workspace(&workspace, &source).is_err());
     assert!(Path::new(&candidate.path).is_dir());
     remove_worktree(&source, Path::new(&candidate.path));
@@ -1759,7 +1759,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
         serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
     );
     authoritative.input_digests.eval_config = Some("4".repeat(64));
-    seaf_loop::state::save_run(&workspace, &authoritative).expect("Development authority");
+    persist_run_fixture(&workspace, &authoritative).expect("Development authority");
 
     let applied =
         apply_candidate_development_evidence(&workspace, &source).expect("apply exact evidence");
@@ -1907,7 +1907,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     let intent_bytes = canonical_json_bytes(&intent).expect("canonical tampered intent");
     fs::write(&intent_path, &intent_bytes).expect("coherent intent tamper");
     transaction.intent.digest = hex::encode(Sha256::digest(&intent_bytes));
-    seaf_loop::state::save_run(&workspace, &tampered_run).expect("coherent tampered authority");
+    persist_run_fixture(&workspace, &tampered_run).expect("coherent tampered authority");
     assert!(
         apply_candidate_development_evidence(&workspace, &source).is_err(),
         "coherently rewritten intent/diff/index must not replace authoritative Development"
@@ -2045,7 +2045,7 @@ fn candidate_patch_application_requires_completed_development_on_a_running_run()
             .find(|step| step.name == seaf_core::LoopStepName::Development)
             .unwrap()
             .status = development_status;
-        seaf_loop::state::save_run(&workspace, &run).expect("invalid application authority");
+        persist_run_fixture(&workspace, &run).expect("invalid application authority");
 
         assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
         assert_eq!(
@@ -2294,13 +2294,13 @@ fn persisted_candidate_workspace(
     });
     run.candidate_workspace = Some(planned);
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-    seaf_loop::state::save_run(&workspace, &run).expect("persist candidate plan");
+    persist_run_fixture(&workspace, &run).expect("persist candidate plan");
     let candidate =
         seaf_loop::create_candidate_workspace(workspace.run_directory(), source, &repository)
             .expect("candidate");
     let mut run = seaf_loop::state::load_run(&workspace).expect("active candidate run");
     run.status = status;
-    seaf_loop::state::save_run(&workspace, &run).expect("persist candidate run status");
+    persist_run_fixture(&workspace, &run).expect("persist candidate run status");
     (workspace, candidate)
 }
 
@@ -2362,7 +2362,7 @@ fn prepare_candidate_workspace(
         });
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
         run.candidate_workspace = Some(planned);
-        seaf_loop::state::save_run(&workspace, &run).expect("fixture authority");
+        persist_run_fixture(&workspace, &run).expect("fixture authority");
         workspace
     } else {
         LoopWorkspace::open(
@@ -2439,7 +2439,7 @@ fn persist_development_authority(
     authoritative.policy_decisions.push(
         serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
     );
-    seaf_loop::state::save_run(workspace, &authoritative).expect("Development authority");
+    persist_run_fixture(workspace, &authoritative).expect("Development authority");
     evidence
 }
 
@@ -2459,7 +2459,7 @@ fn synthesize_interrupted_applying(workspace: &LoopWorkspace, reset_physical: bo
     transaction.phase = seaf_core::CandidatePatchPhase::Applying;
     transaction.applied_evidence = None;
     transaction.applied_at = None;
-    seaf_loop::state::save_run(workspace, &run).expect("synthesized Applying authority");
+    persist_run_fixture(workspace, &run).expect("synthesized Applying authority");
 }
 
 fn assert_same_applied_candidate(
@@ -2547,6 +2547,29 @@ fn git_with_stdin(path: &Path, args: &[&str], stdin: &[u8]) -> String {
 
 fn empty_sha256() -> &'static str {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+
+fn persist_run_fixture(
+    workspace: &LoopWorkspace,
+    run: &seaf_core::LoopRun,
+) -> Result<(), seaf_loop::state::StateError> {
+    if !workspace.run_file().exists() {
+        return seaf_loop::state::save_run(workspace, run);
+    }
+    let errors = seaf_core::validate_loop_run(run);
+    if !errors.is_empty() {
+        return Err(seaf_loop::state::StateError::InvalidRun(
+            errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let mut bytes = serde_json::to_vec_pretty(run)?;
+    bytes.push(b'\n');
+    fs::write(workspace.run_file(), bytes)?;
+    Ok(())
 }
 
 fn identity_digest(path: &Path) -> String {

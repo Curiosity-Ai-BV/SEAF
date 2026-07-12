@@ -309,6 +309,8 @@ where
             )
         })?;
         validate_exact_approval_retry(&evidence, reviewer, &bindings)?;
+        crate::state::resync_exact_run(workspace, &expected)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
         return Ok(CandidateApprovalOutcome {
             run: expected,
             evidence,
@@ -923,6 +925,8 @@ fn apply_candidate_development_evidence_locked(
                 &intent,
             )?;
             validate_applied_patch_evidence(workspace, &run, &candidate, transaction, &intent)?;
+            crate::state::resync_exact_run(workspace, &run)
+                .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
             return Ok(candidate);
         }
     };
@@ -1544,13 +1548,16 @@ fn provision_candidate_workspace_locked(
         )
     })?;
     if planned.lifecycle == CandidateWorkspaceLifecycle::Active {
-        return validate_candidate_physical(
+        let active = validate_candidate_physical(
             workspace.run_directory(),
             Path::new(&planned.source_worktree_root),
             &planned,
             true,
             false,
-        );
+        )?;
+        crate::state::resync_exact_run(workspace, &run)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+        return Ok(active);
     }
     if planned.lifecycle != CandidateWorkspaceLifecycle::Provisioning {
         return Err(CandidateWorkspaceError::Mismatch(
@@ -1941,6 +1948,8 @@ where
                         "cleaned candidate path or registration reappeared".to_string(),
                     ));
                 }
+                crate::state::resync_exact_run(workspace, &run)
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 repository_lock.unlock()?;
                 return CandidateCleanupOutcome::from_locked_run(&run, candidate);
             }
@@ -3409,7 +3418,8 @@ mod tests {
         for workspace in [&source_workspace, &linked_workspace] {
             let mut run = crate::state::load_run(workspace).expect("active run");
             run.status = LoopStatus::Completed;
-            crate::state::save_run(workspace, &run).expect("terminal run");
+            crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+                .expect("terminal run");
         }
         assert_eq!(
             cleanup_candidate_workspace(&source_workspace, &source)
@@ -3500,7 +3510,8 @@ mod tests {
             if phase == CandidateProvisionPhase::WorktreeCreated {
                 let mut concurrent = crate::state::load_run(&workspace).unwrap();
                 concurrent.updated_at = "concurrent-change".to_string();
-                crate::state::save_run(&workspace, &concurrent).unwrap();
+                crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &concurrent)
+                    .unwrap();
             }
             Ok(())
         })
@@ -3599,6 +3610,7 @@ mod tests {
             &fixture.workspace,
             &applied.run_id,
         );
+        let expected = run.clone();
         let output_review = run
             .steps
             .iter_mut()
@@ -3609,8 +3621,9 @@ mod tests {
         output_review.artifact_digest = Some("6".repeat(64));
         run.status = LoopStatus::AwaitingHumanReview;
         run.current_step = LoopStepName::Testing;
-        crate::provider_exchange::persist_run_with_provider_exchange_compare(
+        crate::provider_exchange::persist_run_with_full_compare(
             &fixture.workspace,
+            &expected,
             &run,
         )
         .expect("locked waiting publication");
@@ -3667,7 +3680,8 @@ mod tests {
         let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
         let mut run = crate::state::load_run(&workspace).expect("active run");
         run.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &run).expect("terminal run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("terminal run");
         let repository_lock =
             repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
         fs::remove_file(&repository_lock).expect("remove provision repository lock");
@@ -3749,7 +3763,8 @@ mod tests {
             authority.cleanup_started_at = Some("cleanup-started".to_string());
             authority.cleaned_at = (lifecycle == CandidateWorkspaceLifecycle::Cleaned)
                 .then(|| "cleanup-finished".to_string());
-            crate::state::save_run(&workspace, &run).expect("cleanup lifecycle run");
+            crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+                .expect("cleanup lifecycle run");
             let repository_lock =
                 repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
             fs::remove_file(&repository_lock).expect("remove provision repository lock");
@@ -3815,7 +3830,8 @@ mod tests {
         run.status = LoopStatus::Completed;
         run.candidate_workspace.as_mut().unwrap().git_common_dir =
             malicious_common.display().to_string();
-        crate::state::save_run(&workspace, &run).expect("tampered terminal run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("tampered terminal run");
         let run_before = fs::read(workspace.run_file()).expect("run bytes");
         let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
         let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
@@ -3864,7 +3880,8 @@ mod tests {
         let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
         let mut run = crate::state::load_run(&workspace).expect("active run");
         run.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &run).expect("terminal run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("terminal run");
 
         let malicious_common = temp.path().join("malicious-common");
         fs::create_dir(&malicious_common).expect("malicious common dir");
@@ -3886,7 +3903,7 @@ mod tests {
                 authority.run_directory_digest = Some("f".repeat(64));
                 authority.git_common_dir =
                     path_text(&malicious_common, "malicious common")?.to_string();
-                crate::state::write_run_file(&workspace.run_file(), &swapped)
+                crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &swapped)
                     .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 *swapped_bytes.borrow_mut() = Some(fs::read(workspace.run_file())?);
             }
@@ -3927,7 +3944,8 @@ mod tests {
         let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
         let mut terminal = crate::state::load_run(&workspace).expect("active run");
         terminal.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &terminal).expect("terminal run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &terminal)
+            .expect("terminal run");
         let repository_lock =
             repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
         fs::remove_file(&repository_lock).expect("remove provision repository lock");
@@ -3943,7 +3961,7 @@ mod tests {
                 let mut swapped = crate::state::load_run(&workspace)
                     .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 swapped.run_id = "other-safe-run".to_string();
-                crate::state::write_run_file(&workspace.run_file(), &swapped)
+                crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &swapped)
                     .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 *swapped_bytes.borrow_mut() = Some(fs::read(workspace.run_file())?);
             }
@@ -3973,7 +3991,8 @@ mod tests {
             git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
             candidate_status
         );
-        crate::state::write_run_file(&workspace.run_file(), &terminal).expect("restore run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &terminal)
+            .expect("restore run");
         test_git(
             &source,
             &["worktree", "remove", "--force", candidate.path.as_str()],
@@ -4029,7 +4048,7 @@ mod tests {
         .expect("candidate");
         let mut run = crate::state::load_run(&workspace).expect("active run");
         run.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &run).expect("run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).expect("run");
 
         let error = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
             if phase == CandidateCleanupPhase::WorktreeRemoved {
@@ -4051,13 +4070,14 @@ mod tests {
                 .lifecycle,
             CandidateWorkspaceLifecycle::Cleaning
         );
-        let stale_publish =
-            crate::provider_exchange::persist_run_with_provider_exchange_compare(&workspace, &run)
-                .expect_err("stale Active state cannot replace durable Cleaning");
+        let stale_publish = crate::provider_exchange::persist_ordinary_run_with_full_compare(
+            &workspace, &run, &run,
+        )
+        .expect_err("stale Active state cannot replace durable Cleaning");
         assert!(
             stale_publish
                 .to_string()
-                .contains("candidate workspace changed"),
+                .contains("changed before ordinary"),
             "{stale_publish}"
         );
         assert_eq!(
@@ -4074,7 +4094,8 @@ mod tests {
         let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
         let mut run = crate::state::load_run(&workspace).expect("active run");
         run.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &run).expect("terminal run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("terminal run");
 
         let outcome = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
             if phase == CandidateCleanupPhase::CleanedPersisted {
@@ -4093,7 +4114,8 @@ mod tests {
         assert!(!Path::new(&candidate.path).exists());
         assert!(!workspace.run_file().exists());
         run.candidate_workspace = Some(outcome.candidate);
-        crate::state::write_run_file(&workspace.run_file(), &run).expect("restore cleaned run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("restore cleaned run");
     }
 
     #[test]
@@ -4145,14 +4167,14 @@ mod tests {
         .expect("candidate");
         let mut run = crate::state::load_run(&workspace).expect("active run");
         run.status = LoopStatus::Completed;
-        crate::state::save_run(&workspace, &run).expect("run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).expect("run");
 
         let error = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
             if phase == CandidateCleanupPhase::BeforeIntentPersisted {
                 let mut concurrent = crate::state::load_run(&workspace)
                     .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 concurrent.updated_at = "concurrent-change".to_string();
-                crate::state::write_run_file(&workspace.run_file(), &concurrent)
+                crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &concurrent)
                     .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
             }
             Ok(())
@@ -4185,8 +4207,11 @@ mod tests {
                     let mut concurrent = crate::state::load_run(&fixture.workspace)
                         .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                     concurrent.updated_at = "concurrent-application-change".to_string();
-                    crate::state::write_run_file(&fixture.workspace.run_file(), &concurrent)
-                        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+                    crate::state::write_raw_canonical_run_fixture(
+                        &fixture.workspace.run_file(),
+                        &concurrent,
+                    )
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
                 }
                 Ok(())
             },
@@ -4434,7 +4459,8 @@ mod tests {
         let historical = application_fixture("resume-missing-eval-authority");
         let mut run = crate::state::load_run(&historical.workspace).expect("historical run");
         run.input_digests.eval_config = None;
-        crate::state::save_run(&historical.workspace, &run).expect("historical state");
+        crate::state::write_raw_canonical_run_fixture(&historical.workspace.run_file(), &run)
+            .expect("historical state");
         let before_run = fs::read(historical.workspace.run_file()).expect("run bytes");
         let before_candidate = git_text(
             Path::new(&historical.candidate.path),
@@ -4578,7 +4604,7 @@ mod tests {
         run.current_step = LoopStepName::OutputReview;
         run.policy_decisions
             .push(serde_json::from_value(serde_json::to_value(decision).unwrap()).unwrap());
-        crate::state::save_run(&workspace, &run).expect("run");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).expect("run");
         ApplicationFixture {
             _temp: temp,
             source,
@@ -4676,6 +4702,7 @@ mod tests {
             &fixture.workspace,
             &applied.run_id,
         );
+        let expected = run.clone();
         let response = crate::parse_role_response(
             Role::OutputReviewer,
             r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"Approved.","blocking_issues":[],"non_blocking_issues":[]}"#,
@@ -4704,8 +4731,9 @@ mod tests {
         output_review.artifact_digest = Some(artifact.artifact_digest().unwrap());
         run.status = LoopStatus::AwaitingHumanReview;
         run.current_step = LoopStepName::Testing;
-        crate::provider_exchange::persist_run_with_provider_exchange_compare(
+        crate::provider_exchange::persist_run_with_full_compare(
             &fixture.workspace,
+            &expected,
             &run,
         )
         .expect("publish Awaiting");

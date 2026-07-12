@@ -817,7 +817,7 @@ fn resume_rejects_expected_attempt_two_without_matching_rerun_authorization() {
     research.status = LoopStepStatus::Running;
     research.artifact_path = None;
     research.artifact_digest = None;
-    seaf_loop::state::write_run_file(&run_directory.join("run.json"), &unauthorized)
+    crate::state::write_raw_canonical_run_fixture(&run_directory.join("run.json"), &unauthorized)
         .expect("write unauthorized running state");
     let attempt_one =
         std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("attempt one");
