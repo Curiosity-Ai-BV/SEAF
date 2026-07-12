@@ -132,12 +132,10 @@ where
                 "loop state changed before provider rerun reset publication".to_string(),
             ));
         }
-        if matches!(
-            current.status,
-            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
-        ) {
+        if state::is_frozen_review_or_evaluation_authority(&current) {
             return Err(ProviderExchangeError::Invalid(
-                "provider rerun reset cannot replace human review authority".to_string(),
+                "provider rerun reset cannot replace human review authority or final evaluation authority"
+                    .to_string(),
             ));
         }
         if reset.provider_exchange_records != current.provider_exchange_records {
@@ -404,12 +402,10 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let mut run = state::load_run(workspace)?;
-        if matches!(
-            run.status,
-            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
-        ) {
+        if state::is_frozen_review_or_evaluation_authority(&run) {
             return Err(ProviderExchangeError::Invalid(
-                "provider exchange history is frozen by human review authority".to_string(),
+                "provider exchange history is frozen by human review or final evaluation authority"
+                    .to_string(),
             ));
         }
         if run.provider_exchange_records.contains(&reference) {
@@ -447,13 +443,9 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let current = state::load_run(workspace)?;
-        if matches!(
-            current.status,
-            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
-        ) && &current != intended
-        {
+        if state::is_frozen_review_or_evaluation_authority(&current) && &current != intended {
             return Err(ProviderExchangeError::Invalid(
-                "ordinary state publication cannot replace awaiting human review or approved authority"
+                "ordinary state publication cannot replace awaiting human review, approved authority, or final evaluation authority"
                     .to_string(),
             ));
         }
@@ -512,6 +504,7 @@ where
             ));
         }
         validate_current(&current)?;
+        validate_final_authority_cas_relation(workspace, &current, intended)?;
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
@@ -542,12 +535,10 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
-        if matches!(
-            persisted.status,
-            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
-        ) {
+        if state::is_frozen_review_or_evaluation_authority(&persisted) {
             return Err(ProviderExchangeError::Invalid(
-                "provider exchange reconciliation is frozen by human review authority".to_string(),
+                "provider exchange reconciliation is frozen by human review or final evaluation authority"
+                    .to_string(),
             ));
         }
         if persisted != *authoritative {
@@ -857,10 +848,7 @@ fn validate_run_for_atomic_publication(
         ));
     }
     validate_authoritative_provider_exchange_records(workspace, run)?;
-    if matches!(
-        run.status,
-        seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
-    ) {
+    if run.status == seaf_core::LoopStatus::AwaitingHumanReview || run.human_approval.is_some() {
         let terminal = run.provider_exchange_records.last().ok_or_else(|| {
             ProviderExchangeError::Invalid(
                 "human review authority lost terminal OutputReview provider evidence".to_string(),
@@ -882,9 +870,321 @@ fn validate_run_for_atomic_publication(
                     .to_string(),
             ));
         }
-        if run.status == seaf_core::LoopStatus::Approved {
+        if run.human_approval.is_some() {
             validate_approved_publication_evidence(workspace, run)?;
         }
+    }
+    if run.status == seaf_core::LoopStatus::EvalPassed
+        || (run.status == seaf_core::LoopStatus::Failed && run.human_approval.is_some())
+    {
+        crate::load_verified_final_evaluation_authority(workspace, run).map_err(|error| {
+            ProviderExchangeError::Invalid(format!(
+                "final evaluation authority validation failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_final_authority_cas_relation(
+    workspace: &LoopWorkspace,
+    current: &LoopRun,
+    intended: &LoopRun,
+) -> Result<(), ProviderExchangeError> {
+    let intended_is_final = intended.status == seaf_core::LoopStatus::EvalPassed
+        || (intended.status == seaf_core::LoopStatus::Failed && intended.human_approval.is_some());
+    let current_is_final = current.status == seaf_core::LoopStatus::EvalPassed
+        || (current.status == seaf_core::LoopStatus::Failed && current.human_approval.is_some());
+    if current_is_final && !intended_is_final {
+        return Err(ProviderExchangeError::Invalid(
+            "final evaluation authority permits only its audited candidate cleanup transition"
+                .to_string(),
+        ));
+    }
+    if !intended_is_final {
+        return Ok(());
+    }
+
+    validate_run_for_atomic_publication(workspace, current)?;
+    let intended_authority = crate::load_verified_final_evaluation_authority(workspace, intended)
+        .map_err(|error| {
+        ProviderExchangeError::Invalid(format!(
+            "intended final evaluation authority validation failed: {error}"
+        ))
+    })?;
+    match current.status {
+        seaf_core::LoopStatus::Approved => {
+            let current_digest = canonical_sha256_digest(current)?;
+            if intended_authority.approved_run() != current
+                || intended_authority.testing_evidence().approved_run_digest != current_digest
+            {
+                return Err(ProviderExchangeError::Invalid(
+                    "final evaluation authority is not bound to the exact locked Approved predecessor"
+                        .to_string(),
+                ));
+            }
+        }
+        seaf_core::LoopStatus::EvalPassed => {
+            if current != intended {
+                return Err(ProviderExchangeError::Invalid(
+                    "EvalPassed authority is immutable until audited promotion".to_string(),
+                ));
+            }
+            let current_authority = crate::load_verified_final_evaluation_authority(
+                workspace, current,
+            )
+            .map_err(|error| {
+                ProviderExchangeError::Invalid(format!(
+                    "locked final evaluation authority validation failed: {error}"
+                ))
+            })?;
+            validate_preserved_final_lineage(&current_authority, &intended_authority)?;
+        }
+        seaf_core::LoopStatus::Failed if current.human_approval.is_some() => {
+            let current_authority = crate::load_verified_final_evaluation_authority(
+                workspace, current,
+            )
+            .map_err(|error| {
+                ProviderExchangeError::Invalid(format!(
+                    "locked final evaluation authority validation failed: {error}"
+                ))
+            })?;
+            validate_failed_final_cleanup_transition(
+                current,
+                intended,
+                &current_authority,
+                &intended_authority,
+            )?;
+        }
+        _ => {
+            return Err(ProviderExchangeError::Invalid(
+                "initial final evaluation publication requires exact locked Approved authority"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_failed_final_cleanup_transition(
+    current: &LoopRun,
+    intended: &LoopRun,
+    current_authority: &crate::VerifiedFinalEvaluationAuthority,
+    intended_authority: &crate::VerifiedFinalEvaluationAuthority,
+) -> Result<(), ProviderExchangeError> {
+    if intended.status != seaf_core::LoopStatus::Failed {
+        return Err(ProviderExchangeError::Invalid(
+            "reported final failure permits only candidate cleanup progression".to_string(),
+        ));
+    }
+    validate_preserved_final_lineage(current_authority, intended_authority)?;
+    if current_authority.testing_evidence() != intended_authority.testing_evidence()
+        || current_authority.eval_report() != intended_authority.eval_report()
+    {
+        return Err(ProviderExchangeError::Invalid(
+            "reported final failure cleanup cannot replace TestingEvidence or EvalReport authority"
+                .to_string(),
+        ));
+    }
+    let current_candidate = current.candidate_workspace.as_ref().ok_or_else(|| {
+        ProviderExchangeError::Invalid(
+            "reported final failure cleanup lost candidate authority".to_string(),
+        )
+    })?;
+    let intended_candidate = intended.candidate_workspace.as_ref().ok_or_else(|| {
+        ProviderExchangeError::Invalid(
+            "reported final failure cleanup lost candidate authority".to_string(),
+        )
+    })?;
+    validate_failed_cleanup_state(current_candidate, current_authority)?;
+    if current == intended {
+        return Ok(());
+    }
+
+    let mut allowed = current.clone();
+    let allowed_candidate = allowed.candidate_workspace.as_mut().ok_or_else(|| {
+        ProviderExchangeError::Invalid(
+            "reported final failure cleanup lost candidate authority".to_string(),
+        )
+    })?;
+    let transition_timestamp = match (current_candidate.lifecycle, intended_candidate.lifecycle) {
+        (
+            seaf_core::CandidateWorkspaceLifecycle::Active,
+            seaf_core::CandidateWorkspaceLifecycle::Cleaning,
+        ) => {
+            let cleanup_started_at = intended_candidate
+                .cleanup_started_at
+                .as_deref()
+                .ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "Active to Cleaning cleanup requires cleanup_started_at".to_string(),
+                    )
+                })?;
+            let cleanup_started =
+                parse_canonical_unix_seconds(cleanup_started_at).ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "cleanup_started_at must be canonical decimal Unix seconds within u64"
+                            .to_string(),
+                    )
+                })?;
+            let testing_completed =
+                parse_canonical_unix_seconds(&current_authority.testing_evidence().completed_at)
+                    .ok_or_else(|| {
+                        ProviderExchangeError::Invalid(
+                            "TestingEvidence completed_at is not canonical Unix seconds"
+                                .to_string(),
+                        )
+                    })?;
+            if cleanup_started < testing_completed {
+                return Err(ProviderExchangeError::Invalid(
+                    "cleanup_started_at cannot precede TestingEvidence completion".to_string(),
+                ));
+            }
+            allowed_candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaning;
+            allowed_candidate.cleanup_started_at = Some(cleanup_started_at.to_string());
+            allowed_candidate.cleaned_at = None;
+            cleanup_started_at
+        }
+        (
+            seaf_core::CandidateWorkspaceLifecycle::Cleaning,
+            seaf_core::CandidateWorkspaceLifecycle::Cleaned,
+        ) => {
+            let cleanup_started_at =
+                current_candidate
+                    .cleanup_started_at
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ProviderExchangeError::Invalid(
+                            "Cleaning authority lost cleanup_started_at".to_string(),
+                        )
+                    })?;
+            let cleanup_started =
+                parse_canonical_unix_seconds(cleanup_started_at).ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "cleanup_started_at must be canonical decimal Unix seconds within u64"
+                            .to_string(),
+                    )
+                })?;
+            let cleaned_at = intended_candidate.cleaned_at.as_deref().ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "Cleaning to Cleaned cleanup requires cleaned_at".to_string(),
+                )
+            })?;
+            let cleaned = parse_canonical_unix_seconds(cleaned_at).ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "cleaned_at must be canonical decimal Unix seconds within u64".to_string(),
+                )
+            })?;
+            if intended_candidate.cleanup_started_at.as_deref() != Some(cleanup_started_at)
+                || cleaned < cleanup_started
+            {
+                return Err(ProviderExchangeError::Invalid(
+                    "Cleaned authority must preserve cleanup_started_at and complete monotonically"
+                        .to_string(),
+                ));
+            }
+            allowed_candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaned;
+            allowed_candidate.cleaned_at = Some(cleaned_at.to_string());
+            cleaned_at
+        }
+        _ => {
+            return Err(ProviderExchangeError::Invalid(
+                "reported final failure allows only Active to Cleaning to Cleaned cleanup progression"
+                    .to_string(),
+            ));
+        }
+    };
+    if intended.updated_at != current.updated_at && intended.updated_at != transition_timestamp {
+        return Err(ProviderExchangeError::Invalid(
+            "reported final failure updated_at may change only to the corresponding cleanup timestamp"
+                .to_string(),
+        ));
+    }
+    allowed.updated_at = intended.updated_at.clone();
+    if intended != &allowed {
+        return Err(ProviderExchangeError::Invalid(
+            "reported final failure cleanup changed immutable run, candidate, or evaluation authority"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_failed_cleanup_state(
+    candidate: &seaf_core::CandidateWorkspaceState,
+    authority: &crate::VerifiedFinalEvaluationAuthority,
+) -> Result<(), ProviderExchangeError> {
+    let testing_completed = parse_canonical_unix_seconds(
+        &authority.testing_evidence().completed_at,
+    )
+    .ok_or_else(|| {
+        ProviderExchangeError::Invalid(
+            "TestingEvidence completed_at is not canonical Unix seconds".to_string(),
+        )
+    })?;
+    let cleanup_started = match candidate.lifecycle {
+        seaf_core::CandidateWorkspaceLifecycle::Active => return Ok(()),
+        seaf_core::CandidateWorkspaceLifecycle::Cleaning
+        | seaf_core::CandidateWorkspaceLifecycle::Cleaned => {
+            let value = candidate.cleanup_started_at.as_deref().ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "cleanup_started_at is required after cleanup begins".to_string(),
+                )
+            })?;
+            parse_canonical_unix_seconds(value).ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "cleanup_started_at must be canonical decimal Unix seconds within u64"
+                        .to_string(),
+                )
+            })?
+        }
+        seaf_core::CandidateWorkspaceLifecycle::Provisioning => {
+            return Err(ProviderExchangeError::Invalid(
+                "reported final failure cannot have a Provisioning candidate".to_string(),
+            ));
+        }
+    };
+    if cleanup_started < testing_completed {
+        return Err(ProviderExchangeError::Invalid(
+            "cleanup_started_at cannot precede TestingEvidence completion".to_string(),
+        ));
+    }
+    if candidate.lifecycle == seaf_core::CandidateWorkspaceLifecycle::Cleaned {
+        let cleaned_at = candidate.cleaned_at.as_deref().ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "cleaned_at is required for Cleaned candidate authority".to_string(),
+            )
+        })?;
+        let cleaned = parse_canonical_unix_seconds(cleaned_at).ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "cleaned_at must be canonical decimal Unix seconds within u64".to_string(),
+            )
+        })?;
+        if cleaned < cleanup_started {
+            return Err(ProviderExchangeError::Invalid(
+                "cleaned_at cannot precede cleanup_started_at".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_canonical_unix_seconds(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn validate_preserved_final_lineage(
+    current: &crate::VerifiedFinalEvaluationAuthority,
+    intended: &crate::VerifiedFinalEvaluationAuthority,
+) -> Result<(), ProviderExchangeError> {
+    if current.approved_run() != intended.approved_run()
+        || current.testing_evidence().approved_run_digest
+            != intended.testing_evidence().approved_run_digest
+    {
+        return Err(ProviderExchangeError::Invalid(
+            "final evaluation mutation changed its exact Approved predecessor lineage".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1748,8 +2048,9 @@ mod tests {
     use super::*;
     use seaf_core::{
         ArtifactReference, CandidatePatchPhase, CandidatePatchTransaction,
-        CandidateWorkspaceLifecycle, CandidateWorkspaceState, HumanApprovalEvidence,
-        LoopInputDigests, LoopStatus, LoopStepStatus,
+        CandidateWorkspaceLifecycle, CandidateWorkspaceState, CheckStatus, EvalCheck, EvalDecision,
+        EvalLoopEvidence, EvalReport, HumanApprovalEvidence, LoopInputDigests, LoopStatus,
+        LoopStepStatus, RiskLevel,
     };
 
     fn awaiting_human_review_run(workspace: &LoopWorkspace) -> LoopRun {
@@ -1868,12 +2169,360 @@ mod tests {
         run
     }
 
+    fn publish_test_final_artifacts(
+        workspace: &LoopWorkspace,
+        approved: &LoopRun,
+        final_run: &mut LoopRun,
+        passed: bool,
+    ) {
+        publish_test_final_artifacts_variant(workspace, approved, final_run, passed, "", "test");
+    }
+
+    fn publish_test_final_artifacts_variant(
+        workspace: &LoopWorkspace,
+        approved: &LoopRun,
+        final_run: &mut LoopRun,
+        passed: bool,
+        label: &str,
+        summary: &str,
+    ) {
+        let suffix = if label.is_empty() {
+            String::new()
+        } else {
+            format!("-{label}")
+        };
+        let check = EvalCheck {
+            name: "unit".to_string(),
+            status: if passed {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            duration_ms: Some(1),
+            stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
+            stdout_digest: Some("a".repeat(64)),
+            stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
+            stderr_digest: Some("b".repeat(64)),
+            summary: Some(summary.to_string()),
+        };
+        let approved_at = approved
+            .human_approval
+            .as_ref()
+            .unwrap()
+            .approved_at
+            .clone();
+        let testing = crate::TestingEvidence::create(
+            approved,
+            approved_at.clone(),
+            approved_at,
+            vec![check.clone()],
+        )
+        .unwrap();
+        let testing_reference = ArtifactReference {
+            path: format!("artifacts/07-testing{suffix}.json"),
+            digest: testing.artifact_digest().unwrap(),
+        };
+        fs::write(
+            workspace.run_directory().join(&testing_reference.path),
+            testing.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let approval = approved.human_approval.as_ref().unwrap();
+        let report = EvalReport {
+            eval_report_id: format!("eval_{}", approved.run_id),
+            patch_id: approved.run_id.clone(),
+            goal_id: approved.goal_id.clone(),
+            passed,
+            summary: "integrated".to_string(),
+            checks: vec![check],
+            score_delta_estimate: None,
+            risk_level: if passed {
+                RiskLevel::Low
+            } else {
+                RiskLevel::High
+            },
+            decision: if passed {
+                EvalDecision::ApproveForHumanReview
+            } else {
+                EvalDecision::Reject
+            },
+            loop_evidence: Some(EvalLoopEvidence {
+                schema_version: 1,
+                run_id: approved.run_id.clone(),
+                ticket_id: approved.ticket_id.clone(),
+                ticket_digest: approved.input_digests.ticket.clone(),
+                eval_config: ArtifactReference {
+                    path: "inputs/eval-config.json".to_string(),
+                    digest: approved.input_digests.eval_config.clone().unwrap(),
+                },
+                candidate_diff: approval.candidate_diff.clone(),
+                starting_head: approval.starting_head.clone(),
+                human_approval_digest: canonical_sha256_digest(approval).unwrap(),
+                policy_decision_digest: approval.policy_decision_digest.clone(),
+                testing_evidence: testing_reference.clone(),
+            }),
+        };
+        let report_reference = ArtifactReference {
+            path: format!("artifacts/08-eval-report{suffix}.json"),
+            digest: canonical_sha256_digest(&report).unwrap(),
+        };
+        fs::write(
+            workspace.run_directory().join(&report_reference.path),
+            canonical_json_bytes(&report).unwrap(),
+        )
+        .unwrap();
+        for (name, reference) in [
+            (LoopStepName::Testing, testing_reference),
+            (LoopStepName::EvalReport, report_reference.clone()),
+        ] {
+            let record = final_run
+                .steps
+                .iter_mut()
+                .find(|record| record.name == name)
+                .unwrap();
+            record.status = if passed {
+                LoopStepStatus::Passed
+            } else {
+                LoopStepStatus::Failed
+            };
+            record.artifact_path = Some(reference.path);
+            record.artifact_digest = Some(reference.digest);
+        }
+        final_run.eval_report_path = Some(report_reference.path);
+    }
+
+    fn persist_test_approved_authority(workspace: &LoopWorkspace) -> LoopRun {
+        let mut awaiting = awaiting_human_review_run(workspace);
+        awaiting.input_digests.eval_config = Some("0".repeat(64));
+        let mut pre_review = awaiting.clone();
+        pre_review.status = LoopStatus::Running;
+        pre_review.current_step = LoopStepName::OutputReview;
+        let output_review = pre_review
+            .steps
+            .iter_mut()
+            .find(|record| record.name == LoopStepName::OutputReview)
+            .unwrap();
+        output_review.status = LoopStepStatus::Running;
+        output_review.artifact_path = None;
+        output_review.artifact_digest = None;
+        state::save_run(workspace, &pre_review).unwrap();
+        let with_ledger = persist_test_output_review_ledger(workspace, &awaiting.run_id);
+        awaiting.provider_exchange_records = with_ledger.provider_exchange_records;
+        persist_run_with_provider_exchange_compare(workspace, &awaiting).unwrap();
+
+        let policy_decision_digest =
+            canonical_sha256_digest(&awaiting.policy_decisions[0]).unwrap();
+        let mut approved = awaiting.clone();
+        approved.status = LoopStatus::Approved;
+        approved.human_approval = Some(HumanApprovalEvidence {
+            schema_version: 1,
+            run_id: awaiting.run_id.clone(),
+            reviewer: "reviewer@example.invalid".to_string(),
+            approved_at: "100".to_string(),
+            candidate_diff: ArtifactReference {
+                path: "artifacts/candidate-patch.applied.diff".to_string(),
+                digest: awaiting
+                    .candidate_workspace
+                    .as_ref()
+                    .unwrap()
+                    .candidate_diff_digest
+                    .clone(),
+            },
+            starting_head: "e".repeat(40),
+            policy_decision_digest,
+            output_review: ArtifactReference {
+                path: "artifacts/06-output-review.md".to_string(),
+                digest: awaiting
+                    .steps
+                    .iter()
+                    .find(|step| step.name == LoopStepName::OutputReview)
+                    .unwrap()
+                    .artifact_digest
+                    .clone()
+                    .unwrap(),
+            },
+            output_review_request: awaiting
+                .provider_exchange_records
+                .iter()
+                .find(|record| {
+                    record.step == LoopStepName::OutputReview
+                        && record.kind == ProviderExchangeKind::Initial
+                        && record.phase == ProviderExchangePhase::Request
+                })
+                .unwrap()
+                .clone(),
+            output_review_response: awaiting.provider_exchange_records.last().unwrap().clone(),
+        });
+        approved.updated_at = "100".to_string();
+        persist_run_with_full_compare(workspace, &awaiting, &approved).unwrap();
+        approved
+    }
+
+    fn persist_test_failed_final_authority(
+        run_id: &str,
+    ) -> (tempfile::TempDir, LoopWorkspace, LoopRun, LoopRun) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), run_id).unwrap();
+        let approved = persist_test_approved_authority(&workspace);
+        let mut failed = approved.clone();
+        failed.status = LoopStatus::Failed;
+        failed.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts(&workspace, &approved, &mut failed, false);
+        persist_run_with_full_compare(&workspace, &approved, &failed).unwrap();
+        (temp, workspace, approved, failed)
+    }
+
+    #[test]
+    fn failed_final_authority_cannot_be_rewritten_as_eval_passed() {
+        let (_temp, workspace, approved, failed) =
+            persist_test_failed_final_authority("failed-to-passed");
+        let before = fs::read(workspace.run_file()).unwrap();
+        let mut passing = approved.clone();
+        passing.status = LoopStatus::EvalPassed;
+        passing.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts_variant(
+            &workspace,
+            &approved,
+            &mut passing,
+            true,
+            "passing-rewrite",
+            "passing rewrite",
+        );
+        crate::load_verified_final_evaluation_authority(&workspace, &passing)
+            .expect("replacement is independently valid final authority");
+
+        let error = persist_run_with_full_compare(&workspace, &failed, &passing)
+            .expect_err("reported failure cannot become EvalPassed");
+
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+
+        let mut non_final = failed.clone();
+        non_final.status = LoopStatus::Completed;
+        non_final.human_approval = None;
+        let error = persist_run_with_full_compare(&workspace, &failed, &non_final)
+            .expect_err("reported failure cannot be rewritten as non-final authority");
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_final_authority_cannot_replace_its_evaluation_bundle() {
+        let (_temp, workspace, approved, failed) =
+            persist_test_failed_final_authority("failed-bundle-rewrite");
+        let before = fs::read(workspace.run_file()).unwrap();
+        let mut replacement = approved.clone();
+        replacement.status = LoopStatus::Failed;
+        replacement.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts_variant(
+            &workspace,
+            &approved,
+            &mut replacement,
+            false,
+            "failing-rewrite",
+            "different failing result",
+        );
+        crate::load_verified_final_evaluation_authority(&workspace, &replacement)
+            .expect("replacement is independently valid failing authority");
+
+        let error = persist_run_with_full_compare(&workspace, &failed, &replacement)
+            .expect_err("reported failure cannot replace its evidence bundle");
+
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_final_authority_allows_only_monotonic_candidate_cleanup() {
+        let (_temp, workspace, _approved, failed) =
+            persist_test_failed_final_authority("failed-cleanup-cas");
+        let original_authority =
+            crate::load_verified_final_evaluation_authority(&workspace, &failed).unwrap();
+        let before = fs::read(workspace.run_file()).unwrap();
+
+        let mut arbitrary_touch = failed.clone();
+        arbitrary_touch.updated_at = "101".to_string();
+        let error = persist_run_with_full_compare(&workspace, &failed, &arbitrary_touch)
+            .expect_err("updated_at cannot change without cleanup progression");
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+
+        let mut direct_cleaned = failed.clone();
+        let candidate = direct_cleaned.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaned;
+        candidate.cleanup_started_at = Some("101".to_string());
+        candidate.cleaned_at = Some("102".to_string());
+        let error = persist_run_with_full_compare(&workspace, &failed, &direct_cleaned)
+            .expect_err("Active cannot skip directly to Cleaned");
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+
+        let mut cleaning = failed.clone();
+        let candidate = cleaning.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaning;
+        candidate.cleanup_started_at = Some("101".to_string());
+        persist_run_with_full_compare(&workspace, &failed, &cleaning)
+            .expect("Active may progress to Cleaning");
+
+        let mut substituted_candidate = cleaning.clone();
+        substituted_candidate
+            .candidate_workspace
+            .as_mut()
+            .unwrap()
+            .candidate_diff_digest = "8".repeat(64);
+        let error = persist_run_with_full_compare(&workspace, &cleaning, &substituted_candidate)
+            .expect_err("cleanup cannot replace candidate identity or patch authority");
+        assert!(error.to_string().contains("candidate_diff"), "{error}");
+
+        let mut backwards = cleaning.clone();
+        let candidate = backwards.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaned;
+        candidate.cleaned_at = Some("100".to_string());
+        let error = persist_run_with_full_compare(&workspace, &cleaning, &backwards)
+            .expect_err("cleanup completion cannot precede cleanup start");
+        assert!(error.to_string().contains("cleanup"), "{error}");
+
+        let mut cleaned = cleaning.clone();
+        let candidate = cleaned.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaned;
+        candidate.cleaned_at = Some("102".to_string());
+        cleaned.updated_at = "102".to_string();
+        persist_run_with_full_compare(&workspace, &cleaning, &cleaned)
+            .expect("Cleaning may progress monotonically to Cleaned");
+        persist_run_with_full_compare(&workspace, &cleaned, &cleaned)
+            .expect("exact Cleaned retry remains idempotent");
+
+        let cleaned_authority =
+            crate::load_verified_final_evaluation_authority(&workspace, &cleaned)
+                .expect("cleaned final authority remains verifiable");
+        assert_eq!(
+            cleaned_authority.testing_evidence(),
+            original_authority.testing_evidence()
+        );
+        assert_eq!(
+            cleaned_authority.eval_report(),
+            original_authority.eval_report()
+        );
+
+        let mut malformed_retry = failed;
+        let candidate = malformed_retry.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = CandidateWorkspaceLifecycle::Cleaning;
+        candidate.cleanup_started_at = Some("01".to_string());
+        let mut bytes = serde_json::to_vec_pretty(&malformed_retry).unwrap();
+        bytes.push(b'\n');
+        fs::write(workspace.run_file(), bytes).unwrap();
+        let error = persist_run_with_full_compare(&workspace, &malformed_retry, &malformed_retry)
+            .expect_err("cleanup retries still require canonical monotonic timestamps");
+        assert!(error.to_string().contains("cleanup_started_at"), "{error}");
+    }
+
     #[test]
     fn awaiting_human_review_freezes_ordinary_publication_and_provider_suffixes() {
         let temp = tempfile::tempdir().expect("temp");
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), "awaiting-provider-freeze").unwrap();
         let mut run = awaiting_human_review_run(&workspace);
+        run.input_digests.eval_config = Some("0".repeat(64));
         let mut pre_review = run.clone();
         pre_review.status = LoopStatus::Running;
         pre_review.current_step = LoopStepName::OutputReview;
@@ -1947,7 +2596,7 @@ mod tests {
             schema_version: 1,
             run_id: run.run_id.clone(),
             reviewer: "reviewer@example.invalid".to_string(),
-            approved_at: "approved-at".to_string(),
+            approved_at: "100".to_string(),
             candidate_diff: ArtifactReference {
                 path: "artifacts/candidate-patch.applied.diff".to_string(),
                 digest: run
@@ -1982,6 +2631,17 @@ mod tests {
                 .clone(),
             output_review_response: run.provider_exchange_records.last().unwrap().clone(),
         });
+        approved.updated_at = "100".to_string();
+        let mut premature_final = approved.clone();
+        premature_final.status = LoopStatus::EvalPassed;
+        premature_final.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts(&workspace, &approved, &mut premature_final, true);
+        let awaiting_bytes = fs::read(workspace.run_file()).unwrap();
+        let error = persist_run_with_full_compare(&workspace, &run, &premature_final)
+            .expect_err("Awaiting authority cannot publish a final evaluation bundle");
+        assert!(error.to_string().contains("locked Approved"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), awaiting_bytes);
+
         persist_run_with_full_compare(&workspace, &run, &approved)
             .expect("approval transaction may publish Approved");
         let approved_bytes = fs::read(workspace.run_file()).unwrap();
@@ -2013,6 +2673,78 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(workspace.run_file()).unwrap(), approved_bytes);
+
+        let mut substituted_approved = approved.clone();
+        substituted_approved
+            .human_approval
+            .as_mut()
+            .unwrap()
+            .reviewer = "substituted@example.invalid".to_string();
+        substituted_approved
+            .human_approval
+            .as_mut()
+            .unwrap()
+            .approved_at = "101".to_string();
+        substituted_approved.updated_at = "101".to_string();
+        let mut substituted_final = substituted_approved.clone();
+        substituted_final.status = LoopStatus::EvalPassed;
+        substituted_final.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts(
+            &workspace,
+            &substituted_approved,
+            &mut substituted_final,
+            true,
+        );
+        let error = persist_run_with_full_compare(&workspace, &approved, &substituted_final)
+            .expect_err("self-consistent substituted Approved lineage must fail locked CAS");
+        assert!(
+            error.to_string().contains("exact locked Approved"),
+            "{error}"
+        );
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), approved_bytes);
+
+        let mut eval_passed = approved.clone();
+        eval_passed.status = LoopStatus::EvalPassed;
+        eval_passed.current_step = LoopStepName::EvalReport;
+        publish_test_final_artifacts(&workspace, &approved, &mut eval_passed, true);
+        persist_run_with_full_compare(&workspace, &approved, &eval_passed)
+            .expect("private fixture may publish exact EvalPassed validation authority");
+        let final_bytes = fs::read(workspace.run_file()).unwrap();
+        let error = persist_provider_exchange_record_reference(
+            &workspace,
+            eval_passed
+                .provider_exchange_records
+                .last()
+                .unwrap()
+                .clone(),
+        )
+        .expect_err("EvalPassed must freeze provider append");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        let error =
+            reconcile_provider_exchange_state_with_validator(&workspace, &eval_passed, |_| Ok(()))
+                .expect_err("EvalPassed must freeze reconciliation");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        let mut stale = eval_passed.clone();
+        stale.status = LoopStatus::Completed;
+        stale.human_approval = None;
+        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+            .expect_err("ordinary publication cannot replace EvalPassed");
+        assert!(error.to_string().contains("final evaluation"), "{error}");
+        let mut reset = eval_passed.clone();
+        state::reset_from_step(&mut reset, LoopStepName::OutputReview).unwrap();
+        let error = persist_provider_rerun_reset(
+            &workspace,
+            &eval_passed,
+            &reset,
+            LoopStepName::OutputReview,
+            2,
+        )
+        .expect_err("provider rerun reset cannot replace EvalPassed");
+        assert!(
+            error.to_string().contains("human review authority"),
+            "{error}"
+        );
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), final_bytes);
     }
 
     #[test]

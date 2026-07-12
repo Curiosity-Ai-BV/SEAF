@@ -1,4 +1,4 @@
-use std::{fmt::Display, fs, io::Read, path::Path};
+use std::{collections::BTreeSet, fmt::Display, fs, io::Read, path::Path};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -289,7 +289,171 @@ pub fn validate_eval_report(report: &EvalReport) -> Vec<FieldError> {
         ));
     }
 
+    for (index, check) in report.checks.iter().enumerate() {
+        require_non_empty(&mut errors, format!("checks[{index}].name"), &check.name);
+        validate_optional_log_digest(
+            &mut errors,
+            index,
+            "stdout",
+            check.stdout_path.as_deref(),
+            check.stdout_digest.as_deref(),
+        );
+        validate_optional_log_digest(
+            &mut errors,
+            index,
+            "stderr",
+            check.stderr_path.as_deref(),
+            check.stderr_digest.as_deref(),
+        );
+    }
+
+    if let Some(evidence) = &report.loop_evidence {
+        validate_eval_loop_evidence(&mut errors, report, evidence);
+        let mut log_paths = BTreeSet::new();
+        for (index, check) in report.checks.iter().enumerate() {
+            for (stream, path, digest) in [
+                ("stdout", &check.stdout_path, &check.stdout_digest),
+                ("stderr", &check.stderr_path, &check.stderr_digest),
+            ] {
+                if path.is_none() || digest.is_none() {
+                    errors.push(FieldError::new(
+                        format!("checks[{index}].{stream}_digest"),
+                        "integrated loop evaluation requires an exact log path and digest pair",
+                    ));
+                }
+                if path
+                    .as_deref()
+                    .is_some_and(|path| !is_portable_artifact_path(path))
+                {
+                    errors.push(FieldError::new(
+                        format!("checks[{index}].{stream}_path"),
+                        "integrated log path must use strict portable relative artifact spelling",
+                    ));
+                }
+                if let Some(path) = path {
+                    if !log_paths.insert(path.as_str()) {
+                        errors.push(FieldError::new(
+                            format!("checks[{index}].{stream}_path"),
+                            "integrated log paths must be unique",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     errors
+}
+
+fn validate_optional_log_digest(
+    errors: &mut Vec<FieldError>,
+    index: usize,
+    stream: &str,
+    path: Option<&str>,
+    digest: Option<&str>,
+) {
+    if let Some(path) = path {
+        require_non_empty(errors, format!("checks[{index}].{stream}_path"), path);
+    }
+    if let Some(digest) = digest {
+        validate_lowercase_sha256_digest(
+            errors,
+            &format!("checks[{index}].{stream}_digest"),
+            digest,
+        );
+        if path.is_none() {
+            errors.push(FieldError::new(
+                format!("checks[{index}].{stream}_path"),
+                "is required when a log digest is present",
+            ));
+        }
+    }
+}
+
+fn validate_eval_loop_evidence(
+    errors: &mut Vec<FieldError>,
+    report: &EvalReport,
+    evidence: &crate::EvalLoopEvidence,
+) {
+    if evidence.schema_version != 1 {
+        errors.push(FieldError::new("loop_evidence.schema_version", "must be 1"));
+    }
+    if evidence.run_id != report.patch_id {
+        errors.push(FieldError::new(
+            "loop_evidence.run_id",
+            "must match patch_id",
+        ));
+    }
+    require_non_empty(errors, "loop_evidence.ticket_id", &evidence.ticket_id);
+    validate_lowercase_sha256_digest(
+        errors,
+        "loop_evidence.ticket_digest",
+        &evidence.ticket_digest,
+    );
+    validate_artifact_reference(errors, "loop_evidence.eval_config", &evidence.eval_config);
+    if evidence.eval_config.path != "inputs/eval-config.json" {
+        errors.push(FieldError::new(
+            "loop_evidence.eval_config.path",
+            "must select inputs/eval-config.json",
+        ));
+    }
+    validate_artifact_reference(
+        errors,
+        "loop_evidence.candidate_diff",
+        &evidence.candidate_diff,
+    );
+    if !is_portable_artifact_path(&evidence.candidate_diff.path) {
+        errors.push(FieldError::new(
+            "loop_evidence.candidate_diff.path",
+            "must use strict portable relative artifact spelling",
+        ));
+    }
+    if !matches!(evidence.starting_head.len(), 40 | 64)
+        || !evidence
+            .starting_head
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        errors.push(FieldError::new(
+            "loop_evidence.starting_head",
+            "must be a lowercase 40- or 64-character Git object ID",
+        ));
+    }
+    validate_lowercase_sha256_digest(
+        errors,
+        "loop_evidence.human_approval_digest",
+        &evidence.human_approval_digest,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "loop_evidence.policy_decision_digest",
+        &evidence.policy_decision_digest,
+    );
+    validate_artifact_reference(
+        errors,
+        "loop_evidence.testing_evidence",
+        &evidence.testing_evidence,
+    );
+    if !is_portable_artifact_path(&evidence.testing_evidence.path) {
+        errors.push(FieldError::new(
+            "loop_evidence.testing_evidence.path",
+            "must use strict portable relative artifact spelling",
+        ));
+    }
+}
+
+pub fn is_portable_artifact_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains(['\\', ':'])
+        && value.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
 }
 
 pub fn validate_seaf_event(event: &SeafEvent) -> Vec<FieldError> {
@@ -478,17 +642,33 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         _ => {}
     }
 
-    if run.status == crate::LoopStatus::AwaitingHumanReview {
-        validate_awaiting_human_review_run(&mut errors, run);
-    }
-    if run.status == crate::LoopStatus::Approved {
-        validate_awaiting_human_review_run(&mut errors, run);
-        validate_human_approval_evidence(&mut errors, run);
-    } else if run.human_approval.is_some() {
-        errors.push(FieldError::new(
+    match run.status {
+        crate::LoopStatus::AwaitingHumanReview => {
+            validate_awaiting_human_review_run(&mut errors, run);
+            if run.human_approval.is_some() {
+                errors.push(FieldError::new(
+                    "human_approval",
+                    "must be absent before exact human approval publication",
+                ));
+            }
+        }
+        crate::LoopStatus::Approved => {
+            validate_awaiting_human_review_run(&mut errors, run);
+            validate_human_approval_evidence(&mut errors, run);
+        }
+        crate::LoopStatus::EvalPassed => {
+            validate_final_eval_run(&mut errors, run, true);
+            validate_human_approval_evidence(&mut errors, run);
+        }
+        crate::LoopStatus::Failed if run.human_approval.is_some() => {
+            validate_final_eval_run(&mut errors, run, false);
+            validate_human_approval_evidence(&mut errors, run);
+        }
+        _ if run.human_approval.is_some() => errors.push(FieldError::new(
             "human_approval",
-            "is valid only when status is approved",
-        ));
+            "is valid only for approved or final integrated evaluation authority",
+        )),
+        _ => {}
     }
 
     if let Some(eval_report_path) = &run.eval_report_path {
@@ -496,6 +676,121 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
     }
 
     errors
+}
+
+fn validate_final_eval_run(errors: &mut Vec<FieldError>, run: &LoopRun, passed: bool) {
+    if run.execution_mode != crate::LoopExecutionMode::IsolatedCandidate {
+        errors.push(FieldError::new(
+            "execution_mode",
+            "final integrated evaluation requires isolated_candidate execution",
+        ));
+    }
+    if run.current_step != crate::LoopStepName::EvalReport {
+        errors.push(FieldError::new(
+            "current_step",
+            "final integrated evaluation must stop at EvalReport",
+        ));
+    }
+    if run.input_digests.eval_config.is_none() {
+        errors.push(FieldError::new(
+            "input_digests.eval_config",
+            "final integrated evaluation requires immutable eval config authority",
+        ));
+    }
+    match run.candidate_workspace.as_ref() {
+        Some(candidate)
+            if candidate.schema_version == 2
+                && (!passed
+                    || candidate.lifecycle == crate::CandidateWorkspaceLifecycle::Active)
+                && candidate
+                    .patch_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| {
+                        transaction.phase == crate::CandidatePatchPhase::Applied
+                    }) => {}
+        _ => errors.push(FieldError::new(
+            "candidate_workspace",
+            "final integrated evaluation requires v2 candidate authority with an Applied transaction; passing authority must remain active",
+        )),
+    }
+
+    let expected_names = [
+        crate::LoopStepName::Research,
+        crate::LoopStepName::Analysis,
+        crate::LoopStepName::SpecCreation,
+        crate::LoopStepName::SpecReview,
+        crate::LoopStepName::Development,
+        crate::LoopStepName::OutputReview,
+        crate::LoopStepName::Testing,
+        crate::LoopStepName::EvalReport,
+    ];
+    if run.steps.len() != expected_names.len()
+        || run
+            .steps
+            .iter()
+            .zip(expected_names)
+            .any(|(record, expected)| record.name != expected)
+    {
+        errors.push(FieldError::new(
+            "steps",
+            "final integrated evaluation requires the exact ordered eight-step chain without duplicates",
+        ));
+        return;
+    }
+
+    for (index, record) in run.steps.iter().take(6).enumerate() {
+        let valid = match record.name {
+            crate::LoopStepName::Development => record.status == crate::LoopStepStatus::Completed,
+            crate::LoopStepName::OutputReview => record.status == crate::LoopStepStatus::Passed,
+            _ => matches!(
+                record.status,
+                crate::LoopStepStatus::Completed | crate::LoopStepStatus::Passed
+            ),
+        };
+        if !valid {
+            errors.push(FieldError::new(
+                format!("steps[{index}].status"),
+                "must preserve a successful pre-evaluation prefix",
+            ));
+        }
+    }
+
+    let terminal_status = if passed {
+        crate::LoopStepStatus::Passed
+    } else {
+        crate::LoopStepStatus::Failed
+    };
+    for index in [6, 7] {
+        let record = &run.steps[index];
+        if record.status != terminal_status {
+            errors.push(FieldError::new(
+                format!("steps[{index}].status"),
+                format!("must be {terminal_status:?} for this final evaluation outcome"),
+            ));
+        }
+        if record.artifact_path.is_none() || record.artifact_digest.is_none() {
+            errors.push(FieldError::new(
+                format!("steps[{index}].artifact_path"),
+                "final evaluation steps require an artifact path and digest",
+            ));
+        }
+        if record
+            .artifact_path
+            .as_deref()
+            .is_some_and(|path| !is_portable_artifact_path(path))
+        {
+            errors.push(FieldError::new(
+                format!("steps[{index}].artifact_path"),
+                "final evaluation artifact path must use strict portable relative spelling",
+            ));
+        }
+    }
+    if run.eval_report_path.as_deref() != run.steps[7].artifact_path.as_deref() {
+        errors.push(FieldError::new(
+            "eval_report_path",
+            "must exactly match the EvalReport step artifact path",
+        ));
+    }
 }
 
 fn validate_human_approval_evidence(errors: &mut Vec<FieldError>, run: &LoopRun) {
@@ -1774,6 +2069,177 @@ allowed_change_types:
     }
 
     #[test]
+    fn integrated_eval_report_accepts_exact_bound_log_evidence() {
+        let report = integrated_eval_report_fixture();
+
+        assert!(validate_eval_report(&report).is_empty());
+    }
+
+    fn integrated_eval_report_fixture() -> EvalReport {
+        serde_json::from_value(serde_json::json!({
+            "eval_report_id": "eval_run-1",
+            "patch_id": "run-1",
+            "goal_id": "goal-1",
+            "passed": true,
+            "summary": "Integrated evaluation passed.",
+            "checks": [{
+                "name": "unit",
+                "status": "passed",
+                "duration_ms": 10,
+                "stdout_path": "artifacts/eval/unit.stdout.log",
+                "stdout_digest": "1".repeat(64),
+                "stderr_path": "artifacts/eval/unit.stderr.log",
+                "stderr_digest": "2".repeat(64)
+            }],
+            "risk_level": "low",
+            "decision": "approve_for_human_review",
+            "loop_evidence": {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "ticket_id": "ticket-1",
+                "ticket_digest": "3".repeat(64),
+                "eval_config": {
+                    "path": "inputs/eval-config.json",
+                    "digest": "4".repeat(64)
+                },
+                "candidate_diff": {
+                    "path": "artifacts/candidate-patch.applied.diff",
+                    "digest": "5".repeat(64)
+                },
+                "starting_head": "6".repeat(40),
+                "human_approval_digest": "7".repeat(64),
+                "policy_decision_digest": "8".repeat(64),
+                "testing_evidence": {
+                    "path": "artifacts/07-testing.json",
+                    "digest": "9".repeat(64)
+                }
+            }
+        }))
+        .expect("integrated EvalReport should deserialize")
+    }
+
+    #[test]
+    fn integrated_eval_report_rejects_missing_log_digest_pair() {
+        let mut report = integrated_eval_report_fixture();
+        report.checks[0].stdout_digest = None;
+
+        let fields = validate_eval_report(&report)
+            .into_iter()
+            .map(|error| error.field)
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"checks[0].stdout_digest".to_string()));
+    }
+
+    #[test]
+    fn integrated_eval_report_rejects_nonportable_log_and_reference_paths() {
+        let mut report = integrated_eval_report_fixture();
+        report.checks[0].stdout_path = Some(r"artifacts\eval\unit.stdout.log".to_string());
+        let evidence = report.loop_evidence.as_mut().unwrap();
+        evidence.candidate_diff.path = "C:/candidate.diff".to_string();
+        evidence.testing_evidence.path = "artifacts//07-testing.json".to_string();
+
+        let fields = validate_eval_report(&report)
+            .into_iter()
+            .map(|error| error.field)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "checks[0].stdout_path",
+            "loop_evidence.candidate_diff.path",
+            "loop_evidence.testing_evidence.path",
+        ] {
+            assert!(fields.contains(&expected.to_string()), "{expected}");
+        }
+    }
+
+    #[test]
+    fn integrated_eval_report_rejects_reused_log_paths() {
+        let mut report = integrated_eval_report_fixture();
+        report.checks[0].stderr_path = report.checks[0].stdout_path.clone();
+
+        let fields = validate_eval_report(&report)
+            .into_iter()
+            .map(|error| error.field)
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"checks[0].stderr_path".to_string()));
+    }
+
+    #[test]
+    fn integrated_eval_report_rejects_substituted_run_and_authority_digests() {
+        let mut report = integrated_eval_report_fixture();
+        let evidence = report.loop_evidence.as_mut().unwrap();
+        evidence.run_id = "other-run".to_string();
+        evidence.ticket_digest = "UPPER".to_string();
+        evidence.eval_config.path.clear();
+        evidence.candidate_diff.digest = "sha256:bad".to_string();
+        evidence.starting_head = "not-a-head".to_string();
+        evidence.human_approval_digest = "bad".to_string();
+        evidence.policy_decision_digest = "bad".to_string();
+        evidence.testing_evidence.digest = "bad".to_string();
+
+        let fields = validate_eval_report(&report)
+            .into_iter()
+            .map(|error| error.field)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "loop_evidence.run_id",
+            "loop_evidence.ticket_digest",
+            "loop_evidence.eval_config.path",
+            "loop_evidence.candidate_diff.digest",
+            "loop_evidence.starting_head",
+            "loop_evidence.human_approval_digest",
+            "loop_evidence.policy_decision_digest",
+            "loop_evidence.testing_evidence.digest",
+        ] {
+            assert!(fields.contains(&expected.to_string()), "{expected}");
+        }
+    }
+
+    #[test]
+    fn standalone_eval_report_remains_valid_without_log_digests_or_loop_evidence() {
+        let report: EvalReport = serde_json::from_value(serde_json::json!({
+            "eval_report_id": "standalone",
+            "patch_id": "patch",
+            "goal_id": "goal",
+            "passed": true,
+            "summary": "Standalone compatibility.",
+            "checks": [{
+                "name": "unit",
+                "status": "passed",
+                "stdout_path": "/tmp/unit.stdout.log",
+                "stderr_path": "/tmp/unit.stderr.log"
+            }],
+            "risk_level": "low",
+            "decision": "approve_for_release"
+        }))
+        .unwrap();
+
+        assert!(validate_eval_report(&report).is_empty());
+    }
+
+    #[test]
+    fn public_eval_report_schema_exposes_closed_optional_integrated_evidence() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/eval-report.schema.json")).unwrap();
+
+        assert_eq!(
+            schema["properties"]["checks"]["items"]["properties"]["stdout_digest"]["pattern"],
+            "^[a-f0-9]{64}$"
+        );
+        assert_eq!(
+            schema["properties"]["loop_evidence"]["properties"]["schema_version"]["const"],
+            1
+        );
+        assert_eq!(
+            schema["properties"]["loop_evidence"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
     fn event_requires_object_payload() {
         let event = SeafEvent {
             event_id: "evt_1".to_string(),
@@ -2458,6 +2924,140 @@ unexpected_escape: true
             .find(|branch| branch["if"]["properties"]["status"]["const"] == "approved")
             .expect("Approved must have a public schema branch");
         assert_eq!(approved["then"]["allOf"][0]["$ref"], "#/allOf/0/then");
+    }
+
+    #[test]
+    fn eval_passed_status_serializes_as_closed_terminal_authority() {
+        assert_eq!(
+            serde_json::to_value(crate::LoopStatus::EvalPassed).unwrap(),
+            serde_json::json!("eval_passed")
+        );
+    }
+
+    #[test]
+    fn eval_passed_requires_exact_approval_bound_terminal_chain() {
+        let run = final_eval_run_fixture(true);
+        assert!(validate_loop_run(&run).is_empty());
+
+        let mut missing_approval = run.clone();
+        missing_approval.human_approval = None;
+        assert!(validate_loop_run(&missing_approval)
+            .iter()
+            .any(|error| error.field == "human_approval"));
+
+        let mut mismatched_report = run.clone();
+        mismatched_report.eval_report_path = Some("artifacts/substituted.json".to_string());
+        assert!(validate_loop_run(&mismatched_report)
+            .iter()
+            .any(|error| error.field == "eval_report_path"));
+
+        let mut missing_testing_digest = run.clone();
+        missing_testing_digest
+            .steps
+            .iter_mut()
+            .find(|step| step.name == crate::LoopStepName::Testing)
+            .unwrap()
+            .artifact_digest = None;
+        assert!(validate_loop_run(&missing_testing_digest)
+            .iter()
+            .any(|error| error.field.contains("artifact")));
+
+        let mut duplicate = run;
+        duplicate.steps.push(duplicate.steps[7].clone());
+        assert!(validate_loop_run(&duplicate)
+            .iter()
+            .any(|error| error.field == "steps"));
+
+        let mut nonportable = final_eval_run_fixture(true);
+        nonportable.steps[6].artifact_path = Some(r"artifacts\07-testing.json".to_string());
+        assert!(validate_loop_run(&nonportable)
+            .iter()
+            .any(|error| error.field == "steps[6].artifact_path"));
+    }
+
+    #[test]
+    fn public_loop_schema_exposes_eval_passed_and_reported_failure_branches() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/loop-run.schema.json")).unwrap();
+        assert!(schema["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("eval_passed")));
+        assert!(schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch["if"]["properties"]["status"]["const"] == "eval_passed"));
+        assert!(schema["allOf"].as_array().unwrap().iter().any(|branch| {
+            branch["if"]["properties"]["status"]["const"] == "failed"
+                && branch["if"]["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&serde_json::json!("human_approval")))
+        }));
+    }
+
+    #[test]
+    fn approval_bound_reported_eval_failure_has_one_exact_terminal_shape() {
+        let run = final_eval_run_fixture(false);
+        assert!(validate_loop_run(&run).is_empty());
+
+        let mut malformed = run;
+        malformed
+            .steps
+            .iter_mut()
+            .find(|step| step.name == crate::LoopStepName::EvalReport)
+            .unwrap()
+            .status = crate::LoopStepStatus::Passed;
+        assert!(validate_loop_run(&malformed)
+            .iter()
+            .any(|error| error.field.ends_with(".status")));
+    }
+
+    #[test]
+    fn historical_failed_run_without_human_approval_remains_compatible() {
+        let mut run = approved_run_fixture();
+        run.status = crate::LoopStatus::Failed;
+        run.current_step = crate::LoopStepName::Development;
+        run.human_approval = None;
+
+        assert!(validate_loop_run(&run).is_empty());
+    }
+
+    fn final_eval_run_fixture(passed: bool) -> crate::LoopRun {
+        let mut run = approved_run_fixture();
+        run.input_digests.eval_config = Some("0".repeat(64));
+        run.status = if passed {
+            crate::LoopStatus::EvalPassed
+        } else {
+            crate::LoopStatus::Failed
+        };
+        run.current_step = crate::LoopStepName::EvalReport;
+        let testing = run
+            .steps
+            .iter_mut()
+            .find(|step| step.name == crate::LoopStepName::Testing)
+            .unwrap();
+        testing.status = if passed {
+            crate::LoopStepStatus::Passed
+        } else {
+            crate::LoopStepStatus::Failed
+        };
+        testing.artifact_path = Some("artifacts/07-testing.json".to_string());
+        testing.artifact_digest = Some("7".repeat(64));
+        let report = run
+            .steps
+            .iter_mut()
+            .find(|step| step.name == crate::LoopStepName::EvalReport)
+            .unwrap();
+        report.status = if passed {
+            crate::LoopStepStatus::Passed
+        } else {
+            crate::LoopStepStatus::Failed
+        };
+        report.artifact_path = Some("artifacts/08-eval-report.json".to_string());
+        report.artifact_digest = Some("8".repeat(64));
+        run.eval_report_path = report.artifact_path.clone();
+        run
     }
 
     fn approved_run_fixture() -> crate::LoopRun {

@@ -2410,6 +2410,7 @@ fn loop_status_label(status: LoopStatus) -> String {
     match status {
         LoopStatus::AwaitingHumanReview => "awaiting_human_review".to_string(),
         LoopStatus::Approved => "approved".to_string(),
+        LoopStatus::EvalPassed => "eval_passed".to_string(),
         legacy => format!("{legacy:?}"),
     }
 }
@@ -2451,8 +2452,15 @@ fn next_loop_action(run: &LoopRun) -> String {
         LoopStatus::Approved => {
             "candidate is approved; Testing has not run in this release slice".to_string()
         }
+        LoopStatus::EvalPassed => {
+            "integrated evaluation passed; authority is frozen pending audited promotion"
+                .to_string()
+        }
         LoopStatus::Blocked => {
             "inspect the blocked step artifact, resolve the blocker, then resume".to_string()
+        }
+        LoopStatus::Failed if run.human_approval.is_some() => {
+            "integrated evaluation was reported failed; inspect the bound EvalReport".to_string()
         }
         LoopStatus::Failed => {
             "inspect log.md and the failed step response before retrying".to_string()
@@ -2683,6 +2691,7 @@ fn command_eval_report(patch_id: String, goal_id: String, checks: Vec<EvalCheck>
         } else {
             EvalDecision::Reject
         },
+        loop_evidence: None,
     }
 }
 
@@ -2711,7 +2720,9 @@ fn persist_eval_check(
         status: execution.status,
         duration_ms: Some(execution.duration_ms),
         stdout_path: Some(stdout_path.display().to_string()),
+        stdout_digest: None,
         stderr_path: Some(stderr_path.display().to_string()),
+        stderr_digest: None,
         summary: Some(execution.summary),
     })
 }

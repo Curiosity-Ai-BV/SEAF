@@ -93,7 +93,7 @@ pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateErr
 
 pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
     validate_run_integrity(run)?;
-    if guard_awaiting_human_review_direct_write(path, run)? {
+    if guard_frozen_authority_direct_write(path, run)? {
         return Ok(());
     }
     let mut json = serde_json::to_vec_pretty(run)?;
@@ -102,7 +102,7 @@ pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
     Ok(())
 }
 
-fn guard_awaiting_human_review_direct_write(
+fn guard_frozen_authority_direct_write(
     path: &Path,
     intended: &LoopRun,
 ) -> Result<bool, StateError> {
@@ -110,30 +110,35 @@ fn guard_awaiting_human_review_direct_write(
         .ok()
         .and_then(|content| serde_json::from_str::<LoopRun>(&content).ok())
         .filter(|run| validate_run_integrity(run).is_ok());
-    if matches!(
-        intended.status,
-        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
-    ) {
+    if is_frozen_review_or_evaluation_authority(intended) {
         if current.as_ref() == Some(intended) {
             return Ok(true);
         }
         return Err(StateError::InvalidRun(
-            "public state writer cannot create awaiting human review or approved authority"
+            "public state writer cannot create awaiting human review, approved authority, or final evaluation authority"
                 .to_string(),
         ));
     }
-    if current.is_some_and(|run| {
-        matches!(
-            run.status,
-            LoopStatus::AwaitingHumanReview | LoopStatus::Approved
-        )
-    }) {
+    if current
+        .as_ref()
+        .is_some_and(is_frozen_review_or_evaluation_authority)
+    {
         return Err(StateError::InvalidRun(
-            "public state writer cannot replace awaiting human review or approved authority"
+            "public state writer cannot replace awaiting human review, approved authority, or final evaluation authority"
                 .to_string(),
         ));
     }
     Ok(false)
+}
+
+pub(crate) fn is_frozen_review_or_evaluation_authority(run: &LoopRun) -> bool {
+    matches!(
+        run.status,
+        LoopStatus::AwaitingHumanReview | LoopStatus::Approved | LoopStatus::EvalPassed
+    ) || (run.status == LoopStatus::Failed
+        && run.current_step == LoopStepName::EvalReport
+        && run.human_approval.is_some()
+        && run.eval_report_path.is_some())
 }
 
 pub fn next_runnable_step(run: &LoopRun) -> Option<LoopStepName> {

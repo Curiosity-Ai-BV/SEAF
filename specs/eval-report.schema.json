@@ -29,7 +29,15 @@
           "status": { "enum": ["passed", "failed", "skipped"] },
           "duration_ms": { "type": "integer", "minimum": 0 },
           "stdout_path": { "type": "string" },
+          "stdout_digest": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
           "stderr_path": { "type": "string" },
+          "stderr_digest": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
           "summary": { "type": "string" }
         },
         "additionalProperties": false
@@ -39,7 +47,94 @@
     "risk_level": { "enum": ["low", "medium", "high"] },
     "decision": {
       "enum": ["reject", "approve_for_human_review", "approve_for_release"]
+    },
+    "loop_evidence": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "ticket_id",
+        "ticket_digest",
+        "eval_config",
+        "candidate_diff",
+        "starting_head",
+        "human_approval_digest",
+        "policy_decision_digest",
+        "testing_evidence"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "ticket_id": { "type": "string", "minLength": 1 },
+        "ticket_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "eval_config": {
+          "allOf": [
+            { "$ref": "#/$defs/artifactReference" },
+            { "properties": { "path": { "const": "inputs/eval-config.json" } } }
+          ]
+        },
+        "candidate_diff": { "$ref": "#/$defs/artifactReference" },
+        "starting_head": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "human_approval_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "policy_decision_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "testing_evidence": { "$ref": "#/$defs/artifactReference" }
+      },
+      "additionalProperties": false
     }
   },
+  "$defs": {
+    "artifactReference": {
+      "type": "object",
+      "required": ["path", "digest"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+        },
+        "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["loop_evidence"] },
+      "then": {
+        "properties": {
+          "checks": {
+            "items": {
+              "required": [
+                "stdout_path",
+                "stdout_digest",
+                "stderr_path",
+                "stderr_digest"
+              ],
+              "properties": {
+                "stdout_path": {
+                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+                },
+                "stderr_path": {
+                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": false
 }

@@ -625,7 +625,9 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {
         let Some(role) = role_for_step(step) else {
-            return Ok(no_model_request(step));
+            return Err(RunnerError::Step(format!(
+                "{step:?} requires the dedicated locked evaluation publisher"
+            )));
         };
 
         let user_prompt = self
@@ -644,7 +646,9 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         self.pending_policy_decisions.clear();
 
         let Some(role) = role_for_step(step) else {
-            return Ok(StepOutput::completed(no_model_response(step)));
+            return Err(RunnerError::Step(format!(
+                "{step:?} requires the dedicated locked evaluation publisher"
+            )));
         };
 
         if self.fresh_exchange_run {
@@ -2658,14 +2662,6 @@ fn status_for_response(response: &RoleResponse) -> LoopStepStatus {
             ReviewDecision::Reject => LoopStepStatus::Failed,
         },
     }
-}
-
-fn no_model_request(step: LoopStepName) -> String {
-    format!("{step:?} is deterministic for this slice; no model provider call will be made.")
-}
-
-fn no_model_response(step: LoopStepName) -> String {
-    format!("{step:?} completed deterministically; no model provider call was made.")
 }
 
 fn repair_transcript(

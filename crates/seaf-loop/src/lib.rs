@@ -6,6 +6,7 @@ pub mod context_expansion;
 pub mod development_evidence;
 pub mod eval_engine;
 pub mod eval_report;
+pub mod final_evaluation_authority;
 mod immutable_artifact;
 pub mod model_runner;
 pub mod patch;
@@ -16,6 +17,7 @@ pub mod role_artifact;
 pub mod role_response;
 pub mod runner;
 pub mod state;
+pub mod testing_evidence;
 pub mod workspace;
 
 pub use artifacts::ArtifactContent;
@@ -47,6 +49,10 @@ pub use eval_engine::{
     EvalPlan,
 };
 pub use eval_report::build_loop_eval_report;
+pub use final_evaluation_authority::{
+    load_verified_final_evaluation_authority, FinalEvaluationAuthorityError,
+    VerifiedFinalEvaluationAuthority,
+};
 pub use model_runner::{ProviderPatchGateConfig, ProviderStepRunner};
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
 pub use policy_gate::{
@@ -74,6 +80,9 @@ pub use runner::{
     LoopRunnerConfig, PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
 };
 pub use seaf_core::ArtifactReference;
+pub use testing_evidence::{
+    TestingEvidence, TestingEvidenceError, TESTING_EVIDENCE_SCHEMA_VERSION,
+};
 pub use workspace::{LoopWorkspace, WorkspaceError};
 
 #[cfg(test)]

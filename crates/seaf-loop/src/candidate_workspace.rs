@@ -405,6 +405,7 @@ impl CandidateCleanupOutcome {
                 | LoopStatus::Running
                 | LoopStatus::AwaitingHumanReview
                 | LoopStatus::Approved
+                | LoopStatus::EvalPassed
         ) || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
             || run.candidate_workspace.as_ref() != Some(&candidate)
         {
@@ -1687,6 +1688,7 @@ where
                 | LoopStatus::Running
                 | LoopStatus::AwaitingHumanReview
                 | LoopStatus::Approved
+                | LoopStatus::EvalPassed
         ) {
             return Err(CandidateWorkspaceError::Unsafe(
                 "refusing to clean an active run candidate".to_string(),

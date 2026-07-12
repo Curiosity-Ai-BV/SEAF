@@ -128,9 +128,28 @@ pub struct EvalCheck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalLoopEvidence {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub ticket_id: String,
+    pub ticket_digest: String,
+    pub eval_config: ArtifactReference,
+    pub candidate_diff: ArtifactReference,
+    pub starting_head: String,
+    pub human_approval_digest: String,
+    pub policy_decision_digest: String,
+    pub testing_evidence: ArtifactReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,6 +165,8 @@ pub struct EvalReport {
     pub score_delta_estimate: Option<f64>,
     pub risk_level: RiskLevel,
     pub decision: EvalDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_evidence: Option<EvalLoopEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +340,7 @@ pub enum LoopStatus {
     Running,
     AwaitingHumanReview,
     Approved,
+    EvalPassed,
     Blocked,
     Failed,
     Passed,
@@ -430,11 +452,18 @@ impl<'de> Deserialize<'de> for LoopRun {
             DecodedExecutionMode::Missing
                 if matches!(
                     wire.status,
-                    LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+                    LoopStatus::AwaitingHumanReview | LoopStatus::Approved | LoopStatus::EvalPassed
                 ) =>
             {
                 return Err(serde::de::Error::custom(
                     "human review states require explicit isolated_candidate execution_mode",
+                ));
+            }
+            DecodedExecutionMode::Missing
+                if wire.status == LoopStatus::Failed && wire.human_approval.is_some() =>
+            {
+                return Err(serde::de::Error::custom(
+                    "final integrated evaluation requires explicit isolated_candidate execution_mode",
                 ));
             }
             DecodedExecutionMode::Missing if wire.candidate_workspace.is_some() => {

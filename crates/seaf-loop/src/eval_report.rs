@@ -45,6 +45,7 @@ pub fn build_loop_eval_report(
         } else {
             EvalDecision::Reject
         },
+        loop_evidence: None,
     }
 }
 
@@ -154,7 +155,9 @@ fn check(name: &str, passed: bool, summary: impl Into<String>) -> EvalCheck {
         },
         duration_ms: None,
         stdout_path: None,
+        stdout_digest: None,
         stderr_path: None,
+        stderr_digest: None,
         summary: Some(summary.into()),
     }
 }

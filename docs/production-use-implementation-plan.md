@@ -1167,10 +1167,49 @@ Commit boundary: immutable eval input authority only. No command execution.
 
 ### M1-07c - Approved Testing And EvalReport Transaction
 
-Status: active. Dependencies: M1-07b (complete).
+Status: active. Split into M1-07c1 inert evidence/terminal contracts and
+M1-07c2 locked Approved execution. Dependencies: M1-07b (complete).
 
 Objective: execute the canonical checks only in the exact Approved candidate
 and durably publish one approval-bound Testing/EvalReport terminal transaction.
+
+### M1-07c1 - Evaluation Evidence And Terminal Contracts
+
+Status: complete on 2026-07-12. Dependencies: M1-07b (complete).
+
+Objective: define the closed durable Testing/EvalReport evidence and terminal
+state shapes without making any Approved run executable.
+
+Acceptance criteria:
+
+- Add backward-compatible Testing evidence and optional EvalReport loop
+  bindings for run/ticket/config, exact candidate diff and starting HEAD,
+  approval, policy decision, command log digests, and Testing artifact.
+- Add `eval_passed` with a closed final shape: human approval unchanged,
+  Testing and EvalReport passed with artifact path/digest pairs,
+  `eval_report_path` equal to the EvalReport step artifact, and a non-rejecting
+  report. Define the corresponding approval-bound reported-failure shape.
+- Historical LoopRun and standalone EvalReport artifacts remain readable;
+  integrated checks require stdout/stderr path-digest pairs.
+- Direct state writers, provider execution/append/reconciliation, rerun, and
+  cleanup cannot mint, replace, or remove passing eval authority. Direct
+  ProviderStepRunner Testing/EvalReport fails closed instead of returning
+  no-op success.
+- No CLI path executes checks, publishes integrated evidence, or transitions an
+  Approved run in this slice.
+
+RED: legacy fixture compatibility, malformed/mismatched binding, duplicate
+steps, report-path mismatch, provider no-op removal, public-writer minting, and
+non-cleanable eval-passed state tests.
+
+Verification: core/schema/state/report/provider/candidate suites, full Rust
+tests, format, Clippy, and diff check.
+
+Commit boundary: inert durable contracts and freeze rules only.
+
+### M1-07c2 - Locked Approved Evaluation Transaction
+
+Status: active. Dependencies: M1-07c1 (complete).
 
 Acceptance criteria:
 

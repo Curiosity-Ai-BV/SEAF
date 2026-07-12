@@ -2021,17 +2021,20 @@ fn provider_step_runner_persists_failed_early_role_artifact_without_advancing() 
 }
 
 #[test]
-fn provider_step_runner_keeps_testing_and_eval_report_as_no_model_steps() {
+fn provider_step_runner_refuses_testing_and_eval_report_without_locked_evaluation_publisher() {
     let provider = FakeProvider::new(Vec::new());
     let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
 
     for step in [LoopStepName::Testing, LoopStepName::EvalReport] {
-        let request = runner.step_request(step).expect("no-model request");
-        let output = runner.run_step(step, &request).expect("no-model step");
+        let request_error = runner
+            .step_request(step)
+            .expect_err("provider runner must not prepare evaluation");
+        let run_error = runner
+            .run_step(step, "")
+            .expect_err("provider runner must not execute evaluation");
 
-        assert_eq!(output.status, LoopStepStatus::Completed);
-        assert!(request.contains("no model provider call"));
-        assert!(output.response.contains("no model provider call"));
+        assert!(request_error.to_string().contains("dedicated locked evaluation"));
+        assert!(run_error.to_string().contains("dedicated locked evaluation"));
     }
 
     assert!(provider.requests().expect("provider requests").is_empty());

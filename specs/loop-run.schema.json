@@ -45,6 +45,7 @@
         "running",
         "awaiting_human_review",
         "approved",
+        "eval_passed",
         "blocked",
         "failed",
         "passed",
@@ -825,9 +826,109 @@
             "properties": { "human_approval": { "type": "object" } }
           }
         ]
+      }
+    },
+    {
+      "if": {
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "awaiting_human_review",
+              "blocked",
+              "passed",
+              "completed"
+            ]
+          }
+        }
       },
-      "else": {
-        "properties": { "human_approval": { "type": "null" } }
+      "then": { "properties": { "human_approval": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "required": ["status"],
+        "properties": { "status": { "const": "eval_passed" } }
+      },
+      "then": {
+        "required": [
+          "execution_mode",
+          "candidate_workspace",
+          "human_approval",
+          "eval_report_path"
+        ],
+        "properties": {
+          "execution_mode": { "const": "isolated_candidate" },
+          "current_step": { "const": "eval_report" },
+          "human_approval": { "type": "object" },
+          "eval_report_path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+          },
+          "input_digests": { "required": ["eval_config"] },
+          "candidate_workspace": {
+            "$ref": "#/$defs/finalCandidateAuthority"
+          },
+          "steps": {
+            "minItems": 8,
+            "maxItems": 8,
+            "prefixItems": [
+              { "$ref": "#/$defs/successfulResearch" },
+              { "$ref": "#/$defs/successfulAnalysis" },
+              { "$ref": "#/$defs/successfulSpecCreation" },
+              { "$ref": "#/$defs/successfulSpecReview" },
+              { "$ref": "#/$defs/completedDevelopment" },
+              { "$ref": "#/$defs/passedOutputReview" },
+              { "$ref": "#/$defs/passedTesting" },
+              { "$ref": "#/$defs/passedEvalReport" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["status", "human_approval"],
+        "properties": {
+          "status": { "const": "failed" },
+          "human_approval": { "type": "object" }
+        }
+      },
+      "then": {
+        "required": [
+          "execution_mode",
+          "candidate_workspace",
+          "eval_report_path"
+        ],
+        "properties": {
+          "execution_mode": { "const": "isolated_candidate" },
+          "current_step": { "const": "eval_report" },
+          "eval_report_path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+          },
+          "input_digests": { "required": ["eval_config"] },
+          "candidate_workspace": {
+            "$ref": "#/$defs/failedFinalCandidateAuthority"
+          },
+          "steps": {
+            "minItems": 8,
+            "maxItems": 8,
+            "prefixItems": [
+              { "$ref": "#/$defs/successfulResearch" },
+              { "$ref": "#/$defs/successfulAnalysis" },
+              { "$ref": "#/$defs/successfulSpecCreation" },
+              { "$ref": "#/$defs/successfulSpecReview" },
+              { "$ref": "#/$defs/completedDevelopment" },
+              { "$ref": "#/$defs/passedOutputReview" },
+              { "$ref": "#/$defs/failedTesting" },
+              { "$ref": "#/$defs/failedEvalReport" }
+            ]
+          }
+        }
       }
     },
     {
@@ -914,5 +1015,114 @@
       }
     }
   ],
+  "$defs": {
+    "finalCandidateAuthority": {
+      "type": "object",
+      "required": ["schema_version", "lifecycle", "patch_transaction"],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "lifecycle": { "const": "active" },
+        "patch_transaction": {
+          "type": "object",
+          "required": ["phase"],
+          "properties": { "phase": { "const": "applied" } }
+        }
+      }
+    },
+    "failedFinalCandidateAuthority": {
+      "type": "object",
+      "required": ["schema_version", "lifecycle", "patch_transaction"],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "lifecycle": { "enum": ["active", "cleaning", "cleaned"] },
+        "patch_transaction": {
+          "type": "object",
+          "required": ["phase"],
+          "properties": { "phase": { "const": "applied" } }
+        }
+      }
+    },
+    "successfulResearch": {
+      "properties": {
+        "name": { "const": "research" },
+        "status": { "enum": ["completed", "passed"] }
+      }
+    },
+    "successfulAnalysis": {
+      "properties": {
+        "name": { "const": "analysis" },
+        "status": { "enum": ["completed", "passed"] }
+      }
+    },
+    "successfulSpecCreation": {
+      "properties": {
+        "name": { "const": "spec_creation" },
+        "status": { "enum": ["completed", "passed"] }
+      }
+    },
+    "successfulSpecReview": {
+      "properties": {
+        "name": { "const": "spec_review" },
+        "status": { "enum": ["completed", "passed"] }
+      }
+    },
+    "completedDevelopment": {
+      "properties": {
+        "name": { "const": "development" },
+        "status": { "const": "completed" }
+      }
+    },
+    "passedOutputReview": {
+      "required": ["artifact_path", "artifact_digest"],
+      "properties": {
+        "name": { "const": "output_review" },
+        "status": { "const": "passed" }
+      }
+    },
+    "passedTesting": {
+      "required": ["artifact_path", "artifact_digest"],
+      "properties": {
+        "name": { "const": "testing" },
+        "status": { "const": "passed" },
+        "artifact_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+        }
+      }
+    },
+    "passedEvalReport": {
+      "required": ["artifact_path", "artifact_digest"],
+      "properties": {
+        "name": { "const": "eval_report" },
+        "status": { "const": "passed" },
+        "artifact_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+        }
+      }
+    },
+    "failedTesting": {
+      "required": ["artifact_path", "artifact_digest"],
+      "properties": {
+        "name": { "const": "testing" },
+        "status": { "const": "failed" },
+        "artifact_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+        }
+      }
+    },
+    "failedEvalReport": {
+      "required": ["artifact_path", "artifact_digest"],
+      "properties": {
+        "name": { "const": "eval_report" },
+        "status": { "const": "failed" },
+        "artifact_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+        }
+      }
+    }
+  },
   "additionalProperties": false
 }

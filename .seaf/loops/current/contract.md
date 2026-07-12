@@ -44,22 +44,24 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-07c - Approved Testing and EvalReport transaction. `seaf loop resume` on an
-exact Approved run must execute only the canonical ticket and eval snapshots in
-the exact candidate, without a model call. Preflight every check and both
-allowlists before intent or execution. Under candidate authority, reauthenticate
-the human approval, current OutputReview/provider chain, exact policy decision,
-source HEAD/tree, candidate staged diff, and physical workspace immediately
-before commands and again before final publication. Publish a create-only
-execution intent before the first command so an interrupted attempt never
-silently replays side effects. Publish indexed create-only redacted logs,
-canonical Testing evidence, and a backward-compatible EvalReport binding the
-run, ticket/config digests, candidate diff, approval, policy decision, and
-Testing artifact. After those artifacts are durable, use candidate-to-provider
-lock order and full-state compare-and-swap to publish the Testing/EvalReport
-step results, `eval_report_path`, and terminal `eval_passed` or reported `failed`
-together. Direct provider Testing/EvalReport,
-unapproved or historical runs, substitutions, failed checks, timeout, source or
-candidate drift, and partial prior attempts must never claim eval success.
-Preserve the source checkout; do not promote, commit, merge, deploy, or contact
-a model in Testing/EvalReport.
+M1-07c2 - Locked Approved evaluation transaction. Make `loop resume` recognize
+only an exact current Approved authority and execute the canonical immutable
+eval snapshot in that physical candidate without a model call. Acquire the
+candidate lock first, authenticate the human approval, output-review/provider
+chain, policy decision, source HEAD/tree, and physical candidate immediately
+before commands, and plan every check plus both allowlists before executing any
+command. Publish a create-only execution intent bound to the exact Approved run
+digest before the first command; an existing incomplete intent must refuse
+silent replay pending M1-09 recovery.
+
+Execute only through the bounded controlled engine in the candidate. Publish
+indexed create-only redacted stdout/stderr logs with digest pairs, canonical
+Testing evidence, and the approval-bound EvalReport. Revalidate candidate,
+source, approval, and artifacts after commands; physically verify the immutable
+eval config, candidate diff, and log bytes. While retaining the candidate lock,
+take the provider lock only for the final full-state compare-and-swap from the
+exact Approved predecessor to `eval_passed` or the approval-bound reported
+failure. Failed checks and timeouts publish rejecting evidence; prevalidation
+failure executes zero commands; publication failure cannot claim a terminal
+result. Preserve the M1-07c1 freeze rules, do not promote, and do not add an
+audited adoption/invalidation path for incomplete attempts in this slice.

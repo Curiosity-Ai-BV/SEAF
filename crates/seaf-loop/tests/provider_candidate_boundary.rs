@@ -5,20 +5,24 @@ use std::{
 };
 
 use seaf_core::{
-    canonical_json_bytes, canonical_sha256_digest, LoopInputDigests, LoopStepName, Policy,
-    ProviderExchangeKind, ProviderExchangePhase, ProviderExchangeRecord, ProviderRole,
+    canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CheckStatus, EvalCheck,
+    EvalDecision, EvalLoopEvidence, EvalReport, LoopInputDigests, LoopStepName, Policy,
+    ProviderExchangeKind, ProviderExchangePhase, ProviderExchangeRecord, ProviderRole, RiskLevel,
     TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
 };
 use seaf_loop::{
     approve_candidate_for_testing, artifacts::write_step_request,
-    cleanup_candidate_workspace_outcome, persist_provider_exchange_record_reference,
-    stage_provider_exchange_record, verify_candidate_patch_evidence,
-    write_provider_exchange_request, AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits,
-    ContextPackRequest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
-    PatchCommand, PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
-    ProviderPatchGateConfig, ProviderStepRunner, StepRunner, PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    cleanup_candidate_workspace_outcome, load_verified_final_evaluation_authority,
+    persist_provider_exchange_record_reference, stage_provider_exchange_record,
+    verify_candidate_patch_evidence, write_provider_exchange_request,
+    AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits, ContextPackRequest,
+    InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchCommand,
+    PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
+    ProviderPatchGateConfig, ProviderStepRunner, StepRunner, TestingEvidence,
+    PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use seaf_models::{FakeProvider, ModelResponse};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn provider_rejects_context_and_patch_roots_that_are_not_the_candidate() {
@@ -591,6 +595,364 @@ fn human_approval_rejects_stale_or_substituted_authority_without_further_mutatio
         assert_eq!(source_evidence(&fixture.candidate), candidate_before);
         fixture.cleanup();
     }
+}
+
+#[test]
+fn eval_passed_authority_is_inert_frozen_and_non_cleanable() {
+    let fixture = final_eval_fixture("eval-passed-frozen", true);
+    let run = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let before = snapshot_files(fixture.workspace.run_directory());
+
+    let mut replacement = run.clone();
+    replacement.status = seaf_core::LoopStatus::Completed;
+    replacement.human_approval = None;
+    let writer_error = seaf_loop::state::save_run(&fixture.workspace, &replacement)
+        .expect_err("public writer must not replace EvalPassed");
+    assert!(writer_error.to_string().contains("final evaluation"));
+
+    let append_error = persist_provider_exchange_record_reference(
+        &fixture.workspace,
+        run.provider_exchange_records.last().unwrap().clone(),
+    )
+    .expect_err("provider append must remain frozen");
+    assert!(append_error.to_string().contains("frozen"));
+
+    let cleanup_error = cleanup_candidate_workspace_outcome(&fixture.workspace, &fixture.source)
+        .expect_err("EvalPassed must remain non-cleanable until promotion");
+    assert!(cleanup_error.to_string().contains("active run"));
+
+    let mut inert = UnauthenticatedOutputReview;
+    let runs_root = fixture.workspace.run_directory().parent().unwrap();
+    let mut resumed = LoopRunner::resume(runs_root, "eval-passed-frozen", &mut inert)
+        .expect("EvalPassed resumes inertly");
+    assert!(!resumed.run_next_step().unwrap());
+    let rerun_error = resumed
+        .rerun_from(LoopStepName::OutputReview)
+        .expect_err("EvalPassed cannot rerun");
+    assert!(rerun_error.to_string().contains("final evaluation"));
+    assert_eq!(snapshot_files(fixture.workspace.run_directory()), before);
+    fixture.cleanup();
+}
+
+#[test]
+fn approval_bound_reported_failure_freezes_execution_but_allows_terminal_cleanup() {
+    let fixture = final_eval_fixture("eval-failed-frozen", false);
+    let run = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let original_authority =
+        load_verified_final_evaluation_authority(&fixture.workspace, &run).unwrap();
+
+    let append_error = persist_provider_exchange_record_reference(
+        &fixture.workspace,
+        run.provider_exchange_records.last().unwrap().clone(),
+    )
+    .expect_err("reported failure must freeze provider append");
+    assert!(append_error.to_string().contains("frozen"));
+
+    let outcome = cleanup_candidate_workspace_outcome(&fixture.workspace, &fixture.source)
+        .expect("reported evaluation failure remains cleanable");
+    assert_eq!(outcome.status, seaf_core::LoopStatus::Failed);
+    assert_eq!(
+        outcome.candidate.lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Cleaned
+    );
+    let cleaned = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    assert!(cleaned.human_approval.is_some());
+    assert_eq!(cleaned.status, seaf_core::LoopStatus::Failed);
+    let cleaned_authority = load_verified_final_evaluation_authority(&fixture.workspace, &cleaned)
+        .expect("cleaned reported failure retains verifiable final authority");
+    assert_eq!(
+        cleaned_authority.testing_evidence(),
+        original_authority.testing_evidence()
+    );
+    assert_eq!(
+        cleaned_authority.eval_report(),
+        original_authority.eval_report()
+    );
+}
+
+#[test]
+fn public_writers_cannot_mint_final_evaluation_authority_from_approved() {
+    for passed in [true, false] {
+        let run_id = if passed {
+            "public-mint-eval-passed"
+        } else {
+            "public-mint-eval-failed"
+        };
+        let (fixture, approved) = approved_fixture(run_id);
+        let final_run = publish_final_eval_artifacts(&fixture.workspace, &approved, passed);
+        load_verified_final_evaluation_authority(&fixture.workspace, &final_run)
+            .expect("otherwise valid final authority fixture");
+        let before = fs::read(fixture.workspace.run_file()).unwrap();
+
+        let save_error = seaf_loop::state::save_run(&fixture.workspace, &final_run)
+            .expect_err("public save cannot mint final evaluation authority");
+        let write_error =
+            seaf_loop::state::write_run_file(&fixture.workspace.run_file(), &final_run)
+                .expect_err("public writer cannot mint final evaluation authority");
+
+        assert!(save_error.to_string().contains("final evaluation"));
+        assert!(write_error.to_string().contains("final evaluation"));
+        assert_eq!(fs::read(fixture.workspace.run_file()).unwrap(), before);
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn testing_evidence_binding_rejects_every_approved_authority_substitution() {
+    let (fixture, approved) = approved_fixture("testing-binding-substitution");
+    let approved_at = approved
+        .human_approval
+        .as_ref()
+        .unwrap()
+        .approved_at
+        .clone();
+    let exact = TestingEvidence::create(
+        &approved,
+        approved_at.clone(),
+        approved_at,
+        vec![EvalCheck {
+            name: "unit".to_string(),
+            status: CheckStatus::Passed,
+            duration_ms: Some(1),
+            stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
+            stdout_digest: Some("a".repeat(64)),
+            stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
+            stderr_digest: Some("b".repeat(64)),
+            summary: Some("passed".to_string()),
+        }],
+    )
+    .unwrap();
+    let reference = ArtifactReference {
+        path: "artifacts/testing-binding.json".to_string(),
+        digest: exact.artifact_digest().unwrap(),
+    };
+    fs::write(
+        fixture.workspace.run_directory().join(&reference.path),
+        exact.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        TestingEvidence::load_for_approved_run(&fixture.workspace, &reference, &approved).unwrap(),
+        exact
+    );
+
+    let mut substitutions = Vec::new();
+    let mut value = exact.clone();
+    value.run_id = "other-run".to_string();
+    substitutions.push(("run_id", value));
+    let mut value = exact.clone();
+    value.ticket_id = "other-ticket".to_string();
+    substitutions.push(("ticket_id", value));
+    let mut value = exact.clone();
+    value.goal_id = "other-goal".to_string();
+    substitutions.push(("goal_id", value));
+    let mut value = exact.clone();
+    value.eval_config.digest = "c".repeat(64);
+    substitutions.push(("eval_config", value));
+    let mut value = exact.clone();
+    value.candidate_diff.digest = "d".repeat(64);
+    substitutions.push(("candidate_diff", value));
+    let mut value = exact.clone();
+    value.starting_head = "a".repeat(40);
+    substitutions.push(("starting_head", value));
+    let mut value = exact.clone();
+    value.human_approval_digest = "e".repeat(64);
+    substitutions.push(("human_approval_digest", value));
+    let mut value = exact.clone();
+    value.policy_decision_digest = "f".repeat(64);
+    substitutions.push(("policy_decision_digest", value));
+    let mut value = exact;
+    value.approved_run_digest = "0".repeat(64);
+    substitutions.push(("approved_run_digest", value));
+
+    for (field, substitution) in substitutions {
+        let error = substitution
+            .validate_against_approved_run(&approved)
+            .expect_err("substituted Approved binding must fail");
+        assert!(error.to_string().contains("bindings"), "{field}: {error}");
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn testing_evidence_cannot_start_before_canonical_human_approval() {
+    let (fixture, approved) = approved_fixture("testing-after-approval");
+    let approved_at = approved
+        .human_approval
+        .as_ref()
+        .unwrap()
+        .approved_at
+        .parse::<u64>()
+        .unwrap();
+    let checks = vec![EvalCheck {
+        name: "unit".to_string(),
+        status: CheckStatus::Passed,
+        duration_ms: Some(1),
+        stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
+        stdout_digest: Some("a".repeat(64)),
+        stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
+        stderr_digest: Some("b".repeat(64)),
+        summary: Some("passed".to_string()),
+    }];
+
+    let error = TestingEvidence::create(
+        &approved,
+        approved_at.saturating_sub(1).to_string(),
+        approved_at.to_string(),
+        checks.clone(),
+    )
+    .expect_err("Testing cannot begin before approval");
+    assert!(error.to_string().contains("approved_at"), "{error}");
+
+    let exact = TestingEvidence::create(
+        &approved,
+        approved_at.to_string(),
+        approved_at.to_string(),
+        checks,
+    )
+    .unwrap();
+    let mut malformed_approval = approved.clone();
+    malformed_approval
+        .human_approval
+        .as_mut()
+        .unwrap()
+        .approved_at = "not-unix-seconds".to_string();
+    malformed_approval.updated_at = "not-unix-seconds".to_string();
+    let error = exact
+        .validate_against_approved_run(&malformed_approval)
+        .expect_err("integrated evidence requires canonical approval time");
+    assert!(error.to_string().contains("approved_at"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn final_authority_loader_rejects_standalone_substituted_and_noncanonical_artifacts() {
+    let (fixture, approved) = approved_fixture("final-loader-substitutions");
+    let final_run = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let verified = load_verified_final_evaluation_authority(&fixture.workspace, &final_run)
+        .expect("exact final authority");
+    let exact_report = verified.eval_report().clone();
+
+    let mut variants = Vec::new();
+    let mut report = exact_report.clone();
+    report.loop_evidence = None;
+    variants.push(("standalone", report));
+    let mut report = exact_report.clone();
+    report.patch_id = "other-run".to_string();
+    report.loop_evidence.as_mut().unwrap().run_id = "other-run".to_string();
+    variants.push(("wrong-run", report));
+    let mut report = exact_report.clone();
+    report.goal_id = "other-goal".to_string();
+    variants.push(("wrong-goal", report));
+    let mut report = exact_report.clone();
+    report.loop_evidence.as_mut().unwrap().ticket_digest = "c".repeat(64);
+    variants.push(("substituted-ticket", report));
+    let mut report = exact_report.clone();
+    report.loop_evidence.as_mut().unwrap().candidate_diff.digest = "d".repeat(64);
+    variants.push(("substituted-candidate", report));
+    let mut report = exact_report.clone();
+    report.checks[0].summary = Some("substituted check".to_string());
+    variants.push(("substituted-check", report));
+    let mut report = exact_report.clone();
+    report.checks[0].stdout_digest = None;
+    variants.push(("incomplete-log", report));
+    let mut report = exact_report.clone();
+    report.decision = EvalDecision::Reject;
+    variants.push(("rejecting-pass", report));
+
+    for (label, report) in variants {
+        let run = publish_report_variant(&fixture.workspace, &final_run, &report, label, true);
+        let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
+            .expect_err("substituted final report must fail");
+        assert!(!error.to_string().is_empty(), "{label}");
+    }
+
+    let noncanonical = publish_report_variant(
+        &fixture.workspace,
+        &final_run,
+        &exact_report,
+        "noncanonical",
+        false,
+    );
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &noncanonical)
+        .expect_err("noncanonical report must fail");
+    assert!(error.to_string().contains("canonical"), "{error}");
+
+    let mut mismatched_digest = final_run.clone();
+    mismatched_digest.steps[7].artifact_digest = Some("0".repeat(64));
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &mismatched_digest)
+        .expect_err("report digest mismatch must fail");
+    assert!(error.to_string().contains("digest mismatch"), "{error}");
+
+    let mut missing = final_run;
+    missing.steps[7].artifact_path = Some("artifacts/missing-eval-report.json".to_string());
+    missing.eval_report_path = missing.steps[7].artifact_path.clone();
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &missing)
+        .expect_err("missing report must fail");
+    assert!(
+        error.to_string().contains("could not be inspected"),
+        "{error}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn final_authority_loader_rejects_log_incomplete_testing_evidence() {
+    let (fixture, approved) = approved_fixture("final-loader-testing-log");
+    let final_run = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let verified = load_verified_final_evaluation_authority(&fixture.workspace, &final_run)
+        .expect("exact final authority");
+    let mut testing = serde_json::to_value(verified.testing_evidence()).unwrap();
+    testing["checks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stdout_digest");
+    let testing_reference = ArtifactReference {
+        path: "artifacts/07-testing-incomplete.json".to_string(),
+        digest: canonical_sha256_digest(&testing).unwrap(),
+    };
+    fs::write(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&testing_reference.path),
+        canonical_json_bytes(&testing).unwrap(),
+    )
+    .unwrap();
+    let mut report = verified.eval_report().clone();
+    report.loop_evidence.as_mut().unwrap().testing_evidence = testing_reference.clone();
+    let mut run = final_run;
+    run.steps[6].artifact_path = Some(testing_reference.path);
+    run.steps[6].artifact_digest = Some(testing_reference.digest);
+    run = publish_report_variant(
+        &fixture.workspace,
+        &run,
+        &report,
+        "testing-incomplete",
+        true,
+    );
+
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
+        .expect_err("log-incomplete Testing evidence must fail");
+    assert!(error.to_string().contains("stdout"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn reported_eval_failure_requires_a_rejecting_report() {
+    let (fixture, approved) = approved_fixture("final-loader-failed-decision");
+    let final_run = publish_final_eval_artifacts(&fixture.workspace, &approved, false);
+    let verified = load_verified_final_evaluation_authority(&fixture.workspace, &final_run)
+        .expect("exact reported failure");
+    let mut report = verified.eval_report().clone();
+    report.decision = EvalDecision::ApproveForHumanReview;
+    let run = publish_report_variant(&fixture.workspace, &final_run, &report, "nonreject", true);
+
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
+        .expect_err("reported failure with non-Reject report must fail");
+
+    assert!(error.to_string().contains("reject"), "{error}");
+    fixture.cleanup();
 }
 
 #[test]
@@ -1608,6 +1970,194 @@ fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
         candidate,
         workspace,
     }
+}
+
+fn final_eval_fixture(run_id: &str, passed: bool) -> AwaitingApprovalFixture {
+    let (fixture, approved) = approved_fixture(run_id);
+    let run = publish_final_eval_artifacts(&fixture.workspace, &approved, passed);
+    load_verified_final_evaluation_authority(&fixture.workspace, &run)
+        .expect("private final fixture must pass combined authority validation");
+    write_raw_run(&fixture.workspace, &run);
+    fixture
+}
+
+fn approved_fixture(run_id: &str) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
+    let fixture = awaiting_approval_fixture(run_id);
+    let awaiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let candidate = awaiting.candidate_workspace.as_ref().unwrap();
+    let approved = approve_candidate_for_testing(
+        &fixture.workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .unwrap()
+    .run;
+    (fixture, approved)
+}
+
+fn publish_final_eval_artifacts(
+    workspace: &LoopWorkspace,
+    approved: &seaf_core::LoopRun,
+    passed: bool,
+) -> seaf_core::LoopRun {
+    let check = EvalCheck {
+        name: "unit".to_string(),
+        status: if passed {
+            CheckStatus::Passed
+        } else {
+            CheckStatus::Failed
+        },
+        duration_ms: Some(1),
+        stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
+        stdout_digest: Some("a".repeat(64)),
+        stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
+        stderr_digest: Some("b".repeat(64)),
+        summary: Some(if passed { "passed" } else { "failed" }.to_string()),
+    };
+    let approved_at = approved
+        .human_approval
+        .as_ref()
+        .unwrap()
+        .approved_at
+        .clone();
+    let testing_evidence = TestingEvidence::create(
+        approved,
+        approved_at.clone(),
+        approved_at,
+        vec![check.clone()],
+    )
+    .unwrap();
+    let testing_reference = ArtifactReference {
+        path: "artifacts/07-testing.json".to_string(),
+        digest: testing_evidence.artifact_digest().unwrap(),
+    };
+    fs::write(
+        workspace.run_directory().join(&testing_reference.path),
+        testing_evidence.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+
+    let approval = approved.human_approval.as_ref().unwrap();
+    let eval_config_digest = approved.input_digests.eval_config.as_ref().unwrap();
+    let report = EvalReport {
+        eval_report_id: format!("eval_{}", approved.run_id),
+        patch_id: approved.run_id.clone(),
+        goal_id: approved.goal_id.clone(),
+        passed,
+        summary: if passed {
+            "Integrated evaluation passed.".to_string()
+        } else {
+            "Integrated evaluation failed.".to_string()
+        },
+        checks: vec![check],
+        score_delta_estimate: None,
+        risk_level: if passed {
+            RiskLevel::Low
+        } else {
+            RiskLevel::High
+        },
+        decision: if passed {
+            EvalDecision::ApproveForHumanReview
+        } else {
+            EvalDecision::Reject
+        },
+        loop_evidence: Some(EvalLoopEvidence {
+            schema_version: 1,
+            run_id: approved.run_id.clone(),
+            ticket_id: approved.ticket_id.clone(),
+            ticket_digest: approved.input_digests.ticket.clone(),
+            eval_config: ArtifactReference {
+                path: "inputs/eval-config.json".to_string(),
+                digest: eval_config_digest.clone(),
+            },
+            candidate_diff: approval.candidate_diff.clone(),
+            starting_head: approval.starting_head.clone(),
+            human_approval_digest: canonical_sha256_digest(approval).unwrap(),
+            policy_decision_digest: approval.policy_decision_digest.clone(),
+            testing_evidence: testing_reference.clone(),
+        }),
+    };
+    let report_reference = ArtifactReference {
+        path: "artifacts/08-eval-report.json".to_string(),
+        digest: canonical_sha256_digest(&report).unwrap(),
+    };
+    fs::write(
+        workspace.run_directory().join(&report_reference.path),
+        canonical_json_bytes(&report).unwrap(),
+    )
+    .unwrap();
+
+    let mut run = approved.clone();
+    run.status = if passed {
+        seaf_core::LoopStatus::EvalPassed
+    } else {
+        seaf_core::LoopStatus::Failed
+    };
+    run.current_step = LoopStepName::EvalReport;
+    let terminal_status = if passed {
+        seaf_core::LoopStepStatus::Passed
+    } else {
+        seaf_core::LoopStepStatus::Failed
+    };
+    let testing = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    testing.status = terminal_status;
+    testing.artifact_path = Some(testing_reference.path);
+    testing.artifact_digest = Some(testing_reference.digest);
+    let report = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::EvalReport)
+        .unwrap();
+    report.status = terminal_status;
+    report.artifact_path = Some(report_reference.path);
+    report.artifact_digest = Some(report_reference.digest);
+    run.eval_report_path = report.artifact_path.clone();
+    run.updated_at = approved
+        .human_approval
+        .as_ref()
+        .unwrap()
+        .approved_at
+        .clone();
+    run
+}
+
+fn publish_report_variant(
+    workspace: &LoopWorkspace,
+    base_run: &seaf_core::LoopRun,
+    report: &EvalReport,
+    label: &str,
+    canonical: bool,
+) -> seaf_core::LoopRun {
+    let path = format!("artifacts/08-eval-report-{label}.json");
+    let bytes = if canonical {
+        canonical_json_bytes(report).unwrap()
+    } else {
+        let mut bytes = serde_json::to_vec_pretty(report).unwrap();
+        bytes.push(b'\n');
+        bytes
+    };
+    let digest = if canonical {
+        canonical_sha256_digest(report).unwrap()
+    } else {
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    fs::write(workspace.run_directory().join(&path), bytes).unwrap();
+    let mut run = base_run.clone();
+    let record = run
+        .steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::EvalReport)
+        .unwrap();
+    record.artifact_path = Some(path.clone());
+    record.artifact_digest = Some(digest);
+    run.eval_report_path = Some(path);
+    run
 }
 
 fn write_raw_run(workspace: &LoopWorkspace, run: &seaf_core::LoopRun) {

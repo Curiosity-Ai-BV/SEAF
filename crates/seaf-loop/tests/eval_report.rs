@@ -143,7 +143,9 @@ fn passed_check(name: &str) -> EvalCheck {
         status: CheckStatus::Passed,
         duration_ms: None,
         stdout_path: None,
+        stdout_digest: None,
         stderr_path: None,
+        stderr_digest: None,
         summary: Some("deterministic command check passed".to_string()),
     }
 }

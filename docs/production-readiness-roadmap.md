@@ -183,8 +183,13 @@ before the persisted output cap, and reject ambiguous log identities without
 side effects. Immutable eval authority is also complete: new provider runs
 require a normalized repository-root config, bind its canonical typed bytes and
 digest, and preflight an exact snapshot prefix before resume recovery. The
-approved Testing/EvalReport transaction is active. The candidate is still not
-executable until that boundary lands, and it is not promotable before M1-08.
+approved Testing/EvalReport work is split into inert evidence/terminal contracts
+and the locked execution transaction. The contract slice is complete: canonical
+Testing evidence and approval-bound final states now have one combined authority
+validator, passing outcomes are immutable, reported failures permit only ordered
+candidate cleanup, and all direct execution paths remain closed. The locked
+execution transaction is active. The candidate is still not executable until
+it lands, and it is not promotable before M1-08.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

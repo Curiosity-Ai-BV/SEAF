@@ -1581,3 +1581,40 @@ exchange 22, and every remaining Rust/doc-test suite. Strict all-target/all-
 feature Clippy, Rust/Prettier formatting, package lint/typecheck, 8 SDK tests,
 SDK build, and diff checks pass through the pinned pnpm 11.7.0 binary. M1-07b is
 accepted and M1-07c Approved Testing/EvalReport is active.
+
+## 2026-07-12 implementation | M1-07c1 evaluation evidence and terminal contracts
+
+Added versioned, deny-unknown canonical Testing evidence binding the run,
+ticket, goal, immutable eval config, exact approved candidate diff and starting
+HEAD, approval and policy digests, ordered checks, unique log path/digest pairs,
+aggregate result, and canonically encoded ordered timestamps. EvalReport checks
+now optionally carry stdout/stderr digests and integrated reports optionally
+carry typed loop evidence while historical standalone reports remain readable.
+LoopRun now supports `eval_passed` and a closed approval-bound reported-failure
+shape without making Approved runs executable.
+
+A workspace-aware final-authority loader securely reads and digests Testing and
+EvalReport artifacts, reconstructs the exact Approved predecessor, and validates
+all cross-artifact identities, decisions, ordered checks, logs, aggregate result,
+status, and terminal outcome. Direct Testing/EvalReport provider steps now fail
+closed with zero model calls. Public writers cannot mint a final outcome from
+Approved; passing outcomes cannot be replaced, rerun, reconciled, or cleaned;
+reported failures permit only exact retry or ordered candidate cleanup.
+
+Review exposed three authority classes that the initial implementation did not
+close. Final state first referenced merely self-consistent artifact claims, so
+publication now validates real workspace artifacts. The final transaction also
+had to prove that its reconstructed Approved authority was the exact locked
+current predecessor, not a substituted self-consistent bundle. Finally, current
+final results could be replaced, crossed between pass and failure, or downgraded;
+the in-lock relation now makes EvalPassed immutable and limits final Failed to
+identity-preserving cleanup with canonical time ordering. Testing cannot start
+before approval, and canonical decimal timestamps reject ambiguous encodings.
+
+Both fresh spec and quality reviews approve the corrected slice with no
+actionable findings. Controller verification passes all 480 workspace tests,
+including new evidence, final-authority, substitution, exact-predecessor,
+terminal-freeze, and cleanup-only regressions. Strict all-target/all-feature
+Clippy, Rust and Prettier formatting, package lint/typecheck, 8 SDK tests, SDK
+build, and diff checks pass through pinned pnpm 11.7.0. M1-07c1 is accepted and
+M1-07c2 locked Approved evaluation execution is active.
