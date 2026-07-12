@@ -7,6 +7,7 @@ pub mod context_expansion;
 pub mod development_evidence;
 pub mod eval_engine;
 pub mod eval_report;
+mod evaluation_attempt;
 pub mod final_evaluation_authority;
 mod immutable_artifact;
 pub mod inspect;

@@ -1,18 +1,16 @@
 use std::{
     collections::BTreeSet,
     error::Error,
-    fmt, fs,
+    fmt,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, validate_eval_config, validate_ticket_spec,
-    ArtifactReference, CheckStatus, EvalCheck, EvalCommandConfig, EvalConfig, EvalDecision,
-    EvalLoopEvidence, EvalReport, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, RiskLevel,
-    TicketSpec,
+    ArtifactReference, CheckStatus, EvalCheck, EvalConfig, EvalDecision, EvalLoopEvidence,
+    EvalReport, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, RiskLevel, TicketSpec,
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -22,26 +20,12 @@ use crate::{
         verify_candidate_patch_evidence_locked,
     },
     eval_engine::execute_eval_checks_with_pre_spawn,
+    evaluation_attempt::{
+        ApprovedEvaluationIntentV2, EvaluationAttemptInventory, EvaluationAttemptPaths,
+    },
     immutable_artifact::{publish_create_only, read_verified_regular_file},
     plan_eval_checks, state, LoopWorkspace, TestingEvidence,
 };
-
-const EXECUTION_INTENT_PATH: &str = "artifacts/07-testing.execution-intent.json";
-const TESTING_PATH: &str = "artifacts/07-testing.json";
-const EVAL_REPORT_PATH: &str = "artifacts/08-eval-report.json";
-const EXECUTION_INTENT_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovedEvaluationIntent {
-    schema_version: u32,
-    run_id: String,
-    approved_run_digest: String,
-    ticket: ArtifactReference,
-    eval_config: ArtifactReference,
-    candidate_diff: ArtifactReference,
-    planned_checks: Vec<EvalCommandConfig>,
-}
 
 pub fn execute_approved_evaluation(
     workspace: &LoopWorkspace,
@@ -120,10 +104,18 @@ fn execute_approved_evaluation_locked(
 
     let approved_run_digest =
         canonical_sha256_digest(&approved).map_err(ApprovedEvaluationError::wrapped)?;
-    let intent = ApprovedEvaluationIntent {
-        schema_version: EXECUTION_INTENT_SCHEMA_VERSION,
+    let source_authority =
+        capture_source_worktree_authority(source_worktree_root, Some(workspace.run_directory()))
+            .map_err(ApprovedEvaluationError::wrapped)?;
+    let attempt = 1;
+    let paths =
+        EvaluationAttemptPaths::indexed(attempt).map_err(ApprovedEvaluationError::invalid)?;
+    let intent = ApprovedEvaluationIntentV2 {
+        schema_version: 2,
+        evaluation_attempt: attempt,
         run_id: approved.run_id.clone(),
         approved_run_digest,
+        input_digests: approved.input_digests.clone(),
         ticket: ArtifactReference {
             path: "inputs/ticket.json".to_string(),
             digest: approved.input_digests.ticket.clone(),
@@ -134,19 +126,17 @@ fn execute_approved_evaluation_locked(
                 ApprovedEvaluationError::invalid("Approved authority has no eval config digest")
             })?,
         },
+        candidate_state_digest: canonical_sha256_digest(candidate)
+            .map_err(ApprovedEvaluationError::wrapped)?,
         candidate_diff: approval.candidate_diff.clone(),
+        source_worktree_state_digest: canonical_sha256_digest(&source_authority)
+            .map_err(ApprovedEvaluationError::wrapped)?,
+        recovery: None,
         planned_checks: eval_config.evals.required.clone(),
     };
     let intent_bytes = canonical_json_bytes(&intent).map_err(ApprovedEvaluationError::wrapped)?;
-    let source_authority =
-        capture_source_worktree_authority(source_worktree_root, Some(workspace.run_directory()))
-            .map_err(ApprovedEvaluationError::wrapped)?;
-    publish_create_only(
-        workspace.run_directory(),
-        EXECUTION_INTENT_PATH,
-        &intent_bytes,
-    )
-    .map_err(ApprovedEvaluationError::wrapped)?;
+    publish_create_only(workspace.run_directory(), &paths.intent, &intent_bytes)
+        .map_err(ApprovedEvaluationError::wrapped)?;
 
     let started_at = now_timestamp()?;
     let mut checks = Vec::with_capacity(eval_config.evals.required.len());
@@ -194,7 +184,7 @@ fn execute_approved_evaluation_locked(
             )?;
             verify_snapshot_bytes(
                 workspace,
-                EXECUTION_INTENT_PATH,
+                &paths.intent,
                 &intent_bytes,
                 &sha256_bytes(&intent_bytes),
             )?;
@@ -216,8 +206,8 @@ fn execute_approved_evaluation_locked(
             },
         };
         let number = index + 1;
-        let stdout_path = format!("artifacts/07-testing.check-{number:03}.stdout.log");
-        let stderr_path = format!("artifacts/07-testing.check-{number:03}.stderr.log");
+        let stdout_path = paths.stdout(number);
+        let stderr_path = paths.stderr(number);
         let stdout = execution.stdout.as_bytes();
         let stderr = execution.stderr.as_bytes();
         publish_create_only(workspace.run_directory(), &stdout_path, stdout)
@@ -278,25 +268,36 @@ fn execute_approved_evaluation_locked(
     )?;
     verify_snapshot_bytes(
         workspace,
-        EXECUTION_INTENT_PATH,
+        &paths.intent,
         &intent_bytes,
         &sha256_bytes(&intent_bytes),
     )?;
     verify_check_logs(workspace, &checks)?;
 
-    let testing =
-        TestingEvidence::create(&approved, started_at, completed_at.clone(), checks.clone())
-            .map_err(ApprovedEvaluationError::wrapped)?;
+    let intent_reference = ArtifactReference {
+        path: paths.intent.clone(),
+        digest: sha256_bytes(&intent_bytes),
+    };
+    let testing = TestingEvidence::create_v2(
+        &approved,
+        attempt,
+        None,
+        intent_reference,
+        started_at,
+        completed_at.clone(),
+        checks.clone(),
+    )
+    .map_err(ApprovedEvaluationError::wrapped)?;
     let testing_bytes = testing
         .canonical_bytes()
         .map_err(ApprovedEvaluationError::wrapped)?;
     let testing_reference = ArtifactReference {
-        path: TESTING_PATH.to_string(),
+        path: paths.testing.clone(),
         digest: testing
             .artifact_digest()
             .map_err(ApprovedEvaluationError::wrapped)?,
     };
-    publish_create_only(workspace.run_directory(), TESTING_PATH, &testing_bytes)
+    publish_create_only(workspace.run_directory(), &paths.testing, &testing_bytes)
         .map_err(ApprovedEvaluationError::wrapped)?;
 
     let passed = testing.passed;
@@ -338,21 +339,21 @@ fn execute_approved_evaluation_locked(
     };
     let report_bytes = canonical_json_bytes(&report).map_err(ApprovedEvaluationError::wrapped)?;
     let report_reference = ArtifactReference {
-        path: EVAL_REPORT_PATH.to_string(),
+        path: paths.report.clone(),
         digest: canonical_sha256_digest(&report).map_err(ApprovedEvaluationError::wrapped)?,
     };
-    publish_create_only(workspace.run_directory(), EVAL_REPORT_PATH, &report_bytes)
+    publish_create_only(workspace.run_directory(), &paths.report, &report_bytes)
         .map_err(ApprovedEvaluationError::wrapped)?;
 
     verify_snapshot_bytes(
         workspace,
-        TESTING_PATH,
+        &paths.testing,
         &testing_bytes,
         &testing_reference.digest,
     )?;
     verify_snapshot_bytes(
         workspace,
-        EVAL_REPORT_PATH,
+        &paths.report,
         &report_bytes,
         &report_reference.digest,
     )?;
@@ -459,7 +460,7 @@ fn execute_approved_evaluation_locked(
             })?;
             verify_snapshot_bytes(
                 workspace,
-                EXECUTION_INTENT_PATH,
+                &paths.intent,
                 &intent_bytes,
                 &sha256_bytes(&intent_bytes),
             )
@@ -537,16 +538,12 @@ fn load_canonical_snapshot(
 }
 
 fn refuse_incomplete_attempt(workspace: &LoopWorkspace) -> Result<(), ApprovedEvaluationError> {
-    let artifacts = workspace.run_directory().join("artifacts");
-    for entry in fs::read_dir(&artifacts).map_err(ApprovedEvaluationError::wrapped)? {
-        let entry = entry.map_err(ApprovedEvaluationError::wrapped)?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("07-testing") || name.starts_with("08-eval-report") {
-            return Err(ApprovedEvaluationError::invalid(
-                "an incomplete Approved evaluation attempt exists; audited recovery is required",
-            ));
-        }
+    let inventory =
+        EvaluationAttemptInventory::load(workspace).map_err(ApprovedEvaluationError::invalid)?;
+    if !inventory.is_empty() {
+        return Err(ApprovedEvaluationError::invalid(
+            "an incomplete Approved evaluation attempt exists; audited recovery is required",
+        ));
     }
     Ok(())
 }

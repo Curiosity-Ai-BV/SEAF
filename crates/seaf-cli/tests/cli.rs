@@ -789,7 +789,7 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
         ])
         .output()
         .expect("run loop resume");
-    assert!(resume.status.success());
+    assert!(resume.status.success(), "{resume:?}");
     let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"command\": \"resume\""));
     assert!(stdout.contains("\"status\": \"awaiting_human_review\""));
@@ -826,7 +826,7 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     let run_id = "cli-exact-approval";
     let intent_path = runs_root
         .join(run_id)
-        .join("artifacts/07-testing.execution-intent.json");
+        .join("artifacts/07-testing.attempt-001.execution-intent.json");
     let lock_probe = repo.join("provider-lock-check.pl");
     fs::write(
         &lock_probe,
@@ -1088,8 +1088,12 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
         ])
         .output()
         .expect("approved resume executes canonical evaluation");
-    assert!(resume.status.success());
-    assert!(String::from_utf8_lossy(&resume.stdout).contains("eval_passed"));
+    assert!(resume.status.success(), "{resume:?}");
+    assert!(
+        String::from_utf8_lossy(&resume.stdout).contains("eval_passed"),
+        "{}",
+        String::from_utf8_lossy(&resume.stdout)
+    );
     let evaluated = read_run_json(&run_dir);
     assert_eq!(evaluated["status"], "eval_passed");
     assert_eq!(evaluated["current_step"], "eval_report");
@@ -1097,14 +1101,13 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
         evaluated["provider_exchange_records"], approved_provider_records,
         "Approved evaluation must not make or append provider calls"
     );
-    assert!(run_dir
-        .join("artifacts/07-testing.execution-intent.json")
-        .is_file());
-    let intent: serde_json::Value = serde_json::from_slice(
-        &fs::read(run_dir.join("artifacts/07-testing.execution-intent.json"))
-            .expect("execution intent"),
-    )
-    .expect("canonical intent JSON");
+    let intent_path = "artifacts/07-testing.attempt-001.execution-intent.json";
+    let testing_path = "artifacts/07-testing.attempt-001.json";
+    let report_path = "artifacts/08-eval-report.attempt-001.json";
+    assert!(run_dir.join(intent_path).is_file());
+    let intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join(intent_path)).expect("execution intent"))
+            .expect("canonical intent JSON");
     let approved_run: serde_json::Value = serde_json::from_slice(
         approved_bytes
             .iter()
@@ -1114,17 +1117,30 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
             .as_slice(),
     )
     .expect("approved run JSON");
-    assert_eq!(intent["schema_version"], 1);
+    assert_eq!(intent["schema_version"], 2);
+    assert_eq!(intent["evaluation_attempt"], 1);
+    assert_eq!(intent["recovery"], serde_json::Value::Null);
+    assert_eq!(intent["input_digests"], approved_run["input_digests"]);
     assert_eq!(intent["planned_checks"].as_array().unwrap().len(), 2);
     assert_eq!(
         intent["approved_run_digest"],
         canonical_sha256_digest(&approved_run).expect("Approved digest")
     );
     assert!(run_dir
-        .join("artifacts/07-testing.check-001.stdout.log")
+        .join("artifacts/07-testing.attempt-001.check-001.stdout.log")
         .is_file());
-    assert!(run_dir.join("artifacts/07-testing.json").is_file());
-    assert!(run_dir.join("artifacts/08-eval-report.json").is_file());
+    assert!(run_dir.join(testing_path).is_file());
+    assert!(run_dir.join(report_path).is_file());
+    let testing: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join(testing_path)).expect("Testing evidence"))
+            .expect("canonical Testing JSON");
+    assert_eq!(testing["schema_version"], 2);
+    assert_eq!(testing["evaluation_attempt"], 1);
+    assert_eq!(testing["recovery"], serde_json::Value::Null);
+    assert_eq!(testing["execution_intent"]["path"], intent_path);
+    assert!(!run_dir
+        .join("artifacts/07-testing.execution-intent.json")
+        .exists());
     assert_ne!(read_tree_bytes(&run_dir), approved_bytes);
     assert_eq!(git_evidence(&repo), source_before);
 
@@ -1196,6 +1212,54 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
 }
 
 #[test]
+fn final_evaluation_rejects_mixed_fixed_and_indexed_attempt_one_inventory() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: mixed_inventory\n      command: printf verified\n",
+    )
+    .expect("eval config");
+    commit_all(&repo, "Configure mixed inventory evaluation");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "mixed-evaluation-attempt-one";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let fixed = run_dir.join("artifacts/07-testing.json");
+    let indexed = run_dir.join("artifacts/07-testing.attempt-001.json");
+    if fixed.exists() {
+        fs::copy(&fixed, &indexed).expect("inject indexed alias");
+    } else {
+        fs::copy(&indexed, &fixed).expect("inject fixed alias");
+    }
+    let before = read_tree_bytes(&run_dir);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject mixed attempt-one inventory");
+
+    assert!(!resume.status.success(), "{resume:?}");
+    assert!(
+        String::from_utf8_lossy(&resume.stderr).contains("mixed fixed and indexed"),
+        "{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
 fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_inert() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
@@ -1241,8 +1305,14 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
         status["candidate_diff_path"],
         evaluated["human_approval"]["candidate_diff"]["path"]
     );
-    assert_eq!(status["eval_report_path"], "artifacts/08-eval-report.json");
-    assert_eq!(status["testing_evidence_path"], "artifacts/07-testing.json");
+    assert_eq!(
+        status["eval_report_path"],
+        "artifacts/08-eval-report.attempt-001.json"
+    );
+    assert_eq!(
+        status["testing_evidence_path"],
+        "artifacts/07-testing.attempt-001.json"
+    );
     assert_eq!(
         status["policy_decision_digest"],
         evaluated["human_approval"]["policy_decision_digest"]
@@ -1500,7 +1570,7 @@ fn loop_promote_rejects_dirty_stale_wrong_repo_and_tampered_authority_without_so
             "eval-config" => fs::write(run_dir.join("inputs/eval-config.json"), b"{}\n").unwrap(),
             "command-log" => {
                 let testing: serde_json::Value = serde_json::from_slice(
-                    &fs::read(run_dir.join("artifacts/07-testing.json")).unwrap(),
+                    &fs::read(run_dir.join("artifacts/07-testing.attempt-001.json")).unwrap(),
                 )
                 .unwrap();
                 let path = testing["checks"][0]["stdout_path"].as_str().unwrap();
@@ -2398,7 +2468,7 @@ fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands(
         );
         match pre_mutation {
             "partial" => fs::write(
-                run_dir.join("artifacts/07-testing.execution-intent.json"),
+                run_dir.join("artifacts/07-testing.attempt-001.execution-intent.json"),
                 b"partial-attempt-bytes",
             )
             .expect("partial intent"),
@@ -2440,7 +2510,7 @@ fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands(
         if pre_mutation != "partial" {
             assert!(
                 !run_dir
-                    .join("artifacts/07-testing.execution-intent.json")
+                    .join("artifacts/07-testing.attempt-001.execution-intent.json")
                     .exists(),
                 "{case}: prevalidation must not claim an execution attempt"
             );
@@ -2490,7 +2560,7 @@ fn approved_eval_failed_command_publishes_rejecting_bound_terminal_report() {
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["provider_exchange_records"], provider_records);
     let report: serde_json::Value = serde_json::from_slice(
-        &fs::read(run_dir.join("artifacts/08-eval-report.json")).expect("EvalReport"),
+        &fs::read(run_dir.join("artifacts/08-eval-report.attempt-001.json")).expect("EvalReport"),
     )
     .expect("EvalReport JSON");
     assert_eq!(report["passed"], false);
@@ -2537,7 +2607,7 @@ fn approved_eval_timeout_is_rejecting_evidence_not_eval_success() {
     let run_dir = runs_root.join(run_id);
     assert_eq!(read_run_json(&run_dir)["status"], "failed");
     let report: serde_json::Value = serde_json::from_slice(
-        &fs::read(run_dir.join("artifacts/08-eval-report.json")).expect("EvalReport"),
+        &fs::read(run_dir.join("artifacts/08-eval-report.attempt-001.json")).expect("EvalReport"),
     )
     .expect("EvalReport JSON");
     assert_eq!(report["passed"], false);
@@ -2559,7 +2629,7 @@ fn approved_eval_physical_tamper_or_publication_collision_never_claims_terminal_
         ),
         (
             "intent-tamper",
-            "printf tampered > \"$1/artifacts/07-testing.execution-intent.json\"\n",
+            "printf tampered > \"$1/artifacts/07-testing.attempt-001.execution-intent.json\"\n",
             "execution-intent.json",
         ),
         (
@@ -2579,7 +2649,7 @@ fn approved_eval_physical_tamper_or_publication_collision_never_claims_terminal_
         ),
         (
             "publication-collision",
-            "printf collision > \"$1/artifacts/07-testing.json\"\n",
+            "printf collision > \"$1/artifacts/07-testing.attempt-001.json\"\n",
             "different bytes",
         ),
     ] {
@@ -2630,7 +2700,9 @@ fn approved_eval_physical_tamper_or_publication_collision_never_claims_terminal_
         assert!(stderr.contains(expected_error), "{case}: {stderr}");
         assert_eq!(read_run_json(&run_dir)["status"], "approved", "{case}");
         assert!(
-            !run_dir.join("artifacts/08-eval-report.json").exists(),
+            !run_dir
+                .join("artifacts/08-eval-report.attempt-001.json")
+                .exists(),
             "{case}: no terminal report may be claimed"
         );
         assert_eq!(git_evidence(&repo), source_before, "{case}");
@@ -2666,7 +2738,7 @@ fn approved_eval_rechecks_each_persisted_log_before_terminal_publication() {
     let script = repo.join("log-tamper.sh");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf substituted > \"$1/artifacts/07-testing.check-001.stdout.log\"\n",
+        "#!/bin/sh\nprintf substituted > \"$1/artifacts/07-testing.attempt-001.check-001.stdout.log\"\n",
     )
     .expect("log tamper script");
     let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -2708,7 +2780,9 @@ fn approved_eval_rechecks_each_persisted_log_before_terminal_publication() {
         String::from_utf8_lossy(&resume.stderr)
     );
     assert_eq!(read_run_json(&run_dir)["status"], "approved");
-    assert!(!run_dir.join("artifacts/08-eval-report.json").exists());
+    assert!(!run_dir
+        .join("artifacts/08-eval-report.attempt-001.json")
+        .exists());
 }
 
 #[test]
@@ -2870,7 +2944,9 @@ fn approved_eval_detects_lasting_source_worktree_drift_with_preexisting_dirty_st
         fs::read(repo.join("pre-existing-untracked.txt")).unwrap(),
         original_untracked
     );
-    assert!(!run_dir.join("artifacts/08-eval-report.json").exists());
+    assert!(!run_dir
+        .join("artifacts/08-eval-report.attempt-001.json")
+        .exists());
     let interrupted = read_tree_bytes(&run_dir);
     let retry = seaf_in(&repo)
         .args([

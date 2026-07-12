@@ -1386,7 +1386,9 @@ Commit boundary: provider revise/rerun only. No eval or promotion recovery.
 
 ### M1-09c - Approved-Evaluation Recovery
 
-Status: active. Dependencies: M1-09b (complete).
+Status: active. Split into M1-09c1 versioned evaluation authority, M1-09c2
+zero-command adoption, and M1-09c3 invalidation/rerun. Dependencies: M1-09b
+(complete).
 
 Objective: adopt complete verified interrupted evaluation evidence with zero
 commands, or explicitly invalidate it before one fresh attempt.
@@ -1420,6 +1422,71 @@ Verification: recovery/eval/promotion/provider/CLI suites, full workspace tests,
 format, Clippy, and diff check.
 
 Commit boundary: Approved-evaluation adoption/invalidation/rerun only.
+
+### M1-09c1 - Versioned Evaluation Attempt Authority
+
+Status: complete. Dependencies: M1-09b (complete).
+
+Objective: make every new evaluation artifact attempt-indexed and make final
+validation/promotion select the exact bound attempt before recovery can adopt or
+invalidate it.
+
+Acceptance criteria:
+
+- New evaluations publish `ApprovedEvaluationIntent` v2, indexed logs,
+  `TestingEvidence` v2, and indexed EvalReport at canonical attempt-001 paths.
+  The intent binds evaluation attempt, exact Approved/input/candidate/source
+  authority, optional recovery (`null` for a fresh attempt), and complete plan.
+  Testing binds that exact intent, attempt, optional recovery, and every log.
+- Strict inventory rejects mixed fixed/indexed attempt 1, gaps, malformed names,
+  unsafe file types, duplicate logs, orphan future attempts, or cross-attempt
+  references. Exact retry is create-only and collision-safe.
+- Historical fixed-path v1 intent/log/Testing/EvalReport remains readable.
+  Final authority and promotion use one typed v1/v2 loader and select only the
+  intent bound by Testing; no hardcoded v1 promotion path remains.
+- No adopt, invalidate, rerun, final-state relaxation, or provider behavior is
+  added in this checkpoint. Existing incomplete-prefix refusal remains.
+
+RED: fresh attempt-001 v2 path/bindings, v1 final compatibility, mixed/gapped/
+tampered inventory, v2 final pass/fail, exact retry/collision, promotion selects
+the Testing-bound intent and rejects attempt substitution.
+
+Verification: approved-eval/Testing/final/promotion/CLI suites, full workspace,
+format, Clippy, and diff check.
+
+Commit boundary: evaluation artifact/version readers only.
+
+Compatibility note: this pre-preview 0.1.0 checkpoint adds public v2 fields to
+`TestingEvidence`, so downstream Rust struct literals must add those fields.
+Persisted fixed-path v1 JSON remains readable. M1-12 must carry this source API
+change into the preview release notes.
+
+### M1-09c2 - Zero-Command Evaluation Adoption
+
+Status: active. Dependencies: M1-09c1 (complete).
+
+Objective: publish audited recovery and finalize one complete interrupted v1 or
+v2 evaluation prefix without executing commands.
+
+Acceptance criteria: M1-09c adoption criteria above, plus schema-v2 evaluation
+recovery in the existing sequential recovery chain, exact source-snapshot
+Approved reconstruction, deterministic missing EvalReport creation, and
+Approved-to-final recovery CAS without weakening ordinary final relations.
+
+Commit boundary: adoption only; no invalidation or command execution.
+
+### M1-09c3 - Evaluation Invalidation And Rerun
+
+Status: pending. Dependencies: M1-09c2.
+
+Objective: preserve and invalidate one incomplete or failed evaluation attempt,
+then authorize exactly one fresh indexed attempt.
+
+Acceptance criteria: M1-09c invalidation/rerun criteria above, including exact
+prefix binding, final-Failed reset, rerun-only consumption, no within-attempt
+replay, and every interruption/race/frozen-final regression.
+
+Commit boundary: evaluation invalidation and fresh rerun only.
 
 ### M1-10 - Atomic State And Run Locking
 
@@ -1487,6 +1554,9 @@ Acceptance criteria:
   boundaries and resume without duplication or source mutation.
 - The focused Milestone 1 acceptance suite proves authoritative inputs, role
   dataflow, candidate isolation, approval, eval, promotion, and recovery.
+- The preview handoff records that M1-09c1 added public v2 `TestingEvidence`
+  fields: downstream Rust struct literals require an update, while persisted v1
+  JSON remains readable. This note is carried into preview release notes.
 - Roadmap/docs claim only the verified source-workspace path.
 
 Likely seams: integration test harness, CLI tests, docs, and CI focused step.

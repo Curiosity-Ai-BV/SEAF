@@ -33,7 +33,9 @@
 - [x] M1-08: Promotion integrity.
 - [x] M1-09a: Attempt-safe role artifacts and factual inspect.
 - [x] M1-09b: Audited provider revise and rerun.
-- [ ] M1-09c: Approved-evaluation adoption and invalidation (active).
+- [x] M1-09c1: Versioned evaluation attempt authority.
+- [ ] M1-09c2: Zero-command evaluation adoption (active).
+- [ ] M1-09c3: Evaluation invalidation and rerun.
 - [ ] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
 - [ ] M1-12: Interruption recovery acceptance.
@@ -105,5 +107,13 @@ candidate/input/provider/recovery bindings, and one candidate-to-provider CAS.
 `revise` is provider-free; exact `rerun --recovery` owns the first request, then
 ordinary resume may continue it. Every prior role, policy, and provider artifact
 remains byte-identical, downstream current pointers are reset, and the old
-public/CLI rerun writer is retired while its historical reader remains. M1-09c
-is active for incomplete-evaluation recovery.
+public/CLI rerun writer is retired while its historical reader remains. M1-09c1
+now publishes strict attempt-001 v2 evaluation authority, keeps fixed v1 final
+evidence readable, and makes final validation and promotion consume the exact
+Testing-bound intent and logs. Future or mixed attempts, malformed names,
+unsafe file types, gaps, surplus logs, and cross-attempt references fail closed
+before execution or mutation. The pre-preview 0.1.0 public `TestingEvidence`
+shape gained additive v2 fields; downstream Rust struct literals must be
+updated, while persisted v1 JSON remains readable. Carry this
+source-compatibility note into M1-12 and preview release notes. M1-09c2 is active
+for zero-command adoption of a complete interrupted evaluation prefix.

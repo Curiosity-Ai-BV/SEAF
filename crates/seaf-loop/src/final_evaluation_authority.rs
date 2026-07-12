@@ -2,18 +2,26 @@ use std::{error::Error, fmt};
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, is_portable_artifact_path, validate_eval_report,
-    validate_loop_run, ArtifactReference, EvalDecision, EvalReport, LoopRun, LoopStatus,
-    LoopStepName, LoopStepStatus,
+    validate_loop_run, ArtifactReference, EvalConfig, EvalDecision, EvalReport, LoopRun,
+    LoopStatus, LoopStepName, LoopStepStatus,
 };
 use serde_json::Value;
 
-use crate::{LoopWorkspace, TestingEvidence};
+use crate::{
+    evaluation_attempt::{
+        fixed_spelling, load_intent, reference_for_path, selected_attempt,
+        ApprovedEvaluationIntent, EvaluationAttemptInventory,
+    },
+    LoopWorkspace, TestingEvidence,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedFinalEvaluationAuthority {
     approved_run: LoopRun,
     testing_evidence: TestingEvidence,
     eval_report: EvalReport,
+    execution_intent: ApprovedEvaluationIntent,
+    execution_intent_reference: ArtifactReference,
 }
 
 impl VerifiedFinalEvaluationAuthority {
@@ -27,6 +35,14 @@ impl VerifiedFinalEvaluationAuthority {
 
     pub fn eval_report(&self) -> &EvalReport {
         &self.eval_report
+    }
+
+    pub(crate) fn execution_intent(&self) -> &ApprovedEvaluationIntent {
+        &self.execution_intent
+    }
+
+    pub(crate) fn execution_intent_reference(&self) -> &ArtifactReference {
+        &self.execution_intent_reference
     }
 }
 
@@ -77,8 +93,20 @@ pub fn load_verified_final_evaluation_authority(
         run
     };
 
+    let inventory = EvaluationAttemptInventory::load(workspace)
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
     let testing_reference = step_artifact_reference(run, LoopStepName::Testing)?;
     let report_reference = step_artifact_reference(run, LoopStepName::EvalReport)?;
+    let (evaluation_attempt, spelling) =
+        selected_attempt(&testing_reference.path, &report_reference.path)
+            .map_err(FinalEvaluationAuthorityError::invalid)?;
+    inventory
+        .require_selected(
+            evaluation_attempt,
+            &testing_reference.path,
+            &report_reference.path,
+        )
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
     if run.eval_report_path.as_deref() != Some(report_reference.path.as_str()) {
         return Err(FinalEvaluationAuthorityError::invalid(
             "LoopRun eval_report_path does not select the EvalReport artifact",
@@ -93,6 +121,54 @@ pub fn load_verified_final_evaluation_authority(
                     "invalid Testing evidence authority: {error}"
                 ))
             })?;
+    match (
+        testing_evidence.schema_version,
+        testing_evidence.evaluation_attempt,
+        fixed_spelling(spelling),
+    ) {
+        (1, None, true) => {}
+        (2, Some(attempt), false) if attempt == evaluation_attempt => {}
+        _ => {
+            return Err(FinalEvaluationAuthorityError::invalid(
+                "Testing evidence schema does not match selected evaluation attempt path",
+            ))
+        }
+    }
+    inventory
+        .validate_selected_logs(evaluation_attempt, &testing_evidence.checks)
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
+    let execution_intent_reference = match testing_evidence.execution_intent.clone() {
+        Some(reference) => reference,
+        None => reference_for_path(
+            workspace,
+            inventory.intent_path(evaluation_attempt).ok_or_else(|| {
+                FinalEvaluationAuthorityError::invalid("evaluation attempt lost execution intent")
+            })?,
+        )
+        .map_err(FinalEvaluationAuthorityError::invalid)?,
+    };
+    let execution_intent = load_intent(workspace, &execution_intent_reference)
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
+    if execution_intent.attempt() != evaluation_attempt {
+        return Err(FinalEvaluationAuthorityError::invalid(
+            "Testing evidence selects a cross-attempt execution intent",
+        ));
+    }
+    if testing_evidence.schema_version == 2
+        && testing_evidence
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.as_ref())
+            != execution_intent.recovery()
+    {
+        return Err(FinalEvaluationAuthorityError::invalid(
+            "Testing evidence recovery does not match its execution intent",
+        ));
+    }
+    let eval_config = load_eval_config(workspace, run)?;
+    execution_intent
+        .validate_against(&approved_run, &eval_config.evals.required)
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
     let eval_report = load_verified_eval_report(workspace, &report_reference)?;
     let loop_evidence = eval_report.loop_evidence.as_ref().ok_or_else(|| {
         FinalEvaluationAuthorityError::invalid("final EvalReport requires integrated loop evidence")
@@ -153,7 +229,39 @@ pub fn load_verified_final_evaluation_authority(
         approved_run,
         testing_evidence,
         eval_report,
+        execution_intent,
+        execution_intent_reference,
     })
+}
+
+fn load_eval_config(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<EvalConfig, FinalEvaluationAuthorityError> {
+    let digest = run.input_digests.eval_config.as_ref().ok_or_else(|| {
+        FinalEvaluationAuthorityError::invalid("final authority lost eval config digest")
+    })?;
+    let bytes = crate::immutable_artifact::read_verified_regular_file(
+        workspace.run_directory(),
+        "inputs/eval-config.json",
+        "final evaluation config",
+    )
+    .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    if canonical_json_bytes(&value)
+        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?
+        != bytes
+        || canonical_sha256_digest(&value)
+            .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?
+            != *digest
+    {
+        return Err(FinalEvaluationAuthorityError::invalid(
+            "final evaluation config bytes or digest mismatch",
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))
 }
 
 fn reconstruct_approved_authority(

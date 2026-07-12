@@ -2290,6 +2290,20 @@ mod tests {
         publish_test_final_artifacts_variant(workspace, approved, final_run, passed, "", "test");
     }
 
+    fn publish_test_eval_config(workspace: &LoopWorkspace) -> seaf_core::EvalConfig {
+        let eval_config = seaf_core::parse_eval_config(
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: unit\n      command: true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.run_directory().join("inputs")).unwrap();
+        fs::write(
+            workspace.run_directory().join("inputs/eval-config.json"),
+            canonical_json_bytes(&eval_config).unwrap(),
+        )
+        .unwrap();
+        eval_config
+    }
+
     fn publish_test_final_artifacts_variant(
         workspace: &LoopWorkspace,
         approved: &LoopRun,
@@ -2303,6 +2317,12 @@ mod tests {
         } else {
             format!("-{label}")
         };
+        let stdout = b"unit stdout\n";
+        let stderr = b"unit stderr\n";
+        let stdout_path = "artifacts/07-testing.check-001.stdout.log";
+        let stderr_path = "artifacts/07-testing.check-001.stderr.log";
+        fs::write(workspace.run_directory().join(stdout_path), stdout).unwrap();
+        fs::write(workspace.run_directory().join(stderr_path), stderr).unwrap();
         let check = EvalCheck {
             name: "unit".to_string(),
             status: if passed {
@@ -2311,10 +2331,10 @@ mod tests {
                 CheckStatus::Failed
             },
             duration_ms: Some(1),
-            stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
-            stdout_digest: Some("a".repeat(64)),
-            stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
-            stderr_digest: Some("b".repeat(64)),
+            stdout_path: Some(stdout_path.to_string()),
+            stdout_digest: Some(digest_bytes(stdout)),
+            stderr_path: Some(stderr_path.to_string()),
+            stderr_digest: Some(digest_bytes(stderr)),
             summary: Some(summary.to_string()),
         };
         let approved_at = approved
@@ -2328,6 +2348,33 @@ mod tests {
             approved_at.clone(),
             approved_at,
             vec![check.clone()],
+        )
+        .unwrap();
+        let eval_config_bytes =
+            fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap();
+        let eval_config: seaf_core::EvalConfig =
+            serde_json::from_slice(&eval_config_bytes).unwrap();
+        let approval = approved.human_approval.as_ref().unwrap();
+        let intent = crate::evaluation_attempt::ApprovedEvaluationIntentV1 {
+            schema_version: 1,
+            run_id: approved.run_id.clone(),
+            approved_run_digest: canonical_sha256_digest(approved).unwrap(),
+            ticket: ArtifactReference {
+                path: "inputs/ticket.json".to_string(),
+                digest: approved.input_digests.ticket.clone(),
+            },
+            eval_config: ArtifactReference {
+                path: "inputs/eval-config.json".to_string(),
+                digest: approved.input_digests.eval_config.clone().unwrap(),
+            },
+            candidate_diff: approval.candidate_diff.clone(),
+            planned_checks: eval_config.evals.required,
+        };
+        fs::write(
+            workspace
+                .run_directory()
+                .join("artifacts/07-testing.execution-intent.json"),
+            canonical_json_bytes(&intent).unwrap(),
         )
         .unwrap();
         let testing_reference = ArtifactReference {
@@ -2405,7 +2452,8 @@ mod tests {
 
     fn persist_test_approved_authority(workspace: &LoopWorkspace) -> LoopRun {
         let mut awaiting = awaiting_human_review_run(workspace);
-        awaiting.input_digests.eval_config = Some("0".repeat(64));
+        let eval_config = publish_test_eval_config(workspace);
+        awaiting.input_digests.eval_config = Some(canonical_sha256_digest(&eval_config).unwrap());
         let mut pre_review = awaiting.clone();
         pre_review.status = LoopStatus::Running;
         pre_review.current_step = LoopStepName::OutputReview;
@@ -2500,13 +2548,14 @@ mod tests {
             "passing-rewrite",
             "passing rewrite",
         );
-        crate::load_verified_final_evaluation_authority(&workspace, &passing)
-            .expect("replacement is independently valid final authority");
-
         let error = persist_run_with_full_compare(&workspace, &failed, &passing)
             .expect_err("reported failure cannot become EvalPassed");
 
-        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert!(
+            error.to_string().contains("cleanup")
+                || error.to_string().contains("evaluation artifact"),
+            "{error}"
+        );
         assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
 
         let mut non_final = failed.clone();
@@ -2534,13 +2583,14 @@ mod tests {
             "failing-rewrite",
             "different failing result",
         );
-        crate::load_verified_final_evaluation_authority(&workspace, &replacement)
-            .expect("replacement is independently valid failing authority");
-
         let error = persist_run_with_full_compare(&workspace, &failed, &replacement)
             .expect_err("reported failure cannot replace its evidence bundle");
 
-        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert!(
+            error.to_string().contains("cleanup")
+                || error.to_string().contains("evaluation artifact"),
+            "{error}"
+        );
         assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
     }
 
@@ -2634,7 +2684,8 @@ mod tests {
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), "awaiting-provider-freeze").unwrap();
         let mut run = awaiting_human_review_run(&workspace);
-        run.input_digests.eval_config = Some("0".repeat(64));
+        let eval_config = publish_test_eval_config(&workspace);
+        run.input_digests.eval_config = Some(canonical_sha256_digest(&eval_config).unwrap());
         let mut pre_review = run.clone();
         pre_review.status = LoopStatus::Running;
         pre_review.current_step = LoopStepName::OutputReview;

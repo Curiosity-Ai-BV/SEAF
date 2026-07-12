@@ -404,29 +404,15 @@ fn verify_final_supporting_artifacts(
             }
         }
     }
+    let intent_reference = authority.execution_intent_reference();
     let intent_bytes = read_verified_regular_file(
         workspace.run_directory(),
-        "artifacts/07-testing.execution-intent.json",
+        &intent_reference.path,
         "Testing execution intent",
     )
     .map_err(PromotionError::wrapped)?;
-    let intent: serde_json::Value =
-        serde_json::from_slice(&intent_bytes).map_err(PromotionError::wrapped)?;
-    if canonical_json_bytes(&intent).map_err(PromotionError::wrapped)? != intent_bytes
-        || intent
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(1)
-        || intent.get("run_id").and_then(serde_json::Value::as_str) != Some(run.run_id.as_str())
-        || intent
-            .get("approved_run_digest")
-            .and_then(serde_json::Value::as_str)
-            != Some(authority.testing_evidence().approved_run_digest.as_str())
-        || intent.get("candidate_diff")
-            != Some(
-                &serde_json::to_value(&authority.testing_evidence().candidate_diff)
-                    .map_err(PromotionError::wrapped)?,
-            )
+    if digest_bytes(&intent_bytes) != intent_reference.digest
+        || authority.execution_intent().planned_checks().is_empty()
     {
         return Err(PromotionError::invalid(
             "Testing execution intent does not match final evaluation authority",

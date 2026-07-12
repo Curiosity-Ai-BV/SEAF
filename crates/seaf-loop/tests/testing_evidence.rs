@@ -4,6 +4,9 @@ use seaf_loop::{LoopWorkspace, TestingEvidence};
 fn evidence() -> TestingEvidence {
     TestingEvidence {
         schema_version: 1,
+        evaluation_attempt: None,
+        recovery: None,
+        execution_intent: None,
         run_id: "run-1".to_string(),
         ticket_id: "ticket-1".to_string(),
         goal_id: "goal-1".to_string(),

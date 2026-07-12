@@ -30,10 +30,12 @@ cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-ben
 `loop run` stops at `awaiting_human_review`; it does not execute the candidate.
 Copy the exact digest and target HEAD from `loop status` into `loop approve`.
 The Approved `loop resume` uses only the persisted ticket/eval snapshots and
-makes no model call. It writes a create-only execution intent, indexed redacted
-check logs, `artifacts/07-testing.json`, and
-`artifacts/08-eval-report.json`, then records `eval_passed` or an approval-bound
-reported failure. If an attempt is interrupted after intent, resume refuses to
+makes no model call. It writes
+`artifacts/07-testing.attempt-001.execution-intent.json`, indexed redacted check
+logs, `artifacts/07-testing.attempt-001.json`, and
+`artifacts/08-eval-report.attempt-001.json`, then records `eval_passed` or an
+approval-bound reported failure. Historical fixed-path v1 evaluation evidence
+remains readable. If an attempt is interrupted after intent, resume refuses to
 replay it until audited recovery lands in M1-09.
 
 Review all generated evidence under `.seaf/loops/runs/local-loop-demo/`. If the

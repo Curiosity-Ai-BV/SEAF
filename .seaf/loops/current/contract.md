@@ -44,20 +44,19 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09c - Approved-evaluation recovery. Add attempt-indexed create-only
-evaluation intent, log, Testing, and EvalReport paths. ApprovedEvaluationIntent
-v2 must bind its evaluation attempt and recovery reference; TestingEvidence v2
-must bind the exact intent and invalidation authority. Historical v1 fixed paths
-remain readable and final validation selects only the bound attempt.
+M1-09c2 - Zero-command evaluation adoption. Add a schema-v2 evaluation recovery
+variant to the existing sequential recovery chain without changing provider
+RecoveryAttemptV1. `loop revise --from-step testing --eval-recovery adopt` must
+accept only one exact complete v1 or v2 intent/check-log/Testing prefix for the
+active Approved authority. EvalReport may be absent. Gaps, substitutions,
+partial Testing, mixed attempts, physical drift, final Failed, EvalPassed,
+Promoted, or an active recovery fail closed.
 
-`seaf loop revise --from-step testing --eval-recovery adopt|invalidate` must
-publish audited authority under the candidate-to-provider recovery CAS.
-Adoption accepts only a complete verified intent/check/log/Testing prefix,
-executes zero commands, and may deterministically create only a missing
-EvalReport. Invalidation preserves every byte and exact candidate, approval,
-policy, input, and provider authority; clears only current Testing/EvalReport
-and final-eval references; and gates one fresh attempt behind `loop rerun
---recovery N`. Active Approved incomplete prefixes and active approval-bound
-final Failed are eligible. EvalPassed, Promoted, historical missing-eval
-authority, partial adoptable evidence, gaps, substitution, or physical drift
-fail closed. Do not weaken M1-08 promotion-intent or final-state relations.
+Adoption publishes a create-only source-run snapshot and recovery artifact,
+executes zero commands and makes zero provider calls, reconstructs the exact
+execution-time Approved predecessor, and deterministically creates only a
+missing EvalReport before one candidate-to-provider final CAS advances recovery
+authority. Existing complete report bytes must verify exactly. Preserve every
+prior byte and the M1-08 promotion/final-state relations. Do not add evaluation
+invalidation, command rerun, attempt 2 execution, general M1-10 locking, or
+artifact protection in this checkpoint.

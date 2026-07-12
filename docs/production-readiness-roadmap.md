@@ -214,9 +214,13 @@ under candidate-to-provider full CAS without a provider call; only exact `loop
 rerun --recovery <id>` may consume its first request. Attempts, provider ledger,
 role artifacts, and policy artifacts remain immutable, while selected and
 downstream current pointers are reset. The legacy rerun writer is retired.
-M1-09c is active for Approved-evaluation adoption/invalidation. Authoritative input
-changes still require a new run; EvalPassed/Promoted and M1-08 promotion intent
-remain frozen.
+M1-09c1 versioned evaluation authority is complete. New evaluations publish
+strict attempt-001 v2 intent, logs, Testing, and EvalReport; fixed v1 final
+evidence stays readable, while mixed, malformed, future, gapped, surplus, or
+cross-attempt authority fails closed. Final validation and promotion select the
+exact Testing-bound intent. M1-09c2 zero-command adoption is active before
+evaluation invalidation/rerun. Authoritative input changes still require a new
+run; EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

@@ -854,6 +854,13 @@ fn final_authority_loader_rejects_standalone_substituted_and_noncanonical_artifa
         let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
             .expect_err("substituted final report must fail");
         assert!(!error.to_string().is_empty(), "{label}");
+        fs::remove_file(
+            fixture
+                .workspace
+                .run_directory()
+                .join(run.steps[7].artifact_path.as_ref().unwrap()),
+        )
+        .unwrap();
     }
 
     let noncanonical = publish_report_variant(
@@ -866,6 +873,13 @@ fn final_authority_loader_rejects_standalone_substituted_and_noncanonical_artifa
     let error = load_verified_final_evaluation_authority(&fixture.workspace, &noncanonical)
         .expect_err("noncanonical report must fail");
     assert!(error.to_string().contains("canonical"), "{error}");
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(noncanonical.steps[7].artifact_path.as_ref().unwrap()),
+    )
+    .unwrap();
 
     let mut mismatched_digest = final_run.clone();
     mismatched_digest.steps[7].artifact_digest = Some("0".repeat(64));
@@ -878,10 +892,7 @@ fn final_authority_loader_rejects_standalone_substituted_and_noncanonical_artifa
     missing.eval_report_path = missing.steps[7].artifact_path.clone();
     let error = load_verified_final_evaluation_authority(&fixture.workspace, &missing)
         .expect_err("missing report must fail");
-    assert!(
-        error.to_string().contains("could not be inspected"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("canonical"), "{error}");
     fixture.cleanup();
 }
 
@@ -897,7 +908,7 @@ fn final_authority_loader_rejects_log_incomplete_testing_evidence() {
         .unwrap()
         .remove("stdout_digest");
     let testing_reference = ArtifactReference {
-        path: "artifacts/07-testing-incomplete.json".to_string(),
+        path: "artifacts/07-testing.json".to_string(),
         digest: canonical_sha256_digest(&testing).unwrap(),
     };
     fs::write(
@@ -913,13 +924,15 @@ fn final_authority_loader_rejects_log_incomplete_testing_evidence() {
     let mut run = final_run;
     run.steps[6].artifact_path = Some(testing_reference.path);
     run.steps[6].artifact_digest = Some(testing_reference.digest);
-    run = publish_report_variant(
-        &fixture.workspace,
-        &run,
-        &report,
-        "testing-incomplete",
-        true,
-    );
+    let report_path = "artifacts/08-eval-report.json";
+    fs::write(
+        fixture.workspace.run_directory().join(report_path),
+        canonical_json_bytes(&report).unwrap(),
+    )
+    .unwrap();
+    run.steps[7].artifact_path = Some(report_path.to_string());
+    run.steps[7].artifact_digest = Some(canonical_sha256_digest(&report).unwrap());
+    run.eval_report_path = Some(report_path.to_string());
 
     let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
         .expect_err("log-incomplete Testing evidence must fail");
@@ -1798,6 +1811,12 @@ fn publish_final_eval_artifacts(
     approved: &seaf_core::LoopRun,
     passed: bool,
 ) -> seaf_core::LoopRun {
+    let stdout = b"fixture stdout\n";
+    let stderr = b"fixture stderr\n";
+    let stdout_path = "artifacts/07-testing.check-001.stdout.log";
+    let stderr_path = "artifacts/07-testing.check-001.stderr.log";
+    fs::write(workspace.run_directory().join(stdout_path), stdout).unwrap();
+    fs::write(workspace.run_directory().join(stderr_path), stderr).unwrap();
     let check = EvalCheck {
         name: "unit".to_string(),
         status: if passed {
@@ -1806,10 +1825,10 @@ fn publish_final_eval_artifacts(
             CheckStatus::Failed
         },
         duration_ms: Some(1),
-        stdout_path: Some("artifacts/eval/unit.stdout.log".to_string()),
-        stdout_digest: Some("a".repeat(64)),
-        stderr_path: Some("artifacts/eval/unit.stderr.log".to_string()),
-        stderr_digest: Some("b".repeat(64)),
+        stdout_path: Some(stdout_path.to_string()),
+        stdout_digest: Some(hex::encode(Sha256::digest(stdout))),
+        stderr_path: Some(stderr_path.to_string()),
+        stderr_digest: Some(hex::encode(Sha256::digest(stderr))),
         summary: Some(if passed { "passed" } else { "failed" }.to_string()),
     };
     let approved_at = approved
@@ -1823,6 +1842,32 @@ fn publish_final_eval_artifacts(
         approved_at.clone(),
         approved_at,
         vec![check.clone()],
+    )
+    .unwrap();
+    let eval_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap(),
+    )
+    .unwrap();
+    let intent = serde_json::json!({
+        "schema_version": 1,
+        "run_id": approved.run_id,
+        "approved_run_digest": canonical_sha256_digest(approved).unwrap(),
+        "ticket": {
+            "path": "inputs/ticket.json",
+            "digest": approved.input_digests.ticket,
+        },
+        "eval_config": {
+            "path": "inputs/eval-config.json",
+            "digest": approved.input_digests.eval_config,
+        },
+        "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
+        "planned_checks": eval_config["evals"]["required"],
+    });
+    fs::write(
+        workspace
+            .run_directory()
+            .join("artifacts/07-testing.execution-intent.json"),
+        canonical_json_bytes(&intent).unwrap(),
     )
     .unwrap();
     let testing_reference = ArtifactReference {

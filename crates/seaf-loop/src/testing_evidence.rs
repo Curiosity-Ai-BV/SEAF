@@ -2,9 +2,9 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, is_portable_artifact_path, ArtifactReference,
-    CheckStatus, EvalCheck, LoopRun, LoopStatus,
+    CheckStatus, EvalCheck, LoopRun, LoopStatus, RecoveryReference,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::workspace::LoopWorkspace;
@@ -15,6 +15,16 @@ pub const TESTING_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct TestingEvidence {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_attempt: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub recovery: Option<Option<RecoveryReference>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_intent: Option<ArtifactReference>,
     pub run_id: String,
     pub ticket_id: String,
     pub goal_id: String,
@@ -29,6 +39,14 @@ pub struct TestingEvidence {
     pub completed_at: String,
     pub checks: Vec<EvalCheck>,
     pub passed: bool,
+}
+
+fn deserialize_present_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl TestingEvidence {
@@ -56,6 +74,9 @@ impl TestingEvidence {
                 })?;
         let evidence = Self {
             schema_version: TESTING_EVIDENCE_SCHEMA_VERSION,
+            evaluation_attempt: None,
+            recovery: None,
+            execution_intent: None,
             run_id: approved_run.run_id.clone(),
             ticket_id: approved_run.ticket_id.clone(),
             goal_id: approved_run.goal_id.clone(),
@@ -78,6 +99,24 @@ impl TestingEvidence {
                 .all(|check| check.status == CheckStatus::Passed),
             checks,
         };
+        evidence.validate_against_approved_run(approved_run)?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn create_v2(
+        approved_run: &LoopRun,
+        evaluation_attempt: u32,
+        recovery: Option<RecoveryReference>,
+        execution_intent: ArtifactReference,
+        started_at: impl Into<String>,
+        completed_at: impl Into<String>,
+        checks: Vec<EvalCheck>,
+    ) -> Result<Self, TestingEvidenceError> {
+        let mut evidence = Self::create(approved_run, started_at, completed_at, checks)?;
+        evidence.schema_version = 2;
+        evidence.evaluation_attempt = Some(evaluation_attempt);
+        evidence.recovery = Some(recovery);
+        evidence.execution_intent = Some(execution_intent);
         evidence.validate_against_approved_run(approved_run)?;
         Ok(evidence)
     }
@@ -143,8 +182,46 @@ impl TestingEvidence {
 
     pub fn validate(&self) -> Result<(), TestingEvidenceError> {
         let mut errors = Vec::new();
-        if self.schema_version != TESTING_EVIDENCE_SCHEMA_VERSION {
-            errors.push("schema_version must be 1".to_string());
+        if !matches!(self.schema_version, TESTING_EVIDENCE_SCHEMA_VERSION | 2) {
+            errors.push("schema_version must be 1 or 2".to_string());
+        }
+        match self.schema_version {
+            1 if self.evaluation_attempt.is_some()
+                || self.recovery.is_some()
+                || self.execution_intent.is_some() =>
+            {
+                errors.push("Testing v1 cannot contain v2 attempt authority".to_string());
+            }
+            2 => {
+                if self.evaluation_attempt.is_none_or(|attempt| attempt == 0)
+                    || self.recovery.is_none()
+                    || self.execution_intent.is_none()
+                {
+                    errors.push(
+                        "Testing v2 requires attempt, recovery, and execution intent authority"
+                            .to_string(),
+                    );
+                }
+                if self
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.is_some())
+                {
+                    errors.push("evaluation recovery is not supported before M1-09c3".to_string());
+                }
+                if let (Some(attempt), Some(intent)) =
+                    (self.evaluation_attempt, self.execution_intent.as_ref())
+                {
+                    validate_reference(&mut errors, "execution_intent", intent);
+                    let expected =
+                        format!("artifacts/07-testing.attempt-{attempt:03}.execution-intent.json");
+                    if intent.path != expected {
+                        errors
+                            .push("Testing v2 intent path does not match its attempt".to_string());
+                    }
+                }
+            }
+            _ => {}
         }
         for (field, value) in [
             ("run_id", self.run_id.as_str()),

@@ -1761,3 +1761,46 @@ suite. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
 package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass through
 pinned pnpm 11.7.0. M1-09b is accepted and M1-09c Approved-evaluation recovery
 is active.
+
+## 2026-07-12 implementation | M1-09c1 versioned evaluation attempt authority
+
+Every new Approved evaluation now publishes create-only indexed attempt-001
+authority: `ApprovedEvaluationIntent` v2, paired redacted check logs,
+`TestingEvidence` v2, and the bound EvalReport. The intent binds the exact
+Approved predecessor, full immutable input digests, candidate state/diff,
+captured source-worktree state, complete ordered plan, evaluation attempt, and
+an explicitly present null recovery. Testing binds that exact intent, attempt,
+recovery value, and every ordered log. Source and candidate authority are
+rechecked before every command spawn and final publication.
+
+A shared strict inventory and typed v1/v2 loader now owns evaluation artifact
+selection. It rejects malformed or non-UTF names, unsafe file types, mixed
+fixed/indexed attempt 1, future attempts including a contiguous forged attempt
+2, missing intent, gapped or unpaired logs, surplus logs, and cross-attempt
+references before mutation. Historical fixed-path v1 final authority remains
+readable. Final evaluation selects the exact Testing-bound intent/log set, and
+promotion consumes the already verified typed intent instead of a hardcoded v1
+path. Incomplete prefixes still refuse replay; adoption, invalidation, rerun,
+provider recovery, and final-state CAS behavior are unchanged.
+
+Review found and closed three authority issues: paired-log inventory initially
+accepted surplus/gapped shapes; contiguous attempt 2 was not rejected as a
+future unauthorized attempt; and omitted v2 intent recovery aliased explicit
+null during deserialization. A proposed promotion-time source recapture was
+removed because execution already binds and rechecks the source witness, while
+recapture crossed the promotion boundary, rejected legitimate states, and
+could execute repository filters. Independent final review approves the
+corrected slice with no remaining actionable findings.
+
+The pre-preview 0.1.0 public `TestingEvidence` struct gained additive v2 fields.
+Downstream Rust struct literals must add them, while persisted fixed-path v1 JSON
+remains readable. This accepted source-compatibility change is carried into
+M1-12 and preview release notes.
+
+Controller verification passes the full workspace: CLI 134, core 51, loop unit
+133, candidate 39, context expansion 22, policy 13, provider-candidate 22,
+provider-exchange 22, state 32, and every remaining Rust integration and doc-test
+suite. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
+package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass through
+pinned pnpm 11.7.0. M1-09c1 is accepted and M1-09c2 zero-command evaluation
+adoption is active.
