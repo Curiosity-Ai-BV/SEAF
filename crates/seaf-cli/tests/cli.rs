@@ -817,6 +817,247 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
 }
 
 #[test]
+fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-exact-approval";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let run = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .output()
+        .expect("run loop");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run_dir = runs_root.join(run_id);
+    let public_run: serde_json::Value =
+        serde_json::from_slice(&run.stdout).expect("public run report JSON");
+    let diff = public_run["candidate_diff_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let head = public_run["target_head"].as_str().unwrap().to_string();
+    let public_status = seaf_in(&repo)
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("public approval confirmation status");
+    assert!(public_status.status.success());
+    let public_status: serde_json::Value =
+        serde_json::from_slice(&public_status.stdout).expect("public status JSON");
+    assert_eq!(public_status["candidate_diff_digest"], diff);
+    assert_eq!(public_status["target_head"], head);
+    let human_status = seaf_in(&repo)
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("human approval confirmation status");
+    let human_status = String::from_utf8(human_status.stdout).unwrap();
+    assert!(human_status.contains(&format!("--confirm-candidate-diff: {diff}")));
+    assert!(human_status.contains(&format!("--confirm-target-head: {head}")));
+
+    let before_rejected = read_tree_bytes(&run_dir);
+    let rejected = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &"f".repeat(64),
+            "--confirm-target-head",
+            &head,
+            "--json",
+        ])
+        .output()
+        .expect("reject wrong confirmation");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("diff digest"));
+    assert_eq!(read_tree_bytes(&run_dir), before_rejected);
+    let wrong_head = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            "0000000000000000000000000000000000000000",
+        ])
+        .output()
+        .expect("reject wrong target HEAD");
+    assert!(!wrong_head.status.success());
+    assert!(String::from_utf8_lossy(&wrong_head.stderr).contains("target HEAD"));
+    assert_eq!(read_tree_bytes(&run_dir), before_rejected);
+    let unsafe_reviewer = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "unsafe\nreviewer",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+        ])
+        .output()
+        .expect("reject unsafe reviewer identity");
+    assert!(!unsafe_reviewer.status.success());
+    assert!(String::from_utf8_lossy(&unsafe_reviewer.stderr).contains("control characters"));
+    assert_eq!(read_tree_bytes(&run_dir), before_rejected);
+
+    fs::write(repo.join("tracked.txt"), "dirty but preserved\n").expect("dirty tracked file");
+    fs::write(repo.join("untracked.txt"), "also preserved\n").expect("dirty untracked file");
+    let source_before = git_evidence(&repo);
+    let approved = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+            "--json",
+        ])
+        .output()
+        .expect("approve exact candidate");
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&approved.stdout).expect("approval JSON");
+    assert_eq!(report["status"], "approved");
+    assert_eq!(report["current_step"], "testing");
+    assert_eq!(report["testing_ran"], false);
+    assert_eq!(report["evidence"]["candidate_diff"]["digest"], diff);
+    assert_eq!(report["evidence"]["starting_head"], head);
+    assert_eq!(git_evidence(&repo), source_before);
+    for absent in [
+        "prompts/07-testing.prompt.md",
+        "responses/07-testing.raw.txt",
+        "artifacts/07-testing.md",
+        "artifacts/08-eval-report.md",
+    ] {
+        assert!(
+            !run_dir.join(absent).exists(),
+            "{absent} must remain absent"
+        );
+    }
+
+    let approved_bytes = read_tree_bytes(&run_dir);
+    let retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+            "--json",
+        ])
+        .output()
+        .expect("retry approval");
+    assert!(retry.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), approved_bytes);
+
+    let changed_reviewer = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "someone-else@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+        ])
+        .output()
+        .expect("reject changed reviewer");
+    assert!(!changed_reviewer.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), approved_bytes);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("approved resume is inert");
+    assert!(resume.status.success());
+    assert!(String::from_utf8_lossy(&resume.stdout).contains("Testing has not run"));
+    assert_eq!(read_tree_bytes(&run_dir), approved_bytes);
+    assert_eq!(git_evidence(&repo), source_before);
+}
+
+#[test]
 fn loop_cleanup_json_removes_only_a_terminal_candidate_and_reports_cleaned_authority() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");

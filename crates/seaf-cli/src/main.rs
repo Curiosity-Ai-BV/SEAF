@@ -13,17 +13,19 @@ use clap::{Args, Parser, Subcommand};
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, sha256_digest_file, templates, AgentTaskBrief,
     AgentTaskConstraints, CandidateWorkspaceLifecycle, CheckStatus, EvalCheck, EvalDecision,
-    EvalReport, FieldError, LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
-    Policy, ProjectConfig, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy,
-    TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus, ValidationReport,
+    EvalReport, FieldError, HumanApprovalEvidence, LoopInputDigests, LoopRun, LoopStatus,
+    LoopStepName, LoopStepStatus, Policy, ProjectConfig, ReleaseCapsule, RiskLevel, RolloutChannel,
+    RolloutPolicy, TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
+    ValidationReport,
 };
 use seaf_loop::{
-    build_loop_eval_report, cleanup_candidate_workspace_outcome, evaluate_zero_tolerance,
-    load_agent_bench_fixture, validate_human_review_execution_barrier, validate_rerun_eligibility,
-    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
-    ContextLimits, ContextPackRequest, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
-    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
+    evaluate_zero_tolerance, load_agent_bench_fixture, validate_human_review_execution_barrier,
+    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
+    CandidateCleanupOutcome, ContextLimits, ContextPackRequest, GitCommandRunner,
+    InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchDecisionKind,
+    PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RunnerError,
+    StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -147,6 +149,8 @@ enum LoopCommand {
     Status(LoopStatusArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
+    /// Approve the exact reviewed candidate for future Testing.
+    Approve(LoopApproveArgs),
     /// Explicitly remove a terminal run's verified candidate worktree.
     Cleanup(LoopCleanupArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
@@ -333,6 +337,28 @@ struct LoopCleanupArgs {
 }
 
 #[derive(Debug, Args)]
+struct LoopApproveArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Stable identity of the human reviewer granting approval.
+    #[arg(long)]
+    reviewer: String,
+    /// Exact candidate staged-diff SHA-256 shown to and confirmed by the reviewer.
+    #[arg(long)]
+    confirm_candidate_diff: String,
+    /// Exact target HEAD shown to and confirmed by the reviewer.
+    #[arg(long)]
+    confirm_target_head: String,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct LoopSmokeArgs {
     /// Directory where loop run workspaces are written.
     #[arg(long, default_value = ".seaf/loops/runs")]
@@ -470,6 +496,10 @@ struct LoopCommandReport {
     run_directory: String,
     run_file: String,
     next_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_diff_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_head: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -481,6 +511,18 @@ struct LoopCleanupReport {
     candidate_path: String,
     run_directory: String,
     run_file: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoopApprovalReport {
+    command: String,
+    run_id: String,
+    status: LoopStatus,
+    current_step: LoopStepName,
+    testing_ran: bool,
+    run_directory: String,
+    run_file: String,
+    evidence: HumanApprovalEvidence,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,6 +582,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
+        Command::Loop {
+            command: LoopCommand::Approve(args),
+        } => approve_loop(args),
         Command::Loop {
             command: LoopCommand::Cleanup(args),
         } => cleanup_loop(args),
@@ -909,6 +954,44 @@ fn cleanup_loop(args: LoopCleanupArgs) -> Result<(), CliFailure> {
             "cleaned candidate for loop {}: {}",
             report.run_id, report.candidate_path
         );
+        println!("run file: {}", report.run_file);
+        Ok(())
+    }
+}
+
+fn approve_loop(args: LoopApproveArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    let repository_root = current_cleanup_repository_root()?;
+    let outcome = approve_candidate_for_testing(
+        &workspace,
+        &repository_root,
+        &args.reviewer,
+        &args.confirm_candidate_diff,
+        &args.confirm_target_head,
+    )
+    .map_err(|error| CliFailure::message(format!("candidate approval failed: {error}")))?;
+    let report = LoopApprovalReport {
+        command: "approve".to_string(),
+        run_id: outcome.run.run_id,
+        status: outcome.run.status,
+        current_step: outcome.run.current_step,
+        testing_ran: false,
+        run_directory: workspace.run_directory().display().to_string(),
+        run_file: workspace.run_file().display().to_string(),
+        evidence: outcome.evidence,
+    };
+    if args.json {
+        print_json(&report)
+    } else {
+        println!(
+            "approved loop {} for future Testing; Testing has not run",
+            report.run_id
+        );
+        println!("reviewer: {}", report.evidence.reviewer);
+        println!("candidate diff: {}", report.evidence.candidate_diff.digest);
+        println!("target HEAD: {}", report.evidence.starting_head);
         println!("run file: {}", report.run_file);
         Ok(())
     }
@@ -2078,6 +2161,12 @@ fn finish_loop_command(
             report.current_step
         );
         println!("next action: {}", report.next_action);
+        if let Some(candidate_diff_digest) = &report.candidate_diff_digest {
+            println!("--confirm-candidate-diff: {candidate_diff_digest}");
+        }
+        if let Some(target_head) = &report.target_head {
+            println!("--confirm-target-head: {target_head}");
+        }
         println!("run file: {}", report.run_file);
     }
     Ok(())
@@ -2086,12 +2175,19 @@ fn finish_loop_command(
 fn loop_status_label(status: LoopStatus) -> String {
     match status {
         LoopStatus::AwaitingHumanReview => "awaiting_human_review".to_string(),
+        LoopStatus::Approved => "approved".to_string(),
         legacy => format!("{legacy:?}"),
     }
 }
 
 fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCommandReport {
     let run_directory = runs_root.join(&run.run_id);
+    let confirmation_candidate = matches!(
+        run.status,
+        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+    )
+    .then(|| run.candidate_workspace.as_ref())
+    .flatten();
     LoopCommandReport {
         command: command.to_string(),
         run_id: run.run_id.clone(),
@@ -2104,6 +2200,9 @@ fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCo
         run_file: run_directory.join("run.json").display().to_string(),
         run_directory: run_directory.display().to_string(),
         next_action: next_loop_action(run),
+        candidate_diff_digest: confirmation_candidate
+            .map(|candidate| candidate.candidate_diff_digest.clone()),
+        target_head: confirmation_candidate.map(|candidate| candidate.starting_head.clone()),
     }
 }
 
@@ -2114,6 +2213,9 @@ fn next_loop_action(run: &LoopRun) -> String {
         }
         LoopStatus::AwaitingHumanReview => {
             "human approval is required; Testing has not run".to_string()
+        }
+        LoopStatus::Approved => {
+            "candidate is approved; Testing has not run in this release slice".to_string()
         }
         LoopStatus::Blocked => {
             "inspect the blocked step artifact, resolve the blocker, then resume".to_string()

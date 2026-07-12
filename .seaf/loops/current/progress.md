@@ -25,8 +25,8 @@
 - [x] M1-05b4a: Authoritative run-directory binding.
 - [x] M1-05b4b: Explicit candidate cleanup CLI.
 - [x] M1-06a: Stop isolated runs for human review.
-- [ ] M1-06b: Record exact human candidate approvals (active).
-- [ ] M1-07: Integrated Testing and EvalReport.
+- [x] M1-06b: Record exact human candidate approvals.
+- [ ] M1-07: Integrated Testing and EvalReport (active).
 - [ ] M1-08: Promotion integrity.
 - [ ] M1-09: Audited recovery operations.
 - [ ] M1-10: Atomic state and run locking.
@@ -54,10 +54,11 @@
 
 ## Current Gate
 
-M1-06a is complete and M1-06b is active. An isolated run now stops atomically
-after an authenticated OutputReview `ApproveForTests` response, with Testing
-and EvalReport still pending and artifact-free. Provider, rerun,
-reconciliation, cleanup, historical-prefix, non-approving-review, and public
-writer bypasses fail without candidate or source mutation. The next gate is a
-versioned approval record and explicit CLI confirmation bound to the exact
-candidate, target, policy, and authenticated review evidence.
+M1-06 is complete and M1-07 is active. Public run/status output supplies the
+exact staged-diff digest and target HEAD required by `seaf loop approve`.
+Approval publishes versioned inline evidence only after candidate-to-provider
+locked revalidation of physical candidate/source state, policy, approving role
+artifact, and authenticated latest provider exchange. Exact retries preserve
+bytes; stale, substituted, concurrent, non-Awaiting, cleanup, rerun, provider,
+and direct-writer paths fail closed. Approved still cannot execute Testing or
+EvalReport until M1-07 integrates the controlled eval engine.

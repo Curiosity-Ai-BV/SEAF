@@ -61,6 +61,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
         policy_decisions: Vec::<std::collections::BTreeMap<String, Value>>::new(),
         provider_exchange_records: Vec::new(),
         candidate_workspace: None,
+        human_approval: None,
         eval_report_path: None,
     }
 }
@@ -109,17 +110,27 @@ fn guard_awaiting_human_review_direct_write(
         .ok()
         .and_then(|content| serde_json::from_str::<LoopRun>(&content).ok())
         .filter(|run| validate_run_integrity(run).is_ok());
-    if intended.status == LoopStatus::AwaitingHumanReview {
+    if matches!(
+        intended.status,
+        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+    ) {
         if current.as_ref() == Some(intended) {
             return Ok(true);
         }
         return Err(StateError::InvalidRun(
-            "public state writer cannot create an awaiting human review barrier".to_string(),
+            "public state writer cannot create awaiting human review or approved authority"
+                .to_string(),
         ));
     }
-    if current.is_some_and(|run| run.status == LoopStatus::AwaitingHumanReview) {
+    if current.is_some_and(|run| {
+        matches!(
+            run.status,
+            LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+        )
+    }) {
         return Err(StateError::InvalidRun(
-            "public state writer cannot replace an awaiting human review barrier".to_string(),
+            "public state writer cannot replace awaiting human review or approved authority"
+                .to_string(),
         ));
     }
     Ok(false)

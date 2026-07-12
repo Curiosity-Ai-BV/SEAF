@@ -132,6 +132,14 @@ where
                 "loop state changed before provider rerun reset publication".to_string(),
             ));
         }
+        if matches!(
+            current.status,
+            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
+        ) {
+            return Err(ProviderExchangeError::Invalid(
+                "provider rerun reset cannot replace human review authority".to_string(),
+            ));
+        }
         if reset.provider_exchange_records != current.provider_exchange_records {
             return Err(ProviderExchangeError::Invalid(
                 "provider rerun reset changed the authoritative exchange head".to_string(),
@@ -396,9 +404,12 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let mut run = state::load_run(workspace)?;
-        if run.status == seaf_core::LoopStatus::AwaitingHumanReview {
+        if matches!(
+            run.status,
+            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
+        ) {
             return Err(ProviderExchangeError::Invalid(
-                "provider exchange history is frozen while awaiting human review".to_string(),
+                "provider exchange history is frozen by human review authority".to_string(),
             ));
         }
         if run.provider_exchange_records.contains(&reference) {
@@ -436,9 +447,13 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let current = state::load_run(workspace)?;
-        if current.status == seaf_core::LoopStatus::AwaitingHumanReview && &current != intended {
+        if matches!(
+            current.status,
+            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
+        ) && &current != intended
+        {
             return Err(ProviderExchangeError::Invalid(
-                "ordinary state publication cannot replace an awaiting human review barrier"
+                "ordinary state publication cannot replace awaiting human review or approved authority"
                     .to_string(),
             ));
         }
@@ -476,6 +491,18 @@ pub(crate) fn persist_run_with_full_compare(
     expected: &LoopRun,
     intended: &LoopRun,
 ) -> Result<(), ProviderExchangeError> {
+    persist_run_with_full_compare_and_validator(workspace, expected, intended, |_| Ok(()))
+}
+
+pub(crate) fn persist_run_with_full_compare_and_validator<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+    validate_current: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let current = state::load_run(workspace)?;
@@ -484,6 +511,7 @@ pub(crate) fn persist_run_with_full_compare(
                 "LoopRun changed before compare-and-swap publication".to_string(),
             ));
         }
+        validate_current(&current)?;
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
@@ -514,10 +542,12 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
-        if persisted.status == seaf_core::LoopStatus::AwaitingHumanReview {
+        if matches!(
+            persisted.status,
+            seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
+        ) {
             return Err(ProviderExchangeError::Invalid(
-                "provider exchange reconciliation is frozen while awaiting human review"
-                    .to_string(),
+                "provider exchange reconciliation is frozen by human review authority".to_string(),
             ));
         }
         if persisted != *authoritative {
@@ -827,16 +857,19 @@ fn validate_run_for_atomic_publication(
         ));
     }
     validate_authoritative_provider_exchange_records(workspace, run)?;
-    if run.status == seaf_core::LoopStatus::AwaitingHumanReview {
+    if matches!(
+        run.status,
+        seaf_core::LoopStatus::AwaitingHumanReview | seaf_core::LoopStatus::Approved
+    ) {
         let terminal = run.provider_exchange_records.last().ok_or_else(|| {
             ProviderExchangeError::Invalid(
-                "awaiting human review lost terminal OutputReview provider evidence".to_string(),
+                "human review authority lost terminal OutputReview provider evidence".to_string(),
             )
         })?;
         let record = load_provider_exchange_record(workspace.run_directory(), terminal)?;
         if record.outcome != Some(ProviderExchangeOutcome::ApproveForTests) {
             return Err(ProviderExchangeError::Invalid(
-                "awaiting human review requires an authenticated OutputReview ApproveForTests outcome"
+                "human review authority requires an authenticated OutputReview ApproveForTests outcome"
                     .to_string(),
             ));
         }
@@ -845,10 +878,59 @@ fn validate_run_for_atomic_publication(
                 .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
         if latest_attempt != Some(terminal.step_attempt) {
             return Err(ProviderExchangeError::Invalid(
-                "awaiting human review requires the current OutputReview attempt's authenticated response"
+                "human review authority requires the current OutputReview attempt's authenticated response"
                     .to_string(),
             ));
         }
+        if run.status == seaf_core::LoopStatus::Approved {
+            validate_approved_publication_evidence(workspace, run)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_approved_publication_evidence(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<(), ProviderExchangeError> {
+    let evidence = run.human_approval.as_ref().ok_or_else(|| {
+        ProviderExchangeError::Invalid("approved run lost human approval evidence".to_string())
+    })?;
+    let diff = read_verified_regular_file(
+        workspace.run_directory(),
+        &evidence.candidate_diff.path,
+        "approved candidate diff",
+    )?;
+    if digest_bytes(&diff) != evidence.candidate_diff.digest {
+        return Err(ProviderExchangeError::Invalid(
+            "approved candidate diff artifact digest mismatch".to_string(),
+        ));
+    }
+    let artifact = crate::ValidatedRoleArtifact::load(
+        workspace,
+        &evidence.output_review.path,
+        &evidence.output_review.digest,
+        &run.run_id,
+        LoopStepName::OutputReview,
+        Role::OutputReviewer,
+    )
+    .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+    if !matches!(
+        artifact.response,
+        RoleResponse::Reviewer(ref response)
+            if response.decision == ReviewDecision::ApproveForTests
+    ) {
+        return Err(ProviderExchangeError::Invalid(
+            "approved OutputReview artifact is not ApproveForTests".to_string(),
+        ));
+    }
+    load_provider_exchange_record(workspace.run_directory(), &evidence.output_review_request)?;
+    let response =
+        load_provider_exchange_record(workspace.run_directory(), &evidence.output_review_response)?;
+    if response.outcome != Some(ProviderExchangeOutcome::ApproveForTests) {
+        return Err(ProviderExchangeError::Invalid(
+            "approved terminal OutputReview exchange is not ApproveForTests".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1666,8 +1748,8 @@ mod tests {
     use super::*;
     use seaf_core::{
         ArtifactReference, CandidatePatchPhase, CandidatePatchTransaction,
-        CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopInputDigests, LoopStatus,
-        LoopStepStatus,
+        CandidateWorkspaceLifecycle, CandidateWorkspaceState, HumanApprovalEvidence,
+        LoopInputDigests, LoopStatus, LoopStepStatus,
     };
 
     fn awaiting_human_review_run(workspace: &LoopWorkspace) -> LoopRun {
@@ -1692,6 +1774,32 @@ mod tests {
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
         run.status = LoopStatus::AwaitingHumanReview;
         run.current_step = LoopStepName::Testing;
+        let review_response = parse_role_response(
+            Role::OutputReviewer,
+            r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"Approved.","blocking_issues":[],"non_blocking_issues":[]}"#,
+        )
+        .unwrap();
+        let review_artifact = crate::ValidatedRoleArtifact::new(
+            run.run_id.clone(),
+            LoopStepName::OutputReview,
+            Role::OutputReviewer,
+            review_response,
+        )
+        .unwrap();
+        let review_path = "artifacts/06-output-review.md";
+        fs::write(
+            workspace.run_directory().join(review_path),
+            review_artifact.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let candidate_diff_path = "artifacts/candidate-patch.applied.diff";
+        let candidate_diff = b"candidate diff";
+        fs::write(
+            workspace.run_directory().join(candidate_diff_path),
+            candidate_diff,
+        )
+        .unwrap();
+        let candidate_diff_digest = digest_bytes(candidate_diff);
         for record in &mut run.steps {
             match record.name {
                 LoopStepName::Research
@@ -1701,8 +1809,8 @@ mod tests {
                 | LoopStepName::Development => record.status = LoopStepStatus::Completed,
                 LoopStepName::OutputReview => {
                     record.status = LoopStepStatus::Passed;
-                    record.artifact_path = Some("artifacts/06-output-review.md".to_string());
-                    record.artifact_digest = Some("6".repeat(64));
+                    record.artifact_path = Some(review_path.to_string());
+                    record.artifact_digest = Some(review_artifact.artifact_digest().unwrap());
                 }
                 LoopStepName::Testing | LoopStepName::EvalReport => {}
             }
@@ -1730,7 +1838,7 @@ mod tests {
             starting_tree: "f".repeat(40),
             candidate_head: "e".repeat(40),
             candidate_tree: "1".repeat(40),
-            candidate_diff_digest: "2".repeat(64),
+            candidate_diff_digest,
             patch_transaction: Some(CandidatePatchTransaction {
                 schema_version: 1,
                 phase: CandidatePatchPhase::Applied,
@@ -1749,6 +1857,13 @@ mod tests {
             cleanup_started_at: None,
             cleaned_at: None,
         });
+        run.policy_decisions.push(
+            serde_json::from_value(serde_json::json!({
+                "patch_id": run.run_id.clone(),
+                "decision": "allowed"
+            }))
+            .unwrap(),
+        );
         run
     }
 
@@ -1815,15 +1930,88 @@ mod tests {
             outcome: None,
         };
         let reference = stage_provider_exchange_record(workspace.run_directory(), &record).unwrap();
-        let error = persist_provider_exchange_record_reference(&workspace, reference)
+        let error = persist_provider_exchange_record_reference(&workspace, reference.clone())
             .expect_err("late provider suffix must remain unreferenced");
         assert!(error.to_string().contains("frozen"), "{error}");
         assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes);
-
         let error = reconcile_provider_exchange_state_with_validator(&workspace, &run, |_| Ok(()))
-            .expect_err("reconciliation must not adopt a late suffix");
+            .expect_err("Awaiting reconciliation must not adopt a late suffix");
         assert!(error.to_string().contains("frozen"), "{error}");
         assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes);
+
+        let policy_decision_digest = canonical_sha256_digest(&run.policy_decisions[0]).unwrap();
+        let mut approved = run.clone();
+        approved.status = LoopStatus::Approved;
+        approved.human_approval = Some(HumanApprovalEvidence {
+            schema_version: 1,
+            run_id: run.run_id.clone(),
+            reviewer: "reviewer@example.invalid".to_string(),
+            approved_at: "approved-at".to_string(),
+            candidate_diff: ArtifactReference {
+                path: "artifacts/candidate-patch.applied.diff".to_string(),
+                digest: run
+                    .candidate_workspace
+                    .as_ref()
+                    .unwrap()
+                    .candidate_diff_digest
+                    .clone(),
+            },
+            starting_head: "e".repeat(40),
+            policy_decision_digest,
+            output_review: ArtifactReference {
+                path: "artifacts/06-output-review.md".to_string(),
+                digest: run
+                    .steps
+                    .iter()
+                    .find(|step| step.name == LoopStepName::OutputReview)
+                    .unwrap()
+                    .artifact_digest
+                    .clone()
+                    .unwrap(),
+            },
+            output_review_request: run
+                .provider_exchange_records
+                .iter()
+                .find(|record| {
+                    record.step == LoopStepName::OutputReview
+                        && record.kind == ProviderExchangeKind::Initial
+                        && record.phase == ProviderExchangePhase::Request
+                })
+                .unwrap()
+                .clone(),
+            output_review_response: run.provider_exchange_records.last().unwrap().clone(),
+        });
+        persist_run_with_full_compare(&workspace, &run, &approved)
+            .expect("approval transaction may publish Approved");
+        let approved_bytes = fs::read(workspace.run_file()).unwrap();
+        let error = persist_provider_exchange_record_reference(&workspace, reference)
+            .expect_err("Approved must freeze provider append");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        let error =
+            reconcile_provider_exchange_state_with_validator(&workspace, &approved, |_| Ok(()))
+                .expect_err("Approved must freeze reconciliation");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        let mut stale = approved.clone();
+        stale.status = LoopStatus::Running;
+        stale.human_approval = None;
+        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+            .expect_err("ordinary publication cannot replace Approved");
+        assert!(error.to_string().contains("approved authority"), "{error}");
+        let mut reset = approved.clone();
+        state::reset_from_step(&mut reset, LoopStepName::OutputReview).unwrap();
+        let error = persist_provider_rerun_reset(
+            &workspace,
+            &approved,
+            &reset,
+            LoopStepName::OutputReview,
+            2,
+        )
+        .expect_err("provider rerun reset cannot replace Approved");
+        assert!(
+            error.to_string().contains("human review authority"),
+            "{error}"
+        );
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), approved_bytes);
     }
 
     #[test]

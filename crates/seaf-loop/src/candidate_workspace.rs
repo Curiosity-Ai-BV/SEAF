@@ -13,7 +13,9 @@ use std::{
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CandidatePatchPhase,
     CandidatePatchTransaction, CandidateWorkspaceLifecycle, CandidateWorkspaceState,
-    LoopExecutionMode, LoopStatus, LoopStepName,
+    HumanApprovalEvidence, LoopExecutionMode, LoopRun, LoopStatus, LoopStepName,
+    ProviderExchangeKind, ProviderExchangeOutcome, ProviderExchangePhase,
+    ProviderExchangeRecordReference, ProviderRole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,7 +24,8 @@ use crate::{
     context::{CandidateContextAuthority, CandidateContextAuthorityKind},
     immutable_artifact::{publish_create_only, read_verified_regular_file},
     workspace::{LoopWorkspace, ARTIFACTS_DIR},
-    DevelopmentEvidence, PatchDecisionKind, PolicyDecision,
+    DevelopmentEvidence, PatchDecisionKind, PolicyDecision, ReviewDecision, Role, RoleResponse,
+    ValidatedRoleArtifact,
 };
 
 #[cfg(unix)]
@@ -54,6 +57,336 @@ pub struct VerifiedCandidatePatchEvidence {
     pub applied_diff_content: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateApprovalOutcome {
+    pub run: LoopRun,
+    pub evidence: HumanApprovalEvidence,
+}
+
+pub fn approve_candidate_for_testing(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    reviewer: &str,
+    confirmed_candidate_diff_digest: &str,
+    confirmed_starting_head: &str,
+) -> Result<CandidateApprovalOutcome, CandidateWorkspaceError> {
+    approve_candidate_for_testing_with_hook(
+        workspace,
+        source_worktree_root,
+        reviewer,
+        confirmed_candidate_diff_digest,
+        confirmed_starting_head,
+        || Ok(()),
+    )
+}
+
+fn approve_candidate_for_testing_with_hook<F>(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    reviewer: &str,
+    confirmed_candidate_diff_digest: &str,
+    confirmed_starting_head: &str,
+    before_provider_lock: F,
+) -> Result<CandidateApprovalOutcome, CandidateWorkspaceError>
+where
+    F: FnOnce() -> Result<(), CandidateWorkspaceError>,
+{
+    if reviewer.is_empty()
+        || reviewer.len() > 256
+        || reviewer.trim() != reviewer
+        || reviewer.chars().any(char::is_control)
+    {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "reviewer identity must be 1..=256 bytes with no surrounding whitespace or control characters"
+                .to_string(),
+        ));
+    }
+    preflight_workspace_run_directory_authority(workspace)?;
+    let lock = acquire_candidate_lock(workspace)?;
+    let result = approve_candidate_for_testing_locked(
+        workspace,
+        source_worktree_root,
+        reviewer,
+        confirmed_candidate_diff_digest,
+        confirmed_starting_head,
+        before_provider_lock,
+    );
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn approve_candidate_for_testing_locked<F>(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    reviewer: &str,
+    confirmed_candidate_diff_digest: &str,
+    confirmed_starting_head: &str,
+    before_provider_lock: F,
+) -> Result<CandidateApprovalOutcome, CandidateWorkspaceError>
+where
+    F: FnOnce() -> Result<(), CandidateWorkspaceError>,
+{
+    let expected = crate::state::load_run(workspace)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    validate_workspace_run_id(workspace, &expected)?;
+    if !matches!(
+        expected.status,
+        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+    ) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "human approval requires an awaiting_human_review run".to_string(),
+        ));
+    }
+    let verified = verify_candidate_patch_evidence_locked(workspace, source_worktree_root)?;
+    let candidate = validate_candidate_approval_confirmation(
+        &expected,
+        &verified,
+        confirmed_candidate_diff_digest,
+        confirmed_starting_head,
+    )?;
+    let bindings = approval_bindings(workspace, &expected, &verified)?;
+    if expected.status == LoopStatus::Approved {
+        let evidence = expected.human_approval.clone().ok_or_else(|| {
+            CandidateWorkspaceError::Mismatch(
+                "approved run has no human approval evidence".to_string(),
+            )
+        })?;
+        validate_exact_approval_retry(&evidence, reviewer, &bindings)?;
+        return Ok(CandidateApprovalOutcome {
+            run: expected,
+            evidence,
+        });
+    }
+    if expected.human_approval.is_some() {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "awaiting_human_review run already contains approval evidence".to_string(),
+        ));
+    }
+    let evidence = HumanApprovalEvidence {
+        schema_version: 1,
+        run_id: expected.run_id.clone(),
+        reviewer: reviewer.to_string(),
+        approved_at: now_timestamp(),
+        candidate_diff: verified.applied_diff,
+        starting_head: candidate.starting_head.clone(),
+        policy_decision_digest: verified.policy_decision_digest,
+        output_review: bindings.output_review,
+        output_review_request: bindings.request,
+        output_review_response: bindings.response,
+    };
+    let mut intended = expected.clone();
+    intended.status = LoopStatus::Approved;
+    intended.updated_at = evidence.approved_at.clone();
+    intended.human_approval = Some(evidence.clone());
+    before_provider_lock()?;
+    crate::provider_exchange::persist_run_with_full_compare_and_validator(
+        workspace,
+        &expected,
+        &intended,
+        |current| {
+            let result = (|| {
+                validate_workspace_run_id(workspace, current)?;
+                if current.status != LoopStatus::AwaitingHumanReview {
+                    return Err(CandidateWorkspaceError::Unsafe(
+                        "approval publication requires awaiting_human_review authority".to_string(),
+                    ));
+                }
+                let verified =
+                    verify_candidate_patch_evidence_locked(workspace, source_worktree_root)?;
+                validate_candidate_approval_confirmation(
+                    current,
+                    &verified,
+                    confirmed_candidate_diff_digest,
+                    confirmed_starting_head,
+                )?;
+                let bindings = approval_bindings(workspace, current, &verified)?;
+                let evidence = intended.human_approval.as_ref().ok_or_else(|| {
+                    CandidateWorkspaceError::Mismatch(
+                        "approval publication lost intended evidence".to_string(),
+                    )
+                })?;
+                validate_exact_approval_retry(evidence, reviewer, &bindings)
+            })();
+            result.map_err(|error| {
+                crate::provider_exchange::ProviderExchangeError::Invalid(format!(
+                    "approval authority changed before publication: {error}"
+                ))
+            })
+        },
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    Ok(CandidateApprovalOutcome {
+        run: intended,
+        evidence,
+    })
+}
+
+fn validate_candidate_approval_confirmation<'a>(
+    run: &'a LoopRun,
+    verified: &VerifiedCandidatePatchEvidence,
+    confirmed_candidate_diff_digest: &str,
+    confirmed_starting_head: &str,
+) -> Result<&'a CandidateWorkspaceState, CandidateWorkspaceError> {
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "approval requires authoritative candidate workspace evidence".to_string(),
+        )
+    })?;
+    if confirmed_candidate_diff_digest != verified.applied_diff_digest
+        || confirmed_candidate_diff_digest != candidate.candidate_diff_digest
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "confirmed candidate diff digest does not match the current staged candidate diff"
+                .to_string(),
+        ));
+    }
+    if confirmed_starting_head != candidate.starting_head {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "confirmed target HEAD does not match the candidate starting HEAD".to_string(),
+        ));
+    }
+    Ok(candidate)
+}
+
+struct ApprovalBindings {
+    output_review: ArtifactReference,
+    request: ProviderExchangeRecordReference,
+    response: ProviderExchangeRecordReference,
+    policy_decision_digest: String,
+    candidate_diff: ArtifactReference,
+    starting_head: String,
+}
+
+fn approval_bindings(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    verified: &VerifiedCandidatePatchEvidence,
+) -> Result<ApprovalBindings, CandidateWorkspaceError> {
+    let output_review_step = run
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::OutputReview)
+        .ok_or_else(|| {
+            CandidateWorkspaceError::Mismatch("missing OutputReview step".to_string())
+        })?;
+    let output_review = ArtifactReference {
+        path: output_review_step.artifact_path.clone().ok_or_else(|| {
+            CandidateWorkspaceError::Mismatch("missing OutputReview artifact".to_string())
+        })?,
+        digest: output_review_step.artifact_digest.clone().ok_or_else(|| {
+            CandidateWorkspaceError::Mismatch("missing OutputReview artifact digest".to_string())
+        })?,
+    };
+    let artifact = ValidatedRoleArtifact::load(
+        workspace,
+        &output_review.path,
+        &output_review.digest,
+        &run.run_id,
+        LoopStepName::OutputReview,
+        Role::OutputReviewer,
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if !matches!(
+        artifact.response,
+        RoleResponse::Reviewer(ref response)
+            if response.decision == ReviewDecision::ApproveForTests
+    ) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "OutputReview artifact does not approve the candidate for tests".to_string(),
+        ));
+    }
+    let response = run
+        .provider_exchange_records
+        .last()
+        .cloned()
+        .ok_or_else(|| {
+            CandidateWorkspaceError::Mismatch(
+                "approval requires a terminal OutputReview provider response".to_string(),
+            )
+        })?;
+    if response.step != LoopStepName::OutputReview
+        || response.role != ProviderRole::OutputReviewer
+        || response.phase != ProviderExchangePhase::Response
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "provider ledger does not end in the terminal OutputReview response".to_string(),
+        ));
+    }
+    let latest_attempt =
+        crate::artifacts::latest_step_attempt(workspace, LoopStepName::OutputReview)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if latest_attempt != Some(response.step_attempt) {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "terminal OutputReview response is not the latest persisted review attempt".to_string(),
+        ));
+    }
+    let response_record =
+        crate::load_provider_exchange_record(workspace.run_directory(), &response)
+            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if response_record.outcome != Some(ProviderExchangeOutcome::ApproveForTests) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "terminal OutputReview provider response is not ApproveForTests".to_string(),
+        ));
+    }
+    let matching_requests = run
+        .provider_exchange_records
+        .iter()
+        .filter(|reference| {
+            reference.step == LoopStepName::OutputReview
+                && reference.role == ProviderRole::OutputReviewer
+                && reference.step_attempt == response.step_attempt
+                && reference.exchange_index == 1
+                && reference.kind == ProviderExchangeKind::Initial
+                && reference.phase == ProviderExchangePhase::Request
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let [request] = matching_requests.as_slice() else {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "approval requires exactly one initial request for the terminal OutputReview attempt"
+                .to_string(),
+        ));
+    };
+    crate::load_provider_exchange_record(workspace.run_directory(), request)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch("missing candidate authority".to_string())
+    })?;
+    Ok(ApprovalBindings {
+        output_review,
+        request: request.clone(),
+        response,
+        policy_decision_digest: verified.policy_decision_digest.clone(),
+        candidate_diff: verified.applied_diff.clone(),
+        starting_head: candidate.starting_head.clone(),
+    })
+}
+
+fn validate_exact_approval_retry(
+    evidence: &HumanApprovalEvidence,
+    reviewer: &str,
+    bindings: &ApprovalBindings,
+) -> Result<(), CandidateWorkspaceError> {
+    if evidence.schema_version != 1
+        || evidence.reviewer != reviewer
+        || evidence.output_review != bindings.output_review
+        || evidence.output_review_request != bindings.request
+        || evidence.output_review_response != bindings.response
+        || evidence.policy_decision_digest != bindings.policy_decision_digest
+        || evidence.candidate_diff != bindings.candidate_diff
+        || evidence.starting_head != bindings.starting_head
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "approved run does not match this exact human confirmation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateCleanupOutcome {
     pub run_id: String,
@@ -68,7 +401,10 @@ impl CandidateCleanupOutcome {
     ) -> Result<Self, CandidateWorkspaceError> {
         if matches!(
             run.status,
-            LoopStatus::Pending | LoopStatus::Running | LoopStatus::AwaitingHumanReview
+            LoopStatus::Pending
+                | LoopStatus::Running
+                | LoopStatus::AwaitingHumanReview
+                | LoopStatus::Approved
         ) || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
             || run.candidate_workspace.as_ref() != Some(&candidate)
         {
@@ -1347,7 +1683,10 @@ where
         validate_workspace_run_id(workspace, &run)?;
         if matches!(
             run.status,
-            LoopStatus::Pending | LoopStatus::Running | LoopStatus::AwaitingHumanReview
+            LoopStatus::Pending
+                | LoopStatus::Running
+                | LoopStatus::AwaitingHumanReview
+                | LoopStatus::Approved
         ) {
             return Err(CandidateWorkspaceError::Unsafe(
                 "refusing to clean an active run candidate".to_string(),
@@ -3980,6 +4319,131 @@ mod tests {
             workspace,
             candidate,
         }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ApprovalPublicationRace {
+        RunState,
+        CandidateWorktree,
+        SourceHead,
+    }
+
+    #[test]
+    fn approval_publication_rechecks_exact_authority_after_the_pre_provider_barrier() {
+        for mutation in [
+            ApprovalPublicationRace::RunState,
+            ApprovalPublicationRace::CandidateWorktree,
+            ApprovalPublicationRace::SourceHead,
+        ] {
+            let run_id = format!("approval-barrier-{mutation:?}").to_ascii_lowercase();
+            let fixture = awaiting_approval_application_fixture(&run_id);
+            let waiting = crate::state::load_run(&fixture.workspace).expect("Awaiting run");
+            let waiting_bytes = fs::read(fixture.workspace.run_file()).expect("Awaiting bytes");
+            let candidate = waiting.candidate_workspace.as_ref().unwrap().clone();
+            let diff = candidate.candidate_diff_digest.clone();
+            let head = candidate.starting_head.clone();
+            let mut expected_run_bytes = waiting_bytes.clone();
+            let error = approve_candidate_for_testing_with_hook(
+                &fixture.workspace,
+                &fixture.source,
+                "reviewer@example.invalid",
+                &diff,
+                &head,
+                || {
+                    match mutation {
+                        ApprovalPublicationRace::RunState => {
+                            let mut changed = waiting.clone();
+                            changed.updated_at = "concurrent-run-change".to_string();
+                            expected_run_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+                            expected_run_bytes.push(b'\n');
+                            fs::write(fixture.workspace.run_file(), &expected_run_bytes).unwrap();
+                        }
+                        ApprovalPublicationRace::CandidateWorktree => {
+                            fs::write(
+                                Path::new(&candidate.path).join("tracked.txt"),
+                                "candidate changed after initial verification\n",
+                            )
+                            .unwrap();
+                        }
+                        ApprovalPublicationRace::SourceHead => {
+                            fs::write(fixture.source.join("raced.txt"), "advanced source HEAD\n")
+                                .unwrap();
+                            test_git(&fixture.source, &["add", "raced.txt"]);
+                            test_git(&fixture.source, &["commit", "-qm", "advance source"]);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("stale approval publication must fail");
+
+            match mutation {
+                ApprovalPublicationRace::RunState => {
+                    assert!(error.to_string().contains("LoopRun changed"), "{error}");
+                }
+                ApprovalPublicationRace::CandidateWorktree
+                | ApprovalPublicationRace::SourceHead => assert!(
+                    error
+                        .to_string()
+                        .contains("approval authority changed before publication"),
+                    "{error}"
+                ),
+            }
+            assert_eq!(
+                fs::read(fixture.workspace.run_file()).unwrap(),
+                expected_run_bytes
+            );
+            assert_eq!(
+                crate::state::load_run(&fixture.workspace).unwrap().status,
+                LoopStatus::AwaitingHumanReview
+            );
+            fixture.cleanup();
+        }
+    }
+
+    fn awaiting_approval_application_fixture(run_id: &str) -> ApplicationFixture {
+        let fixture = application_fixture(run_id);
+        apply_candidate_development_evidence(&fixture.workspace, &fixture.source)
+            .expect("Applied candidate");
+        let applied = crate::state::load_run(&fixture.workspace).expect("Applied run");
+        let mut run = crate::provider_exchange::persist_test_output_review_ledger(
+            &fixture.workspace,
+            &applied.run_id,
+        );
+        let response = crate::parse_role_response(
+            Role::OutputReviewer,
+            r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"Approved.","blocking_issues":[],"non_blocking_issues":[]}"#,
+        )
+        .unwrap();
+        let artifact = ValidatedRoleArtifact::new(
+            run.run_id.clone(),
+            LoopStepName::OutputReview,
+            Role::OutputReviewer,
+            response,
+        )
+        .unwrap();
+        let path = "artifacts/06-output-review.json";
+        fs::write(
+            fixture.workspace.run_directory().join(path),
+            artifact.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let output_review = run
+            .steps
+            .iter_mut()
+            .find(|record| record.name == LoopStepName::OutputReview)
+            .unwrap();
+        output_review.status = seaf_core::LoopStepStatus::Passed;
+        output_review.artifact_path = Some(path.to_string());
+        output_review.artifact_digest = Some(artifact.artifact_digest().unwrap());
+        run.status = LoopStatus::AwaitingHumanReview;
+        run.current_step = LoopStepName::Testing;
+        crate::provider_exchange::persist_run_with_provider_exchange_compare(
+            &fixture.workspace,
+            &run,
+        )
+        .expect("publish Awaiting");
+        fixture
     }
 
     fn assert_applying_without_future_evidence(fixture: &ApplicationFixture, materialized: bool) {

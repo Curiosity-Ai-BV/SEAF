@@ -318,6 +318,7 @@ pub enum LoopStatus {
     Pending,
     Running,
     AwaitingHumanReview,
+    Approved,
     Blocked,
     Failed,
     Passed,
@@ -370,6 +371,8 @@ pub struct LoopRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_workspace: Option<CandidateWorkspaceState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_approval: Option<HumanApprovalEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
 }
 
@@ -394,6 +397,8 @@ struct LoopRunWire {
     provider_exchange_records: Vec<ProviderExchangeRecordReference>,
     #[serde(default)]
     candidate_workspace: Option<CandidateWorkspaceState>,
+    #[serde(default)]
+    human_approval: Option<HumanApprovalEvidence>,
     #[serde(default)]
     eval_report_path: Option<String>,
 }
@@ -422,9 +427,14 @@ impl<'de> Deserialize<'de> for LoopRun {
         let wire = LoopRunWire::deserialize(deserializer)?;
         let execution_mode = match wire.execution_mode {
             DecodedExecutionMode::Present(mode) => mode,
-            DecodedExecutionMode::Missing if wire.status == LoopStatus::AwaitingHumanReview => {
+            DecodedExecutionMode::Missing
+                if matches!(
+                    wire.status,
+                    LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+                ) =>
+            {
                 return Err(serde::de::Error::custom(
-                    "awaiting_human_review requires explicit isolated_candidate execution_mode",
+                    "human review states require explicit isolated_candidate execution_mode",
                 ));
             }
             DecodedExecutionMode::Missing if wire.candidate_workspace.is_some() => {
@@ -448,6 +458,7 @@ impl<'de> Deserialize<'de> for LoopRun {
             policy_decisions: wire.policy_decisions,
             provider_exchange_records: wire.provider_exchange_records,
             candidate_workspace: wire.candidate_workspace,
+            human_approval: wire.human_approval,
             eval_report_path: wire.eval_report_path,
         })
     }
@@ -530,6 +541,21 @@ pub enum CandidateWorkspaceLifecycle {
 pub struct ArtifactReference {
     pub path: String,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanApprovalEvidence {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub reviewer: String,
+    pub approved_at: String,
+    pub candidate_diff: ArtifactReference,
+    pub starting_head: String,
+    pub policy_decision_digest: String,
+    pub output_review: ArtifactReference,
+    pub output_review_request: ProviderExchangeRecordReference,
+    pub output_review_response: ProviderExchangeRecordReference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

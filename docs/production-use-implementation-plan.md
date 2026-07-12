@@ -996,8 +996,8 @@ promotion, or eval execution.
 
 ### M1-06 - Human Approval State
 
-Status: active. Split into M1-06a stop barrier (complete) and M1-06b exact
-approval transaction (active) so execution safety is independently reviewable
+Status: complete on 2026-07-12. Split into M1-06a stop barrier and M1-06b exact
+approval transaction so execution safety was independently reviewable
 from approval evidence and CLI confirmation.
 
 Roadmap: U3. Dependencies: M1-05.
@@ -1040,9 +1040,10 @@ Commit boundary: authenticated stop barrier only.
 
 ### M1-06b - Exact Human Approval Transaction
 
-Status: active. Dependencies: M1-06a.
+Status: complete on 2026-07-12; independently approved by spec and quality
+review after two correction rounds. Dependencies: M1-06a.
 
-Acceptance criteria:
+Acceptance criteria delivered:
 
 - Run state explicitly represents approved without weakening or replacing the
   durable awaiting barrier.
@@ -1053,6 +1054,27 @@ Acceptance criteria:
   approval evidence under the candidate/run locking order with a full-state
   compare-and-swap. Duplicate approval is byte-identical or rejected.
 - Testing and promotion remain impossible in this slice.
+
+`seaf loop approve` requires a bounded reviewer identity plus exact
+`--confirm-candidate-diff` and `--confirm-target-head` values. Awaiting and
+Approved run/status reports expose those values through JSON and human output,
+so the supported flow does not require parsing `run.json`. Approval reuses the
+candidate-locked Applied verifier, selects exactly one typed Development policy
+decision, loads the approving OutputReview artifact, and binds the complete
+initial and latest terminal provider record references. The inline versioned
+evidence and Approved status publish together; exact retries revalidate and
+return without rewriting bytes.
+
+The first quality review found that physical source/candidate verification
+occurred before waiting for the provider lock, allowing stale physical
+authority to publish despite an unchanged LoopRun. A validator now runs after
+provider-lock acquisition while the candidate lock remains held and re-derives
+the complete physical and evidence authority immediately before atomic write.
+It also found that required confirmation values were absent from public CLI
+output. Both received focused regressions. Re-review rejected timing-based
+race tests; the final deterministic in-crate hook injects run, candidate, and
+source changes at the exact post-verification/pre-provider boundary without a
+public test API. Spec and quality approved the final frozen result.
 
 Likely seams: core state models/schemas, CLI approval command, state machine,
 candidate authority, provider exchange evidence, and CLI/state tests.
@@ -1069,6 +1091,8 @@ Docs/tracker: approval command/state and M1-06 status.
 Commit boundary: approval evidence and state only.
 
 ### M1-07 - Integrated Testing And EvalReport
+
+Status: active. Dependencies: M1-06 (complete).
 
 Roadmap: U4. Dependencies: M1-06.
 

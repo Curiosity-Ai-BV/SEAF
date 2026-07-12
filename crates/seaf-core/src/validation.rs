@@ -478,12 +478,177 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
     if run.status == crate::LoopStatus::AwaitingHumanReview {
         validate_awaiting_human_review_run(&mut errors, run);
     }
+    if run.status == crate::LoopStatus::Approved {
+        validate_awaiting_human_review_run(&mut errors, run);
+        validate_human_approval_evidence(&mut errors, run);
+    } else if run.human_approval.is_some() {
+        errors.push(FieldError::new(
+            "human_approval",
+            "is valid only when status is approved",
+        ));
+    }
 
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
 
     errors
+}
+
+fn validate_human_approval_evidence(errors: &mut Vec<FieldError>, run: &LoopRun) {
+    let Some(approval) = run.human_approval.as_ref() else {
+        errors.push(FieldError::new(
+            "human_approval",
+            "approved requires exact human approval evidence",
+        ));
+        return;
+    };
+    if approval.schema_version != 1 {
+        errors.push(FieldError::new(
+            "human_approval.schema_version",
+            "must be 1",
+        ));
+    }
+    if approval.run_id != run.run_id {
+        errors.push(FieldError::new(
+            "human_approval.run_id",
+            "must match run_id",
+        ));
+    }
+    require_non_empty(errors, "human_approval.reviewer", &approval.reviewer);
+    if approval.reviewer.len() > 256 {
+        errors.push(FieldError::new(
+            "human_approval.reviewer",
+            "must not exceed 256 bytes",
+        ));
+    }
+    if approval.reviewer.chars().any(char::is_control) {
+        errors.push(FieldError::new(
+            "human_approval.reviewer",
+            "must not contain control characters",
+        ));
+    }
+    require_non_empty(errors, "human_approval.approved_at", &approval.approved_at);
+    if approval.approved_at.len() > 64 {
+        errors.push(FieldError::new(
+            "human_approval.approved_at",
+            "must not exceed 64 bytes",
+        ));
+    }
+    require_non_empty(
+        errors,
+        "human_approval.candidate_diff.path",
+        &approval.candidate_diff.path,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "human_approval.candidate_diff.digest",
+        &approval.candidate_diff.digest,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "human_approval.policy_decision_digest",
+        &approval.policy_decision_digest,
+    );
+    require_non_empty(
+        errors,
+        "human_approval.output_review.path",
+        &approval.output_review.path,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "human_approval.output_review.digest",
+        &approval.output_review.digest,
+    );
+    if !matches!(approval.starting_head.len(), 40 | 64)
+        || !approval
+            .starting_head
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        errors.push(FieldError::new(
+            "human_approval.starting_head",
+            "must be a lowercase Git object ID",
+        ));
+    }
+    if let Some(candidate) = run.candidate_workspace.as_ref() {
+        if approval.starting_head != candidate.starting_head {
+            errors.push(FieldError::new(
+                "human_approval.starting_head",
+                "must match the candidate starting HEAD",
+            ));
+        }
+        if approval.candidate_diff.digest != candidate.candidate_diff_digest {
+            errors.push(FieldError::new(
+                "human_approval.candidate_diff.digest",
+                "must match the candidate diff digest",
+            ));
+        }
+    }
+    let Some(output_review) = run
+        .steps
+        .iter()
+        .find(|record| record.name == crate::LoopStepName::OutputReview)
+    else {
+        return;
+    };
+    if output_review.artifact_path.as_deref() != Some(&approval.output_review.path)
+        || output_review.artifact_digest.as_deref() != Some(&approval.output_review.digest)
+    {
+        errors.push(FieldError::new(
+            "human_approval.output_review",
+            "must match the current OutputReview artifact",
+        ));
+    }
+    if !run
+        .provider_exchange_records
+        .contains(&approval.output_review_request)
+        || !run
+            .provider_exchange_records
+            .contains(&approval.output_review_response)
+    {
+        errors.push(FieldError::new(
+            "human_approval.output_review_request",
+            "approval exchange references must belong to the authoritative ledger",
+        ));
+    }
+    let request = &approval.output_review_request;
+    let response = &approval.output_review_response;
+    if request.run_id != run.run_id
+        || request.step != crate::LoopStepName::OutputReview
+        || request.role != ProviderRole::OutputReviewer
+        || request.kind != ProviderExchangeKind::Initial
+        || request.exchange_index != 1
+        || request.phase != ProviderExchangePhase::Request
+        || response.run_id != run.run_id
+        || response.step != crate::LoopStepName::OutputReview
+        || response.role != ProviderRole::OutputReviewer
+        || response.phase != ProviderExchangePhase::Response
+        || request.step_attempt != response.step_attempt
+        || run.provider_exchange_records.last() != Some(response)
+    {
+        errors.push(FieldError::new(
+            "human_approval.output_review_response",
+            "must bind the latest OutputReview attempt's initial request and terminal response",
+        ));
+    }
+    let authoritative = run
+        .policy_decisions
+        .iter()
+        .filter(|decision| {
+            decision.get("patch_id").and_then(serde_json::Value::as_str)
+                == Some(run.run_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if authoritative.len() != 1
+        || crate::canonical_sha256_digest(authoritative[0])
+            .map_or(true, |digest| digest != approval.policy_decision_digest)
+    {
+        errors.push(FieldError::new(
+            "human_approval.policy_decision_digest",
+            "must select the unique authoritative Development policy decision",
+        ));
+    }
 }
 
 fn validate_awaiting_human_review_run(errors: &mut Vec<FieldError>, run: &LoopRun) {
@@ -2187,6 +2352,234 @@ unexpected_escape: true
                 shape["then"]["properties"]["artifact_digest"]["type"],
                 "null"
             );
+        }
+    }
+
+    #[test]
+    fn approved_status_requires_closed_exact_human_evidence_and_pending_testing_shape() {
+        let run = approved_run_fixture();
+        assert_eq!(
+            serde_json::to_value(crate::LoopStatus::Approved).unwrap(),
+            serde_json::json!("approved")
+        );
+        assert!(validate_loop_run(&run).is_empty());
+        let mut missing_mode = serde_json::to_value(&run).unwrap();
+        missing_mode
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_mode");
+        assert!(serde_json::from_value::<crate::LoopRun>(missing_mode)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit isolated_candidate"));
+
+        let mut missing = run.clone();
+        missing.human_approval = None;
+        assert!(validate_loop_run(&missing)
+            .iter()
+            .any(|error| error.field == "human_approval"));
+        let mut smuggled = run.clone();
+        smuggled.status = crate::LoopStatus::AwaitingHumanReview;
+        assert!(validate_loop_run(&smuggled)
+            .iter()
+            .any(|error| error.field == "human_approval"));
+        let mut malformed = run.clone();
+        malformed.human_approval.as_mut().unwrap().schema_version = 2;
+        malformed.human_approval.as_mut().unwrap().run_id = "other".to_string();
+        malformed
+            .human_approval
+            .as_mut()
+            .unwrap()
+            .candidate_diff
+            .digest = "f".repeat(64);
+        malformed.human_approval.as_mut().unwrap().starting_head = "a".repeat(40);
+        malformed
+            .human_approval
+            .as_mut()
+            .unwrap()
+            .output_review_request
+            .step_attempt = 2;
+        malformed
+            .human_approval
+            .as_mut()
+            .unwrap()
+            .policy_decision_digest = "0".repeat(64);
+        let fields = validate_loop_run(&malformed)
+            .into_iter()
+            .map(|error| error.field)
+            .collect::<Vec<_>>();
+        for expected in [
+            "human_approval.schema_version",
+            "human_approval.run_id",
+            "human_approval.candidate_diff.digest",
+            "human_approval.starting_head",
+            "human_approval.output_review_response",
+            "human_approval.policy_decision_digest",
+        ] {
+            assert!(fields.iter().any(|field| field == expected), "{expected}");
+        }
+        let mut duplicate_policy = run.clone();
+        duplicate_policy
+            .policy_decisions
+            .push(duplicate_policy.policy_decisions[0].clone());
+        assert!(validate_loop_run(&duplicate_policy)
+            .iter()
+            .any(|error| error.field == "human_approval.policy_decision_digest"));
+        let mut testing_ran = run.clone();
+        testing_ran
+            .steps
+            .iter_mut()
+            .find(|step| step.name == crate::LoopStepName::Testing)
+            .unwrap()
+            .status = crate::LoopStepStatus::Running;
+        assert!(validate_loop_run(&testing_ran)
+            .iter()
+            .any(|error| error.field.ends_with(".status")));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/loop-run.schema.json")).unwrap();
+        assert!(schema["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("approved")));
+        assert_eq!(
+            schema["properties"]["human_approval"]["anyOf"][0]["properties"]["schema_version"]
+                ["const"],
+            1
+        );
+        let approved = schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["if"]["properties"]["status"]["const"] == "approved")
+            .expect("Approved must have a public schema branch");
+        assert_eq!(approved["then"]["allOf"][0]["$ref"], "#/allOf/0/then");
+    }
+
+    fn approved_run_fixture() -> crate::LoopRun {
+        let run_id = "approved-run".to_string();
+        let request = crate::ProviderExchangeRecordReference {
+            run_id: run_id.clone(),
+            step: crate::LoopStepName::OutputReview,
+            role: crate::ProviderRole::OutputReviewer,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: crate::ProviderExchangeKind::Initial,
+            context_round: None,
+            phase: crate::ProviderExchangePhase::Request,
+            path: "artifacts/06-output-review.attempt-001.exchange-001.initial.request.record.json"
+                .to_string(),
+            digest: "1".repeat(64),
+        };
+        let response = crate::ProviderExchangeRecordReference {
+            phase: crate::ProviderExchangePhase::Response,
+            path:
+                "artifacts/06-output-review.attempt-001.exchange-001.initial.response.record.json"
+                    .to_string(),
+            digest: "2".repeat(64),
+            ..request.clone()
+        };
+        let policy: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "patch_id": run_id,
+                "decision": "allowed"
+            }))
+            .unwrap();
+        let policy_digest = canonical_sha256_digest(&policy).unwrap();
+        let steps = [
+            crate::LoopStepName::Research,
+            crate::LoopStepName::Analysis,
+            crate::LoopStepName::SpecCreation,
+            crate::LoopStepName::SpecReview,
+            crate::LoopStepName::Development,
+            crate::LoopStepName::OutputReview,
+            crate::LoopStepName::Testing,
+            crate::LoopStepName::EvalReport,
+        ]
+        .into_iter()
+        .map(|name| crate::LoopStepRecord {
+            name,
+            status: match name {
+                crate::LoopStepName::OutputReview => crate::LoopStepStatus::Passed,
+                crate::LoopStepName::Testing | crate::LoopStepName::EvalReport => {
+                    crate::LoopStepStatus::Pending
+                }
+                _ => crate::LoopStepStatus::Completed,
+            },
+            artifact_path: (name == crate::LoopStepName::OutputReview)
+                .then(|| "artifacts/06-output-review.json".to_string()),
+            artifact_digest: (name == crate::LoopStepName::OutputReview).then(|| "6".repeat(64)),
+        })
+        .collect();
+        crate::LoopRun {
+            run_id: run_id.clone(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: crate::LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+            execution_mode: crate::LoopExecutionMode::IsolatedCandidate,
+            status: crate::LoopStatus::Approved,
+            current_step: crate::LoopStepName::Testing,
+            started_at: "started".to_string(),
+            updated_at: "approved".to_string(),
+            steps,
+            policy_decisions: vec![policy],
+            provider_exchange_records: vec![request.clone(), response.clone()],
+            candidate_workspace: Some(crate::CandidateWorkspaceState {
+                schema_version: 2,
+                run_directory_digest: Some("9".repeat(64)),
+                path: "/tmp/candidate".to_string(),
+                source_worktree_root: "/tmp/source".to_string(),
+                git_common_dir: "/tmp/source/.git".to_string(),
+                repository_identity_digest: "d".repeat(64),
+                starting_head: "e".repeat(40),
+                starting_tree: "f".repeat(40),
+                candidate_head: "e".repeat(40),
+                candidate_tree: "1".repeat(40),
+                candidate_diff_digest: "3".repeat(64),
+                patch_transaction: Some(crate::CandidatePatchTransaction {
+                    schema_version: 1,
+                    phase: crate::CandidatePatchPhase::Applied,
+                    intent: crate::ArtifactReference {
+                        path: "artifacts/intent.json".to_string(),
+                        digest: "4".repeat(64),
+                    },
+                    applied_evidence: Some(crate::ArtifactReference {
+                        path: "artifacts/applied.json".to_string(),
+                        digest: "5".repeat(64),
+                    }),
+                    started_at: "started".to_string(),
+                    applied_at: Some("applied".to_string()),
+                }),
+                lifecycle: crate::CandidateWorkspaceLifecycle::Active,
+                cleanup_started_at: None,
+                cleaned_at: None,
+            }),
+            human_approval: Some(crate::HumanApprovalEvidence {
+                schema_version: 1,
+                run_id,
+                reviewer: "reviewer@example.invalid".to_string(),
+                approved_at: "approved".to_string(),
+                candidate_diff: crate::ArtifactReference {
+                    path: "artifacts/candidate-patch.applied.diff".to_string(),
+                    digest: "3".repeat(64),
+                },
+                starting_head: "e".repeat(40),
+                policy_decision_digest: policy_digest,
+                output_review: crate::ArtifactReference {
+                    path: "artifacts/06-output-review.json".to_string(),
+                    digest: "6".repeat(64),
+                },
+                output_review_request: request,
+                output_review_response: response,
+            }),
+            eval_report_path: None,
         }
     }
 

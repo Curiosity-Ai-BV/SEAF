@@ -180,9 +180,12 @@ pub struct PreparedLoopRun {
 }
 
 pub fn validate_rerun_eligibility(run: &LoopRun, step: LoopStepName) -> Result<(), RunnerError> {
-    if run.status == LoopStatus::AwaitingHumanReview {
+    if matches!(
+        run.status,
+        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+    ) {
         return Err(RunnerError::Step(
-            "awaiting human review cannot be rerun without audited invalidation; start a new run or complete human approval"
+            "awaiting human review or approved authority cannot be rerun without audited invalidation; start a new run"
                 .to_string(),
         ));
     }
@@ -711,7 +714,10 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         run: LoopRun,
         step_runner: &'a mut R,
     ) -> Result<Self, RunnerError> {
-        if run.status == LoopStatus::AwaitingHumanReview {
+        if matches!(
+            run.status,
+            LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+        ) {
             return Ok(Self {
                 workspace,
                 run,
@@ -790,6 +796,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         if matches!(
             self.run.status,
             LoopStatus::AwaitingHumanReview
+                | LoopStatus::Approved
                 | LoopStatus::Blocked
                 | LoopStatus::Failed
                 | LoopStatus::Passed

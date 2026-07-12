@@ -10,7 +10,8 @@ use seaf_core::{
     TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
 };
 use seaf_loop::{
-    artifacts::write_step_request, cleanup_candidate_workspace_outcome,
+    approve_candidate_for_testing, artifacts::write_step_request,
+    cleanup_candidate_workspace_outcome, persist_provider_exchange_record_reference,
     stage_provider_exchange_record, verify_candidate_patch_evidence,
     write_provider_exchange_request, AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits,
     ContextPackRequest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
@@ -349,6 +350,247 @@ fn output_review_receives_only_the_exact_verified_applied_subject() {
     assert_eq!(source_evidence(&fixture.source), source_before_review);
     assert_eq!(source_evidence(&fixture.candidate), candidate_before_review);
     remove_candidate(&fixture.source, &fixture.candidate);
+}
+
+#[test]
+fn human_approval_binds_the_exact_reviewed_candidate_without_running_tests() {
+    let fixture = fixture("exact-human-approval");
+    let provider = FakeProvider::new(candidate_responses(true));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        );
+    let mut runner =
+        LoopRunner::start_initialized(fixture.prepared, &mut step_runner).expect("start");
+    for _ in 0..6 {
+        assert!(runner.run_next_step().expect("through OutputReview"));
+    }
+    drop(runner);
+    drop(step_runner);
+    let workspace = LoopWorkspace::open(&fixture.runs_root, "exact-human-approval").unwrap();
+    let waiting = seaf_loop::state::load_run(&workspace).unwrap();
+    let candidate = waiting.candidate_workspace.as_ref().unwrap();
+
+    let approved = approve_candidate_for_testing(
+        &workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .expect("exact approval");
+
+    assert_eq!(approved.run.status, seaf_core::LoopStatus::Approved);
+    assert_eq!(approved.run.current_step, LoopStepName::Testing);
+    assert_eq!(
+        approved
+            .run
+            .steps
+            .iter()
+            .find(|step| step.name == LoopStepName::Testing)
+            .unwrap()
+            .status,
+        seaf_core::LoopStepStatus::Pending
+    );
+    assert!(approved.run.eval_report_path.is_none());
+    assert_eq!(approved.evidence.schema_version, 1);
+    assert_eq!(approved.evidence.run_id, approved.run.run_id);
+    assert_eq!(approved.evidence.reviewer, "reviewer@example.invalid");
+    assert!(!approved.evidence.approved_at.is_empty());
+    assert_eq!(
+        approved.evidence.candidate_diff.digest,
+        candidate.candidate_diff_digest
+    );
+    assert_eq!(approved.evidence.starting_head, candidate.starting_head);
+    let authoritative_policy = approved
+        .run
+        .policy_decisions
+        .iter()
+        .find(|decision| {
+            decision.get("patch_id").and_then(serde_json::Value::as_str)
+                == Some(approved.run.run_id.as_str())
+        })
+        .unwrap();
+    assert_eq!(
+        approved.evidence.policy_decision_digest,
+        canonical_sha256_digest(authoritative_policy).unwrap()
+    );
+    let review = approved
+        .run
+        .steps
+        .iter()
+        .find(|step| step.name == LoopStepName::OutputReview)
+        .unwrap();
+    assert_eq!(
+        approved.evidence.output_review.path,
+        review.artifact_path.clone().unwrap()
+    );
+    assert_eq!(
+        approved.evidence.output_review.digest,
+        review.artifact_digest.clone().unwrap()
+    );
+    assert!(approved
+        .run
+        .provider_exchange_records
+        .contains(&approved.evidence.output_review_request));
+    assert_eq!(
+        approved.run.provider_exchange_records.last(),
+        Some(&approved.evidence.output_review_response)
+    );
+    assert_eq!(
+        approved.evidence.output_review_request.step_attempt,
+        approved.evidence.output_review_response.step_attempt
+    );
+    let approved_snapshot = snapshot_files(workspace.run_directory());
+    let append_error = persist_provider_exchange_record_reference(
+        &workspace,
+        approved.evidence.output_review_response.clone(),
+    )
+    .expect_err("Approved must freeze provider append");
+    assert!(
+        append_error.to_string().contains("frozen"),
+        "{append_error}"
+    );
+    let cleanup_error = cleanup_candidate_workspace_outcome(&workspace, &fixture.source)
+        .expect_err("Approved candidate remains active and non-cleanable");
+    assert!(
+        cleanup_error.to_string().contains("active run"),
+        "{cleanup_error}"
+    );
+    let mut false_completed = approved.run.clone();
+    false_completed.status = seaf_core::LoopStatus::Completed;
+    false_completed.human_approval = None;
+    let writer_error = seaf_loop::state::save_run(&workspace, &false_completed)
+        .expect_err("public state writer cannot replace Approved");
+    assert!(
+        writer_error.to_string().contains("approved authority"),
+        "{writer_error}"
+    );
+    let mut inert = UnauthenticatedOutputReview;
+    let mut resumed = LoopRunner::resume(&fixture.runs_root, "exact-human-approval", &mut inert)
+        .expect("Approved resumes as inert authority");
+    assert!(!resumed
+        .run_next_step()
+        .expect("Approved has no runnable step"));
+    let rerun_error = resumed
+        .rerun_from(LoopStepName::OutputReview)
+        .expect_err("Approved rerun requires future audited invalidation");
+    assert!(
+        rerun_error.to_string().contains("approved authority"),
+        "{rerun_error}"
+    );
+    assert_eq!(snapshot_files(workspace.run_directory()), approved_snapshot);
+    remove_candidate(&fixture.source, &fixture.candidate);
+}
+
+#[test]
+fn human_approval_rejects_stale_or_substituted_authority_without_further_mutation() {
+    for mutation in [
+        ApprovalMutation::DuplicatePolicy,
+        ApprovalMutation::UnrelatedPolicy,
+        ApprovalMutation::OutputReviewArtifact,
+        ApprovalMutation::InitialProviderReference,
+        ApprovalMutation::ProviderReference,
+        ApprovalMutation::LaterReviewAttempt,
+        ApprovalMutation::MovedSourceHead,
+        ApprovalMutation::ChangedCandidate,
+        ApprovalMutation::NonAwaitingStatus,
+    ] {
+        let run_id = format!("approval-{mutation:?}").to_ascii_lowercase();
+        let fixture = awaiting_approval_fixture(&run_id);
+        let mut waiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+        let candidate = waiting.candidate_workspace.as_ref().unwrap().clone();
+        match mutation {
+            ApprovalMutation::DuplicatePolicy => {
+                waiting
+                    .policy_decisions
+                    .push(waiting.policy_decisions[0].clone());
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+            ApprovalMutation::UnrelatedPolicy => {
+                waiting.policy_decisions[0]
+                    .insert("patch_id".to_string(), serde_json::json!("another-run"));
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+            ApprovalMutation::OutputReviewArtifact => {
+                let review = waiting
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.name == LoopStepName::OutputReview)
+                    .unwrap();
+                review.artifact_digest = Some("f".repeat(64));
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+            ApprovalMutation::ProviderReference => {
+                waiting.provider_exchange_records.last_mut().unwrap().digest = "f".repeat(64);
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+            ApprovalMutation::InitialProviderReference => {
+                waiting
+                    .provider_exchange_records
+                    .iter_mut()
+                    .find(|reference| {
+                        reference.step == LoopStepName::OutputReview
+                            && reference.kind == ProviderExchangeKind::Initial
+                            && reference.phase == ProviderExchangePhase::Request
+                    })
+                    .unwrap()
+                    .digest = "f".repeat(64);
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+            ApprovalMutation::LaterReviewAttempt => {
+                write_step_request(
+                    &fixture.workspace,
+                    LoopStepName::OutputReview,
+                    2,
+                    "unapproved later review attempt",
+                )
+                .unwrap();
+            }
+            ApprovalMutation::MovedSourceHead => {
+                fs::write(fixture.source.join("moved.txt"), "moved\n").unwrap();
+                git_ok(&fixture.source, &["add", "moved.txt"]);
+                git_ok(&fixture.source, &["commit", "-qm", "move source"]);
+            }
+            ApprovalMutation::ChangedCandidate => {
+                fs::write(fixture.candidate.join("src/new.rs"), "substituted\n").unwrap();
+            }
+            ApprovalMutation::NonAwaitingStatus => {
+                waiting.status = seaf_core::LoopStatus::Blocked;
+                write_raw_run(&fixture.workspace, &waiting);
+            }
+        }
+        let run_before = snapshot_files(fixture.workspace.run_directory());
+        let source_before = source_evidence(&fixture.source);
+        let candidate_before = source_evidence(&fixture.candidate);
+
+        let error = approve_candidate_for_testing(
+            &fixture.workspace,
+            &fixture.source,
+            "reviewer@example.invalid",
+            &candidate.candidate_diff_digest,
+            &candidate.starting_head,
+        )
+        .expect_err("stale or substituted approval authority must fail closed");
+
+        assert!(!error.to_string().is_empty(), "{mutation:?}");
+        assert_eq!(
+            snapshot_files(fixture.workspace.run_directory()),
+            run_before
+        );
+        assert_eq!(source_evidence(&fixture.source), source_before);
+        assert_eq!(source_evidence(&fixture.candidate), candidate_before);
+        fixture.cleanup();
+    }
 }
 
 #[test]
@@ -1306,6 +1548,72 @@ struct Fixture {
     ticket: TicketSpec,
     policy: Policy,
     prepared: PreparedLoopRun,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ApprovalMutation {
+    DuplicatePolicy,
+    UnrelatedPolicy,
+    OutputReviewArtifact,
+    InitialProviderReference,
+    ProviderReference,
+    LaterReviewAttempt,
+    MovedSourceHead,
+    ChangedCandidate,
+    NonAwaitingStatus,
+}
+
+struct AwaitingApprovalFixture {
+    _temp: tempfile::TempDir,
+    source: PathBuf,
+    candidate: PathBuf,
+    workspace: LoopWorkspace,
+}
+
+impl AwaitingApprovalFixture {
+    fn cleanup(self) {
+        remove_candidate(&self.source, &self.candidate);
+    }
+}
+
+fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
+    let Fixture {
+        _temp,
+        runs_root,
+        source,
+        candidate,
+        ticket,
+        policy,
+        prepared,
+    } = fixture(run_id);
+    let provider = FakeProvider::new(candidate_responses(true));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
+        .with_context_pack_request(context_request(&candidate, &ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+            &mut patch_runner,
+        );
+    let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).expect("start");
+    for _ in 0..6 {
+        assert!(runner.run_next_step().expect("through OutputReview"));
+    }
+    drop(runner);
+    drop(step_runner);
+    let workspace = LoopWorkspace::open(&runs_root, run_id).unwrap();
+    AwaitingApprovalFixture {
+        _temp,
+        source,
+        candidate,
+        workspace,
+    }
+}
+
+fn write_raw_run(workspace: &LoopWorkspace, run: &seaf_core::LoopRun) {
+    let mut bytes = serde_json::to_vec_pretty(run).unwrap();
+    bytes.push(b'\n');
+    fs::write(workspace.run_file(), bytes).unwrap();
 }
 
 fn fixture(run_id: &str) -> Fixture {

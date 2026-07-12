@@ -1471,3 +1471,42 @@ including the previously timing-sensitive descendant-pipe regression. M1-06a
 is accepted and M1-06b exact human approval is active. The final full locked
 workspace, all-target/all-feature Clippy with warnings denied, Rust/Prettier
 formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff check pass.
+
+## 2026-07-12 implementation | M1-06b exact human approval
+
+Added explicit `Approved` state and closed versioned `HumanApprovalEvidence`
+inside LoopRun. The evidence binds the run, bounded reviewer identity and
+timestamp, exact applied candidate-diff reference and target HEAD, unique typed
+Development policy digest, current approving OutputReview artifact, and exact
+initial/latest-terminal authenticated provider record references. Approved
+retains Testing and EvalReport as pending and artifact-free. Runner, rerun,
+cleanup, provider append/reconciliation/reset, ordinary publication, and public
+state-writer paths remain inert; exact approval retry revalidates authority and
+does not rewrite bytes.
+
+`seaf loop approve` requires exact staged-diff and target-HEAD confirmations.
+Awaiting and Approved run/status reports expose both values in JSON and human
+output, so the public workflow no longer depends on internal run-file parsing.
+Dirty tracked and untracked source bytes remain supported and unchanged while
+the source HEAD must still match candidate authority.
+
+Quality review found a deterministic stale-physical-authority window between
+initial candidate/source verification and provider-lock acquisition. The final
+transaction keeps candidate-to-provider lock order, compares the complete run,
+then re-derives physical candidate/source state, confirmations, policy, review
+artifact, provider bindings, and intended approval evidence inside the provider
+lock before atomic publication. Its first concurrent tests depended on lock
+polling and sleeps; re-review required deterministic proof. A private in-crate
+hook now synchronously injects run-state, candidate-worktree, and source-HEAD
+changes at the exact post-verification/pre-provider boundary. The run change
+hits full CAS; both physical changes hit the inner validator; no public fault
+hook or timing assumption remains.
+
+Spec and quality approved the corrected frozen result. Controller verification
+passes the deterministic three-case publication-race unit, all 17 provider
+candidate tests, core 35, and CLI 96, including public confirmation discovery,
+dirty-source preservation, substitutions, inert Approved state, and exact
+retry. The final locked workspace, all-target/all-feature Clippy with warnings
+denied, Rust/Prettier formatting, package lint/typecheck, 8 SDK tests, SDK
+build, and diff check pass. M1-06 is accepted and M1-07 integrated
+Testing/EvalReport is active.

@@ -168,8 +168,15 @@ OutputReview `ApproveForTests` outcome and records `awaiting_human_review`
 without running Testing or EvalReport. The barrier is closed against provider,
 rerun, reconciliation, cleanup, and public-writer bypasses; historical
 unapproved Testing/Eval prefixes fail before ticket or provider work. M1-06b,
-the exact human approval transaction, is active. The candidate is still not
-executable or promotable before approval and the later eval milestones.
+the exact human approval transaction, now publishes a versioned inline approval
+record under candidate-to-provider locking and full-state compare-and-swap.
+`seaf loop approve` requires the reviewer to confirm the exact staged diff and
+target HEAD exposed by public run/status output; it reauthenticates policy,
+review artifact, provider exchanges, source HEAD, and physical candidate state
+inside the publication lock. Approved runs remain inert and non-cleanable.
+M1-06 is complete and M1-07 integrated Testing/EvalReport is active. The
+candidate is still not executable until that controlled eval boundary lands,
+and it is not promotable before M1-08.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

@@ -41,13 +41,15 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-06b - Exact human approval transaction. Starting only from the closed
-M1-06a `awaiting_human_review` barrier, add a versioned compact approval record
-and explicit CLI operation that can approve only the exact reviewed candidate.
-Bind the run ID, candidate staged-diff digest, starting target HEAD, policy
-decision digest, current OutputReview artifact reference, its authenticated
-initial-request and terminal-response exchange references, reviewer identity,
-and timestamp. Publish under candidate/run locking with full-state
-compare-and-swap; stale, substituted, mismatched, or duplicate evidence fails
-closed or is an exact byte-preserving retry. Do not execute model-modified
-code, run evals, promote, or alter the source checkout in this slice.
+M1-07 - Integrated Testing and EvalReport. Replace the two provider-loop no-op
+steps with the existing controlled eval engine running only inside the exact
+Approved candidate. Consume the canonical ticket `eval.config`, enforce both
+ticket and eval allowlists, bounded commands/time/output/redaction, and refuse
+missing, stale, substituted, or non-Approved human/candidate/policy/review
+authority before any command. Persist command logs and a canonical EvalReport
+bound to run, ticket, candidate staged-diff, approval, and real policy evidence;
+set `LoopRun.eval_report_path` and an explicit terminal eval state only after
+durable report publication. Failed checks/evidence must fail closed and cannot
+claim eval success. Preserve the source checkout and all approval/provider
+evidence; do not promote, commit, merge, deploy, or contact a model in these
+steps.
