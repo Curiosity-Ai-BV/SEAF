@@ -174,9 +174,18 @@ record under candidate-to-provider locking and full-state compare-and-swap.
 target HEAD exposed by public run/status output; it reauthenticates policy,
 review artifact, provider exchanges, source HEAD, and physical candidate state
 inside the publication lock. Approved runs remain inert and non-cleanable.
-M1-06 is complete and M1-07 integrated Testing/EvalReport is active. The
-candidate is still not executable until that controlled eval boundary lands,
-and it is not promotable before M1-08.
+M1-06 is complete. M1-07 is split into a reusable controlled engine, immutable
+eval-configuration authority, and one approved Testing/EvalReport transaction.
+The engine extraction is complete: shared typed configuration and controlled
+planning/execution preserve valid standalone behavior, preflight all checks,
+intersect both allowlists, confine candidate-relative execution paths, redact
+before the persisted output cap, and reject ambiguous log identities without
+side effects. Immutable eval authority is active. The candidate is still not
+executable until the complete controlled eval boundary lands, and it is not
+promotable before M1-08. Human approval authorizes local execution under the
+developer account: SEAF validates command configuration and detects repository
+drift, but it does not contain approved code from malicious same-user filesystem
+access.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable
@@ -325,6 +334,8 @@ and upgrade/recovery behavior is documented and tested.
   retention, privacy handling, and one event-to-signal integration test.
 - Generating every public contract across Rust, TypeScript, and JSON Schema
   before the smaller loop artifact set has stabilized.
+- OS-level containment of approved commands. A sandbox, container, or isolated
+  execution-repository backend requires a separate product-hardening roadmap.
 
 ## Roadmap Discipline
 

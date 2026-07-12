@@ -24,7 +24,10 @@ safety, generic bootstrap, CLI distribution, external acceptance, durable loop
 contracts, pilots, and preview readiness.
 
 Deferred: dashboard, cloud providers, autonomous PR/commit/merge/deploy,
-production updater signing, and supported telemetry SDK/runtime.
+production updater signing, supported telemetry SDK/runtime, and adversarial
+same-user command containment. Human approval authorizes local execution under
+the developer account; SEAF validates configuration and detects repository
+drift but is not an OS sandbox for approved code.
 
 ## Review And Commit Gate
 
@@ -41,15 +44,20 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-07 - Integrated Testing and EvalReport. Replace the two provider-loop no-op
-steps with the existing controlled eval engine running only inside the exact
-Approved candidate. Consume the canonical ticket `eval.config`, enforce both
-ticket and eval allowlists, bounded commands/time/output/redaction, and refuse
-missing, stale, substituted, or non-Approved human/candidate/policy/review
-authority before any command. Persist command logs and a canonical EvalReport
-bound to run, ticket, candidate staged-diff, approval, and real policy evidence;
-set `LoopRun.eval_report_path` and an explicit terminal eval state only after
-durable report publication. Failed checks/evidence must fail closed and cannot
-claim eval success. Preserve the source checkout and all approval/provider
-evidence; do not promote, commit, merge, deploy, or contact a model in these
-steps.
+M1-07b - Immutable eval configuration authority. For every new provider run,
+resolve `ticket.eval.config` before run-directory, candidate, or provider work
+as a real regular file contained by the authoritative repository root. Reject
+absolute, traversal, backslash-ambiguous, missing, malformed, and symlink-escape
+authority without side effects. Parse the shared typed config once,
+canonicalize it to JSON, publish it create-only as `inputs/eval-config.json`,
+and bind its digest in the run input contract. Keep the new digest optional only
+for historical deserialization; new provider runs require it. Incomplete resume
+must compare live authority with the bound digest. Historical Approved runs
+without this authority remain byte-identical, execute no command, and instruct
+the user to start a new run; never backfill from mutable live or candidate YAML.
+Do not execute checks, add eval terminal states, publish Testing/EvalReport
+evidence, promote, or contact a model beyond the existing pre-eval provider
+workflow in this slice.
+
+Next, M1-07c executes one approval-bound Testing/EvalReport transaction from the
+canonical ticket and eval snapshots inside the exact candidate.

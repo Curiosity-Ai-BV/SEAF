@@ -5002,6 +5002,53 @@ fn eval_run_redacts_standalone_secret_like_tokens_from_logs() {
 
 #[cfg(unix)]
 #[test]
+fn eval_run_classifies_obvious_secret_before_persisted_log_cap() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config_path = temp_dir.path().join("seaf.evals.yaml");
+    let report_path = temp_dir.path().join("eval-report.json");
+    let script_path = temp_dir.path().join("emit-capped-secret");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nprintf 'ok sk-proj-exampleSensitiveToken1234567890\\n'\n",
+    );
+    fs::write(
+        &config_path,
+        format!(
+            r#"evals:
+  allow_commands:
+    - {command}
+  required:
+    - name: capped_secret
+      command: "{command}"
+      max_output_bytes: 12
+"#,
+            command = script_path.display()
+        ),
+    )
+    .expect("write eval config");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            config_path.to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout_log = fs::read_to_string(temp_dir.path().join("logs/capped_secret.stdout.log"))
+        .expect("stdout log");
+    assert!(stdout_log.contains("[REDA"), "{stdout_log}");
+    assert!(stdout_log.len() <= 12, "{stdout_log}");
+    assert!(!stdout_log.contains("sk-proj-"), "{stdout_log}");
+}
+
+#[cfg(unix)]
+#[test]
 fn eval_run_redacts_colon_labeled_obvious_secret_tokens_from_logs() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let config_path = temp_dir.path().join("seaf.evals.yaml");
@@ -5118,6 +5165,79 @@ fn eval_run_prevalidates_all_checks_before_executing_any_command() {
             .exists(),
         "prevalidation failure should not write per-check logs"
     );
+}
+
+#[test]
+fn eval_run_prevalidates_sanitized_log_name_collisions_before_executing_commands() {
+    for (case, first_name, second_name, expected_error) in [
+        (
+            "exact duplicate",
+            "same",
+            "same",
+            "duplicate eval check name",
+        ),
+        (
+            "sanitization collision",
+            "same/name",
+            "same?name",
+            "log name collision",
+        ),
+        (
+            "case-folded collision",
+            "Same",
+            "same",
+            "log name collision",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("seaf.evals.yaml");
+        let marker_path = temp_dir.path().join("marker");
+        let report_path = temp_dir.path().join("eval-report.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"evals:
+  allow_commands:
+    - touch
+    - printf
+  required:
+    - name: "{first_name}"
+      command: "touch {marker}"
+    - name: "{second_name}"
+      command: "printf ok"
+"#,
+                marker = marker_path.display()
+            ),
+        )
+        .expect("write eval config");
+
+        let output = seaf()
+            .args([
+                "eval",
+                "run",
+                config_path.to_str().unwrap(),
+                "--output",
+                report_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run eval");
+
+        assert!(!output.status.success(), "{case}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(stderr.contains(expected_error), "{case}: {stderr}");
+        assert!(
+            !marker_path.exists(),
+            "{case}: no eval command should execute"
+        );
+        assert!(
+            !report_path.exists(),
+            "{case}: colliding eval should not write report"
+        );
+        assert!(
+            !temp_dir.path().join("logs").exists(),
+            "{case}: colliding eval should not create a log directory"
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -1,9 +1,14 @@
 mod canonical;
+mod eval_config;
 mod models;
 pub mod templates;
 mod validation;
 
 pub use canonical::{canonical_json_bytes, canonical_sha256_digest};
+pub use eval_config::{
+    parse_eval_config, validate_eval_config, EvalCommandConfig, EvalConfig, EvalConfigError,
+    EvalGroup,
+};
 pub use models::*;
 pub use validation::{
     load_eval_report_file, load_goal_file, load_loop_run_file, load_policy_file,

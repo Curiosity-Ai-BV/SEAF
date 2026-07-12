@@ -1092,34 +1092,118 @@ Commit boundary: approval evidence and state only.
 
 ### M1-07 - Integrated Testing And EvalReport
 
-Status: active. Dependencies: M1-06 (complete).
+Status: active. Split into M1-07a reusable controlled engine, M1-07b immutable
+eval authority, and M1-07c approved Testing/EvalReport transaction.
+Dependencies: M1-06 (complete).
 
 Roadmap: U4. Dependencies: M1-06.
 
 Objective: make Testing and EvalReport deterministic loop steps over the exact
-approved candidate.
+approved candidate without trusting mutable eval configuration.
+
+### M1-07a - Reusable Controlled Eval Engine
+
+Status: complete on 2026-07-12. Dependencies: M1-06 (complete). M1-07b is
+active.
+
+Objective: extract the existing standalone controlled eval implementation into
+shared typed configuration and reusable planning/execution modules while
+preserving valid `seaf eval run` behavior and failing closed on newly exposed
+unsafe invalid configurations.
 
 Acceptance criteria:
 
-- Testing consumes `ticket.eval.config` and both allowlists through the existing
-  controlled runner inside the candidate workspace.
-- Testing refuses missing human approval or mismatched candidate evidence.
-- EvalReport persists logs and real policy evidence, binds run/ticket/patch,
-  populates `LoopRun.eval_report_path`, and determines terminal eval state.
-- Failed commands/evidence cannot produce `eval_passed` or promotion.
+- Shared typed eval configuration rejects unknown fields and the reusable
+  engine returns redacted, bounded output while callers own log persistence.
+- Both command allowlists are intersected, every check is planned before the
+  first command, and empty either allowlist denies execution.
+- Working directories and candidate-relative executables stay inside the
+  supplied root; trusted system executables retain the existing rules.
+- Shell-free parsing, cleared environment, timeout/process-group cleanup,
+  output draining, redaction-before-truncation, CLI flags, report semantics,
+  exit codes, and standalone log paths remain compatible for valid
+  configurations. Duplicate, sanitized-name, and ASCII case-folded log
+  identities fail before directory creation or command execution.
 
-Likely seams: controlled command runner extraction, loop step runner, eval
-builder, state/run contracts, and CLI integration tests.
+RED: independent allowlist denial, invalid later check preventing an earlier
+marker, redacted/capped returned output, root escape, ambiguous log identities
+with zero side effects, and existing standalone CLI behavior tests.
 
-RED: unapproved execution, candidate-only behavior, failed eval, missing policy
-evidence, report binding, and no-op-removal tests.
+Verification: shared engine tests, standalone eval CLI coverage, full Rust
+tests, format, Clippy, and diff check.
+
+Commit boundary: controlled engine extraction and standalone compatibility
+only. No run snapshots, new states, or Approved execution.
+
+### M1-07b - Immutable Eval Configuration Authority
+
+Status: active. Dependencies: M1-07a (complete).
+
+Objective: bind the exact eval program before candidate or provider work so
+later Approved execution never rereads mutable live or candidate YAML.
+
+Acceptance criteria:
+
+- New provider runs require `ticket.eval.config` to resolve to a real,
+  repository-root-contained regular file; absolute, traversal, ambiguous,
+  symlink-escaping, missing, and malformed paths fail before run creation or a
+  provider call.
+- Parse once, canonicalize to JSON, publish create-only as
+  `inputs/eval-config.json`, and bind its digest in the authoritative run input
+  contract. Historical state remains readable through an optional field.
+- Incomplete resume compares live authority with the bound digest. Approved
+  evaluation will consume only the canonical snapshot.
+- Historical Approved runs without this authority stay byte-identical and
+  instruct the user to start a new run; they are never backfilled.
+
+RED: unsafe paths, missing/malformed config, canonical key-order parity, live
+mutation on resume, digest substitution, and inert historical approval.
+
+Verification: core/schema/snapshot/CLI suites, full Rust tests, format, Clippy,
+and diff check.
+
+Commit boundary: immutable eval input authority only. No command execution.
+
+### M1-07c - Approved Testing And EvalReport Transaction
+
+Status: pending. Dependencies: M1-07b.
+
+Objective: execute the canonical checks only in the exact Approved candidate
+and durably publish one approval-bound Testing/EvalReport terminal transaction.
+
+Acceptance criteria:
+
+- `loop resume` recognizes exact Approved authority and uses the canonical
+  ticket and eval snapshots without a model call. Direct provider Testing and
+  EvalReport execution fails closed instead of reporting no-op success.
+- Preflight all checks before mutation or execution. Reauthenticate approval,
+  provider/review/policy evidence, source identity, and physical candidate
+  before commands and before final publication under candidate-to-provider
+  lock order.
+- Publish create-only redacted command logs, canonical Testing evidence, and a
+  backward-compatible EvalReport binding the run, ticket, config, candidate
+  diff, approval, policy decision, and Testing artifact.
+- Publish Testing, EvalReport, `LoopRun.eval_report_path`, and terminal
+  `eval_passed` or reported `failed` state with a full-state compare-and-swap.
+  Failed checks/evidence cannot claim eval success or promotion.
+- An execution intent prevents silent command replay after interruption;
+  M1-09 owns audited adoption or invalidation of an incomplete attempt.
+
+Likely seams: approved-eval controller, candidate/provider locks, create-only
+artifact publisher, eval builder, state/run contracts, and CLI resume tests.
+
+RED: unapproved or historical execution, substituted authority, independent
+allowlist denial with zero commands, candidate-only side effects, no provider
+calls, failed/timeout report binding, mutation before final publication,
+artifact substitution, and no-op-removal tests.
 
 Verification: eval/provider/CLI suites, full Rust tests, format, Clippy, and diff
 check.
 
-Docs/tracker: one-command flow and M1-07 status.
+Docs/tracker: one-command flow, supervised local-execution boundary, and M1-07
+status.
 
-Commit boundary: Testing/EvalReport integration only.
+Commit boundary: Approved Testing/EvalReport transaction only.
 
 ### M1-08 - Promotion Integrity
 

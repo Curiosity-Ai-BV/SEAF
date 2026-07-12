@@ -1510,3 +1510,35 @@ retry. The final locked workspace, all-target/all-feature Clippy with warnings
 denied, Rust/Prettier formatting, package lint/typecheck, 8 SDK tests, SDK
 build, and diff check pass. M1-06 is accepted and M1-07 integrated
 Testing/EvalReport is active.
+
+## 2026-07-12 implementation | M1-07a reusable controlled eval engine
+
+Extracted deny-unknown typed eval configuration and validation into `seaf-core`
+and the shell-free controlled command planner/executor into `seaf-loop`.
+Standalone `seaf eval run` remains the report and log owner and preserves valid
+configuration flags, report semantics, exit behavior, and paths. The reusable
+engine plans every check before execution, intersects eval and ticket
+allowlists, confines cwd and candidate-relative executables to the canonical
+execution root, clears the child environment, preserves trusted executable,
+timeout, process-group, output-drain, cap, and redaction behavior, and returns
+sanitized output for caller persistence.
+
+Quality review found two audit-integrity gaps. Raw capture stopped at the
+persisted byte cap before obvious-secret classification, exposing a truncated
+token prefix. A bounded 26-byte classification lookahead now covers the longest
+recognized prefix plus minimum suffix before sanitized output is truncated to
+the exact configured cap. Distinct check names could also sanitize to one
+replacing log path. CLI preflight now rejects exact duplicates, sanitized-name
+collisions, and ASCII case-folded collisions before directory creation or any
+command; table-driven regressions prove zero marker, report, or log-directory
+side effects. A final review correction aligned the tracker and acceptance text
+with these intentional fail-closed invalid cases.
+
+Spec and quality re-reviews approve the corrected slice. Controller verification
+passes CLI 98, core 37, loop 108, the 5-test shared eval engine, candidate 39,
+provider candidate 17, provider exchange 22, state 29, and every remaining Rust
+and doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
+formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass.
+The first pnpm launcher on `PATH` lacked its managed binary; the exact pinned
+11.7.0 binary from the active Node installation ran the package gate. M1-07a is
+accepted and M1-07b immutable eval configuration authority is active.

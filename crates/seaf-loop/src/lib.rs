@@ -4,6 +4,7 @@ pub mod candidate_workspace;
 pub mod context;
 pub mod context_expansion;
 pub mod development_evidence;
+pub mod eval_engine;
 pub mod eval_report;
 mod immutable_artifact;
 pub mod model_runner;
@@ -41,6 +42,10 @@ pub use context_expansion::{
     CreatedContextExpansion, CONTEXT_EXPANSION_SCHEMA_VERSION,
 };
 pub use development_evidence::DevelopmentEvidence;
+pub use eval_engine::{
+    execute_eval_checks, plan_eval_checks, run_eval_checks, EvalCheckExecution, EvalEngineError,
+    EvalPlan,
+};
 pub use eval_report::build_loop_eval_report;
 pub use model_runner::{ProviderPatchGateConfig, ProviderStepRunner};
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
