@@ -25,13 +25,13 @@ use seaf_core::{
 };
 use seaf_loop::{
     approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
-    evaluate_zero_tolerance, execute_eval_checks, load_agent_bench_fixture, plan_eval_checks,
-    preflight_authoritative_run_inputs, validate_human_review_execution_barrier,
-    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
-    CandidateCleanupOutcome, ContextLimits, ContextPackRequest, EvalCheckExecution,
-    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
-    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
-    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    evaluate_zero_tolerance, execute_approved_evaluation, execute_eval_checks,
+    load_agent_bench_fixture, plan_eval_checks, preflight_authoritative_run_inputs,
+    validate_human_review_execution_barrier, validate_rerun_eligibility, AgentBenchSummary,
+    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
+    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
+    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -993,7 +993,18 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     if let Some(step) = rerun_from {
         validate_rerun_eligibility(&existing, step).map_err(loop_runner_failure)?;
     }
-    let run = if loop_run_needs_provider_resume(&existing) || rerun_from.is_some() {
+    let run = if rerun_from.is_none()
+        && (existing.status == LoopStatus::Approved
+            || existing.status == LoopStatus::EvalPassed
+            || (existing.status == LoopStatus::Failed && existing.human_approval.is_some()))
+    {
+        let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+            .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+        let repository_root = current_cleanup_repository_root()?;
+        execute_approved_evaluation(&workspace, &repository_root).map_err(|error| {
+            CliFailure::message(format!("approved local evaluation failed: {error}"))
+        })?
+    } else if loop_run_needs_provider_resume(&existing) || rerun_from.is_some() {
         let Some(ticket_path) = args.ticket.as_ref() else {
             return Err(CliFailure::message(
                 "--ticket is required to resume an incomplete provider-backed run".to_string(),
@@ -2450,7 +2461,7 @@ fn next_loop_action(run: &LoopRun) -> String {
             "human approval is required; Testing has not run".to_string()
         }
         LoopStatus::Approved => {
-            "candidate is approved; Testing has not run in this release slice".to_string()
+            "candidate is approved; resume to run the bound local evaluation".to_string()
         }
         LoopStatus::EvalPassed => {
             "integrated evaluation passed; authority is frozen pending audited promotion"

@@ -94,3 +94,33 @@ This repository uses a disk-backed implementation loop:
 - `.seaf/loops/current/contract.md` records the active success criteria.
 - `.seaf/loops/current/progress.md` records restartable progress.
 - `.seaf/loops/current/log.md` is append-only trace context for debugging the loop.
+
+### Supervised local evaluation
+
+Provider-backed runs stop before executing model-modified code. Review the
+candidate digest and target HEAD from `loop status`, approve those exact values,
+then resume once to run the immutable ticket/eval checks locally in the
+candidate:
+
+```bash
+cargo run -p seaf-cli -- loop run --ticket <ticket.yaml> --run-id <run-id> --json
+cargo run -p seaf-cli -- loop status --run-id <run-id> --json
+cargo run -p seaf-cli -- loop approve --run-id <run-id> \
+  --reviewer <reviewer> \
+  --confirm-candidate-diff <digest-from-status> \
+  --confirm-target-head <head-from-status> \
+  --json
+cargo run -p seaf-cli -- loop resume --run-id <run-id> --json
+```
+
+Approved resume uses the persisted canonical ticket and eval snapshots, not
+live files, and makes no model-provider call. Before any check it publishes a
+create-only execution intent; it then records indexed redacted logs, canonical
+Testing evidence, and a bound EvalReport. A passing run becomes `eval_passed`;
+a failed check becomes an approval-bound reported failure. An interrupted
+attempt will not replay commands until M1-09 adds audited recovery.
+
+Human approval authorizes local command execution under the developer account.
+SEAF detects lasting source/candidate drift but is not an OS sandbox against
+malicious same-user commands. The original checkout is not promoted by this
+flow; explicit verified promotion is the next production-readiness slice.

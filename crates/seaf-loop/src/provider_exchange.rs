@@ -833,7 +833,7 @@ fn metadata_identity_matches(_left: &fs::Metadata, _right: &fs::Metadata) -> boo
     false
 }
 
-fn validate_run_for_atomic_publication(
+pub(crate) fn validate_run_for_atomic_publication(
     workspace: &LoopWorkspace,
     run: &LoopRun,
 ) -> Result<(), ProviderExchangeError> {

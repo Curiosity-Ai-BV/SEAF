@@ -44,24 +44,20 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-07c2 - Locked Approved evaluation transaction. Make `loop resume` recognize
-only an exact current Approved authority and execute the canonical immutable
-eval snapshot in that physical candidate without a model call. Acquire the
-candidate lock first, authenticate the human approval, output-review/provider
-chain, policy decision, source HEAD/tree, and physical candidate immediately
-before commands, and plan every check plus both allowlists before executing any
-command. Publish a create-only execution intent bound to the exact Approved run
-digest before the first command; an existing incomplete intent must refuse
-silent replay pending M1-09 recovery.
+M1-08 - Promotion integrity. Add an explicit human-authorized promotion
+transaction for a frozen `eval_passed` run. Require a fresh bounded reviewer
+identity and exact confirmations for the approved candidate diff, bound
+EvalReport digest, and current target HEAD. Under candidate authority, reload
+and physically verify the immutable human approval, policy decision, Testing
+evidence, EvalReport, command logs, candidate diff, source repository identity,
+and clean target worktree before any source mutation.
 
-Execute only through the bounded controlled engine in the candidate. Publish
-indexed create-only redacted stdout/stderr logs with digest pairs, canonical
-Testing evidence, and the approval-bound EvalReport. Revalidate candidate,
-source, approval, and artifacts after commands; physically verify the immutable
-eval config, candidate diff, and log bytes. While retaining the candidate lock,
-take the provider lock only for the final full-state compare-and-swap from the
-exact Approved predecessor to `eval_passed` or the approval-bound reported
-failure. Failed checks and timeouts publish rejecting evidence; prevalidation
-failure executes zero commands; publication failure cannot claim a terminal
-result. Preserve the M1-07c1 freeze rules, do not promote, and do not add an
-audited adoption/invalidation path for incomplete attempts in this slice.
+Use candidate-to-repository-operation lock order and a full-state compare-and-
+swap. Apply only the exact already-approved staged patch to the original
+checkout without committing, merging, pushing, deploying, or deleting the
+candidate. Reverify target HEAD and cleanliness immediately before application,
+fail closed on stale/substituted authority or patch conflict, and publish a
+closed `promoted` record bound to the fresh confirmation. Exact retry must be
+byte-identical; failed, incomplete, cleaned, or non-passing runs must never
+mutate the target. Preserve the M1-07 terminal evidence and add focused
+temporary-repository regressions before implementation.

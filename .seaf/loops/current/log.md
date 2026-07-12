@@ -1618,3 +1618,56 @@ terminal-freeze, and cleanup-only regressions. Strict all-target/all-feature
 Clippy, Rust and Prettier formatting, package lint/typecheck, 8 SDK tests, SDK
 build, and diff checks pass through pinned pnpm 11.7.0. M1-07c1 is accepted and
 M1-07c2 locked Approved evaluation execution is active.
+
+## 2026-07-12 implementation | M1-07c2 locked Approved evaluation transaction
+
+Exact Approved `loop resume` now enters a dedicated local controller without
+requiring live ticket/config files or contacting the model provider. Under the
+candidate lock it authenticates the approval, latest OutputReview exchange,
+policy decision, source and candidate state, and canonical ticket/eval snapshots;
+plans every check against both allowlists; and publishes a versioned create-only
+intent bound to the exact Approved run and complete plan before the first
+command. Any partial prior evaluation prefix refuses byte-identical replay until
+M1-09 provides audited recovery.
+
+The bounded engine executes only in the candidate and revalidates Approved,
+candidate, source, input, cwd, and executable identity before every spawn.
+Indexed create-only stdout/stderr logs are redacted and digest-bound. Canonical
+Testing evidence and the integrated EvalReport bind the immutable config,
+approved diff, human approval, policy decision, ordered checks, logs, and one
+another. After physical revalidation, the controller retains the candidate lock,
+takes the provider lock, and uses the M1-07c1 exact-predecessor relation to
+publish `eval_passed` or an approval-bound reported failure. Failed exits,
+spawn failures, and timeouts produce rejecting evidence; publication failures
+cannot claim a terminal result. No promotion or model call occurs.
+
+Initial review found three production blockers. Strict candidate verification
+rejected Git-ignored Cargo `target/` output after a successful check, so a narrow
+evaluation-only relation now permits ignored generated output while keeping
+HEAD, index, staged diff, and tracked worktree exact; every approval, cleanup,
+and future promotion caller stays strict. Lasting source-worktree mutation could
+also publish success because only source HEAD/tree were checked. A canonical
+source authority now preserves pre-existing dirty state and binds HEAD, staged
+and tracked diffs, plus path/type/mode/content identity for ignored and
+nonignored untracked entries before intent and at every later authority gate,
+excluding only the bound run directory. Finally, planned cwd/executable paths
+and authority reads had replacement windows; per-spawn identity/digest checks
+and no-follow opened-handle reads with before/after path and parent identity
+close them.
+
+REDs reproduced a real candidate Cargo build stranded after success, lasting
+ordinary and ignored source mutations, later-executable substitution, symlink
+and regular-file replacement during verified reads, independent allowlist
+denial, partial replay, config/intent/log/candidate/concurrent tamper, failed
+commands, timeout, and publication collision. Both independent code re-reviews
+approve the corrected behavior; the final quality note was formatting-only and
+was resolved by Rust formatting. Controller documentation now describes the
+`run -> status -> approve -> resume` flow, local-execution boundary, artifacts,
+interruption behavior, and frozen pre-promotion result. M1-07 is accepted and
+M1-08 promotion integrity is active.
+
+Controller verification passes CLI 109, core 49, loop unit 114, candidate 39,
+eval-engine 7, provider-candidate 25, provider-exchange 22, and every remaining
+Rust and doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
+formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
+through pinned pnpm 11.7.0.

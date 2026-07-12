@@ -29,8 +29,8 @@
 - [x] M1-07a: Reusable controlled eval engine.
 - [x] M1-07b: Immutable eval configuration authority.
 - [x] M1-07c1: Evaluation evidence and terminal contracts.
-- [ ] M1-07c2: Locked Approved Testing and EvalReport transaction (active).
-- [ ] M1-08: Promotion integrity.
+- [x] M1-07c2: Locked Approved Testing and EvalReport transaction.
+- [ ] M1-08: Promotion integrity (active).
 - [ ] M1-09: Audited recovery operations.
 - [ ] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
@@ -57,15 +57,13 @@
 
 ## Current Gate
 
-M1-06, M1-07a, M1-07b, and M1-07c1 are complete; M1-07c2 is active. Public run/status
-output supplies the exact staged-diff digest and target HEAD required by
-`seaf loop approve`.
+M1-06 and M1-07 are complete; M1-08 is active. Public run/status output supplies
+the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
 artifact, and authenticated latest provider exchange. Exact retries preserve
 bytes; stale, substituted, concurrent, non-Awaiting, cleanup, rerun, provider,
-and direct-writer paths fail closed. Approved still cannot execute Testing or
-EvalReport until M1-07c integrates the controlled eval engine. M1-07a extracted
+and direct-writer paths fail closed. M1-07a extracted
 typed eval configuration into core and the controlled planner/executor into the
 loop crate while preserving valid standalone behavior. Every check is planned
 before execution; both allowlists are intersected; candidate-relative cwd and
@@ -77,6 +75,12 @@ persists canonical typed JSON with a bound digest, and preflights exact snapshot
 prefixes before any resume recovery. Historical runs without this authority
 stay inert. M1-07c1 defines canonical Testing evidence, approval-bound final
 states, combined final authority validation, and immutable passing/cleanup-only
-failed outcomes. M1-07c2 now owns the locked approval-bound execution
-transaction, create-only execution intent and logs, physical artifact checks,
-and exact Approved-to-final compare-and-swap.
+failed outcomes. M1-07c2 makes exact Approved `loop resume` run immutable
+ticket/eval checks locally in the candidate with no provider call. It publishes
+create-only intent, indexed redacted logs, Testing evidence, and a bound
+EvalReport before the exact Approved-to-final compare-and-swap. Prevalidation
+executes zero commands, partial attempts refuse replay pending M1-09, ignored
+candidate build output is permitted without weakening the approved diff, and
+lasting source/candidate/artifact drift blocks final publication. Human approval
+authorizes local execution under the developer account; it is not OS
+containment. Passing authority remains frozen and cannot promote until M1-08.

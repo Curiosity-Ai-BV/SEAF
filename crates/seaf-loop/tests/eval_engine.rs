@@ -71,6 +71,75 @@ fn invalid_later_check_prevents_earlier_command_execution() {
 
 #[cfg(unix)]
 #[test]
+fn replacing_a_later_planned_executable_cannot_execute_substituted_bytes() {
+    let root = tempfile::tempdir().expect("execution root");
+    let target = root.path().join("later-check");
+    let replacer = root.path().join("replace-later");
+    let marker = root.path().join("substituted-marker");
+    write_executable(&target, "#!/bin/sh\nprintf original\n");
+    write_executable(
+        &replacer,
+        &format!(
+            "#!/bin/sh\nprintf '#!/bin/sh\\ntouch {}\\n' > {}\nchmod +x {}\n",
+            marker.display(),
+            target.display(),
+            target.display()
+        ),
+    );
+    let config = config(
+        vec![replacer.display().to_string(), target.display().to_string()],
+        vec![
+            check("replace_later", replacer.display().to_string()),
+            check("must_stay_original", target.display().to_string()),
+        ],
+    );
+
+    let error = run_eval_checks(&config, None, root.path())
+        .expect_err("each planned executable identity must be revalidated before spawn");
+
+    assert!(error.to_string().contains("executable identity"), "{error}");
+    assert!(
+        !marker.exists(),
+        "substituted executable bytes must never run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_later_planned_cwd_prevents_the_command_spawn() {
+    let root = tempfile::tempdir().expect("execution root");
+    let cwd = root.path().join("later-cwd");
+    fs::create_dir(&cwd).expect("later cwd");
+    let replacer = root.path().join("replace-cwd");
+    let marker = root.path().join("cwd-marker");
+    write_executable(
+        &replacer,
+        &format!(
+            "#!/bin/sh\nmv {} {}\nmkdir {}\n",
+            cwd.display(),
+            root.path().join("old-cwd").display(),
+            cwd.display()
+        ),
+    );
+    let mut later = check("must_keep_cwd", format!("touch {}", marker.display()));
+    later.cwd = Some(PathBuf::from("later-cwd"));
+    let config = config(
+        vec![replacer.display().to_string(), "touch".to_string()],
+        vec![check("replace_cwd", replacer.display().to_string()), later],
+    );
+
+    let error = run_eval_checks(&config, None, root.path())
+        .expect_err("each planned cwd identity must be revalidated before spawn");
+
+    assert!(error.to_string().contains("cwd identity"), "{error}");
+    assert!(
+        !marker.exists(),
+        "command in substituted cwd must never spawn"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn returned_output_is_redacted_before_it_is_capped() {
     let root = tempfile::tempdir().expect("execution root");
     let script = root.path().join("emit-secret");

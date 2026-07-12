@@ -1,3 +1,4 @@
+pub mod approved_eval;
 pub mod artifacts;
 pub mod bench;
 pub mod candidate_workspace;
@@ -20,6 +21,7 @@ pub mod state;
 pub mod testing_evidence;
 pub mod workspace;
 
+pub use approved_eval::{execute_approved_evaluation, ApprovedEvaluationError};
 pub use artifacts::ArtifactContent;
 pub use bench::{
     evaluate_zero_tolerance, load_agent_bench_fixture, summarize_agent_bench_results,

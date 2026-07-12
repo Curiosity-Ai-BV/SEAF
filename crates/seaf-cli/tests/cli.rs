@@ -824,7 +824,33 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     init_git_repo(&repo);
     let runs_root = temp_dir.path().join("runs");
     let run_id = "cli-exact-approval";
+    let intent_path = runs_root
+        .join(run_id)
+        .join("artifacts/07-testing.execution-intent.json");
+    let lock_probe = repo.join("provider-lock-check.pl");
+    fs::write(
+        &lock_probe,
+        "#!/usr/bin/perl\nuse Fcntl qw(:flock);\nopen(my $lock, '+<', $ARGV[0]) or die $!;\nflock($lock, LOCK_EX | LOCK_NB) or exit 42;\n",
+    )
+    .expect("provider lock probe");
+    let mut lock_probe_permissions = fs::metadata(&lock_probe).unwrap().permissions();
+    lock_probe_permissions.set_mode(0o755);
+    fs::set_permissions(&lock_probe, lock_probe_permissions).unwrap();
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        format!(
+            "evals:\n  allow_commands: [test, ./provider-lock-check.pl]\n  required:\n    - name: intent_precedes_execution\n      command: test -f {}\n    - name: provider_lock_is_not_held_during_execution\n      command: ./provider-lock-check.pl {}\n",
+            intent_path.display(),
+            runs_root.join(run_id).join("provider-exchange.lock").display()
+        ),
+    )
+    .expect("write approved eval config");
+    commit_all(&repo, "Use bounded approved eval");
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - test\n    - ./provider-lock-check.pl");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
     let run = seaf_in(&repo)
         .args([
             "loop",
@@ -953,6 +979,16 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
 
     fs::write(repo.join("tracked.txt"), "dirty but preserved\n").expect("dirty tracked file");
     fs::write(repo.join("untracked.txt"), "also preserved\n").expect("dirty untracked file");
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [false]\n  required:\n    - name: live_mutation_must_be_ignored\n      command: false\n",
+    )
+    .expect("mutate live eval after snapshot");
+    fs::write(
+        &ticket_path,
+        "live ticket bytes are no longer authoritative\n",
+    )
+    .expect("mutate live ticket after snapshot");
     let source_before = git_evidence(&repo);
     let approved = seaf_in(&repo)
         .args([
@@ -998,6 +1034,7 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     }
 
     let approved_bytes = read_tree_bytes(&run_dir);
+    let approved_provider_records = read_run_json(&run_dir)["provider_exchange_records"].clone();
     let retry = seaf_in(&repo)
         .args([
             "loop",
@@ -1050,13 +1087,73 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
             "--json",
         ])
         .output()
-        .expect("approved resume is inert");
+        .expect("approved resume executes canonical evaluation");
     assert!(resume.status.success());
-    assert!(String::from_utf8_lossy(&resume.stdout).contains("Testing has not run"));
-    assert_eq!(read_tree_bytes(&run_dir), approved_bytes);
+    assert!(String::from_utf8_lossy(&resume.stdout).contains("eval_passed"));
+    let evaluated = read_run_json(&run_dir);
+    assert_eq!(evaluated["status"], "eval_passed");
+    assert_eq!(evaluated["current_step"], "eval_report");
+    assert_eq!(
+        evaluated["provider_exchange_records"], approved_provider_records,
+        "Approved evaluation must not make or append provider calls"
+    );
+    assert!(run_dir
+        .join("artifacts/07-testing.execution-intent.json")
+        .is_file());
+    let intent: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join("artifacts/07-testing.execution-intent.json"))
+            .expect("execution intent"),
+    )
+    .expect("canonical intent JSON");
+    let approved_run: serde_json::Value = serde_json::from_slice(
+        approved_bytes
+            .iter()
+            .find(|(path, _)| path == Path::new("run.json"))
+            .expect("approved run")
+            .1
+            .as_slice(),
+    )
+    .expect("approved run JSON");
+    assert_eq!(intent["schema_version"], 1);
+    assert_eq!(intent["planned_checks"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        intent["approved_run_digest"],
+        canonical_sha256_digest(&approved_run).expect("Approved digest")
+    );
+    assert!(run_dir
+        .join("artifacts/07-testing.check-001.stdout.log")
+        .is_file());
+    assert!(run_dir.join("artifacts/07-testing.json").is_file());
+    assert!(run_dir.join("artifacts/08-eval-report.json").is_file());
+    assert_ne!(read_tree_bytes(&run_dir), approved_bytes);
     assert_eq!(git_evidence(&repo), source_before);
 
-    let mut historical = read_run_json(&run_dir);
+    let terminal_bytes = read_tree_bytes(&run_dir);
+    let terminal_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("terminal resume retry is inert");
+    assert!(terminal_retry.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), terminal_bytes);
+    assert_eq!(git_evidence(&repo), source_before);
+
+    let mut historical = serde_json::from_slice::<serde_json::Value>(
+        approved_bytes
+            .iter()
+            .find(|(path, _)| path == Path::new("run.json"))
+            .expect("approved run bytes")
+            .1
+            .as_slice(),
+    )
+    .expect("approved run JSON");
     historical["input_digests"]
         .as_object_mut()
         .unwrap()
@@ -1066,6 +1163,18 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
         serde_json::to_vec_pretty(&historical).unwrap(),
     )
     .unwrap();
+    for (relative, _) in read_tree_bytes(&run_dir) {
+        let path = run_dir.join(relative);
+        if path.is_file() && path != run_dir.join("run.json") {
+            // Restore the pre-evaluation fixture by removing only artifacts created by resume.
+            if path.file_name().is_some_and(|name| {
+                name.to_string_lossy().starts_with("07-testing")
+                    || name.to_string_lossy().starts_with("08-eval-report")
+            }) {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
     let historical_bytes = read_tree_bytes(&run_dir);
     let historical_resume = seaf_in(&repo)
         .args([
@@ -1084,6 +1193,569 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     assert!(stderr.contains("start a new run"), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), historical_bytes);
     assert_eq!(git_evidence(&repo), source_before);
+}
+
+#[test]
+fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands() {
+    for (case, eval_yaml, ticket_command, pre_mutation, expected_error) in [
+        (
+            "ticket-denial",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
+            "printf",
+            "none",
+            "ticket autonomy",
+        ),
+        (
+            "eval-denial",
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
+            "touch",
+            "none",
+            "eval allow_commands",
+        ),
+        (
+            "partial-intent",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
+            "touch",
+            "partial",
+            "audited recovery",
+        ),
+        (
+            "duplicate-check-identity",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: duplicated\n      command: touch eval-marker\n    - name: duplicated\n      command: touch eval-marker-two\n",
+            "touch",
+            "none",
+            "duplicated check names",
+        ),
+        (
+            "approval-artifact-substitution",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
+            "touch",
+            "approval",
+            "diff artifact digest mismatch",
+        ),
+        (
+            "source-substitution",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
+            "touch",
+            "source",
+            "source HEAD",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        init_git_repo(&repo);
+        fs::write(repo.join("seaf.evals.yaml"), eval_yaml).expect("eval config");
+        commit_all(&repo, "Configure denied eval");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("approved-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let ticket = fs::read_to_string(&ticket_path)
+            .expect("ticket")
+            .replace("    - printf", &format!("    - {ticket_command}"));
+        fs::write(&ticket_path, ticket).expect("ticket allowlist");
+        let approved = run_and_approve_provider_loop(
+            &repo,
+            &ticket_path,
+            &runs_root,
+            &run_id,
+        );
+        let run_dir = runs_root.join(&run_id);
+        let candidate = PathBuf::from(
+            approved["candidate_workspace"]["path"]
+                .as_str()
+                .expect("candidate path"),
+        );
+        match pre_mutation {
+            "partial" => fs::write(
+                run_dir.join("artifacts/07-testing.execution-intent.json"),
+                b"partial-attempt-bytes",
+            )
+            .expect("partial intent"),
+            "approval" => {
+                let relative = approved["human_approval"]["candidate_diff"]["path"]
+                    .as_str()
+                    .expect("approved diff path");
+                fs::write(run_dir.join(relative), b"substituted approved diff")
+                    .expect("substitute approved diff");
+            }
+            "source" => {
+                fs::write(repo.join("source-substitution.txt"), b"new source HEAD\n")
+                    .expect("source substitution");
+                commit_all(&repo, "Substitute source HEAD");
+            }
+            "none" => {}
+            _ => unreachable!(),
+        }
+        let before = read_tree_bytes(&run_dir);
+        let resume = seaf_in(&repo)
+            .args([
+                "loop",
+                "resume",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("resume denied evaluation");
+
+        assert!(!resume.status.success(), "{case}: {resume:?}");
+        let stderr = String::from_utf8_lossy(&resume.stderr);
+        assert!(stderr.contains(expected_error), "{case}: {stderr}");
+        assert!(!candidate.join("eval-marker").exists(), "{case}");
+        assert_eq!(read_tree_bytes(&run_dir), before, "{case}");
+        assert_eq!(read_run_json(&run_dir)["status"], "approved", "{case}");
+        if pre_mutation != "partial" {
+            assert!(
+                !run_dir
+                    .join("artifacts/07-testing.execution-intent.json")
+                    .exists(),
+                "{case}: prevalidation must not claim an execution attempt"
+            );
+        }
+    }
+}
+
+#[test]
+fn approved_eval_failed_command_publishes_rejecting_bound_terminal_report() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [false]\n  required:\n    - name: required_failure\n      command: false\n",
+    )
+    .expect("failing eval config");
+    commit_all(&repo, "Configure failing eval");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "approved-failed-check";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - false");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
+    let approved = run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let source_before = git_evidence(&repo);
+    let provider_records = approved["provider_exchange_records"].clone();
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume failing evaluation");
+
+    assert!(resume.status.success(), "{resume:?}");
+    let run_dir = runs_root.join(run_id);
+    let failed = read_run_json(&run_dir);
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["provider_exchange_records"], provider_records);
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join("artifacts/08-eval-report.json")).expect("EvalReport"),
+    )
+    .expect("EvalReport JSON");
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["decision"], "reject");
+    assert_eq!(report["checks"][0]["status"], "failed");
+    assert_eq!(git_evidence(&repo), source_before);
+}
+
+#[test]
+fn approved_eval_timeout_is_rejecting_evidence_not_eval_success() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [sleep]\n  required:\n    - name: bounded_timeout\n      command: sleep 1\n      timeout_ms: 10\n",
+    )
+    .expect("timeout eval config");
+    commit_all(&repo, "Configure timeout eval");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "approved-timeout";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - sleep");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
+    run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume timeout evaluation");
+
+    assert!(resume.status.success(), "{resume:?}");
+    let run_dir = runs_root.join(run_id);
+    assert_eq!(read_run_json(&run_dir)["status"], "failed");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_dir.join("artifacts/08-eval-report.json")).expect("EvalReport"),
+    )
+    .expect("EvalReport JSON");
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["decision"], "reject");
+    assert!(report["checks"][0]["summary"]
+        .as_str()
+        .expect("timeout summary")
+        .contains("timed out"));
+}
+
+#[cfg(unix)]
+#[test]
+fn approved_eval_physical_tamper_or_publication_collision_never_claims_terminal_success() {
+    for (case, script_body, expected_error) in [
+        (
+            "config-tamper",
+            "printf tampered > \"$1/inputs/eval-config.json\"\n",
+            "eval-config.json",
+        ),
+        (
+            "intent-tamper",
+            "printf tampered > \"$1/artifacts/07-testing.execution-intent.json\"\n",
+            "execution-intent.json",
+        ),
+        (
+            "candidate-tamper",
+            "printf tampered >> seaf.policy.json\ngit add seaf.policy.json\n",
+            "candidate",
+        ),
+        (
+            "candidate-nonignored-output",
+            "touch generated-not-ignored\n",
+            "candidate",
+        ),
+        (
+            "concurrent-authority",
+            "perl -0pi -e 's/safety-reviewer/concurrent-reviewer/' \"$1/run.json\"\n",
+            "Approved authority changed",
+        ),
+        (
+            "publication-collision",
+            "printf collision > \"$1/artifacts/07-testing.json\"\n",
+            "different bytes",
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        init_git_repo(&repo);
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("approved-{case}");
+        let run_dir = runs_root.join(&run_id);
+        let script = repo.join("eval-tamper.sh");
+        fs::write(&script, format!("#!/bin/sh\n{script_body}")).expect("tamper script");
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            format!(
+                "evals:\n  allow_commands: [./eval-tamper.sh]\n  required:\n    - name: {case}\n      command: ./eval-tamper.sh {}\n",
+                run_dir.display()
+            ),
+        )
+        .expect("tamper eval config");
+        commit_all(&repo, "Configure tamper eval");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let ticket = fs::read_to_string(&ticket_path)
+            .expect("ticket")
+            .replace("    - printf", "    - ./eval-tamper.sh");
+        fs::write(&ticket_path, ticket).expect("ticket allowlist");
+        run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let source_before = git_evidence(&repo);
+
+        let resume = seaf_in(&repo)
+            .args([
+                "loop",
+                "resume",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("resume tampering evaluation");
+
+        assert!(!resume.status.success(), "{case}: {resume:?}");
+        let stderr = String::from_utf8_lossy(&resume.stderr);
+        assert!(stderr.contains(expected_error), "{case}: {stderr}");
+        assert_eq!(read_run_json(&run_dir)["status"], "approved", "{case}");
+        assert!(
+            !run_dir.join("artifacts/08-eval-report.json").exists(),
+            "{case}: no terminal report may be claimed"
+        );
+        assert_eq!(git_evidence(&repo), source_before, "{case}");
+
+        let interrupted = read_tree_bytes(&run_dir);
+        let retry = seaf_in(&repo)
+            .args([
+                "loop",
+                "resume",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("retry interrupted evaluation");
+        assert!(!retry.status.success(), "{case}: {retry:?}");
+        assert_eq!(read_tree_bytes(&run_dir), interrupted, "{case}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn approved_eval_rechecks_each_persisted_log_before_terminal_publication() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "approved-log-tamper";
+    let run_dir = runs_root.join(run_id);
+    let script = repo.join("log-tamper.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf substituted > \"$1/artifacts/07-testing.check-001.stdout.log\"\n",
+    )
+    .expect("log tamper script");
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        format!(
+            "evals:\n  allow_commands: [printf, ./log-tamper.sh]\n  required:\n    - name: first_log\n      command: printf original\n    - name: tamper_first_log\n      command: ./log-tamper.sh {}\n",
+            run_dir.display()
+        ),
+    )
+    .expect("log tamper eval config");
+    commit_all(&repo, "Configure log tamper eval");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - printf\n    - ./log-tamper.sh");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
+    run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume log tamper evaluation");
+
+    assert!(!resume.status.success(), "{resume:?}");
+    assert!(
+        String::from_utf8_lossy(&resume.stderr).contains("log digest mismatch"),
+        "{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert_eq!(read_run_json(&run_dir)["status"], "approved");
+    assert!(!run_dir.join("artifacts/08-eval-report.json").exists());
+}
+
+#[test]
+fn approved_eval_real_candidate_cargo_build_allows_only_ignored_generated_output() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo src");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"approved-eval-build\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("Cargo manifest");
+    fs::write(repo.join("src/lib.rs"), "pub fn ready() -> bool { true }\n").expect("Cargo source");
+    fs::write(repo.join(".gitignore"), "/target\n").expect("Cargo ignore");
+    let lock = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&repo)
+        .output()
+        .expect("generate Cargo lockfile");
+    assert!(lock.status.success(), "{lock:?}");
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [cargo check]\n  required:\n    - name: candidate_cargo_check\n      command: cargo check --quiet\n",
+    )
+    .expect("Cargo eval config");
+    commit_all(&repo, "Add buildable candidate");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn ready() -> bool { true } // dirty\n",
+    )
+    .expect("pre-existing dirty tracked source");
+    fs::write(repo.join("pre-existing.txt"), "preserved dirty bytes\n")
+        .expect("pre-existing dirty untracked source");
+    let source_before = git_evidence(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "approved-real-cargo-build";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - cargo check");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
+    let approved = run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let approved_diff = approved["human_approval"]["candidate_diff"]["digest"].clone();
+    let candidate = PathBuf::from(
+        approved["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let candidate_before = git_evidence(&candidate);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume Cargo evaluation");
+
+    assert!(
+        resume.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let evaluated = read_run_json(&runs_root.join(run_id));
+    assert_eq!(evaluated["status"], "eval_passed");
+    assert_eq!(
+        evaluated["human_approval"]["candidate_diff"]["digest"], approved_diff,
+        "the approved staged diff must remain exact"
+    );
+    assert!(
+        candidate.join("target").is_dir(),
+        "build output belongs to candidate"
+    );
+    assert_eq!(
+        git_evidence(&candidate),
+        candidate_before,
+        "ignored build output must not change candidate HEAD/index/staged or tracked worktree diff"
+    );
+    assert!(
+        !repo.join("target").exists(),
+        "source must not receive build output"
+    );
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(
+        fs::read(repo.join("pre-existing.txt")).unwrap(),
+        b"preserved dirty bytes\n"
+    );
+}
+
+#[test]
+fn approved_eval_detects_lasting_source_worktree_drift_with_preexisting_dirty_state() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(repo.join(".gitignore"), "/ignored-output/\n").expect("source ignore rule");
+    fs::create_dir_all(repo.join("ignored-output")).expect("ignored source directory");
+    let injected = repo.join("ignored-output/eval-mutated");
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        format!(
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: lasting_source_mutation\n      command: touch {}\n",
+            injected.display()
+        ),
+    )
+    .expect("source mutation eval config");
+    commit_all(&repo, "Configure ignored source mutation eval");
+    let policy = fs::read_to_string(repo.join("seaf.policy.json")).expect("policy");
+    fs::write(repo.join("seaf.policy.json"), format!("{policy}\n "))
+        .expect("valid dirty tracked source");
+    fs::write(
+        repo.join("pre-existing-untracked.txt"),
+        "original untracked bytes\n",
+    )
+    .expect("dirty untracked source");
+    let original_tracked = fs::read(repo.join("seaf.policy.json")).unwrap();
+    let original_untracked = fs::read(repo.join("pre-existing-untracked.txt")).unwrap();
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "approved-source-drift";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let ticket = fs::read_to_string(&ticket_path)
+        .expect("ticket")
+        .replace("    - printf", "    - touch");
+    fs::write(&ticket_path, ticket).expect("ticket allowlist");
+    run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("resume source mutation evaluation");
+
+    assert!(
+        !resume.status.success(),
+        "lasting source drift must block publication"
+    );
+    assert!(String::from_utf8_lossy(&resume.stderr).contains("source worktree authority"));
+    let run_dir = runs_root.join(run_id);
+    assert_eq!(read_run_json(&run_dir)["status"], "approved");
+    assert!(injected.exists(), "the allowed command did execute");
+    assert_eq!(
+        fs::read(repo.join("seaf.policy.json")).unwrap(),
+        original_tracked
+    );
+    assert_eq!(
+        fs::read(repo.join("pre-existing-untracked.txt")).unwrap(),
+        original_untracked
+    );
+    assert!(!run_dir.join("artifacts/08-eval-report.json").exists());
+    let interrupted = read_tree_bytes(&run_dir);
+    let retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("retry source-drift interruption");
+    assert!(!retry.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), interrupted);
 }
 
 #[test]
@@ -5987,6 +6659,51 @@ fn run_fake_provider(
     command.args(extra_args);
     let output = command.output().expect("run fake provider");
     assert!(output.status.success(), "{output:?}");
+}
+
+fn run_and_approve_provider_loop(
+    repo: &Path,
+    ticket_path: &Path,
+    runs_root: &Path,
+    run_id: &str,
+) -> serde_json::Value {
+    run_fake_provider(repo, ticket_path, runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let awaiting = read_run_json(&run_dir);
+    let diff = awaiting["candidate_workspace"]["candidate_diff_digest"]
+        .as_str()
+        .expect("candidate diff")
+        .to_string();
+    let head = awaiting["candidate_workspace"]["starting_head"]
+        .as_str()
+        .expect("starting HEAD")
+        .to_string();
+    let approval = seaf_in(repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "safety-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+            "--json",
+        ])
+        .output()
+        .expect("approve provider loop");
+    assert!(
+        approval.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
+    let approved = read_run_json(&run_dir);
+    assert_eq!(approved["status"], "approved");
+    approved
 }
 
 fn resume_provider_run(

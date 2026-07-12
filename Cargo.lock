@@ -426,6 +426,7 @@ name = "seaf-loop"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "seaf-core",
  "seaf-models",
  "serde",

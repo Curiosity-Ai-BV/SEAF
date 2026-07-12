@@ -10,6 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CandidatePatchPhase,
     CandidatePatchTransaction, CandidateWorkspaceLifecycle, CandidateWorkspaceState,
@@ -55,6 +58,155 @@ pub struct VerifiedCandidatePatchEvidence {
     pub applied_diff: ArtifactReference,
     pub applied_diff_digest: String,
     pub applied_diff_content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceWorktreeAuthority {
+    // This witnesses lasting practical Git worktree state. It is not OS containment and cannot
+    // distinguish a same-user command that mutates and restores the exact bytes before recheck.
+    canonical_root: PathBuf,
+    head: String,
+    staged_diff_digest: String,
+    tracked_worktree_diff_digest: String,
+    untracked: Vec<SourceUntrackedEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceUntrackedEvidence {
+    path: PathBuf,
+    kind: SourceUntrackedKind,
+    digest: String,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceUntrackedKind {
+    Regular,
+    Symlink,
+}
+
+pub(crate) fn capture_source_worktree_authority(
+    source_worktree_root: &Path,
+    excluded_runtime_directory: Option<&Path>,
+) -> Result<SourceWorktreeAuthority, CandidateWorkspaceError> {
+    let canonical_root = canonical_real_directory(source_worktree_root, "source worktree")?;
+    let excluded_runtime_directory = excluded_runtime_directory
+        .map(|path| canonical_real_directory(path, "excluded runtime directory"))
+        .transpose()?;
+    let head = git_text(&canonical_root, &["rev-parse", "HEAD"])?;
+    let staged_diff = git_bytes(
+        &canonical_root,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    )?;
+    let tracked_worktree_diff = git_bytes(
+        &canonical_root,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ],
+    )?;
+    let paths = git_bytes(&canonical_root, &["ls-files", "--others", "-z"])?;
+    let mut untracked = Vec::new();
+    for raw in paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = source_untracked_path(raw)?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(CandidateWorkspaceError::Unsafe(
+                "source untracked path is not strict repository-relative spelling".to_string(),
+            ));
+        }
+        let absolute = canonical_root.join(&relative);
+        if excluded_runtime_directory
+            .as_ref()
+            .is_some_and(|excluded| absolute.starts_with(excluded))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&absolute)?;
+        let (kind, bytes) = if metadata.file_type().is_symlink() {
+            (
+                SourceUntrackedKind::Symlink,
+                fs::read_link(&absolute)?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+        } else if metadata.is_file() {
+            (SourceUntrackedKind::Regular, fs::read(&absolute)?)
+        } else {
+            return Err(CandidateWorkspaceError::Unsafe(format!(
+                "source untracked authority contains unsupported file type: {}",
+                absolute.display()
+            )));
+        };
+        untracked.push(SourceUntrackedEvidence {
+            path: relative,
+            kind,
+            digest: sha256_bytes(&bytes),
+            #[cfg(unix)]
+            mode: {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            },
+        });
+    }
+    Ok(SourceWorktreeAuthority {
+        canonical_root,
+        head,
+        staged_diff_digest: sha256_bytes(&staged_diff),
+        tracked_worktree_diff_digest: sha256_bytes(&tracked_worktree_diff),
+        untracked,
+    })
+}
+
+pub(crate) fn validate_source_worktree_authority(
+    source_worktree_root: &Path,
+    excluded_runtime_directory: Option<&Path>,
+    expected: &SourceWorktreeAuthority,
+) -> Result<(), CandidateWorkspaceError> {
+    let current =
+        capture_source_worktree_authority(source_worktree_root, excluded_runtime_directory)?;
+    if &current != expected {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "source worktree authority changed during Approved evaluation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn source_untracked_path(raw: &[u8]) -> Result<PathBuf, CandidateWorkspaceError> {
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn source_untracked_path(raw: &[u8]) -> Result<PathBuf, CandidateWorkspaceError> {
+    String::from_utf8(raw.to_vec())
+        .map(PathBuf::from)
+        .map_err(|error| {
+            CandidateWorkspaceError::Unsafe(format!(
+                "source untracked path is not UTF-8 on this platform: {error}"
+            ))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -480,9 +632,32 @@ pub fn verify_candidate_patch_evidence(
     }
 }
 
-fn verify_candidate_patch_evidence_locked(
+pub(crate) fn verify_candidate_patch_evidence_locked(
     workspace: &LoopWorkspace,
     source_worktree_root: &Path,
+) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
+    verify_candidate_patch_evidence_locked_with_ignored_outputs(
+        workspace,
+        source_worktree_root,
+        false,
+    )
+}
+
+pub(crate) fn verify_candidate_patch_evidence_for_evaluation_locked(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
+    verify_candidate_patch_evidence_locked_with_ignored_outputs(
+        workspace,
+        source_worktree_root,
+        true,
+    )
+}
+
+fn verify_candidate_patch_evidence_locked_with_ignored_outputs(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    allow_ignored_outputs: bool,
 ) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
     let run = crate::state::load_run(workspace)
         .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
@@ -506,6 +681,7 @@ fn verify_candidate_patch_evidence_locked(
         source_worktree_root,
         candidate,
         true,
+        allow_ignored_outputs,
     )?;
     let development_evidence = development_evidence_reference(&run)?;
     let evidence = DevelopmentEvidence::load(
@@ -664,6 +840,7 @@ fn apply_candidate_development_evidence_locked(
                 source_worktree_root,
                 &candidate,
                 true,
+                false,
             )?;
             let plan = plan_candidate_patch(workspace, &candidate, &evidence)?;
             let expected_diff = write_create_only_artifact(
@@ -732,6 +909,7 @@ fn apply_candidate_development_evidence_locked(
                 source_worktree_root,
                 &candidate,
                 true,
+                false,
             )?;
             validate_patch_intent(
                 workspace,
@@ -1369,6 +1547,7 @@ fn provision_candidate_workspace_locked(
             Path::new(&planned.source_worktree_root),
             &planned,
             true,
+            false,
         );
     }
     if planned.lifecycle != CandidateWorkspaceLifecycle::Provisioning {
@@ -1469,7 +1648,7 @@ fn provision_planned_candidate(
         let mut state = planned.clone();
         state.path = path_text(&candidate, "candidate path")?.to_string();
         state.lifecycle = CandidateWorkspaceLifecycle::Active;
-        refresh_candidate_workspace(&mut state)?;
+        refresh_candidate_workspace(&mut state, false)?;
         Ok(state)
     })();
     let result = match result {
@@ -1556,7 +1735,7 @@ pub fn validate_candidate_workspace(
     source_worktree_root: &Path,
     state: &CandidateWorkspaceState,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
-    validate_candidate_physical(run_directory, source_worktree_root, state, true)
+    validate_candidate_physical(run_directory, source_worktree_root, state, true, false)
 }
 
 fn validate_candidate_physical(
@@ -1564,6 +1743,7 @@ fn validate_candidate_physical(
     source_worktree_root: &Path,
     state: &CandidateWorkspaceState,
     require_current_source_head: bool,
+    allow_ignored_outputs: bool,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
     if state.lifecycle != CandidateWorkspaceLifecycle::Active || state.cleaned_at.is_some() {
         return Err(CandidateWorkspaceError::Mismatch(
@@ -1596,7 +1776,7 @@ fn validate_candidate_physical(
         ));
     }
     let mut observed = state.clone();
-    refresh_candidate_workspace(&mut observed)?;
+    refresh_candidate_workspace(&mut observed, allow_ignored_outputs)?;
     if observed.candidate_head != state.candidate_head
         || observed.candidate_tree != state.candidate_tree
         || observed.candidate_diff_digest != state.candidate_diff_digest
@@ -1616,6 +1796,7 @@ fn validate_candidate_physical(
 
 fn refresh_candidate_workspace(
     state: &mut CandidateWorkspaceState,
+    allow_ignored_outputs: bool,
 ) -> Result<(), CandidateWorkspaceError> {
     if state.lifecycle != CandidateWorkspaceLifecycle::Active {
         return Err(CandidateWorkspaceError::Mismatch(
@@ -1624,7 +1805,12 @@ fn refresh_candidate_workspace(
     }
     let candidate = canonical_real_directory(Path::new(&state.path), "candidate worktree")?;
     verify_worktree_matches_index(&candidate)?;
-    let untracked = git_bytes(&candidate, &["ls-files", "--others", "-z"])?;
+    let untracked_args: &[&str] = if allow_ignored_outputs {
+        &["ls-files", "--others", "--exclude-standard", "-z"]
+    } else {
+        &["ls-files", "--others", "-z"]
+    };
+    let untracked = git_bytes(&candidate, untracked_args)?;
     if !untracked.is_empty() {
         return Err(CandidateWorkspaceError::Mismatch(
             "candidate contains untracked files outside its exact index tree".to_string(),
@@ -1724,6 +1910,7 @@ where
                     source_worktree_root,
                     &candidate,
                     false,
+                    false,
                 )?;
                 let mut cleaning = candidate;
                 cleaning.lifecycle = CandidateWorkspaceLifecycle::Cleaning;
@@ -1774,6 +1961,7 @@ where
                     workspace.run_directory(),
                     source_worktree_root,
                     &active_view,
+                    false,
                     false,
                 )?;
                 git_success(
@@ -1901,7 +2089,9 @@ fn run_directory_digest(run_directory: &Path) -> Result<String, CandidateWorkspa
     Ok(sha256_bytes(canonical.as_os_str().as_encoded_bytes()))
 }
 
-fn acquire_candidate_lock(workspace: &LoopWorkspace) -> Result<fs::File, CandidateWorkspaceError> {
+pub(crate) fn acquire_candidate_lock(
+    workspace: &LoopWorkspace,
+) -> Result<fs::File, CandidateWorkspaceError> {
     acquire_candidate_directory_lock(workspace.run_directory())
 }
 
@@ -2093,7 +2283,7 @@ fn adopt_existing_candidate(
         cleanup_started_at: None,
         cleaned_at: None,
     };
-    refresh_candidate_workspace(&mut state)?;
+    refresh_candidate_workspace(&mut state, false)?;
     Ok(state)
 }
 

@@ -1,10 +1,13 @@
 use std::{
     error::Error,
     fmt, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -13,18 +16,147 @@ pub(crate) fn read_verified_regular_file(
     relative_path: &str,
     label: &str,
 ) -> Result<Vec<u8>, ImmutableArtifactError> {
+    read_verified_regular_file_with_hook(run_directory, relative_path, label, || Ok(()))
+}
+
+fn read_verified_regular_file_with_hook<F>(
+    run_directory: &Path,
+    relative_path: &str,
+    label: &str,
+    after_inspect: F,
+) -> Result<Vec<u8>, ImmutableArtifactError>
+where
+    F: FnOnce() -> Result<(), ImmutableArtifactError>,
+{
     validate_relative_path(relative_path)?;
-    let path = run_directory.join(relative_path);
-    validate_real_run_parent(run_directory, Path::new(relative_path))?;
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+    let relative = Path::new(relative_path);
+    let canonical_parent = validate_real_run_parent(run_directory, relative)?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| ImmutableArtifactError::Safety(format!("{label} has no flat file name")))?;
+    let path = canonical_parent.join(file_name);
+    let parent_identity = fs::symlink_metadata(&canonical_parent)?;
+    read_opened_verified_file(
+        &path,
+        &canonical_parent,
+        &parent_identity,
+        label,
+        after_inspect,
+    )
+}
+
+#[cfg(unix)]
+fn read_opened_verified_file<F>(
+    path: &Path,
+    parent: &Path,
+    parent_identity: &fs::Metadata,
+    label: &str,
+    after_inspect: F,
+) -> Result<Vec<u8>, ImmutableArtifactError>
+where
+    F: FnOnce() -> Result<(), ImmutableArtifactError>,
+{
+    validate_parent_identity(parent, parent_identity, label)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            let context = if error.kind() == std::io::ErrorKind::NotFound {
+                "could not be inspected"
+            } else {
+                "could not be opened without following links"
+            };
+            ImmutableArtifactError::Safety(format!("{label} {context}: {error}"))
+        })?;
+    let opened = file.metadata().map_err(|error| {
         ImmutableArtifactError::Safety(format!("{label} could not be inspected: {error}"))
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !opened.is_file() {
         return Err(ImmutableArtifactError::Safety(format!(
             "{label} is not a real regular file"
         )));
     }
-    Ok(fs::read(path)?)
+    validate_opened_file_identity(path, &opened, label)?;
+    after_inspect()?;
+    validate_parent_identity(parent, parent_identity, label)?;
+    validate_opened_file_identity(path, &opened, label)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    validate_parent_identity(parent, parent_identity, label)?;
+    validate_opened_file_identity(path, &opened, label)?;
+    let after = file.metadata()?;
+    if !metadata_identity_matches(&opened, &after) {
+        return Err(ImmutableArtifactError::Safety(format!(
+            "{label} opened file identity changed while reading"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn validate_parent_identity(
+    path: &Path,
+    opened: &fs::Metadata,
+    label: &str,
+) -> Result<(), ImmutableArtifactError> {
+    let current = fs::symlink_metadata(path).map_err(|error| {
+        ImmutableArtifactError::Safety(format!(
+            "{label} parent identity could not be revalidated: {error}"
+        ))
+    })?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || !metadata_identity_matches(opened, &current)
+    {
+        return Err(ImmutableArtifactError::Safety(format!(
+            "{label} parent identity changed while reading"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_opened_file_identity(
+    path: &Path,
+    opened: &fs::Metadata,
+    label: &str,
+) -> Result<(), ImmutableArtifactError> {
+    let current = fs::symlink_metadata(path).map_err(|error| {
+        ImmutableArtifactError::Safety(format!(
+            "{label} path identity could not be revalidated: {error}"
+        ))
+    })?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || !metadata_identity_matches(opened, &current)
+    {
+        return Err(ImmutableArtifactError::Safety(format!(
+            "{label} path identity changed while reading"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_identity_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn read_opened_verified_file<F>(
+    _path: &Path,
+    _parent: &Path,
+    _parent_identity: &fs::Metadata,
+    label: &str,
+    _after_inspect: F,
+) -> Result<Vec<u8>, ImmutableArtifactError>
+where
+    F: FnOnce() -> Result<(), ImmutableArtifactError>,
+{
+    Err(ImmutableArtifactError::Safety(format!(
+        "{label} verified no-follow reads are unsupported on this platform"
+    )))
 }
 
 pub(crate) fn publish_create_only(
@@ -195,5 +327,48 @@ impl Error for ImmutableArtifactError {}
 impl From<std::io::Error> for ImmutableArtifactError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::symlink};
+
+    use super::*;
+
+    #[test]
+    fn verified_read_rejects_a_symlink_replacement_after_initial_inspection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let run = temp.path().join("run");
+        fs::create_dir(&run).unwrap();
+        fs::write(run.join("artifact"), b"approved").unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"substituted").unwrap();
+
+        let error = read_verified_regular_file_with_hook(&run, "artifact", "artifact", || {
+            fs::remove_file(run.join("artifact"))?;
+            symlink(&outside, run.join("artifact"))?;
+            Ok(())
+        })
+        .expect_err("a replacement symlink must never be followed");
+
+        assert!(error.to_string().contains("identity") || error.to_string().contains("regular"));
+    }
+
+    #[test]
+    fn verified_read_rejects_a_regular_file_replacement_after_initial_inspection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let run = temp.path().join("run");
+        fs::create_dir(&run).unwrap();
+        fs::write(run.join("artifact"), b"approved").unwrap();
+
+        let error = read_verified_regular_file_with_hook(&run, "artifact", "artifact", || {
+            fs::rename(run.join("artifact"), run.join("old"))?;
+            fs::write(run.join("artifact"), b"substituted")?;
+            Ok(())
+        })
+        .expect_err("a replacement regular file must not satisfy the inspected authority");
+
+        assert!(error.to_string().contains("identity"));
     }
 }

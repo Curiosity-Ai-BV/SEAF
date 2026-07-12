@@ -11,6 +11,10 @@ use std::{
 };
 
 use seaf_core::{validate_eval_config, CheckStatus, EvalCommandConfig, EvalConfig};
+use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const DEFAULT_EVAL_TIMEOUT_MS: u64 = 120_000;
 const MAX_EVAL_TIMEOUT_MS: u64 = 3_600_000;
@@ -85,6 +89,24 @@ pub fn execute_eval_checks(
     plan: &EvalPlan,
 ) -> impl Iterator<Item = Result<EvalCheckExecution, EvalEngineError>> + '_ {
     plan.checks.iter().map(run_eval_check)
+}
+
+pub(crate) fn execute_eval_checks_with_pre_spawn<'a, F>(
+    plan: &'a EvalPlan,
+    mut validate_authority: F,
+) -> impl Iterator<Item = Result<EvalCheckExecution, EvalEngineError>> + 'a
+where
+    F: FnMut(usize) -> Result<(), String> + 'a,
+{
+    plan.checks.iter().enumerate().map(move |(index, check)| {
+        validate_authority(index).map_err(|error| {
+            EvalEngineError::message(format!(
+                "eval check {} pre-spawn authority rejected: {error}",
+                check.name
+            ))
+        })?;
+        run_eval_check(check)
+    })
 }
 
 #[derive(Debug)]
@@ -164,6 +186,27 @@ struct EvalCheckPlan {
     env: BTreeMap<String, String>,
     timeout_ms: u64,
     max_output_bytes: usize,
+    cwd_identity: PlannedDirectoryIdentity,
+    executable_identity: PlannedExecutableIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedDirectoryIdentity {
+    canonical_path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedExecutableIdentity {
+    canonical_path: PathBuf,
+    digest: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 fn plan_eval_check(
@@ -209,6 +252,8 @@ fn plan_eval_check(
     validate_eval_env(check)?;
     let mut argv = argv;
     argv[0] = resolve_eval_executable(&argv[0], &cwd, execution_root, &check.name)?;
+    let cwd_identity = capture_directory_identity(&cwd, &check.name)?;
+    let executable_identity = capture_executable_identity(Path::new(&argv[0]), &check.name)?;
     let timeout_ms = check.timeout_ms.unwrap_or(DEFAULT_EVAL_TIMEOUT_MS);
     if timeout_ms == 0 || timeout_ms > MAX_EVAL_TIMEOUT_MS {
         return Err(EvalEngineError::message(format!(
@@ -231,10 +276,13 @@ fn plan_eval_check(
         env: check.env.clone(),
         timeout_ms,
         max_output_bytes,
+        cwd_identity,
+        executable_identity,
     })
 }
 
 fn run_eval_check(plan: &EvalCheckPlan) -> Result<EvalCheckExecution, EvalEngineError> {
+    validate_planned_spawn_identity(plan)?;
     let started = Instant::now();
     let output = run_controlled_command(
         &plan.argv,
@@ -269,6 +317,150 @@ fn run_eval_check(plan: &EvalCheckPlan) -> Result<EvalCheckExecution, EvalEngine
         stdout,
         stderr,
         summary,
+    })
+}
+
+fn validate_planned_spawn_identity(plan: &EvalCheckPlan) -> Result<(), EvalEngineError> {
+    let cwd = capture_directory_identity(&plan.cwd, &plan.name)?;
+    if cwd != plan.cwd_identity {
+        return Err(EvalEngineError::message(format!(
+            "eval check {} cwd identity changed after planning",
+            plan.name
+        )));
+    }
+    let executable = capture_executable_identity(Path::new(&plan.argv[0]), &plan.name)?;
+    if executable != plan.executable_identity {
+        return Err(EvalEngineError::message(format!(
+            "eval check {} executable identity changed after planning",
+            plan.name
+        )));
+    }
+    Ok(())
+}
+
+fn capture_directory_identity(
+    path: &Path,
+    check_name: &str,
+) -> Result<PlannedDirectoryIdentity, EvalEngineError> {
+    let canonical_path = path.canonicalize().map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} cwd identity could not be resolved"),
+            error,
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&canonical_path).map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} cwd identity could not be inspected"),
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(EvalEngineError::message(format!(
+            "eval check {check_name} cwd identity is not a real directory"
+        )));
+    }
+    Ok(PlannedDirectoryIdentity {
+        canonical_path,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn capture_executable_identity(
+    path: &Path,
+    check_name: &str,
+) -> Result<PlannedExecutableIdentity, EvalEngineError> {
+    let canonical_path = path.canonicalize().map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable identity could not be resolved"),
+            error,
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&canonical_path)
+        .map_err(|error| {
+            EvalEngineError::io(
+                format!("eval check {check_name} executable identity could not be opened"),
+                error,
+            )
+        })?;
+    let opened = file.metadata().map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable identity could not be inspected"),
+            error,
+        )
+    })?;
+    let current = fs::symlink_metadata(&canonical_path).map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable path could not be inspected"),
+            error,
+        )
+    })?;
+    if !opened.is_file()
+        || current.file_type().is_symlink()
+        || !current.is_file()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        return Err(EvalEngineError::message(format!(
+            "eval check {check_name} executable identity is not a stable regular file"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable identity could not be read"),
+            error,
+        )
+    })?;
+    let after = fs::symlink_metadata(&canonical_path).map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable path could not be revalidated"),
+            error,
+        )
+    })?;
+    if after.file_type().is_symlink()
+        || !after.is_file()
+        || opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+    {
+        return Err(EvalEngineError::message(format!(
+            "eval check {check_name} executable identity changed while reading"
+        )));
+    }
+    Ok(PlannedExecutableIdentity {
+        canonical_path,
+        digest: format!("{:x}", Sha256::digest(&bytes)),
+        device: opened.dev(),
+        inode: opened.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn capture_executable_identity(
+    path: &Path,
+    check_name: &str,
+) -> Result<PlannedExecutableIdentity, EvalEngineError> {
+    let canonical_path = path.canonicalize().map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable identity could not be resolved"),
+            error,
+        )
+    })?;
+    let bytes = fs::read(&canonical_path).map_err(|error| {
+        EvalEngineError::io(
+            format!("eval check {check_name} executable identity could not be read"),
+            error,
+        )
+    })?;
+    Ok(PlannedExecutableIdentity {
+        canonical_path,
+        digest: format!("{:x}", Sha256::digest(&bytes)),
     })
 }
 

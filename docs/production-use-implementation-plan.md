@@ -1167,7 +1167,7 @@ Commit boundary: immutable eval input authority only. No command execution.
 
 ### M1-07c - Approved Testing And EvalReport Transaction
 
-Status: active. Split into M1-07c1 inert evidence/terminal contracts and
+Status: complete on 2026-07-12. Split into M1-07c1 inert evidence/terminal contracts and
 M1-07c2 locked Approved execution. Dependencies: M1-07b (complete).
 
 Objective: execute the canonical checks only in the exact Approved candidate
@@ -1209,7 +1209,7 @@ Commit boundary: inert durable contracts and freeze rules only.
 
 ### M1-07c2 - Locked Approved Evaluation Transaction
 
-Status: active. Dependencies: M1-07c1 (complete).
+Status: complete on 2026-07-12. Dependencies: M1-07c1 (complete).
 
 Acceptance criteria:
 
@@ -1248,6 +1248,8 @@ Commit boundary: Approved Testing/EvalReport transaction only.
 ### M1-08 - Promotion Integrity
 
 Roadmap: U3. Dependencies: M1-07.
+
+Status: active. Dependencies: M1-07 (complete).
 
 Objective: promote only the exact approved and evaluated candidate with a new
 human confirmation.

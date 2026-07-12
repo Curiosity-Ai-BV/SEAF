@@ -188,8 +188,14 @@ and the locked execution transaction. The contract slice is complete: canonical
 Testing evidence and approval-bound final states now have one combined authority
 validator, passing outcomes are immutable, reported failures permit only ordered
 candidate cleanup, and all direct execution paths remain closed. The locked
-execution transaction is active. The candidate is still not executable until
-it lands, and it is not promotable before M1-08.
+execution transaction is also complete. Exact Approved resume now runs only
+immutable ticket/eval checks in the candidate without a provider call, after
+complete preflight and a create-only execution intent. It publishes indexed
+redacted logs, canonical Testing evidence, and a bound EvalReport, then
+atomically records `eval_passed` or approval-bound reported failure. Interrupted
+attempts refuse silent replay; lasting source, candidate, command-identity, or
+artifact drift blocks terminal publication. M1-08 promotion integrity is active,
+so evaluated candidates are still not promotable.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.
