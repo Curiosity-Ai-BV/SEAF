@@ -159,9 +159,12 @@ recovers None/Applying/Applied transaction cuts; only OutputReview may rerun
 after Applied, and forbidden reruns fail before mutation. M1-05b4a binds every
 candidate operation to the canonical original run directory and makes legacy
 authority forensic-only, so copied or moved run state cannot operate on or
-remove the real candidate. Explicit CLI cleanup remains M1-05b4b and is active.
-The candidate is still not executable or promotable before the later
-human-approval and eval milestones.
+remove the real candidate. M1-05b4b now exposes only explicit, run-targeted
+cleanup, binds the caller repository and persisted run identity before
+repository-lock selection, returns one locked Cleaned outcome, and preserves
+the source checkout across success, refusal, retry, and timeout. M1-05 is
+complete and M1-06 human approval is active. The candidate is still not
+executable or promotable before the later human-approval and eval milestones.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

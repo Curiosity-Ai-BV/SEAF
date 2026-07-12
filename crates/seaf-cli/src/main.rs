@@ -12,16 +12,17 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, sha256_digest_file, templates, AgentTaskBrief,
-    AgentTaskConstraints, CheckStatus, EvalCheck, EvalDecision, EvalReport, FieldError,
-    LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, Policy, ProjectConfig,
-    ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext,
-    TicketPriority, TicketSpec, TicketStatus, ValidationReport,
+    AgentTaskConstraints, CandidateWorkspaceLifecycle, CheckStatus, EvalCheck, EvalDecision,
+    EvalReport, FieldError, LoopInputDigests, LoopRun, LoopStatus, LoopStepName, LoopStepStatus,
+    Policy, ProjectConfig, ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy,
+    TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
-    build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture,
-    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
-    ContextLimits, ContextPackRequest, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
+    build_loop_eval_report, cleanup_candidate_workspace_outcome, evaluate_zero_tolerance,
+    load_agent_bench_fixture, validate_rerun_eligibility, AgentBenchSummary, ArtifactContent,
+    AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits, ContextPackRequest,
+    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
+    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
     ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
@@ -146,6 +147,8 @@ enum LoopCommand {
     Status(LoopStatusArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
+    /// Explicitly remove a terminal run's verified candidate worktree.
+    Cleanup(LoopCleanupArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
     Smoke(LoopSmokeArgs),
     /// Run AgentBench-lite against a deterministic fixture.
@@ -317,6 +320,19 @@ struct LoopResumeArgs {
 }
 
 #[derive(Debug, Args)]
+struct LoopCleanupArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct LoopSmokeArgs {
     /// Directory where loop run workspaces are written.
     #[arg(long, default_value = ".seaf/loops/runs")]
@@ -457,6 +473,17 @@ struct LoopCommandReport {
 }
 
 #[derive(Debug, Serialize)]
+struct LoopCleanupReport {
+    command: String,
+    run_id: String,
+    status: LoopStatus,
+    candidate_lifecycle: CandidateWorkspaceLifecycle,
+    candidate_path: String,
+    run_directory: String,
+    run_file: String,
+}
+
+#[derive(Debug, Serialize)]
 struct LoopBenchReport<'a> {
     provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -513,6 +540,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
+        Command::Loop {
+            command: LoopCommand::Cleanup(args),
+        } => cleanup_loop(args),
         Command::Loop {
             command: LoopCommand::Smoke(args),
         } => smoke_loop(args),
@@ -848,6 +878,40 @@ fn loop_status(args: LoopStatusArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
     let run = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
     finish_loop_command("status", &args.runs_root, &run, args.json)
+}
+
+fn cleanup_loop(args: LoopCleanupArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let workspace = LoopWorkspace::open_minimal(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    let repository_root = current_cleanup_repository_root()?;
+    let outcome = cleanup_candidate_workspace_outcome(&workspace, &repository_root)
+        .map_err(|error| CliFailure::message(format!("candidate cleanup failed: {error}")))?;
+    let CandidateCleanupOutcome {
+        run_id,
+        status,
+        candidate,
+    } = outcome;
+    let report = LoopCleanupReport {
+        command: "cleanup".to_string(),
+        run_id,
+        status,
+        candidate_lifecycle: candidate.lifecycle,
+        candidate_path: candidate.path,
+        run_directory: workspace.run_directory().display().to_string(),
+        run_file: workspace.run_file().display().to_string(),
+    };
+
+    if args.json {
+        print_json(&report)
+    } else {
+        println!(
+            "cleaned candidate for loop {}: {}",
+            report.run_id, report.candidate_path
+        );
+        println!("run file: {}", report.run_file);
+        Ok(())
+    }
 }
 
 fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
@@ -1567,7 +1631,52 @@ fn validate_provider_timeout(timeout_ms: u64) -> Result<(), CliFailure> {
 }
 
 fn current_repository_root() -> Result<PathBuf, CliFailure> {
-    let output = ProcessCommand::new("git")
+    resolve_current_repository_root(ProcessCommand::new("git"))
+}
+
+fn current_cleanup_repository_root() -> Result<PathBuf, CliFailure> {
+    let mut command = ProcessCommand::new("git");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ] {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(name.as_ref());
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device)
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_ATTR_NOSYSTEM", "1");
+    resolve_current_repository_root(command)
+}
+
+fn resolve_current_repository_root(mut command: ProcessCommand) -> Result<PathBuf, CliFailure> {
+    let output = command
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|err| {

@@ -6,10 +6,10 @@ use std::{
 
 use seaf_core::{canonical_json_bytes, validate_loop_run, LoopInputDigests, LoopStatus};
 use seaf_loop::{
-    apply_candidate_development_evidence, cleanup_candidate_workspace, patch_digest,
-    plan_candidate_workspace, provision_candidate_workspace, validate_candidate_workspace,
-    DeveloperResponse, DeveloperStatus, DevelopmentEvidence, LoopWorkspace, PatchDecisionKind,
-    PolicyDecision, Role,
+    apply_candidate_development_evidence, cleanup_candidate_workspace,
+    cleanup_candidate_workspace_outcome, patch_digest, plan_candidate_workspace,
+    provision_candidate_workspace, validate_candidate_workspace, DeveloperResponse,
+    DeveloperStatus, DevelopmentEvidence, LoopWorkspace, PatchDecisionKind, PolicyDecision, Role,
 };
 use sha2::{Digest, Sha256};
 
@@ -1118,8 +1118,11 @@ fn cleanup_reconciles_durable_intent_after_the_bound_worktree_was_removed() {
     git_ok(&source, &["add", "after-intent.txt"]);
     git_ok(&source, &["commit", "-qm", "advance after cleanup intent"]);
 
-    let cleaned = cleanup_candidate_workspace(&workspace, &source)
+    let outcome = cleanup_candidate_workspace_outcome(&workspace, &source)
         .expect("retry finalizes a durable post-remove cleanup");
+    assert_eq!(outcome.run_id, "run-cleanup-crash");
+    assert_eq!(outcome.status, LoopStatus::Completed);
+    let cleaned = outcome.candidate;
     assert_eq!(
         cleaned.lifecycle,
         seaf_core::CandidateWorkspaceLifecycle::Cleaned

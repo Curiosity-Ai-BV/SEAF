@@ -625,11 +625,13 @@ fn non_completed_development_never_creates_a_transaction_or_calls_output_review(
         Rejected,
         Blocked,
         ProviderFailure,
+        Timeout,
     }
     for (name, case) in [
         ("rejected", Case::Rejected),
         ("blocked", Case::Blocked),
         ("provider-failure", Case::ProviderFailure),
+        ("timeout", Case::Timeout),
     ] {
         let fixture = fixture(&format!("candidate-development-{name}"));
         let source_before = source_evidence(&fixture.source);
@@ -646,6 +648,11 @@ fn non_completed_development_never_creates_a_transaction_or_calls_output_review(
             Case::ProviderFailure => Err(seaf_models::ModelError::provider(
                 "injected Development provider failure",
                 false,
+                serde_json::Value::Null,
+            )),
+            Case::Timeout => Err(seaf_models::ModelError::timeout(
+                "injected Development timeout",
+                30_000,
                 serde_json::Value::Null,
             )),
         });

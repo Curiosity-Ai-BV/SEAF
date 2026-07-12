@@ -764,6 +764,463 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
 }
 
 #[test]
+fn loop_cleanup_json_removes_only_a_terminal_candidate_and_reports_cleaned_authority() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-cleanup";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+
+    let run_dir = runs_root.join(run_id);
+    let before = read_run_json(&run_dir);
+    assert_eq!(before["status"], "completed");
+    assert_eq!(before["candidate_workspace"]["lifecycle"], "active");
+    let candidate_path = PathBuf::from(
+        before["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    assert!(candidate_path.is_dir());
+    let registration_before = git_worktree_registration(&repo);
+    assert!(
+        registration_before
+            .windows(candidate_path.as_os_str().as_encoded_bytes().len())
+            .any(|window| window == candidate_path.as_os_str().as_encoded_bytes()),
+        "candidate must be registered before cleanup"
+    );
+    let source_git_before = git_evidence(&repo);
+    let source_bytes_before = fs::read(repo.join("seaf.policy.json")).expect("source bytes");
+
+    let cleanup = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("clean terminal candidate");
+
+    assert!(cleanup.status.success(), "{cleanup:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&cleanup.stdout).expect("cleanup report JSON");
+    assert_eq!(
+        report.as_object().expect("cleanup report object").len(),
+        7,
+        "cleanup JSON is a dedicated closed operation report"
+    );
+    assert_eq!(report["command"], "cleanup");
+    assert_eq!(report["run_id"], run_id);
+    assert_eq!(report["status"], "completed");
+    assert_eq!(report["candidate_lifecycle"], "cleaned");
+    assert_eq!(
+        report["candidate_path"],
+        candidate_path.display().to_string()
+    );
+    assert_eq!(
+        report["run_directory"],
+        run_dir.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(
+        report["run_file"],
+        run_dir
+            .join("run.json")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert!(!candidate_path.exists());
+    assert!(
+        !git_worktree_registration(&repo)
+            .windows(candidate_path.as_os_str().as_encoded_bytes().len())
+            .any(|window| window == candidate_path.as_os_str().as_encoded_bytes()),
+        "cleanup must remove the exact candidate registration"
+    );
+    assert_eq!(
+        read_run_json(&run_dir)["candidate_workspace"]["lifecycle"],
+        "cleaned"
+    );
+    assert_eq!(git_evidence(&repo), source_git_before);
+    assert_eq!(
+        fs::read(repo.join("seaf.policy.json")).expect("source bytes after cleanup"),
+        source_bytes_before
+    );
+
+    let cleaned_run_bytes = fs::read(run_dir.join("run.json")).expect("cleaned run bytes");
+    let repeated = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("repeat terminal cleanup");
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated_report: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("repeated cleanup report JSON");
+    assert_eq!(repeated_report, report);
+    assert_eq!(
+        fs::read(run_dir.join("run.json")).expect("run bytes after repeated cleanup"),
+        cleaned_run_bytes,
+        "idempotent cleanup must not republish or alter retained evidence"
+    );
+    assert_eq!(git_evidence(&repo), source_git_before);
+}
+
+#[test]
+fn loop_cleanup_refuses_an_active_run_without_mutating_run_source_or_candidate() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-cleanup-active";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    let candidate_path = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let run_before = read_tree_bytes(&run_dir);
+    let source_before = git_evidence(&repo);
+    let candidate_before = git_evidence(&candidate_path);
+    let registration_before = git_worktree_registration(&repo);
+
+    let cleanup = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("refuse active cleanup");
+
+    assert!(!cleanup.status.success(), "active cleanup must fail");
+    assert!(
+        cleanup.stdout.is_empty(),
+        "failed cleanup must not emit a success report"
+    );
+    let stderr = String::from_utf8(cleanup.stderr).expect("stderr");
+    assert!(stderr.contains("active run"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate_path), candidate_before);
+    assert_eq!(git_worktree_registration(&repo), registration_before);
+    assert!(candidate_path.is_dir());
+}
+
+#[test]
+fn loop_cleanup_uses_the_current_repository_as_witness_and_rejects_another_repo() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source_repo = temp_dir.path().join("source");
+    let other_repo = temp_dir.path().join("other");
+    fs::create_dir_all(&source_repo).expect("source repo dir");
+    fs::create_dir_all(&other_repo).expect("other repo dir");
+    init_git_repo(&source_repo);
+    init_git_repo(&other_repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-cleanup-wrong-repo";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&source_repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let candidate_path = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let run_before = read_tree_bytes(&run_dir);
+    let source_before = git_evidence(&source_repo);
+    let other_before = git_evidence(&other_repo);
+    let candidate_before = git_evidence(&candidate_path);
+
+    let cleanup = seaf_in(&other_repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reject cleanup from another repository");
+
+    assert!(
+        !cleanup.status.success(),
+        "wrong repository cleanup must fail"
+    );
+    let stderr = String::from_utf8(cleanup.stderr).expect("stderr");
+    assert!(
+        stderr.contains("source worktree") || stderr.contains("Git common directory"),
+        "{stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(git_evidence(&source_repo), source_before);
+    assert_eq!(git_evidence(&other_repo), other_before);
+    assert_eq!(git_evidence(&candidate_path), candidate_before);
+    assert!(candidate_path.is_dir());
+}
+
+#[test]
+fn loop_cleanup_rejects_a_copied_run_before_touching_its_original_candidate() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let copied_runs_root = temp_dir.path().join("copied-runs");
+    let run_id = "cli-loop-cleanup-copied";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let copied_run_dir = copied_runs_root.join(run_id);
+    copy_directory(&run_dir, &copied_run_dir);
+    let candidate_path = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let original_run_before = read_tree_bytes(&run_dir);
+    let copied_run_before = read_tree_bytes(&copied_run_dir);
+    let source_before = git_evidence(&repo);
+    let candidate_before = git_evidence(&candidate_path);
+
+    let cleanup = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            copied_runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject copied run cleanup");
+
+    assert!(!cleanup.status.success(), "copied run cleanup must fail");
+    assert!(
+        cleanup.stdout.is_empty(),
+        "failed cleanup must not emit a success report"
+    );
+    let stderr = String::from_utf8(cleanup.stderr).expect("stderr");
+    assert!(stderr.contains("run directory"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), original_run_before);
+    assert_eq!(read_tree_bytes(&copied_run_dir), copied_run_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate_path), candidate_before);
+    assert!(candidate_path.is_dir());
+}
+
+#[test]
+fn loop_cleanup_rejects_a_persisted_run_id_mismatch_before_any_lock_or_checkout_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-cleanup-run-id";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let mut run = read_run_json(&run_dir);
+    let candidate_path = PathBuf::from(
+        run["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    run["run_id"] = serde_json::json!("other-safe-run");
+    run["provider_exchange_records"] = serde_json::json!([]);
+    for decision in run["policy_decisions"]
+        .as_array_mut()
+        .expect("policy decisions")
+    {
+        decision["patch_id"] = serde_json::json!("other-safe-run");
+    }
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&run).expect("serialize mismatched run"),
+    )
+    .expect("persist mismatched run");
+    let authority_root = temp_dir.path().join("seaf-test-tmp");
+    let run_before = read_tree_bytes(&run_dir);
+    let authority_before = read_tree_bytes(&authority_root);
+    let source_before = git_evidence(&repo);
+    let candidate_before = git_evidence(&candidate_path);
+    let registration_before = git_worktree_registration(&repo);
+
+    let cleanup = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject persisted run ID mismatch");
+
+    assert!(!cleanup.status.success(), "mismatched run ID must fail");
+    let stderr = String::from_utf8(cleanup.stderr).expect("stderr");
+    assert!(stderr.contains("run ID"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(read_tree_bytes(&authority_root), authority_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate_path), candidate_before);
+    assert_eq!(git_worktree_registration(&repo), registration_before);
+    assert!(candidate_path.is_dir());
+}
+
+#[test]
+fn loop_cleanup_ignores_inherited_git_redirection_when_resolving_the_caller_repository() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source_repo = temp_dir.path().join("source");
+    let caller_repo = temp_dir.path().join("caller");
+    fs::create_dir_all(&source_repo).expect("source repo dir");
+    fs::create_dir_all(&caller_repo).expect("caller repo dir");
+    init_git_repo(&source_repo);
+    init_git_repo(&caller_repo);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-loop-cleanup-git-env";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&source_repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let candidate_path = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let authority_root = temp_dir.path().join("seaf-test-tmp");
+    let run_before = read_tree_bytes(&run_dir);
+    let authority_before = read_tree_bytes(&authority_root);
+    let source_before = git_evidence(&source_repo);
+    let caller_before = git_evidence(&caller_repo);
+    let candidate_before = git_evidence(&candidate_path);
+    let registration_before = git_worktree_registration(&source_repo);
+
+    let cleanup = seaf_in(&caller_repo)
+        .env("GIT_DIR", source_repo.join(".git"))
+        .env("GIT_WORK_TREE", &source_repo)
+        .env("GIT_COMMON_DIR", source_repo.join(".git"))
+        .env("GIT_INDEX_FILE", source_repo.join(".git/index"))
+        .env("GIT_OBJECT_DIRECTORY", source_repo.join(".git/objects"))
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject inherited Git redirection");
+
+    assert!(
+        !cleanup.status.success(),
+        "redirected caller witness must fail"
+    );
+    let stderr = String::from_utf8(cleanup.stderr).expect("stderr");
+    assert!(stderr.contains("source worktree"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(read_tree_bytes(&authority_root), authority_before);
+    assert_eq!(git_evidence(&source_repo), source_before);
+    assert_eq!(git_evidence(&caller_repo), caller_before);
+    assert_eq!(git_evidence(&candidate_path), candidate_before);
+    assert_eq!(git_worktree_registration(&source_repo), registration_before);
+    assert!(candidate_path.is_dir());
+}
+
+#[test]
+fn loop_cleanup_rejects_invalid_and_missing_targets_without_creating_workspace_state() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = temp_dir.path().join("runs");
+
+    let invalid = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            "../escaped",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject traversal run id");
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8(invalid.stderr)
+        .expect("stderr")
+        .contains("invalid run ID"));
+    assert!(!runs_root.exists());
+
+    fs::create_dir(&runs_root).expect("empty runs root");
+    let source_before = git_evidence(&repo);
+    let missing = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            "missing-run",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject missing run");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8(missing.stderr)
+        .expect("stderr")
+        .contains("run directory does not exist"));
+    assert!(fs::read_dir(&runs_root)
+        .expect("read runs root")
+        .next()
+        .is_none());
+    assert_eq!(git_evidence(&repo), source_before);
+}
+
+#[test]
+fn loop_help_exposes_cleanup_as_an_explicit_operation() {
+    let output = seaf().args(["loop", "--help"]).output().expect("loop help");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    for command in ["run", "status", "resume", "smoke", "bench", "cleanup"] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "missing {command} in {stdout}"
+        );
+    }
+}
+
+#[test]
 fn loop_run_project_config_policy_changes_fake_gating_and_explicit_policy_wins() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
@@ -4695,6 +5152,20 @@ fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         run(&["diff", "--binary"]),
         run(&["diff", "--cached", "--binary"]),
     )
+}
+
+fn git_worktree_registration(root: &Path) -> Vec<u8> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .expect("git worktree registration evidence");
+    assert!(
+        output.status.success(),
+        "git worktree list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 fn copy_directory(source: &Path, destination: &Path) {

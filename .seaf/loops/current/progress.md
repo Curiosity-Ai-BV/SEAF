@@ -23,8 +23,8 @@
 - [x] M1-05b2: Provider start/resume candidate authority.
 - [x] M1-05b3: Development/output-review candidate integration.
 - [x] M1-05b4a: Authoritative run-directory binding.
-- [ ] M1-05b4b: Explicit candidate cleanup CLI (active).
-- [ ] M1-06: Human approval state.
+- [x] M1-05b4b: Explicit candidate cleanup CLI.
+- [ ] M1-06: Human approval state (active).
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
 - [ ] M1-09: Audited recovery operations.
@@ -53,8 +53,9 @@
 
 ## Current Gate
 
-M1-05b1 through M1-05b4a are complete; M1-05b4b is active. Milestone 1 remains
-active. Candidate schema v2 binds every operation to the canonical original
-run directory; copied, moved, symlinked, tampered, and forensic v1 authority
-fail before locks or Git/state mutation, including an under-lock cleanup race.
-Explicit safe candidate cleanup remains M1-05b4b.
+M1-05 is complete and M1-06 is active. Explicit cleanup minimally opens only
+the named run, sanitizes Git caller discovery, binds persisted run identity,
+validates static authority before repository-lock selection, and returns one
+locked Cleaned outcome. Exact retries are byte-identical; active, copied,
+wrong-repository, tampered, legacy, invalid, and missing authority fail without
+candidate removal or false success output. Human approval is the next gate.

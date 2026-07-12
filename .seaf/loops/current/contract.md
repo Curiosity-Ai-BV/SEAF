@@ -41,10 +41,10 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-05b4b - Explicit candidate cleanup CLI. Expose the existing authoritative
-Active-to-Cleaning-to-Cleaned transition through one explicit run-targeted CLI
-operation. It must open the named run from the selected runs root, use the
-current canonical repository as the caller witness, preserve idempotent Cleaned
-behavior, reject active/provisioning/legacy/copied authority before mutation,
-and report the exact cleaned candidate without adding implicit cleanup,
-approval, promotion, or eval behavior.
+M1-06 - Human approval state. Add a closed durable approval contract and an
+explicit CLI operation that can approve only the exact reviewed candidate.
+Approval must bind the candidate patch digest, starting target HEAD, policy
+decision, reviewer identity, and timestamp; stale/mismatched/duplicate evidence
+fails closed. Represent awaiting-human-review and approved state explicitly.
+Do not execute model-modified code, run evals, promote, or alter the source
+checkout in this slice.

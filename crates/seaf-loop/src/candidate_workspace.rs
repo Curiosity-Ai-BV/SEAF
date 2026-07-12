@@ -54,6 +54,34 @@ pub struct VerifiedCandidatePatchEvidence {
     pub applied_diff_content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateCleanupOutcome {
+    pub run_id: String,
+    pub status: LoopStatus,
+    pub candidate: CandidateWorkspaceState,
+}
+
+impl CandidateCleanupOutcome {
+    fn from_locked_run(
+        run: &seaf_core::LoopRun,
+        candidate: CandidateWorkspaceState,
+    ) -> Result<Self, CandidateWorkspaceError> {
+        if matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
+            || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
+            || run.candidate_workspace.as_ref() != Some(&candidate)
+        {
+            return Err(CandidateWorkspaceError::Mismatch(
+                "cleanup outcome is not the exact locked terminal Cleaned authority".to_string(),
+            ));
+        }
+        Ok(Self {
+            run_id: run.run_id.clone(),
+            status: run.status,
+            candidate,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CandidatePatchIntent {
@@ -1289,6 +1317,14 @@ pub fn cleanup_candidate_workspace(
     workspace: &LoopWorkspace,
     source_worktree_root: &Path,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
+    cleanup_candidate_workspace_outcome(workspace, source_worktree_root)
+        .map(|outcome| outcome.candidate)
+}
+
+pub fn cleanup_candidate_workspace_outcome(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+) -> Result<CandidateCleanupOutcome, CandidateWorkspaceError> {
     cleanup_candidate_workspace_with_hook(workspace, source_worktree_root, |_| Ok(()))
 }
 
@@ -1296,7 +1332,7 @@ fn cleanup_candidate_workspace_with_hook<F>(
     workspace: &LoopWorkspace,
     source_worktree_root: &Path,
     mut hook: F,
-) -> Result<CandidateWorkspaceState, CandidateWorkspaceError>
+) -> Result<CandidateCleanupOutcome, CandidateWorkspaceError>
 where
     F: FnMut(CandidateCleanupPhase) -> Result<(), CandidateWorkspaceError>,
 {
@@ -1306,6 +1342,7 @@ where
         hook(CandidateCleanupPhase::CandidateLockAcquired)?;
         let mut run = crate::state::load_run(workspace)
             .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+        validate_workspace_run_id(workspace, &run)?;
         if matches!(run.status, LoopStatus::Pending | LoopStatus::Running) {
             return Err(CandidateWorkspaceError::Unsafe(
                 "refusing to clean an active run candidate".to_string(),
@@ -1317,14 +1354,23 @@ where
             )
         })?;
         validate_run_directory_authority(workspace.run_directory(), &candidate)?;
+        if candidate.lifecycle == CandidateWorkspaceLifecycle::Provisioning {
+            return Err(CandidateWorkspaceError::Unsafe(
+                "refusing to clean a candidate before provisioning completes".to_string(),
+            ));
+        }
+        validate_static_authority(
+            workspace.run_directory(),
+            source_worktree_root,
+            &candidate,
+            false,
+        )?;
         let repository_lock =
             acquire_repository_operation_lock(Path::new(&candidate.git_common_dir))?;
 
         let mut cleaning = match candidate.lifecycle {
             CandidateWorkspaceLifecycle::Provisioning => {
-                return Err(CandidateWorkspaceError::Unsafe(
-                    "refusing to clean a candidate before provisioning completes".to_string(),
-                ));
+                unreachable!("Provisioning is rejected before repository lock selection")
             }
             CandidateWorkspaceLifecycle::Active => {
                 validate_candidate_physical(
@@ -1360,7 +1406,7 @@ where
                     ));
                 }
                 repository_lock.unlock()?;
-                return Ok(candidate);
+                return CandidateCleanupOutcome::from_locked_run(&run, candidate);
             }
         };
 
@@ -1415,8 +1461,9 @@ where
         let expected = run.clone();
         run.candidate_workspace = Some(cleaning.clone());
         persist_candidate_run(workspace, &expected, &run)?;
+        hook(CandidateCleanupPhase::CleanedPersisted)?;
         repository_lock.unlock()?;
-        Ok(cleaning)
+        CandidateCleanupOutcome::from_locked_run(&run, cleaning)
     })();
     let unlock = lock.unlock();
     match (result, unlock) {
@@ -1432,6 +1479,7 @@ enum CandidateCleanupPhase {
     BeforeIntentPersisted,
     IntentPersisted,
     WorktreeRemoved,
+    CleanedPersisted,
 }
 
 fn persist_candidate_run(
@@ -1450,12 +1498,25 @@ fn preflight_workspace_run_directory_authority(
 ) -> Result<(), CandidateWorkspaceError> {
     let run = crate::state::load_run(workspace)
         .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    validate_workspace_run_id(workspace, &run)?;
     let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
         CandidateWorkspaceError::Mismatch(
             "authoritative LoopRun has no candidate workspace".to_string(),
         )
     })?;
     validate_run_directory_authority(workspace.run_directory(), candidate)
+}
+
+fn validate_workspace_run_id(
+    workspace: &LoopWorkspace,
+    run: &seaf_core::LoopRun,
+) -> Result<(), CandidateWorkspaceError> {
+    if run.run_id != safe_run_id(workspace.run_directory())? {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "persisted run ID does not match the authoritative run directory".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_run_directory_authority(
@@ -2928,6 +2989,232 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_rejects_valid_provisioning_before_selecting_a_repository_lock() {
+        let (_temp, source, workspace, planned) = provisioning_fixture("cleanup-provisioning");
+        let repository_lock =
+            repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
+        if repository_lock.exists() {
+            fs::remove_file(&repository_lock).expect("remove prior repository lock");
+        }
+        let run_before = fs::read(workspace.run_file()).expect("run bytes");
+        let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
+        let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
+
+        let error = cleanup_candidate_workspace(&workspace, &source)
+            .expect_err("valid Provisioning authority cannot be cleaned");
+
+        assert!(error.to_string().contains("active run"), "{error}");
+        assert!(!repository_lock.exists());
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_before);
+        assert_eq!(
+            git_text(&source, &["rev-parse", "HEAD"]).unwrap(),
+            source_head
+        );
+        assert_eq!(
+            git_text(&source, &["status", "--porcelain=v1"]).unwrap(),
+            source_status
+        );
+        assert!(!Path::new(&planned.path).exists());
+    }
+
+    #[test]
+    fn cleanup_rejects_wrong_source_before_recreating_the_repository_lock() {
+        let (temp, source, workspace, planned) = provisioning_fixture("cleanup-wrong-source");
+        let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
+        let mut run = crate::state::load_run(&workspace).expect("active run");
+        run.status = LoopStatus::Completed;
+        crate::state::save_run(&workspace, &run).expect("terminal run");
+        let repository_lock =
+            repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
+        fs::remove_file(&repository_lock).expect("remove provision repository lock");
+
+        let other = temp.path().join("other");
+        fs::create_dir(&other).expect("other source");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "seaf@example.invalid"],
+            vec!["config", "user.name", "SEAF Test"],
+        ] {
+            test_git(&other, &args);
+        }
+        fs::write(other.join("tracked.txt"), "other\n").unwrap();
+        test_git(&other, &["add", "tracked.txt"]);
+        test_git(&other, &["commit", "-qm", "initial"]);
+        let run_before = fs::read(workspace.run_file()).expect("run bytes");
+        let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
+        let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
+        let candidate_tree = git_text(Path::new(&candidate.path), &["write-tree"]).unwrap();
+        let candidate_status =
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap();
+
+        let error = cleanup_candidate_workspace(&workspace, &other)
+            .expect_err("wrong caller source must fail before repository locking");
+
+        let repository_lock_created = repository_lock.exists();
+        if repository_lock_created {
+            fs::remove_file(&repository_lock).expect("remove recreated test lock");
+        }
+        assert!(error.to_string().contains("source worktree"), "{error}");
+        assert!(!repository_lock_created);
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_before);
+        assert_eq!(
+            git_text(&source, &["rev-parse", "HEAD"]).unwrap(),
+            source_head
+        );
+        assert_eq!(
+            git_text(&source, &["status", "--porcelain=v1"]).unwrap(),
+            source_status
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["write-tree"]).unwrap(),
+            candidate_tree
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
+            candidate_status
+        );
+        test_git(
+            &source,
+            &["worktree", "remove", "--force", candidate.path.as_str()],
+        );
+    }
+
+    #[test]
+    fn cleanup_wrong_source_never_selects_a_lock_for_cleaning_or_cleaned_authority() {
+        for lifecycle in [
+            CandidateWorkspaceLifecycle::Cleaning,
+            CandidateWorkspaceLifecycle::Cleaned,
+        ] {
+            let run_id = match lifecycle {
+                CandidateWorkspaceLifecycle::Cleaning => "cleanup-wrong-source-cleaning",
+                CandidateWorkspaceLifecycle::Cleaned => "cleanup-wrong-source-cleaned",
+                _ => unreachable!(),
+            };
+            let (temp, source, workspace, planned) = provisioning_fixture(run_id);
+            let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
+            if lifecycle == CandidateWorkspaceLifecycle::Cleaned {
+                test_git(
+                    &source,
+                    &["worktree", "remove", "--force", candidate.path.as_str()],
+                );
+            }
+            let mut run = crate::state::load_run(&workspace).expect("active run");
+            run.status = LoopStatus::Completed;
+            let authority = run.candidate_workspace.as_mut().unwrap();
+            authority.lifecycle = lifecycle;
+            authority.cleanup_started_at = Some("cleanup-started".to_string());
+            authority.cleaned_at = (lifecycle == CandidateWorkspaceLifecycle::Cleaned)
+                .then(|| "cleanup-finished".to_string());
+            crate::state::save_run(&workspace, &run).expect("cleanup lifecycle run");
+            let repository_lock =
+                repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
+            fs::remove_file(&repository_lock).expect("remove provision repository lock");
+
+            let other = temp.path().join("other");
+            fs::create_dir(&other).expect("other source");
+            test_git(&other, &["init", "-q"]);
+            let run_before = fs::read(workspace.run_file()).expect("run bytes");
+            let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
+            let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
+            let candidate_before = Path::new(&candidate.path).exists().then(|| {
+                (
+                    git_text(Path::new(&candidate.path), &["write-tree"]).unwrap(),
+                    git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
+                )
+            });
+
+            let error = cleanup_candidate_workspace(&workspace, &other)
+                .expect_err("wrong source must fail before repository locking");
+
+            let repository_lock_created = repository_lock.exists();
+            if repository_lock_created {
+                fs::remove_file(&repository_lock).expect("remove recreated test lock");
+            }
+            assert!(error.to_string().contains("source worktree"), "{error}");
+            assert!(!repository_lock_created, "{lifecycle:?}");
+            assert_eq!(fs::read(workspace.run_file()).unwrap(), run_before);
+            assert_eq!(
+                git_text(&source, &["rev-parse", "HEAD"]).unwrap(),
+                source_head
+            );
+            assert_eq!(
+                git_text(&source, &["status", "--porcelain=v1"]).unwrap(),
+                source_status
+            );
+            if let Some((tree, status)) = candidate_before {
+                assert_eq!(
+                    git_text(Path::new(&candidate.path), &["write-tree"]).unwrap(),
+                    tree
+                );
+                assert_eq!(
+                    git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
+                    status
+                );
+                test_git(
+                    &source,
+                    &["worktree", "remove", "--force", candidate.path.as_str()],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_rejects_tampered_common_dir_before_selecting_its_lock_namespace() {
+        let (temp, source, workspace, _) = provisioning_fixture("cleanup-common-dir");
+        let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
+        let malicious_common = temp.path().join("malicious-common");
+        fs::create_dir(&malicious_common).expect("malicious common dir");
+        let malicious_common = malicious_common.canonicalize().unwrap();
+        let malicious_lock = repository_operation_lock_path(&malicious_common).unwrap();
+        assert!(!malicious_lock.exists());
+        let mut run = crate::state::load_run(&workspace).expect("active run");
+        run.status = LoopStatus::Completed;
+        run.candidate_workspace.as_mut().unwrap().git_common_dir =
+            malicious_common.display().to_string();
+        crate::state::save_run(&workspace, &run).expect("tampered terminal run");
+        let run_before = fs::read(workspace.run_file()).expect("run bytes");
+        let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
+        let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
+        let candidate_tree = git_text(Path::new(&candidate.path), &["write-tree"]).unwrap();
+        let candidate_status =
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap();
+
+        let error = cleanup_candidate_workspace(&workspace, &source)
+            .expect_err("tampered common dir must fail before repository locking");
+
+        let malicious_lock_created = malicious_lock.exists();
+        if malicious_lock_created {
+            fs::remove_file(&malicious_lock).expect("remove malicious test lock");
+        }
+        assert!(
+            error.to_string().contains("Git common directory"),
+            "{error}"
+        );
+        assert!(!malicious_lock_created);
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_before);
+        assert_eq!(
+            git_text(&source, &["rev-parse", "HEAD"]).unwrap(),
+            source_head
+        );
+        assert_eq!(
+            git_text(&source, &["status", "--porcelain=v1"]).unwrap(),
+            source_status
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["write-tree"]).unwrap(),
+            candidate_tree
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
+            candidate_status
+        );
+        test_git(
+            &source,
+            &["worktree", "remove", "--force", candidate.path.as_str()],
+        );
+    }
+
+    #[test]
     fn cleanup_revalidates_reloaded_run_authority_before_selecting_repository_lock() {
         let (temp, source, workspace, _) = provisioning_fixture("cleanup-authority-race");
         let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
@@ -2988,6 +3275,65 @@ mod tests {
         assert!(run_unchanged_after_swap);
         assert!(source_unchanged);
         assert!(candidate_unchanged);
+    }
+
+    #[test]
+    fn cleanup_revalidates_run_id_after_the_candidate_lock() {
+        let (_temp, source, workspace, planned) = provisioning_fixture("cleanup-run-id-race");
+        let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
+        let mut terminal = crate::state::load_run(&workspace).expect("active run");
+        terminal.status = LoopStatus::Completed;
+        crate::state::save_run(&workspace, &terminal).expect("terminal run");
+        let repository_lock =
+            repository_operation_lock_path(Path::new(&planned.git_common_dir)).unwrap();
+        fs::remove_file(&repository_lock).expect("remove provision repository lock");
+        let source_head = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
+        let source_status = git_text(&source, &["status", "--porcelain=v1"]).unwrap();
+        let candidate_tree = git_text(Path::new(&candidate.path), &["write-tree"]).unwrap();
+        let candidate_status =
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap();
+        let swapped_bytes = std::cell::RefCell::new(None);
+
+        let error = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
+            if phase == CandidateCleanupPhase::CandidateLockAcquired {
+                let mut swapped = crate::state::load_run(&workspace)
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+                swapped.run_id = "other-safe-run".to_string();
+                crate::state::write_run_file(&workspace.run_file(), &swapped)
+                    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+                *swapped_bytes.borrow_mut() = Some(fs::read(workspace.run_file())?);
+            }
+            Ok(())
+        })
+        .expect_err("locked reload must bind persisted run ID to the directory");
+
+        assert!(error.to_string().contains("run ID"), "{error}");
+        assert!(!repository_lock.exists());
+        assert_eq!(
+            fs::read(workspace.run_file()).unwrap(),
+            swapped_bytes.into_inner().expect("swapped run bytes")
+        );
+        assert_eq!(
+            git_text(&source, &["rev-parse", "HEAD"]).unwrap(),
+            source_head
+        );
+        assert_eq!(
+            git_text(&source, &["status", "--porcelain=v1"]).unwrap(),
+            source_status
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["write-tree"]).unwrap(),
+            candidate_tree
+        );
+        assert_eq!(
+            git_text(Path::new(&candidate.path), &["status", "--porcelain=v1"]).unwrap(),
+            candidate_status
+        );
+        crate::state::write_run_file(&workspace.run_file(), &terminal).expect("restore run");
+        test_git(
+            &source,
+            &["worktree", "remove", "--force", candidate.path.as_str()],
+        );
     }
 
     #[test]
@@ -3075,6 +3421,34 @@ mod tests {
                 .lifecycle,
             CandidateWorkspaceLifecycle::Cleaned
         );
+    }
+
+    #[test]
+    fn cleanup_outcome_uses_the_locked_snapshot_without_a_post_success_reread() {
+        let (_temp, source, workspace, _) = provisioning_fixture("cleanup-locked-outcome");
+        let candidate = provision_candidate_workspace(&workspace).expect("active candidate");
+        let mut run = crate::state::load_run(&workspace).expect("active run");
+        run.status = LoopStatus::Completed;
+        crate::state::save_run(&workspace, &run).expect("terminal run");
+
+        let outcome = cleanup_candidate_workspace_with_hook(&workspace, &source, |phase| {
+            if phase == CandidateCleanupPhase::CleanedPersisted {
+                fs::remove_file(workspace.run_file())?;
+            }
+            Ok(())
+        })
+        .expect("completed cleanup must not depend on an unlocked reread");
+
+        assert_eq!(outcome.run_id, "cleanup-locked-outcome");
+        assert_eq!(outcome.status, LoopStatus::Completed);
+        assert_eq!(
+            outcome.candidate.lifecycle,
+            CandidateWorkspaceLifecycle::Cleaned
+        );
+        assert!(!Path::new(&candidate.path).exists());
+        assert!(!workspace.run_file().exists());
+        run.candidate_workspace = Some(outcome.candidate);
+        crate::state::write_run_file(&workspace.run_file(), &run).expect("restore cleaned run");
     }
 
     #[test]

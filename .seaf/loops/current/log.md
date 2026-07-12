@@ -1400,3 +1400,42 @@ provider exchange 22, state 28, all remaining integration/doc tests, and SDK 8.
 Clippy with all targets/features and warnings denied, package lint, typecheck,
 SDK build, Rust/Prettier formatting, and diff checks pass. M1-05b4a is accepted;
 M1-05b4b explicit cleanup CLI is active.
+
+## 2026-07-12 implementation | M1-05b4b explicit candidate cleanup CLI
+
+Added `seaf loop cleanup --run-id ID [--runs-root PATH] [--json]` as the only
+candidate cleanup trigger. The command validates the requested ID, minimally
+opens the existing run, resolves the current repository with inherited Git
+repository/config/object/index redirection removed, and delegates to the
+authoritative Active-to-Cleaning-to-Cleaned transaction. Success emits a
+dedicated seven-field report; exact Cleaned retries preserve identical run
+bytes and output.
+
+The first CLI RED was the absent cleanup subcommand. Real terminal-run coverage
+then proved exact worktree and registration removal while preserving source
+HEAD, status, staged/unstaged diffs, and tracked bytes. Boundary tests cover
+active refusal, wrong repository, copied run, persisted run-ID mismatch,
+inherited Git redirection, traversal, missing run, idempotence, help, and no
+false JSON success. The normal-build isolated Development matrix now includes
+provider timeout and proves no source/candidate change, patch transaction, or
+OutputReview.
+
+Independent review found four real safety gaps. Wrong-source and tampered
+common-directory REDs showed cleanup could create the persistent repository
+lock before rejecting static authority. A mismatched persisted run ID could
+remove the candidate. Inherited `GIT_DIR`/`GIT_WORK_TREE` could impersonate the
+source repository. The CLI also combined a locked candidate result with an
+unlocked later run reread. Corrections prevalidate source/common/path authority
+before repository-lock selection and revalidate under it; bind run ID before
+and after candidate locking; sanitize destructive Git discovery; and return a
+typed locked run/status/candidate outcome with no post-success reread. Focused
+REDs failed the old paths, and both reviewers approved the final regressions.
+
+Controller-focused verification passes seven cleanup CLI tests, eight cleanup
+unit tests, six cleanup integration tests, and the isolated timeout boundary.
+The final gate passes the complete locked workspace: CLI 94, core 33, loop
+library 105, candidate integration 39, provider candidate 11, provider exchange
+22, state 28, all remaining integration/doc tests, and SDK 8. Clippy with all
+targets/features and warnings denied, package lint, typecheck, SDK build,
+Rust/Prettier formatting, and diff checks pass. M1-05b4b and M1-05 are accepted;
+M1-06 human approval is active.

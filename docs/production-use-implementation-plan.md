@@ -715,9 +715,9 @@ remains M1-09.
 
 ### M1-05 - Isolated Candidate Workspace
 
-Status: active. Split into M1-05a lifecycle contract and M1-05b provider/CLI
-integration so the durable identity boundary can be reviewed independently
-from patch-gate mutation.
+Status: complete on 2026-07-12. Split into M1-05a lifecycle contract and
+M1-05b provider/CLI integration so the durable identity boundary could be
+reviewed independently from patch-gate mutation. M1-06 is active.
 
 ### M1-05a - Candidate Workspace Lifecycle Contract
 
@@ -769,9 +769,9 @@ same-user directory-entry races remain M1-10/M1-11 hardening scope.
 
 ### M1-05b - Candidate Provider And CLI Integration
 
-Status: active. Dependencies: M1-05a (complete). Split into four reviewable
-boundaries: M1-05b1 through M1-05b3 and the M1-05b4a safety prerequisite are
-complete; M1-05b4b is active.
+Status: complete on 2026-07-12. Dependencies: M1-05a (complete). Split into
+four reviewable boundaries: M1-05b1 through M1-05b3 plus the M1-05b4a safety
+prerequisite and M1-05b4b CLI are complete. M1-06 is active.
 
 Roadmap: U3. Dependencies: M1-04b.
 
@@ -951,33 +951,48 @@ promotion, or eval behavior.
 
 #### M1-05b4b - Explicit Candidate Cleanup CLI
 
-Status: active. Dependencies: M1-05b4a (complete).
+Status: complete on 2026-07-12. Dependencies: M1-05b4a (complete).
 
 Expose explicit cleanup through the existing authoritative
 Active-to-Cleaning-to-Cleaned primitive and close end-to-end source immutability
 coverage.
 
-Acceptance criteria:
+- `seaf loop cleanup --run-id ID [--runs-root PATH] [--json]` is the only
+  cleanup trigger. It validates the run ID, minimally opens the named existing
+  run, resolves the current repository through a Git-redirection-sanitized
+  command, and delegates to the authoritative cleanup transaction.
+- Persisted run identity is bound to the run-directory basename before the
+  candidate lock and again on the locked reload. Active, Cleaning, and Cleaned
+  authority validates the caller source, Git common directory, and candidate
+  path read-only before selecting the persistent repository lock, then repeats
+  physical/static validation under that lock.
+- Cleanup returns a typed locked outcome containing the exact run ID, terminal
+  status, and Cleaned candidate authority. The CLI renders only that snapshot;
+  it never rereads and combines state after the destructive transaction.
+- Exact terminal Active cleanup removes only the verified candidate path and
+  Git registration, leaves the source checkout unchanged, and persists
+  Cleaned. Repeating cleanup is byte-for-byte idempotent. Active,
+  Provisioning, legacy, copied, wrong-repository, tampered, invalid, and missing
+  authority fail without candidate removal or false success output.
+- Normal-build isolated provider coverage now explicitly includes timeout in
+  the non-completed Development matrix and proves source/candidate immutability,
+  no patch transaction, and no OutputReview.
 
-- Provider runs create a dedicated candidate Git worktree bound to the starting
-  repository and HEAD.
-- Policy check and patch application target the candidate; the source checkout
-  stays byte-for-byte unchanged on pass, block, failure, timeout, and resume.
-- Candidate paths and HEAD/digests are persisted; cleanup is explicit and safe.
+The first independent review found repository-lock mutation before source
+validation, missing persisted run-ID binding, inherited Git-environment
+redirection, a mixed post-cleanup report, and missing normal-build timeout
+coverage. Each received a focused regression and both spec and quality
+re-reviews approved the corrected boundary.
 
-Likely seams: workspace/state, patch gate runner, CLI lifecycle, Git helpers,
-and integration tests.
-
-RED: real temporary-repository tests for source immutability and candidate
-identity across failure/resume.
-
-Verification: focused worktree/policy/CLI tests, full Rust workspace tests,
-format, Clippy, and diff check.
+Verification: 94 CLI tests, 105 loop library tests, 39 candidate integration
+tests, 11 provider-candidate boundary tests, the full locked Rust workspace,
+Clippy with all targets/features and warnings denied, Rust/Prettier formatting,
+SDK/package gates, and diff check.
 
 Docs/tracker: candidate lifecycle and M1-05 status.
 
-Commit boundary: isolated proposal/application and explicit cleanup only; no
-approval, promotion, or evals.
+Commit boundary: explicit cleanup and its lifecycle safety only; no approval,
+promotion, or eval execution.
 
 ### M1-06 - Human Approval State
 

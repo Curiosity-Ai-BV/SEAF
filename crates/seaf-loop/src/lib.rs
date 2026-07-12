@@ -23,9 +23,10 @@ pub use bench::{
     AgentBenchFixture, AgentBenchResult, AgentBenchSummary, BenchError, ZeroToleranceError,
 };
 pub use candidate_workspace::{
-    apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
-    plan_candidate_workspace, provision_candidate_workspace, validate_candidate_workspace,
-    verify_candidate_patch_evidence, CandidateWorkspaceError, VerifiedCandidatePatchEvidence,
+    apply_candidate_development_evidence, cleanup_candidate_workspace,
+    cleanup_candidate_workspace_outcome, create_candidate_workspace, plan_candidate_workspace,
+    provision_candidate_workspace, validate_candidate_workspace, verify_candidate_patch_evidence,
+    CandidateCleanupOutcome, CandidateWorkspaceError, VerifiedCandidatePatchEvidence,
     CANDIDATE_WORKSPACE_SCHEMA_VERSION,
 };
 pub use context::{
