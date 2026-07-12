@@ -7,7 +7,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::artifact_safety;
+use crate::{
+    artifact_safety,
+    run_persistence::{RunMutationGuard, RunPersistenceError},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -43,6 +46,7 @@ where
         &path,
         &canonical_parent,
         &parent_identity,
+        relative_path,
         label,
         after_inspect,
     )
@@ -53,6 +57,7 @@ fn read_opened_verified_file<F>(
     path: &Path,
     parent: &Path,
     parent_identity: &fs::Metadata,
+    relative_path: &str,
     label: &str,
     after_inspect: F,
 ) -> Result<Vec<u8>, ImmutableArtifactError>
@@ -81,16 +86,19 @@ where
         )));
     }
     artifact_safety::validate_opened_private_regular_file(path, &opened)?;
+    crate::artifact_storage::validate_artifact_size_u64(relative_path, opened.len())?;
     validate_opened_file_identity(path, &opened, label)?;
     after_inspect()?;
     validate_parent_identity(parent, parent_identity, label)?;
     validate_opened_file_identity(path, &opened, label)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let cap = crate::artifact_storage::artifact_byte_cap(relative_path);
+    (&mut file).take(cap + 1).read_to_end(&mut bytes)?;
+    crate::artifact_storage::validate_artifact_size(relative_path, bytes.len())?;
     validate_parent_identity(parent, parent_identity, label)?;
     validate_opened_file_identity(path, &opened, label)?;
     let after = file.metadata()?;
-    if !metadata_identity_matches(&opened, &after) {
+    if !metadata_identity_matches(&opened, &after) || after.len() != bytes.len() as u64 {
         return Err(ImmutableArtifactError::Safety(format!(
             "{label} opened file identity changed while reading"
         )));
@@ -152,6 +160,7 @@ fn read_opened_verified_file<F>(
     _path: &Path,
     _parent: &Path,
     _parent_identity: &fs::Metadata,
+    _relative_path: &str,
     label: &str,
     _after_inspect: F,
 ) -> Result<Vec<u8>, ImmutableArtifactError>
@@ -168,10 +177,170 @@ pub(crate) fn publish_create_only(
     relative_path: &str,
     bytes: &[u8],
 ) -> Result<(), ImmutableArtifactError> {
-    publish_create_only_with_hook(run_directory, relative_path, bytes, |_| Ok(()))
+    let guard = RunMutationGuard::acquire(run_directory)?;
+    publish_create_only_with_guard_and_hook(&guard, relative_path, bytes, |_| Ok(()))
 }
 
+pub(crate) fn publish_create_only_with_guard(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    publish_create_only_with_guard_and_hook(guard, relative_path, bytes, |_| Ok(()))
+}
+
+pub(crate) fn publish_create_only_standalone(
+    run_directory: &Path,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    publish_create_only_standalone_with_hook(run_directory, relative_path, bytes, |_| Ok(()))
+}
+
+#[cfg(test)]
+pub(crate) fn publish_mutable_with_guard(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    publish_mutable_with_guard_core(guard, relative_path, bytes, None, false)
+}
+
+pub(crate) fn publish_mutable_with_guard_expected(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+    expected: Option<&fs::Metadata>,
+) -> Result<(), ImmutableArtifactError> {
+    publish_mutable_with_guard_core(guard, relative_path, bytes, expected, true)
+}
+
+fn publish_mutable_with_guard_core(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+    expected: Option<&fs::Metadata>,
+    enforce_expected: bool,
+) -> Result<(), ImmutableArtifactError> {
+    let run_directory = guard.run_directory();
+    validate_relative_path(relative_path)?;
+    validate_real_run_parent(run_directory, Path::new(relative_path))?;
+    let parent =
+        artifact_safety::open_private_descendant_parent(run_directory, Path::new(relative_path))?;
+    let file_name = Path::new(relative_path).file_name().ok_or_else(|| {
+        ImmutableArtifactError::Safety("artifact has no flat file name".to_string())
+    })?;
+    let current = match parent.open_existing_file(file_name, true, false) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            parent.validate_single_link_file(file_name, &metadata)?;
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if enforce_expected {
+        match (expected, current.as_ref()) {
+            (Some(expected), Some(current))
+                if artifact_safety::same_file_identity(expected, current) => {}
+            (None, None) => {}
+            _ => {
+                return Err(ImmutableArtifactError::Safety(
+                    "mutable artifact target identity changed before publication".to_string(),
+                ));
+            }
+        }
+    }
+    if current.is_some() {
+        guard.validate_atomic_replacement_projection(relative_path, bytes.len())?;
+    } else {
+        guard.validate_create_projection(relative_path, bytes.len())?;
+    }
+    let (temp_name, _temp_path, mut temp) = create_unique_temp_file(&parent, file_name)?;
+    let temp_identity = temp.metadata()?;
+    let result = (|| {
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        drop(temp);
+        guard.validate()?;
+        parent.validate_identity()?;
+        parent.validate_file(&temp_name, &temp_identity)?;
+        match current {
+            Some(ref current_identity) => {
+                parent.validate_file(file_name, current_identity)?;
+                parent.rename(&temp_name, file_name)?;
+            }
+            None => {
+                parent.hard_link(&temp_name, file_name)?;
+                parent.unlink_if_same(&temp_name, &temp_identity)?;
+            }
+        }
+        let published = parent.open_existing_file(file_name, true, false)?;
+        let published_identity = published.metadata()?;
+        parent.validate_file(file_name, &published_identity)?;
+        if !artifact_safety::same_file_identity(&temp_identity, &published_identity) {
+            return Err(ImmutableArtifactError::Safety(
+                "mutable artifact target changed after publication".to_string(),
+            ));
+        }
+        parent.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = parent.unlink_if_same(&temp_name, &temp_identity);
+    }
+    result
+}
+
+#[cfg(test)]
 fn publish_create_only_with_hook<F>(
+    run_directory: &Path,
+    relative_path: &str,
+    bytes: &[u8],
+    before_link: F,
+) -> Result<(), ImmutableArtifactError>
+where
+    F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
+{
+    let guard = RunMutationGuard::acquire(run_directory)?;
+    publish_create_only_with_guard_and_hook(&guard, relative_path, bytes, before_link)
+}
+
+fn publish_create_only_with_guard_and_hook<F>(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+    before_link: F,
+) -> Result<(), ImmutableArtifactError>
+where
+    F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
+{
+    let run_directory = guard.run_directory();
+    validate_relative_path(relative_path)?;
+    validate_real_run_parent(run_directory, Path::new(relative_path))?;
+    let parent =
+        artifact_safety::open_private_descendant_parent(run_directory, Path::new(relative_path))?;
+    let file_name = Path::new(relative_path).file_name().ok_or_else(|| {
+        ImmutableArtifactError::Safety("artifact has no flat file name".to_string())
+    })?;
+    match parent.open_existing_file(file_name, true, false) {
+        Ok(file) => {
+            crate::artifact_storage::validate_artifact_size(relative_path, bytes.len())?;
+            verify_existing_winner_in(&parent, file_name, bytes, || Ok(()))?;
+            guard.validate_existing_projection(relative_path, file.metadata()?.len())?;
+            parent.sync_all()?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    guard.validate_create_projection(relative_path, bytes.len())?;
+    publish_create_only_standalone_with_open_parent(&parent, file_name, bytes, before_link, || {
+        guard.validate().map_err(Into::into)
+    })
+}
+
+fn publish_create_only_standalone_with_hook<F>(
     run_directory: &Path,
     relative_path: &str,
     bytes: &[u8],
@@ -187,13 +356,30 @@ where
     let file_name = Path::new(relative_path).file_name().ok_or_else(|| {
         ImmutableArtifactError::Safety("artifact has no flat file name".to_string())
     })?;
-    let (temp_name, temp_path, mut temp) = create_unique_temp_file(&parent, file_name)?;
+    publish_create_only_standalone_with_open_parent(&parent, file_name, bytes, before_link, || {
+        Ok(())
+    })
+}
+
+fn publish_create_only_standalone_with_open_parent<F, V>(
+    parent: &artifact_safety::PinnedPrivateDirectory,
+    file_name: &OsStr,
+    bytes: &[u8],
+    before_link: F,
+    validate_guard: V,
+) -> Result<(), ImmutableArtifactError>
+where
+    F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
+    V: Fn() -> Result<(), ImmutableArtifactError>,
+{
+    let (temp_name, temp_path, mut temp) = create_unique_temp_file(parent, file_name)?;
     let temp_identity = temp.metadata()?;
     let result = (|| {
         temp.write_all(bytes)?;
         temp.sync_all()?;
         drop(temp);
         before_link(&temp_path)?;
+        validate_guard()?;
         parent.validate_identity()?;
         parent.validate_file(&temp_name, &temp_identity)?;
 
@@ -211,7 +397,7 @@ where
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                verify_existing_winner_in(&parent, file_name, bytes, || Ok(()))?;
+                verify_existing_winner_in(parent, file_name, bytes, || Ok(()))?;
                 parent.sync_all()?;
                 Ok(())
             }
@@ -282,11 +468,23 @@ where
     let mut file = parent.open_existing_file(file_name, true, false)?;
     let opened = file.metadata()?;
     parent.validate_file(file_name, &opened)?;
+    if opened.len() != bytes.len() as u64 {
+        return Err(ImmutableArtifactError::Collision(
+            "existing artifact has different bytes".to_string(),
+        ));
+    }
     after_open()?;
     let mut current = Vec::new();
-    file.read_to_end(&mut current)?;
+    (&mut file)
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut current)?;
     parent.validate_identity()?;
     parent.validate_file(file_name, &opened)?;
+    if file.metadata()?.len() != current.len() as u64 {
+        return Err(ImmutableArtifactError::Collision(
+            "existing artifact changed while being verified".to_string(),
+        ));
+    }
     if current == bytes {
         file.sync_all()?;
         Ok(())
@@ -381,6 +579,12 @@ impl From<std::io::Error> for ImmutableArtifactError {
     }
 }
 
+impl From<RunPersistenceError> for ImmutableArtifactError {
+    fn from(error: RunPersistenceError) -> Self {
+        Self::Safety(error.to_string())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
@@ -401,6 +605,137 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    fn initialize_run_lock(run: &Path) {
+        drop(RunMutationGuard::acquire(run).unwrap());
+    }
+
+    fn create_zero_byte_entries(run: &Path, count: usize, prefix: &str) {
+        let directory = artifact_safety::PinnedPrivateDirectory::open(run).unwrap();
+        for index in 0..count {
+            directory
+                .create_file(OsStr::new(&format!("{prefix}-{index:04}")))
+                .unwrap();
+        }
+    }
+
+    fn has_temp_entry(run: &Path) -> bool {
+        fs::read_dir(run)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_name().to_string_lossy().contains(".tmp-")
+                    || entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".run-state.tmp-")
+            })
+    }
+
+    #[test]
+    fn immutable_create_and_retry_respect_projected_entry_peaks() {
+        let exact_temp = tempfile::tempdir().unwrap();
+        let exact = private_run(&exact_temp);
+        initialize_run_lock(&exact);
+        create_zero_byte_entries(
+            &exact,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 3,
+            "exact-create",
+        );
+        publish_create_only(&exact, "artifact", b"approved")
+            .expect("temp plus final names may reach the exact entry cap");
+
+        let rejected_temp = tempfile::tempdir().unwrap();
+        let rejected = private_run(&rejected_temp);
+        initialize_run_lock(&rejected);
+        create_zero_byte_entries(
+            &rejected,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "rejected-create",
+        );
+        let hook_called = std::cell::Cell::new(false);
+        let error = publish_create_only_with_hook(&rejected, "artifact", b"approved", |_| {
+            hook_called.set(true);
+            Ok(())
+        })
+        .expect_err("projected entry cap plus one must reject before temp creation");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!hook_called.get());
+        assert!(!rejected.join("artifact").exists());
+        assert!(!has_temp_entry(&rejected));
+
+        let retry_temp = tempfile::tempdir().unwrap();
+        let retry = private_run(&retry_temp);
+        initialize_run_lock(&retry);
+        write_private(&retry.join("artifact"), b"approved");
+        create_zero_byte_entries(
+            &retry,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "exact-retry",
+        );
+        publish_create_only(&retry, "artifact", b"approved")
+            .expect("an exact existing retry consumes zero entry budget");
+    }
+
+    #[test]
+    fn mutable_create_and_replacement_respect_projected_entry_peaks() {
+        let exact_create_temp = tempfile::tempdir().unwrap();
+        let exact_create = private_run(&exact_create_temp);
+        initialize_run_lock(&exact_create);
+        create_zero_byte_entries(
+            &exact_create,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 3,
+            "mutable-create-exact",
+        );
+        let guard = RunMutationGuard::acquire(&exact_create).unwrap();
+        publish_mutable_with_guard(&guard, "mutable", b"new")
+            .expect("mutable temp plus final names may reach the exact entry cap");
+
+        let rejected_create_temp = tempfile::tempdir().unwrap();
+        let rejected_create = private_run(&rejected_create_temp);
+        initialize_run_lock(&rejected_create);
+        create_zero_byte_entries(
+            &rejected_create,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "mutable-create-rejected",
+        );
+        let guard = RunMutationGuard::acquire(&rejected_create).unwrap();
+        let error = publish_mutable_with_guard(&guard, "mutable", b"new")
+            .expect_err("mutable create projected entry cap plus one must fail");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!rejected_create.join("mutable").exists());
+        assert!(!has_temp_entry(&rejected_create));
+
+        let exact_replace_temp = tempfile::tempdir().unwrap();
+        let exact_replace = private_run(&exact_replace_temp);
+        initialize_run_lock(&exact_replace);
+        write_private(&exact_replace.join("mutable"), b"old");
+        create_zero_byte_entries(
+            &exact_replace,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 3,
+            "mutable-replace-exact",
+        );
+        let guard = RunMutationGuard::acquire(&exact_replace).unwrap();
+        publish_mutable_with_guard(&guard, "mutable", b"new")
+            .expect("replacement temp name may reach the exact entry cap");
+        assert_eq!(fs::read(exact_replace.join("mutable")).unwrap(), b"new");
+
+        let rejected_replace_temp = tempfile::tempdir().unwrap();
+        let rejected_replace = private_run(&rejected_replace_temp);
+        initialize_run_lock(&rejected_replace);
+        write_private(&rejected_replace.join("mutable"), b"old");
+        create_zero_byte_entries(
+            &rejected_replace,
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "mutable-replace-rejected",
+        );
+        let guard = RunMutationGuard::acquire(&rejected_replace).unwrap();
+        let error = publish_mutable_with_guard(&guard, "mutable", b"new")
+            .expect_err("replacement projected entry cap plus one must fail");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert_eq!(fs::read(rejected_replace.join("mutable")).unwrap(), b"old");
+        assert!(!has_temp_entry(&rejected_replace));
+    }
+
     #[test]
     fn create_only_publication_keeps_temp_and_final_inode_private() {
         let temp = tempfile::tempdir().unwrap();
@@ -419,6 +754,32 @@ mod tests {
             fs::symlink_metadata(run.join("artifact")).unwrap().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn sparse_oversized_existing_winner_rejects_before_read_or_temp_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = private_run(&temp);
+        let target = run.join("artifact");
+        write_private(&target, b"");
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = publish_create_only(&run, "artifact", b"small")
+            .expect_err("oversized existing artifact must reject from metadata");
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(fs::metadata(&target).unwrap().len(), 2 * 1024 * 1024 + 1);
+        assert!(fs::read_dir(&run).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
     }
 
     #[test]

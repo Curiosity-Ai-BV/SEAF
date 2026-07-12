@@ -392,11 +392,13 @@ name = "seaf-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "seaf-core",
  "seaf-loop",
  "seaf-models",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

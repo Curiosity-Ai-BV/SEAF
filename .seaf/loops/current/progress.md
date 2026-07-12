@@ -40,7 +40,9 @@
 - [x] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
   - [x] M1-11a: Private run artifacts.
-  - [ ] M1-11b: Bounded artifact storage (active).
+  - [ ] M1-11b: Bounded artifact storage.
+    - [x] M1-11b1: Serialized artifact limits.
+    - [ ] M1-11b2: Pre-side-effect storage commitments (active).
   - [ ] M1-11c: Bounded secret redaction.
 - [ ] M1-12: Interruption recovery acceptance.
 
@@ -154,5 +156,25 @@ guidance, and publishes through pinned directory handles with identity-checked
 create/link/rename/unlink operations. Parent, path, symlink, lock, target, and
 temporary-file substitution fail closed without touching the substituted tree;
 valid existing scaffold content remains intact. Source/candidate Git modes and
-standalone eval/release artifacts are unchanged. M1-11b per-artifact and
-aggregate storage limits is active; M1-11c bounded secret redaction is pending.
+standalone eval/release artifacts are unchanged. M1-11b1 now enforces semantic
+per-file caps and a pinned 32 MiB physical aggregate across every cooperative
+run publisher under the permanent lock. Unique-inode accounting includes locks
+and orphan temps; unsafe entries and existing oversize files fail before
+mutation or unbounded reads; exact immutable retry costs zero; atomic
+replacement budgets its coexisting temp; concurrent publishers cannot
+oversubscribe. The aggregate scanner streams pinned-directory entries and
+accepts at most 4,096 non-dot entries across the tree and eight descendant
+directory levels from the depth-zero root; hard-link names consume entry budget
+while their bytes remain unique-inode-counted. Prospective checks reserve +1
+entry for the first permanent lock or a child directory, +2 for new-file
+temporary/final-name coexistence, +1 for replacement temporaries, and +0 for
+exact existing retry before mutation. Runtime scaffolding uses the same guarded
+projections, and entry-only lock/directory creation first rejects existing
+aggregate-byte overage. The candidate-workspace lock is now a permanent guarded
+scaffold artifact; authenticated missing-lock migration releases the run guard
+before open-only candidate acquisition, preserving candidate-before-run order.
+Git patch-planning indexes are
+isolated in pinned external operation directories, and promotion crash tests now
+synchronize through the repository-to-provider lock order. M1-11b2
+pre-side-effect storage commitments is active; M1-11c bounded secret redaction
+is pending.

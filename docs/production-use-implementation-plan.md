@@ -1692,7 +1692,9 @@ Commit boundary: private permissions and pinned-directory publication only.
 
 #### M1-11b - Bounded Artifact Storage
 
-Status: active. Dependencies: M1-11a (complete).
+Status: active. Split into M1-11b1 serialized artifact limits and M1-11b2
+pre-side-effect storage commitments. M1-11b1 is complete and M1-11b2 is active.
+Dependencies: M1-11a (complete).
 
 Objective: reject oversized run artifacts before partial or misleading
 authority, provider calls, or evaluation commands can consume an unrecordable
@@ -1718,6 +1720,120 @@ pre-spawn tests.
 
 Commit boundary: per-artifact and aggregate storage limits only.
 
+##### M1-11b1 - Serialized Artifact Limits
+
+Status: complete on 2026-07-12. Dependencies: M1-11a (complete). M1-11b2 is
+active.
+
+Objective: enforce semantic per-artifact and physical aggregate limits for
+every cooperative run-tree publisher.
+
+Delivered: provider exchange requests/prompts are capped at 2 MiB, canonical
+provider response audits at 1 MiB, exchange records at 64 KiB, evaluation
+stdout/stderr and root `log.md` at 1 MiB, and all other run-owned state,
+inputs, and evidence at 2 MiB. Exact cap succeeds and cap plus one fails before
+creation, truncation, or publication. Existing oversized artifacts fail closed
+before allocation through metadata checks and bounded reads.
+
+The existing M1-10 lock now serializes run state, scaffold, logs, mutable and
+immutable artifacts, inputs, policy evidence, provider exchanges, candidate
+evidence, evaluation, recovery, and promotion publishers. A pinned recursive
+scan authenticates private directories and real regular files, counts logical
+bytes once per device/inode, includes locks and crash-orphan temporaries, and
+rejects symlinks, FIFOs, special entries, unsafe modes, and arithmetic overflow.
+Enumeration streams one child name at a time and accepts at most 4,096 total
+non-dot entries across the run tree. The run root is depth zero; descendant
+directories through depth eight, including files directly inside a depth-eight
+directory, are accepted, while a depth-nine directory is rejected before it is
+opened or recursed into. Directory entries and every hard-link name consume the
+entry budget even though hard-linked regular-file bytes remain counted once.
+Prospective entry peaks are authorized under the same permanent run lock:
+first-lock and child-directory creation reserve one name, create-only and
+mutable-create publication reserve two names while the temporary and final
+hard-link names coexist, replacement reserves one temporary name beside the old
+target, and an exact existing retry reserves zero. Runtime scaffolding uses the
+same directory and file projections before each creation. Entry-only
+projections also reject current aggregate bytes over 32 MiB before first-lock or
+child-directory creation, so a zero-byte name cannot mutate an already invalid
+tree.
+The zero-byte candidate-workspace lock is a permanent scaffold artifact. Fresh
+scaffolding creates it through guarded immutable publication; an authenticated
+existing-run operation may migrate a missing lock under a temporary run guard,
+revalidates run-directory authority after acquiring that guard, and releases it
+before candidate locking. Candidate lock acquisition is then authenticated
+open-only. Its existing-file fast path never acquires the run lock, preserving
+candidate-before-run operational order. External repository-operation locks
+retain their separate creation policy outside the run tree.
+Exact immutable retry adds no bytes but still rejects an already-over-cap tree.
+Atomic replacement reserves the new synced inode while the old target still
+exists; competing writers cannot both consume the final capacity.
+
+Git's temporary patch-planning index now lives in a unique pinned `0700`
+operation directory under the external candidate authority, never in the run,
+source, or candidate tree. Parent/child identity is checked around every Git
+call; cleanup accepts Git's private-parent-contained mode but unlinks only
+no-follow single-link regular files through the pinned directory. Rebound
+paths and collisions remain untouched. The permanent zero-byte candidate lock
+is included by every later scan.
+
+Prior specification, writer-inventory, and quality/security reviews approved
+the slice. A subsequent quality follow-up found that the byte-bounded scanner
+still collected unbounded directory names and retained unbounded inode
+metadata; streaming enumeration plus the global entry and depth limits close
+that gap. A further quality follow-up found that entry use was scanned but not
+prospectively reserved; the peak projections above close that path before any
+temporary file, final name, first permanent lock, or child directory is created.
+A specification follow-up then found that entry-only lock/directory projections
+did not reject existing aggregate-byte overage; both seams now validate current
+bytes before entry headroom. A final quality follow-up found direct candidate
+lock creation bypassed accounting; the permanent scaffold/migration contract
+above closes it. The loop library passes 193/193, candidate integration 40/40,
+state 38/38, and provider-candidate boundary 53/53. Both absolute-final
+independent reviews approve with no P0/P1/P2 findings. The definitive controller
+workspace run passes with CLI 138, core 51, local runtime 5, loop library 193,
+candidate 40, context expansion 22, eval engine 7, eval report 3, final authority
+2, patch 7, policy 13, provider-candidate 53, provider-exchange 22, isolation 1,
+staged authority 2, role response 13, state 38, Testing evidence 8, models 7,
+Ollama 8, and all doc tests. Native workspace check, strict
+all-target/all-feature Clippy, Rust and Markdown formatting, and diff checks
+pass.
+
+Commit boundary: per-artifact limits, serialized physical aggregate accounting,
+and directly required bounded reads only.
+
+##### M1-11b2 - Pre-Side-Effect Storage Commitments
+
+Status: active. Dependencies: M1-11b1 (complete).
+
+Objective: guarantee logical capacity for the authoritative result before a
+provider call or approved evaluation command starts, without a new reservation
+file or holding the run lock across external latency.
+
+Acceptance criteria:
+
+- An authenticated request-phase provider ledger tail reserves the missing
+  response-audit cap, response-record cap, and exact future `run.json` growth.
+  Insufficient capacity creates no new authoritative request and performs zero
+  provider calls.
+- An authenticated active evaluation intent reserves every missing stdout and
+  stderr maximum plus bounded Testing evidence, EvalReport, and final run-state
+  growth. An over-budget plan publishes no intent and spawns zero commands.
+- Every cooperative publisher accounts physical bytes plus the one derivable
+  active provider/evaluation commitment. Canonical prefix publication consumes
+  its slot; crash/reopen, staged adoption, invalidation, and exact retry
+  reconstruct the same remaining commitment without accumulating metadata.
+- A provider result whose canonical exact audit exceeds 1 MiB publishes a small
+  typed non-retryable oversize failure without raw result bytes or a raw-result
+  digest. Existing request-only crash recovery semantics remain unchanged.
+
+RED: insufficient/exact provider headroom and call count; request-only,
+response-audit, and staged-record crash cuts; eval worst-case plan and spawn
+count; trailing-log/invalidation/adoption commitments; concurrent unrelated
+publisher; typed oversize provider failure with no raw leak.
+
+Commit boundary: derived provider/evaluation commitments and bounded oversize
+provider failure only.
+
 #### M1-11c - Bounded Secret Redaction
 
 Status: pending. Dependencies: M1-11b.
@@ -1733,9 +1849,10 @@ Acceptance criteria:
   evidence redact configured and obvious credential forms before persistence.
 - At most 64 configured secret values are accepted, each at most 4 KiB and
   together at most 64 KiB; oversized redaction input or output fails closed.
-- A clean provider result remains exact. A secret-bearing or oversized response
-  becomes a small safe non-retryable audited failure without raw bytes or a raw
-  digest, preserving existing request-only recovery semantics.
+- A clean provider result and M1-11b2's typed oversize failure remain exact. A
+  secret-bearing response becomes a small safe non-retryable audited failure
+  without raw bytes or a raw digest, preserving existing request-only recovery
+  semantics.
 
 RED: configured-value, obvious-pattern, overlap, cap, provider-response,
 request-only crash recovery, and no-raw-leak tests.

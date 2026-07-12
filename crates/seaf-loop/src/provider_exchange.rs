@@ -173,8 +173,8 @@ where
                 .map(|reference| reference.digest.clone()),
         };
         let authorization_bytes = canonical_json_bytes(&authorization)?;
-        publish_create_only(
-            workspace.run_directory(),
+        crate::immutable_artifact::publish_create_only_with_guard(
+            &lock,
             &rerun_authorization_path(step, step_attempt),
             &authorization_bytes,
         )?;
@@ -2936,7 +2936,7 @@ mod tests {
             path: "artifacts/09-promotion.intent.json".to_string(),
             digest: canonical_sha256_digest(&intent).unwrap(),
         };
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(&intent_reference.path),
             intent_bytes,
         )

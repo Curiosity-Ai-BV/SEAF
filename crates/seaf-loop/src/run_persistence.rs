@@ -51,6 +51,7 @@ impl RunMutationGuard {
         let file = match open_existing_lock_file(&directory) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::artifact_storage::validate_entry_projection(&directory, 1)?;
                 match directory.create_file(lock_name) {
                     Ok(file) => {
                         created = true;
@@ -109,6 +110,72 @@ impl RunMutationGuard {
             &self.file.metadata()?,
         )?;
         Ok(())
+    }
+
+    pub(crate) fn run_directory(&self) -> &Path {
+        self.directory.path()
+    }
+
+    pub(crate) fn validate_create_projection(
+        &self,
+        relative_path: &str,
+        size: usize,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_create_projection(&self.directory, relative_path, size)?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_atomic_replacement_projection(
+        &self,
+        relative_path: &str,
+        size: usize,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_atomic_replacement_projection(
+            &self.directory,
+            relative_path,
+            size,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_existing_projection(
+        &self,
+        relative_path: &str,
+        size: u64,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_existing_projection(
+            &self.directory,
+            relative_path,
+            size,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_entry_projection(
+        &self,
+        additional: usize,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_entry_projection(&self.directory, additional)?;
+        self.validate()
+    }
+
+    pub(crate) fn ensure_child_directory(&self, name: &OsStr) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        match self.directory.open_child_directory(name) {
+            Ok(child) => child.validate_identity()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.validate_entry_projection(1)?;
+                let child = self.directory.create_child_directory(name)?;
+                child.validate_identity()?;
+                self.directory.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.validate()
     }
 
     pub(crate) fn unlock(mut self) -> Result<(), RunPersistenceError> {
@@ -176,6 +243,10 @@ where
     let file_name = guard_target_name(guard, target)?;
     let current_target = guard.directory.open_existing_file(file_name, true, false)?;
     let current_identity = current_target.metadata()?;
+    let relative = file_name.to_str().ok_or_else(|| {
+        RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
+    })?;
+    guard.validate_atomic_replacement_projection(relative, bytes.len())?;
     let (temp_name, _temp_path, mut temp) = create_temp(&guard.directory, file_name)?;
     let temp_identity = temp.metadata()?;
     let result = (|| {
@@ -240,6 +311,10 @@ where
     F: FnOnce() -> Result<(), RunPersistenceError>,
 {
     let file_name = guard_target_name(guard, target)?;
+    let relative = file_name.to_str().ok_or_else(|| {
+        RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
+    })?;
+    guard.validate_create_projection(relative, bytes.len())?;
     let (temp_name, _temp_path, mut temp) = create_temp(&guard.directory, file_name)?;
     let temp_identity = temp.metadata()?;
     let result = (|| {
@@ -327,6 +402,10 @@ pub(crate) fn sync_existing(
     let file_name = guard_target_name(guard, target)?;
     let file = guard.directory.open_existing_file(file_name, true, false)?;
     let identity = file.metadata()?;
+    let relative = file_name.to_str().ok_or_else(|| {
+        RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
+    })?;
+    guard.validate_existing_projection(relative, identity.len())?;
     file.sync_all()?;
     guard.directory.validate_file(file_name, &identity)?;
     guard.validate()?;
@@ -344,10 +423,21 @@ pub(crate) fn read_regular_file(path: &Path) -> Result<Vec<u8>, RunPersistenceEr
     let directory = artifact_safety::PinnedPrivateDirectory::open(parent)?;
     let mut file = directory.open_existing_file(name, true, false)?;
     let identity = file.metadata()?;
+    let relative = name.to_str().ok_or_else(|| {
+        RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
+    })?;
+    crate::artifact_storage::validate_artifact_size_u64(relative, identity.len())?;
+    let cap = crate::artifact_storage::artifact_byte_cap(relative);
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    (&mut file).take(cap + 1).read_to_end(&mut bytes)?;
+    crate::artifact_storage::validate_artifact_size(relative, bytes.len())?;
     directory.validate_identity()?;
     directory.validate_file(name, &identity)?;
+    if file.metadata()?.len() != bytes.len() as u64 {
+        return Err(RunPersistenceError::Invalid(
+            "run artifact changed while being read".to_string(),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -473,6 +563,222 @@ mod tests {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         }
         (temp, target, old)
+    }
+
+    fn initialize_run_lock(root: &Path) {
+        drop(RunMutationGuard::acquire(root).unwrap());
+    }
+
+    fn create_zero_byte_entries(root: &Path, count: usize, prefix: &str) {
+        let directory = artifact_safety::PinnedPrivateDirectory::open(root).unwrap();
+        for index in 0..count {
+            directory
+                .create_file(OsStr::new(&format!("{prefix}-{index:04}")))
+                .unwrap();
+        }
+    }
+
+    fn fill_individually_legal_files_over_aggregate_cap(root: &Path, prefix: &str) {
+        let directory = artifact_safety::PinnedPrivateDirectory::open(root).unwrap();
+        for index in 0..16 {
+            directory
+                .create_file(OsStr::new(&format!("{prefix}-{index:02}")))
+                .unwrap()
+                .set_len(2 * 1024 * 1024)
+                .unwrap();
+        }
+        directory
+            .create_file(OsStr::new(&format!("{prefix}-extra")))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+    }
+
+    fn has_publication_temp(root: &Path) -> bool {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".run-state.tmp-")
+            })
+    }
+
+    #[test]
+    fn first_run_lock_creation_respects_projected_entry_limit() {
+        let exact_cap = private_temp();
+        create_zero_byte_entries(
+            exact_cap.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP,
+            "lock-rejected",
+        );
+        let error = RunMutationGuard::acquire(exact_cap.path())
+            .expect_err("first lock must not turn an exact-cap tree into cap plus one");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!exact_cap.path().join(RUN_MUTATION_LOCK_FILE).exists());
+
+        let exact_projection = private_temp();
+        create_zero_byte_entries(
+            exact_projection.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 1,
+            "lock-exact",
+        );
+        drop(
+            RunMutationGuard::acquire(exact_projection.path())
+                .expect("first lock entry may reach the exact cap"),
+        );
+        assert!(exact_projection
+            .path()
+            .join(RUN_MUTATION_LOCK_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn entry_only_creations_reject_existing_aggregate_byte_overage_before_mutation() {
+        let lockless = private_temp();
+        fill_individually_legal_files_over_aggregate_cap(lockless.path(), "lock-byte-overage");
+        let pinned = artifact_safety::PinnedPrivateDirectory::open(lockless.path()).unwrap();
+        let before = crate::artifact_storage::published_run_usage(&pinned).unwrap();
+        let error = RunMutationGuard::acquire(lockless.path())
+            .expect_err("first lock must reject an already byte-over-cap tree");
+        assert!(error.to_string().contains("aggregate cap"), "{error}");
+        assert!(!lockless.path().join(RUN_MUTATION_LOCK_FILE).exists());
+        assert_eq!(
+            crate::artifact_storage::published_run_usage(&pinned).unwrap(),
+            before
+        );
+
+        let guarded = private_temp();
+        initialize_run_lock(guarded.path());
+        fill_individually_legal_files_over_aggregate_cap(guarded.path(), "child-byte-overage");
+        let guard = RunMutationGuard::acquire(guarded.path()).unwrap();
+        let pinned = artifact_safety::PinnedPrivateDirectory::open(guarded.path()).unwrap();
+        let before = crate::artifact_storage::published_run_usage(&pinned).unwrap();
+        let error = guard
+            .ensure_child_directory(OsStr::new("child"))
+            .expect_err("child directory must reject an already byte-over-cap tree");
+        assert!(error.to_string().contains("aggregate cap"), "{error}");
+        assert!(!guarded.path().join("child").exists());
+        assert_eq!(
+            crate::artifact_storage::published_run_usage(&pinned).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn run_state_create_and_replacement_respect_projected_entry_peaks() {
+        let exact_create = private_temp();
+        initialize_run_lock(exact_create.path());
+        create_zero_byte_entries(
+            exact_create.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 3,
+            "state-create-exact",
+        );
+        let guard = RunMutationGuard::acquire(exact_create.path()).unwrap();
+        let target = exact_create.path().join("run.json");
+        publish_create_only(&guard, &target, b"new")
+            .expect("run-state temp plus final names may reach the exact entry cap");
+
+        let rejected_create = private_temp();
+        initialize_run_lock(rejected_create.path());
+        create_zero_byte_entries(
+            rejected_create.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "state-create-rejected",
+        );
+        let guard = RunMutationGuard::acquire(rejected_create.path()).unwrap();
+        let target = rejected_create.path().join("run.json");
+        let error = publish_create_only(&guard, &target, b"new")
+            .expect_err("run-state create projected entry cap plus one must fail");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!target.exists());
+        assert!(!has_publication_temp(rejected_create.path()));
+
+        let exact_replace = private_temp();
+        initialize_run_lock(exact_replace.path());
+        crate::artifact_safety::write_private_fixture(
+            exact_replace.path().join("run.json"),
+            b"old",
+        )
+        .unwrap();
+        create_zero_byte_entries(
+            exact_replace.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 3,
+            "state-replace-exact",
+        );
+        let guard = RunMutationGuard::acquire(exact_replace.path()).unwrap();
+        let target = exact_replace.path().join("run.json");
+        publish_replacement(&guard, &target, b"new")
+            .expect("run-state replacement temp may reach the exact entry cap");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+
+        let rejected_replace = private_temp();
+        initialize_run_lock(rejected_replace.path());
+        crate::artifact_safety::write_private_fixture(
+            rejected_replace.path().join("run.json"),
+            b"old",
+        )
+        .unwrap();
+        create_zero_byte_entries(
+            rejected_replace.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "state-replace-rejected",
+        );
+        let guard = RunMutationGuard::acquire(rejected_replace.path()).unwrap();
+        let target = rejected_replace.path().join("run.json");
+        let error = publish_replacement(&guard, &target, b"new")
+            .expect_err("run-state replacement projected entry cap plus one must fail");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!has_publication_temp(rejected_replace.path()));
+    }
+
+    #[test]
+    fn child_directory_creation_respects_projected_entry_limit() {
+        let exact = private_temp();
+        initialize_run_lock(exact.path());
+        create_zero_byte_entries(
+            exact.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 2,
+            "directory-exact",
+        );
+        let guard = RunMutationGuard::acquire(exact.path()).unwrap();
+        guard
+            .ensure_child_directory(OsStr::new("child"))
+            .expect("directory entry may reach the exact cap");
+
+        let rejected = private_temp();
+        initialize_run_lock(rejected.path());
+        create_zero_byte_entries(
+            rejected.path(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 1,
+            "directory-rejected",
+        );
+        let guard = RunMutationGuard::acquire(rejected.path()).unwrap();
+        let error = guard
+            .ensure_child_directory(OsStr::new("child"))
+            .expect_err("directory entry cap plus one must fail before creation");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!rejected.path().join("child").exists());
+    }
+
+    #[test]
+    fn run_reader_rejects_a_sparse_cap_plus_one_file_before_allocation() {
+        let temp = private_temp();
+        let target = temp.path().join("run.json");
+        crate::artifact_safety::write_private_fixture(&target, b"").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = read_regular_file(&target).expect_err("oversized run.json must fail closed");
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(fs::metadata(target).unwrap().len(), 2 * 1024 * 1024 + 1);
     }
 
     #[cfg(unix)]
@@ -720,7 +1026,7 @@ mod tests {
 
         let (temp, target, _old) = initialized_target();
         let outside = temp.path().join("outside-run");
-        fs::write(&outside, b"outside-unchanged\n").unwrap();
+        crate::artifact_safety::write_private_fixture(&outside, b"outside-unchanged\n").unwrap();
         let guard = RunMutationGuard::acquire(temp.path()).unwrap();
         let error = publish_replacement_core(&guard, &target, b"replacement\n", None, |phase| {
             if phase == PublishPhase::BeforeRename {

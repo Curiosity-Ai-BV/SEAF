@@ -296,6 +296,8 @@ impl InitializedLoopRun {
         let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
             RunnerError::Step("isolated run has no candidate authority".to_string())
         })?;
+        crate::candidate_workspace::ensure_candidate_lock_file(&workspace)
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
         let recovered = match candidate.lifecycle {
             seaf_core::CandidateWorkspaceLifecycle::Provisioning => {
                 crate::candidate_workspace::provision_candidate_workspace(&workspace)
@@ -494,17 +496,15 @@ fn ensure_authoritative_run_inputs(
     validate_authoritative_run_input_payloads(run, snapshots)?;
     preflight_authoritative_snapshot_prefix(workspace, run, snapshots)?;
 
-    let inputs = workspace.run_directory().join("inputs");
-    crate::artifact_safety::ensure_private_child_directory(&inputs)
+    let guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
         .map_err(|error| RunnerError::Step(error.to_string()))?;
-    fs::File::open(workspace.run_directory())
-        .and_then(|directory| directory.sync_all())
+    guard
+        .ensure_child_directory(std::ffi::OsStr::new("inputs"))
         .map_err(|error| RunnerError::Step(error.to_string()))?;
     for (name, bytes, _) in authoritative_run_input_entries(run, snapshots)? {
-        crate::immutable_artifact::publish_create_only(workspace.run_directory(), name, bytes)
-            .map_err(|error| {
-                RunnerError::Step(format!("failed to publish authoritative {name}: {error}"))
-            })?;
+        crate::immutable_artifact::publish_create_only_with_guard(&guard, name, bytes).map_err(
+            |error| RunnerError::Step(format!("failed to publish authoritative {name}: {error}")),
+        )?;
     }
     Ok(())
 }
@@ -685,8 +685,13 @@ fn preflight_authoritative_snapshot_prefix(
                         path.display()
                     )));
                 }
-                if fs::read(&path).map_err(|error| RunnerError::Step(error.to_string()))? != *bytes
-                {
+                let persisted = crate::immutable_artifact::read_verified_regular_file(
+                    workspace.run_directory(),
+                    name,
+                    "authoritative run input",
+                )
+                .map_err(|error| RunnerError::Step(error.to_string()))?;
+                if persisted != *bytes {
                     return Err(RunnerError::Step(format!(
                         "authoritative snapshot collision at {}",
                         path.display()
@@ -748,8 +753,12 @@ fn preflight_persisted_authoritative_snapshot_prefix(
                         path.display()
                     )));
                 }
-                let bytes =
-                    fs::read(&path).map_err(|error| RunnerError::Step(error.to_string()))?;
+                let bytes = crate::immutable_artifact::read_verified_regular_file(
+                    workspace.run_directory(),
+                    relative,
+                    "authoritative run input",
+                )
+                .map_err(|error| RunnerError::Step(error.to_string()))?;
                 let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
                     RunnerError::Step(format!("authoritative {relative} is not JSON: {error}"))
                 })?;
@@ -1162,8 +1171,16 @@ impl<R: StepRunner + ?Sized> fmt::Debug for LoopRunner<'_, R> {
 }
 
 fn cleanup_failed_start_workspace(workspace: &LoopWorkspace, error: RunnerError) -> RunnerError {
-    if workspace.run_file().exists() {
-        return error;
+    match fs::symlink_metadata(workspace.run_file()) {
+        Ok(metadata) if !metadata.is_dir() => return error,
+        Ok(_) => {}
+        Err(inspect_error) if inspect_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(inspect_error) => {
+            return RunnerError::Step(format!(
+                "{error}; failed to inspect partial run state {} before cleanup: {inspect_error}",
+                workspace.run_file().display()
+            ));
+        }
     }
 
     match fs::remove_dir_all(workspace.run_directory()) {
@@ -1219,5 +1236,78 @@ impl From<WorkspaceError> for RunnerError {
 impl From<state::StateError> for RunnerError {
     fn from(error: state::StateError) -> Self {
         Self::State(error)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_oversized_authoritative_prefix_rejects_before_prepare_or_mutation() {
+        for persisted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = LoopWorkspace::create(
+                &temp.path().join("runs"),
+                if persisted {
+                    "persisted-cap"
+                } else {
+                    "provided-cap"
+                },
+            )
+            .unwrap();
+            crate::artifact_safety::ensure_private_child_directory(
+                &workspace.run_directory().join("inputs"),
+            )
+            .unwrap();
+            let path = workspace.run_directory().join("inputs/ticket.json");
+            crate::artifact_safety::write_private_fixture(&path, b"").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(2 * 1024 * 1024 + 1)
+                .unwrap();
+            let mut run = state::create_run(state::NewLoopRun {
+                run_id: if persisted {
+                    "persisted-cap"
+                } else {
+                    "provided-cap"
+                }
+                .to_string(),
+                ticket_id: "ticket".to_string(),
+                goal_id: "goal".to_string(),
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_digests: seaf_core::LoopInputDigests {
+                    ticket: "0".repeat(64),
+                    policy: "1".repeat(64),
+                    config: "2".repeat(64),
+                    repository: "3".repeat(64),
+                    eval_config: Some("4".repeat(64)),
+                },
+            });
+            run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+            let snapshots = AuthoritativeRunInputSnapshots {
+                ticket: b"{}".to_vec(),
+                policy: b"{}".to_vec(),
+                config: b"{}".to_vec(),
+                repository: b"{}".to_vec(),
+                eval_config: b"{}".to_vec(),
+                provider_ticket: b"{}".to_vec(),
+            };
+
+            let error = if persisted {
+                preflight_persisted_authoritative_snapshot_prefix(&workspace, &run)
+                    .expect_err("persisted preflight must reject oversized snapshot")
+            } else {
+                preflight_authoritative_snapshot_prefix(&workspace, &run, &snapshots)
+                    .expect_err("provided preflight must reject oversized snapshot")
+            };
+
+            assert!(error.to_string().contains("byte cap"), "{error}");
+            assert_eq!(fs::metadata(path).unwrap().len(), 2 * 1024 * 1024 + 1);
+            assert!(!workspace.run_file().exists());
+        }
     }
 }

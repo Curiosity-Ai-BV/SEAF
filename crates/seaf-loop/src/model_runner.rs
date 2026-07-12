@@ -34,7 +34,7 @@ use crate::{
     },
     parse_role_response_with_repair,
     policy_gate::{
-        gate_patch_proposal_attempt, CommandOutput, PatchCommand, PatchCommandRunner,
+        gate_run_patch_proposal_attempt, CommandOutput, PatchCommand, PatchCommandRunner,
         PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision,
     },
     runner::{RunnerError, StepRunner},
@@ -309,9 +309,14 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
 
         let decision = if config.apply_patch && !config.worktree_clean {
             let mut guard = DirtyWorktreePatchRunner;
-            gate_patch_proposal_attempt(request, &mut guard, artifact_attempt)
+            gate_run_patch_proposal_attempt(run_directory, request, &mut guard, artifact_attempt)
         } else {
-            gate_patch_proposal_attempt(request, &mut *patch_gate.runner, artifact_attempt)
+            gate_run_patch_proposal_attempt(
+                run_directory,
+                request,
+                &mut *patch_gate.runner,
+                artifact_attempt,
+            )
         }
         .map_err(|error| RunnerError::Step(format!("patch gate failed: {error}")))?;
 

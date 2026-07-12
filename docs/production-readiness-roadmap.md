@@ -244,8 +244,26 @@ complete: supported Unix run trees are private from creation, existing broad
 modes fail closed with remediation, and pinned directory-handle publication
 protects run files, locks, temporaries, and final artifacts from pathname and
 parent-substitution races. Source/candidate Git modes and standalone eval or
-release files are unchanged. M1-11b bounded artifact storage is active;
-M1-11c bounded secret redaction remains pending, so M1-11 is not yet complete.
+release files are unchanged. M1-11b1 serialized artifact limits is complete:
+semantic caps and a pinned 32 MiB physical run-tree budget now cover every
+cooperative publisher under the permanent run lock, while exact retry,
+replacement peaks, concurrency, unsafe entries, bounded reads, and external Git
+planning-temporary isolation are verified. Aggregate enumeration streams one
+name at a time and is scanner-wide bounded to 4,096 non-dot entries and eight
+descendant-directory levels from the depth-zero root, preventing zero-byte
+files, hard-link names, or nested empty directories from causing unbounded
+metadata retention or recursion. Under the permanent run lock, first-lock and
+directory creation reserve one entry, new file publication reserves the
+two-name temporary/final hard-link peak, replacement reserves one temporary
+name, and exact existing retry reserves zero; runtime scaffolding shares these
+checks. Entry-only lock and directory projections first validate that current
+aggregate bytes remain within 32 MiB. The candidate-workspace lock is a guarded
+permanent scaffold artifact; missing historical locks migrate only after
+authority validation, with the run guard released before open-only candidate
+acquisition to preserve candidate-before-run lock order. External
+repository-operation locks remain outside this policy. M1-11b2 pre-side-effect storage
+commitments is active; M1-11c bounded secret redaction remains pending, so
+M1-11 is not yet complete.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF

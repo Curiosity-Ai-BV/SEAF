@@ -1,13 +1,13 @@
 use std::{
     error::Error,
     ffi::OsStr,
-    fmt, fs,
-    io::{self, Write},
+    fmt, fs, io,
     path::{Component, Path, PathBuf},
 };
 
 use crate::artifact_safety;
 use crate::context::{ContextManifest, UNTRUSTED_CONTEXT_MARKER};
+use crate::run_persistence::RunMutationGuard;
 
 pub const RUN_FILE: &str = "run.json";
 pub const CONTEXT_MANIFEST_PLACEHOLDER_FILE: &str = "context-manifest.json";
@@ -15,6 +15,7 @@ pub const PROMPTS_DIR: &str = "prompts";
 pub const RESPONSES_DIR: &str = "responses";
 pub const ARTIFACTS_DIR: &str = "artifacts";
 pub const LOG_FILE: &str = "log.md";
+pub(crate) const CANDIDATE_LOCK_FILE: &str = ".candidate-workspace.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopWorkspace {
@@ -114,13 +115,23 @@ impl LoopWorkspace {
     }
 
     pub fn append_log(&self, line: &str) -> Result<(), WorkspaceError> {
+        let guard = RunMutationGuard::acquire(&self.run_directory).map_err(io::Error::other)?;
         let directory = artifact_safety::PinnedPrivateDirectory::open(&self.run_directory)?;
-        let mut file = directory.open_append_file(OsStr::new(LOG_FILE))?;
+        let mut file = directory.open_existing_file(OsStr::new(LOG_FILE), true, false)?;
         let identity = file.metadata()?;
         directory.validate_identity()?;
         directory.validate_single_link_file(OsStr::new(LOG_FILE), &identity)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        let mut bytes = read_bounded_run_artifact(&mut file, LOG_FILE)?;
+        directory.validate_single_link_file(OsStr::new(LOG_FILE), &identity)?;
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        crate::immutable_artifact::publish_mutable_with_guard_expected(
+            &guard,
+            LOG_FILE,
+            &bytes,
+            Some(&identity),
+        )
+        .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -145,11 +156,13 @@ impl LoopWorkspace {
         AfterInspection: FnOnce() -> Result<(), WorkspaceError>,
         AfterDirectories: FnOnce() -> Result<(), WorkspaceError>,
     {
+        let guard = RunMutationGuard::acquire(&self.run_directory).map_err(io::Error::other)?;
         let directory = artifact_safety::PinnedPrivateDirectory::open(&self.run_directory)?;
         let manifest = empty_context_manifest_bytes()?;
         let files = [
             (CONTEXT_MANIFEST_PLACEHOLDER_FILE, manifest.as_slice()),
             (LOG_FILE, b"# Loop run log\n".as_slice()),
+            (CANDIDATE_LOCK_FILE, b"".as_slice()),
         ];
         let mut existing_files = Vec::new();
         let mut missing_files = Vec::new();
@@ -170,8 +183,7 @@ impl LoopWorkspace {
             match directory.open_existing_file(OsStr::new(name), true, false) {
                 Ok(mut file) if name == LOG_FILE => {
                     let identity = file.metadata()?;
-                    let mut bytes = Vec::new();
-                    io::Read::read_to_end(&mut file, &mut bytes)?;
+                    let bytes = read_bounded_run_artifact(&mut file, name)?;
                     if !bytes.starts_with(b"# Loop run log\n") {
                         return Err(WorkspaceError::UnsafeExistingLayout(
                             path,
@@ -181,10 +193,21 @@ impl LoopWorkspace {
                     directory.validate_file(OsStr::new(name), &identity)?;
                     existing_files.push((name, file, identity));
                 }
+                Ok(mut file) if name == CANDIDATE_LOCK_FILE => {
+                    let identity = file.metadata()?;
+                    let bytes = read_bounded_run_artifact(&mut file, name)?;
+                    if !bytes.is_empty() {
+                        return Err(WorkspaceError::UnsafeExistingLayout(
+                            path,
+                            "candidate workspace lock is not empty".to_string(),
+                        ));
+                    }
+                    directory.validate_file(OsStr::new(name), &identity)?;
+                    existing_files.push((name, file, identity));
+                }
                 Ok(mut file) => {
                     let identity = file.metadata()?;
-                    let mut bytes = Vec::new();
-                    io::Read::read_to_end(&mut file, &mut bytes)?;
+                    let bytes = read_bounded_run_artifact(&mut file, name)?;
                     let parsed: ContextManifest =
                         serde_json::from_slice(&bytes).map_err(|error| {
                             WorkspaceError::UnsafeExistingLayout(
@@ -223,9 +246,11 @@ impl LoopWorkspace {
             match directory.open_child_directory(OsStr::new(directory_name)) {
                 Ok(child) => retained_directories.push((directory_name, child)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let child = directory.create_child_directory(OsStr::new(directory_name))?;
+                    guard
+                        .ensure_child_directory(OsStr::new(directory_name))
+                        .map_err(io::Error::other)?;
+                    let child = directory.open_child_directory(OsStr::new(directory_name))?;
                     retained_directories.push((directory_name, child));
-                    directory.sync_all()?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -237,7 +262,7 @@ impl LoopWorkspace {
             child.validate_identity()?;
         }
         for (name, expected) in missing_files {
-            crate::immutable_artifact::publish_create_only(&self.run_directory, name, expected)
+            crate::immutable_artifact::publish_create_only_with_guard(&guard, name, expected)
                 .map_err(|error| {
                     WorkspaceError::UnsafeExistingLayout(
                         self.run_directory.join(name),
@@ -366,6 +391,25 @@ fn empty_context_manifest_bytes() -> Result<Vec<u8>, WorkspaceError> {
     Ok(json)
 }
 
+fn read_bounded_run_artifact(file: &mut fs::File, relative_path: &str) -> io::Result<Vec<u8>> {
+    let opened = file.metadata()?;
+    crate::artifact_storage::validate_artifact_size_u64(relative_path, opened.len())?;
+    let cap = crate::artifact_storage::artifact_byte_cap(relative_path);
+    let mut bytes = Vec::new();
+    {
+        let mut limited = io::Read::take(&mut *file, cap + 1);
+        io::Read::read_to_end(&mut limited, &mut bytes)?;
+    }
+    crate::artifact_storage::validate_artifact_size(relative_path, bytes.len())?;
+    if file.metadata()?.len() != bytes.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "run artifact changed while being read",
+        ));
+    }
+    Ok(bytes)
+}
+
 pub fn write_artifact(
     run_directory: &Path,
     file_name: &str,
@@ -398,6 +442,7 @@ where
     BeforeOpen: FnOnce() -> std::io::Result<()>,
     AfterOpen: FnOnce() -> std::io::Result<()>,
 {
+    let relative_name = file_name;
     let relative_path = Path::new(file_name);
     if relative_path.as_os_str().is_empty()
         || relative_path
@@ -411,6 +456,7 @@ where
     }
 
     let path = run_directory.join(relative_path);
+    let guard = RunMutationGuard::acquire(run_directory).map_err(io::Error::other)?;
     let parent = artifact_safety::open_private_descendant_parent(run_directory, relative_path)?;
     let file_name = relative_path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -420,22 +466,27 @@ where
     })?;
     before_open()?;
     parent.validate_identity()?;
-    let (mut file, existed) = match parent.open_existing_file(file_name, false, true) {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            (parent.create_file(file_name)?, false)
-        }
+    let file = match parent.open_existing_file(file_name, true, false) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let opened = file.metadata()?;
-    parent.validate_single_link_file(file_name, &opened)?;
+    let opened = file.as_ref().map(fs::File::metadata).transpose()?;
+    if let Some(opened) = &opened {
+        parent.validate_single_link_file(file_name, opened)?;
+    }
     after_open()?;
     parent.validate_identity()?;
-    parent.validate_single_link_file(file_name, &opened)?;
-    if existed {
-        file.set_len(0)?;
+    if let Some(opened) = &opened {
+        parent.validate_single_link_file(file_name, opened)?;
     }
-    file.write_all(bytes)?;
+    crate::immutable_artifact::publish_mutable_with_guard_expected(
+        &guard,
+        relative_name,
+        bytes,
+        opened.as_ref(),
+    )
+    .map_err(io::Error::other)?;
     Ok(path)
 }
 
@@ -494,9 +545,128 @@ impl From<serde_json::Error> for WorkspaceError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::{
+        io::Write,
+        os::unix::fs::{symlink, PermissionsExt},
+    };
 
     use super::*;
+
+    fn create_zero_byte_entries(root: &Path, count: usize, prefix: &str) {
+        let directory = artifact_safety::PinnedPrivateDirectory::open(root).unwrap();
+        for index in 0..count {
+            directory
+                .create_file(OsStr::new(&format!("{prefix}-{index:04}")))
+                .unwrap();
+        }
+    }
+
+    fn create_existing_runtime_scaffold_without_candidate_lock(workspace: &LoopWorkspace) {
+        for directory in [PROMPTS_DIR, RESPONSES_DIR, ARTIFACTS_DIR] {
+            artifact_safety::create_private_directory(&workspace.run_directory().join(directory))
+                .unwrap();
+        }
+        artifact_safety::write_private_fixture(
+            workspace
+                .run_directory()
+                .join(CONTEXT_MANIFEST_PLACEHOLDER_FILE),
+            empty_context_manifest_bytes().unwrap(),
+        )
+        .unwrap();
+        artifact_safety::write_private_fixture(
+            workspace.run_directory().join(LOG_FILE),
+            b"# Loop run log\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_scaffold_respects_projected_entry_peaks_before_temp_or_directory_mutation() {
+        let exact_temp = tempfile::tempdir().unwrap();
+        let exact =
+            LoopWorkspace::create_minimal(&exact_temp.path().join("runs"), "exact").unwrap();
+        drop(RunMutationGuard::acquire(exact.run_directory()).unwrap());
+        create_zero_byte_entries(
+            exact.run_directory(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 8,
+            "scaffold-exact",
+        );
+        exact
+            .scaffold_runtime()
+            .expect("three directories and three files may reach the exact peak cap");
+        assert!(exact
+            .run_directory()
+            .join(".candidate-workspace.lock")
+            .exists());
+
+        let rejected_temp = tempfile::tempdir().unwrap();
+        let rejected =
+            LoopWorkspace::create_minimal(&rejected_temp.path().join("runs"), "rejected").unwrap();
+        drop(RunMutationGuard::acquire(rejected.run_directory()).unwrap());
+        create_zero_byte_entries(
+            rejected.run_directory(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 1,
+            "scaffold-rejected",
+        );
+        let error = rejected
+            .scaffold_runtime()
+            .expect_err("the first projected directory must fail before scaffold mutation");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        for path in [
+            PROMPTS_DIR,
+            RESPONSES_DIR,
+            ARTIFACTS_DIR,
+            CONTEXT_MANIFEST_PLACEHOLDER_FILE,
+            LOG_FILE,
+        ] {
+            assert!(!rejected.run_directory().join(path).exists(), "{path}");
+        }
+    }
+
+    #[test]
+    fn missing_candidate_lock_migration_respects_exact_and_plus_one_entry_peaks() {
+        let exact_temp = tempfile::tempdir().unwrap();
+        let exact =
+            LoopWorkspace::create_minimal(&exact_temp.path().join("runs"), "exact-lock").unwrap();
+        drop(RunMutationGuard::acquire(exact.run_directory()).unwrap());
+        create_existing_runtime_scaffold_without_candidate_lock(&exact);
+        create_zero_byte_entries(
+            exact.run_directory(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 8,
+            "candidate-lock-exact",
+        );
+        exact
+            .scaffold_runtime()
+            .expect("candidate temp and final names may reach the exact cap");
+        assert!(exact
+            .run_directory()
+            .join(".candidate-workspace.lock")
+            .exists());
+
+        let rejected_temp = tempfile::tempdir().unwrap();
+        let rejected =
+            LoopWorkspace::create_minimal(&rejected_temp.path().join("runs"), "rejected-lock")
+                .unwrap();
+        drop(RunMutationGuard::acquire(rejected.run_directory()).unwrap());
+        create_existing_runtime_scaffold_without_candidate_lock(&rejected);
+        create_zero_byte_entries(
+            rejected.run_directory(),
+            crate::artifact_storage::RUN_TREE_ENTRY_CAP - 7,
+            "candidate-lock-rejected",
+        );
+        let error = rejected
+            .scaffold_runtime()
+            .expect_err("candidate-lock peak cap plus one must reject before temp creation");
+        assert!(error.to_string().contains("entry cap"), "{error}");
+        assert!(!rejected
+            .run_directory()
+            .join(".candidate-workspace.lock")
+            .exists());
+        assert!(!fs::read_dir(rejected.run_directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
+    }
 
     #[test]
     fn mutable_writer_revalidates_identity_before_truncating_existing_bytes() {
@@ -528,6 +698,46 @@ mod tests {
         assert!(error.to_string().contains("identity"), "{error}");
         assert_eq!(fs::read(parked).unwrap(), b"authoritative");
         assert_eq!(fs::read(target).unwrap(), b"substitute");
+    }
+
+    #[test]
+    fn mutable_writer_rejects_a_target_created_after_absence_was_authenticated() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "create-race").unwrap();
+        let target = workspace.run_directory().join("prompts/race.md");
+        let error = write_artifact_with_hook(
+            workspace.run_directory(),
+            "prompts/race.md",
+            b"intended",
+            || {
+                crate::artifact_safety::write_private_fixture(&target, b"external")?;
+                Ok(())
+            },
+        )
+        .expect_err("late target creation must not be replaced");
+        assert!(error.to_string().contains("identity"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), b"external");
+    }
+
+    #[test]
+    fn append_and_scaffold_reject_sparse_oversized_log_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "oversized-log").unwrap();
+        let log = workspace.run_directory().join(LOG_FILE);
+        fs::File::options()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+
+        let append = workspace
+            .append_log("must not append")
+            .expect_err("append cap");
+        assert!(append.to_string().contains("byte cap"), "{append}");
+        let scaffold = workspace.scaffold_runtime().expect_err("scaffold cap");
+        assert!(scaffold.to_string().contains("byte cap"), "{scaffold}");
+        assert_eq!(fs::metadata(log).unwrap().len(), 1024 * 1024 + 1);
     }
 
     #[test]

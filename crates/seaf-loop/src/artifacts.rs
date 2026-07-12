@@ -53,31 +53,17 @@ pub fn write_step_request(
         PROMPTS_DIR,
         request_file_name(step_file_stem(step), attempt)
     );
-    let absolute = workspace.run_directory().join(&relative_path);
-    match fs::symlink_metadata(&absolute) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(WorkspaceError::UnsafeExistingLayout(
-                absolute,
-                "prompt attempt is not a real regular file or is a symlink".to_string(),
-            ));
-        }
-        Ok(_) => {
-            if fs::read(&absolute)? != request.as_bytes() {
-                return Err(WorkspaceError::UnsafeExistingLayout(
-                    absolute,
-                    "existing prompt attempt differs from the recovered request bytes".to_string(),
-                ));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            write_artifact(
-                workspace.run_directory(),
-                &relative_path,
-                request.as_bytes(),
-            )?;
-        }
-        Err(error) => return Err(error.into()),
-    }
+    crate::immutable_artifact::publish_create_only(
+        workspace.run_directory(),
+        &relative_path,
+        request.as_bytes(),
+    )
+    .map_err(|error| {
+        WorkspaceError::UnsafeExistingLayout(
+            workspace.run_directory().join(&relative_path),
+            error.to_string(),
+        )
+    })?;
     Ok(relative_path)
 }
 
@@ -458,6 +444,21 @@ mod tests {
     }
 
     #[test]
+    fn exact_prompt_retry_still_enforces_the_prompt_byte_cap() {
+        let (_temp, workspace) = workspace();
+        let oversized = "x".repeat(2 * 1024 * 1024 + 1);
+        let path = workspace
+            .run_directory()
+            .join("prompts/01-research.prompt.md");
+        crate::artifact_safety::write_private_fixture(&path, oversized.as_bytes()).unwrap();
+
+        let error = write_step_request(&workspace, LoopStepName::Research, 1, &oversized)
+            .expect_err("an exact existing prompt above the cap must fail closed");
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(fs::metadata(path).unwrap().len(), oversized.len() as u64);
+    }
+
+    #[test]
     fn different_bytes_collision_fails_without_replacing_attempt_history() {
         let (_temp, workspace) = workspace();
         write_step_request(&workspace, LoopStepName::Research, 1, "request").expect("request");
@@ -582,7 +583,7 @@ mod tests {
         write_step_request(&workspace, LoopStepName::Research, 1, "attempt one").unwrap();
         write_step_request(&workspace, LoopStepName::Research, 2, "attempt two").unwrap();
         let fixed = ArtifactContent::new("json", b"fixed history");
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join("artifacts/01-research.json"),
             fixed.bytes(),
         )

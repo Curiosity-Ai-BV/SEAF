@@ -2026,3 +2026,100 @@ tests. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
 package lint/typecheck, eight SDK tests, SDK build, and diff checks pass through
 the pinned pnpm runtime. M1-11a is accepted; M1-11b bounded artifact storage is
 active and M1-11c bounded secret redaction remains pending.
+
+## 2026-07-12 implementation | M1-11b1 serialized artifact limits
+
+Added semantic run-artifact caps: 2 MiB for provider requests/prompts and other
+state/input/evidence, 1 MiB for canonical provider response audits and each eval
+stdout/stderr plus root `log.md`, and 64 KiB for provider exchange records.
+Exact cap succeeds; cap plus one fails before publication. Existing files are
+metadata-checked and read through bounded cap-plus-one readers, preventing a
+private sparse or concurrently grown artifact from allocating without limit.
+
+Every cooperative run-tree publisher now serializes through the permanent
+M1-10 lock. A fresh pinned-dirfd traversal recursively authenticates private
+directories and real files, rejects symlinks/FIFOs/special or unsafe entries,
+counts logical bytes once per device/inode, and includes permanent locks and
+orphan temporaries in the 32 MiB aggregate. Exact immutable retry adds zero but
+still rejects an over-cap tree. Atomic replacement authorizes the new synced
+inode while the old target remains; mutable log/scaffold writes are atomic and
+identity-bound; two writers competing for the final byte produce one winner.
+The traversal now streams one name at a time instead of collecting a directory,
+counts every non-dot entry against one scanner-wide 4,096-entry budget, and
+permits descendant directories only through depth eight from the depth-zero run
+root. Exact entry/depth limits pass; limit plus one fails before retaining
+another inode identity or opening and recursing into a depth-nine directory.
+Hard-link names consume entries while logical bytes remain unique-inode-counted.
+
+The independent writer audit found and closed a raw recovered-prompt retry that
+bypassed accounting. Specification review then moved Git's patch-planning index
+out of the run tree into a unique private external candidate-authority
+operation directory. Quality review pinned its parent/child identity around
+each Git call, made cleanup no-follow and inode-bound even for Git's `0644`
+index, bounded all pre-existing artifact reads, and constrained enumeration to
+supported errno platforms with fail-closed fallback. Rebound directories and
+collisions remain untouched. Final gate review also migrated promotion crash
+tests to repository-lock then provider-lock synchronization and hardened that
+test helper against broad/symlink state without changing production.
+
+The first definitive workspace run exposed the now-global lock's intended
+promotion ordering; the second exposed a stale failed-start lock collision.
+The final fixture reaches a `run.json` directory collision, and cleanup removes
+only that impossible state shape from an exclusively created fresh workspace
+while retaining every file-like or symlinked possible authority. Independent
+absolute-final spec and quality reviews approve with no remaining P0/P1/P2.
+
+Controller verification passes the full Rust workspace with exit zero: CLI
+138, core 51, local runtime 5, loop library 181, candidate 40, context expansion
+22, eval engine 7, eval report 3, final authority 2, patch 7, policy 13,
+provider-candidate 53, provider-exchange 22, isolation 1, staged authority 2,
+role response 13, state 38, Testing evidence 8, models 7, Ollama 8, and all doc
+tests. Strict all-target/all-feature Clippy, native workspace check, Linux
+cross-target check, Rust formatting, and diff checks pass. M1-11b1 is accepted;
+M1-11b2 pre-side-effect storage commitments is active and M1-11c bounded secret
+redaction remains pending.
+
+A subsequent quality follow-up found that directory enumeration and retained
+inode metadata were not bounded by the byte cap. Streaming enumeration and the
+4,096-entry/eight-level scanner limits close the finding. The focused aggregate
+suite passes 11/11.
+
+A further quality follow-up found that the scanner rejected existing excess but
+publishers did not reserve their transient entry peaks. Aggregate usage now
+returns bytes plus entries. Under the existing lock, first permanent-lock and
+child-directory creation reserve +1, new immutable/mutable/run-state creation
+reserves the +2 temporary/final-name peak, replacement reserves +1, and exact
+existing retry reserves +0. Runtime scaffold directories use the same guarded
+projection. Exact peaks succeed and cap plus one rejects before mutation; an
+immutable pre-link hook proves no temporary is created after rejection. The
+specification follow-up found that entry-only projections checked entries but
+not current bytes. First-lock and child-directory creation now reject an
+existing 32 MiB + 1 tree assembled from individually legal sparse files before
+creating a name, with byte/entry usage unchanged. The complete loop library
+passes 190/190; native workspace check, strict Clippy, Rust/Markdown formatting,
+and diff checks pass. Focused re-review and the controller full-workspace rerun
+are pending.
+
+A final quality follow-up found `.candidate-workspace.lock` was still created
+directly by candidate acquisition, bypassing run accounting and serialization.
+It is now a permanent zero-byte scaffold artifact published through guarded
+immutable creation. Existing valid locks take an authenticated no-run-lock fast
+path; missing historical locks migrate under a temporary run guard only after
+candidate/run-directory authority validation, revalidate that authority while
+the guard is held, then release it before open-only candidate locking. Candidate
+acquisition completes while another thread holds the run lock, proving no
+run-to-candidate inversion. External repository-operation lock creation remains
+unchanged. Exact missing-lock peak succeeds and cap plus one leaves no lock or
+temporary. The loop library passes 193/193, candidate integration 40/40, state
+38/38, and provider-candidate boundary 53/53; native check, strict Clippy,
+formatting, and diff checks pass. Re-review and the controller full-workspace
+rerun are pending.
+
+Absolute-final specification and adversarial reviews now approve M1-11b1 with
+no P0/P1/P2 findings. The controller's definitive exact-diff Rust workspace run
+passes with CLI 138, core 51, local runtime 5, loop library 193, candidate 40,
+context expansion 22, eval engine 7, eval report 3, final authority 2, patch 7,
+policy 13, provider-candidate 53, provider-exchange 22, isolation 1, staged
+authority 2, role response 13, state 38, Testing evidence 8, models 7, Ollama 8,
+and all doc tests. M1-11b1 is accepted; M1-11b2 remains active and M1-11c
+remains pending.

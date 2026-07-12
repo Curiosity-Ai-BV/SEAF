@@ -146,9 +146,10 @@ pub fn gate_patch<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
 ) -> Result<PolicyDecision, PatchGateError> {
-    gate_patch_with_execution(request, runner, true, 1)
+    gate_patch_with_execution(request, runner, true, 1, None)
 }
 
+#[cfg(test)]
 pub(crate) fn gate_patch_proposal_attempt<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
@@ -159,7 +160,26 @@ pub(crate) fn gate_patch_proposal_attempt<R: PatchCommandRunner + ?Sized>(
             "policy artifact attempt must be positive".to_string(),
         ));
     }
-    gate_patch_with_execution(request, runner, false, attempt)
+    gate_patch_with_execution(request, runner, false, attempt, None)
+}
+
+pub(crate) fn gate_run_patch_proposal_attempt<R: PatchCommandRunner + ?Sized>(
+    run_directory: &Path,
+    request: PatchGateRequest<'_>,
+    runner: &mut R,
+    attempt: u32,
+) -> Result<PolicyDecision, PatchGateError> {
+    if attempt == 0 {
+        return Err(PatchGateError::Artifact(
+            "policy artifact attempt must be positive".to_string(),
+        ));
+    }
+    if request.artifact_dir != run_directory.join("artifacts") {
+        return Err(PatchGateError::Artifact(
+            "run-bound policy artifact directory does not match the run root".to_string(),
+        ));
+    }
+    gate_patch_with_execution(request, runner, false, attempt, Some(run_directory))
 }
 
 fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
@@ -167,6 +187,7 @@ fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
     runner: &mut R,
     execute_apply: bool,
     artifact_attempt: u32,
+    run_directory: Option<&Path>,
 ) -> Result<PolicyDecision, PatchGateError> {
     // Standalone policy gating is also public outside a LoopWorkspace. Its artifact directory is
     // private, but an arbitrary repository/temp parent is not required to be a private run root.
@@ -182,11 +203,20 @@ fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
         }
         _ => safe_artifact_stem(request.patch_id),
     };
-    crate::immutable_artifact::publish_create_only(
-        request.artifact_dir,
-        &format!("{artifact_stem}.diff"),
-        request.patch.as_bytes(),
-    )
+    let patch_name = format!("{artifact_stem}.diff");
+    if let Some(run_directory) = run_directory {
+        crate::immutable_artifact::publish_create_only(
+            run_directory,
+            &format!("artifacts/{patch_name}"),
+            request.patch.as_bytes(),
+        )
+    } else {
+        crate::immutable_artifact::publish_create_only_standalone(
+            request.artifact_dir,
+            &patch_name,
+            request.patch.as_bytes(),
+        )
+    }
     .map_err(|error| PatchGateError::Artifact(error.to_string()))?;
 
     let mut decision = PolicyDecision {
@@ -256,7 +286,12 @@ fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
         }
     }
 
-    write_decision_artifact(request.artifact_dir, &artifact_stem, &decision)?;
+    write_decision_artifact(
+        request.artifact_dir,
+        run_directory,
+        &artifact_stem,
+        &decision,
+    )?;
     Ok(decision)
 }
 
@@ -524,16 +559,22 @@ fn parse_error_reason(error: &PatchParseError) -> PolicyDecisionReason {
 
 fn write_decision_artifact(
     artifact_dir: &Path,
+    run_directory: Option<&Path>,
     artifact_stem: &str,
     decision: &PolicyDecision,
 ) -> Result<(), PatchGateError> {
     let mut json = serde_json::to_vec_pretty(decision).map_err(PatchGateError::Json)?;
     json.push(b'\n');
-    crate::immutable_artifact::publish_create_only(
-        artifact_dir,
-        &format!("{artifact_stem}.policy-decision.json"),
-        &json,
-    )
+    let name = format!("{artifact_stem}.policy-decision.json");
+    if let Some(run_directory) = run_directory {
+        crate::immutable_artifact::publish_create_only(
+            run_directory,
+            &format!("artifacts/{name}"),
+            &json,
+        )
+    } else {
+        crate::immutable_artifact::publish_create_only_standalone(artifact_dir, &name, &json)
+    }
     .map_err(|error| PatchGateError::Artifact(error.to_string()))
 }
 

@@ -810,7 +810,7 @@ fn legacy_start_cleans_a_fresh_workspace_when_initial_state_publication_fails() 
     let temp = tempfile::tempdir().unwrap();
     let runs_root = temp.path().join("runs");
     let run_id = "initial-publication-failure";
-    let mut step_runner = InitialLockCollisionRunner;
+    let mut step_runner = InitialStateCollisionRunner;
 
     let error = LoopRunner::start(
         LoopRunnerConfig::for_ticket(
@@ -823,12 +823,16 @@ fn legacy_start_cleans_a_fresh_workspace_when_initial_state_publication_fails() 
         ),
         &mut step_runner,
     )
-    .expect_err("invalid fresh lock must fail initial state publication");
+    .expect_err("invalid fresh run.json target must fail initial state publication");
 
-    assert!(error.to_string().contains("regular file"), "{error}");
+    assert!(
+        error.to_string().contains("run-state publication")
+            && error.to_string().contains("run.json"),
+        "{error}"
+    );
     assert!(
         !runs_root.join(run_id).exists(),
-        "a failed fresh start must not strand its lock-only workspace"
+        "a failed fresh start must not strand its scaffolded workspace"
     );
 }
 
@@ -1504,16 +1508,21 @@ fn state_resume_verified_rejects_exhausted_next_attempt_before_prepare_or_mutati
     assert!(step_runner.calls.is_empty());
 }
 
-struct InitialLockCollisionRunner;
+struct InitialStateCollisionRunner;
 
-impl StepRunner for InitialLockCollisionRunner {
+impl StepRunner for InitialStateCollisionRunner {
     fn prepare_fresh_run(
         &mut self,
         workspace: &LoopWorkspace,
         _run: &LoopRun,
     ) -> Result<(), seaf_loop::RunnerError> {
-        fs::create_dir(workspace.run_directory().join("provider-exchange.lock"))
-            .map_err(|error| seaf_loop::RunnerError::Step(error.to_string()))
+        let run_file = workspace.run_file();
+        fs::create_dir(&run_file)
+            .map_err(|error| seaf_loop::RunnerError::Step(error.to_string()))?;
+        #[cfg(unix)]
+        fs::set_permissions(&run_file, fs::Permissions::from_mode(0o700))
+            .map_err(|error| seaf_loop::RunnerError::Step(error.to_string()))?;
+        Ok(())
     }
 
     fn step_request(&mut self, _step: LoopStepName) -> Result<String, seaf_loop::RunnerError> {

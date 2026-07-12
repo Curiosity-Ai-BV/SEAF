@@ -44,22 +44,24 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-11b - Bounded artifact storage. Enforce per-artifact and aggregate run-tree
-limits without changing immutable identities, M1-10 persistence semantics, or
-the candidate/repository/run lock order.
+M1-11b2 - Pre-side-effect storage commitments. Derive logical capacity from
+authority that already defines recovery; do not add a reservation file or hold
+the permanent run lock across provider latency or approved commands.
 
-Provider prompts/requests are capped at 2 MiB, canonical provider response
-audits at 1 MiB, exchange records at 64 KiB, evaluation logs at 1 MiB, and all
-other generated evidence/input artifacts at 2 MiB. The aggregate durable run
-tree is capped at 32 MiB. Exact cap is valid and cap plus one is rejected.
-Exact immutable retries cost zero; replacements account for both the observed
-old size and intended new size without allowing concurrent oversubscription.
+An authenticated provider request-phase ledger tail reserves the missing 1 MiB
+response audit, 64 KiB response record, and exact future run-state growth. An
+active authenticated evaluation intent reserves missing configured stdout and
+stderr maxima plus bounded Testing, EvalReport, and final run-state bytes.
+Before creating a fresh request or evaluation intent, prove that its physical
+publication and complete future commitment fit within the 32 MiB run budget.
+Insufficient capacity performs zero provider calls or command spawns.
 
-Reuse the permanent M1-10 per-run lock for aggregate accounting and reservation;
-do not add a competing lock. Before an external provider call or evaluation
-command, prove or reserve enough durable capacity for the authoritative audit
-that must follow. A refused or failed reservation executes no external side
-effect and publishes no partial or misleading authority. Preserve standalone
-policy/evaluation behavior where no run root exists. Do not add secret
-redaction, retention/purge, format migration, packaging, or release behavior in
-this slice.
+Every cooperative writer continues using the M1-10 lock and authorizes physical
+bytes plus the one derivable active commitment. Verified canonical prefix files
+consume their reserved slots. Request-only and staged-response recovery,
+evaluation crash prefixes, invalidation, zero-command adoption, and exact retry
+must reconstruct the same remainder without durable reservation metadata. A
+provider result whose exact canonical audit exceeds 1 MiB becomes a small typed
+non-retryable oversize failure with no raw bytes or raw-result digest. Preserve
+request-only replay decisions. Do not add secret redaction, retention/purge,
+format migration, packaging, or release behavior in this slice.

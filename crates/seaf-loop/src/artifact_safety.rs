@@ -16,6 +16,13 @@ use std::os::{
 pub(crate) const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedEntryKind {
+    Directory,
+    RegularFile,
+    Other,
+}
+
 pub(crate) fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -68,6 +75,10 @@ impl PinnedPrivateDirectory {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
     }
 
     pub(crate) fn validate_identity(&self) -> io::Result<()> {
@@ -124,19 +135,19 @@ impl PinnedPrivateDirectory {
         }
     }
 
-    pub(crate) fn open_append_file(&self, name: &OsStr) -> io::Result<fs::File> {
+    pub(crate) fn open_existing_regular_file_any_mode(&self, name: &OsStr) -> io::Result<fs::File> {
         #[cfg(unix)]
         {
             let name = c_name(name)?;
-            let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-            // SAFETY: dirfd and C string are valid; returned descriptor is uniquely owned.
+            let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            // SAFETY: dirfd and C string are valid; the returned descriptor is uniquely owned.
             let fd = unsafe { libc::openat(self.file.as_raw_fd(), name.as_ptr(), flags) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: successful openat returned a new owned descriptor.
             let file = unsafe { fs::File::from_raw_fd(fd) };
-            self.validate_file_identity(name.as_c_str(), &file.metadata()?)?;
+            self.validate_regular_file_identity_any_mode(name.as_c_str(), &file.metadata()?)?;
             Ok(file)
         }
         #[cfg(not(unix))]
@@ -213,6 +224,75 @@ impl PinnedPrivateDirectory {
         #[cfg(not(unix))]
         {
             let _ = name;
+            Err(unsupported())
+        }
+    }
+
+    pub(crate) fn validate_child_directory(
+        &self,
+        name: &OsStr,
+        opened: &fs::Metadata,
+    ) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.validate_identity()?;
+            let name = c_name(name)?;
+            let mut current: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: stat is initialized on success; dirfd and name are valid.
+            let result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut current,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let path = self.path.join(OsStr::from_bytes(name.to_bytes()));
+            if current.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || (current.st_mode as u32) & 0o7777 != PRIVATE_DIRECTORY_MODE
+                || opened.dev() != current.st_dev as u64
+                || opened.ino() != current.st_ino as u64
+            {
+                return Err(invalid(format!(
+                    "private child directory identity changed: {}",
+                    path.display()
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, opened);
+            Err(unsupported())
+        }
+    }
+
+    pub(crate) fn remove_child_directory_if_same(
+        &self,
+        name: &OsStr,
+        child: &PinnedPrivateDirectory,
+    ) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            child.validate_identity()?;
+            let opened = child.metadata()?;
+            self.validate_child_directory(name, &opened)?;
+            let name = c_name(name)?;
+            // SAFETY: the pinned parent descriptor and validated child name are valid.
+            let result =
+                unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, child);
             Err(unsupported())
         }
     }
@@ -318,6 +398,39 @@ impl PinnedPrivateDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn validate_regular_file_identity_any_mode(
+        &self,
+        name: &std::ffi::CStr,
+        opened: &fs::Metadata,
+    ) -> io::Result<()> {
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: stat is initialized by fstatat on success; dirfd and name are valid.
+        let result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                &mut current,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if current.st_mode & libc::S_IFMT != libc::S_IFREG
+            || !opened.is_file()
+            || opened.dev() != current.st_dev as u64
+            || opened.ino() != current.st_ino as u64
+            || opened.nlink() != 1
+        {
+            return Err(invalid(format!(
+                "authority artifact identity changed or is not a single-link regular file: {}",
+                self.path.join(OsStr::from_bytes(name.to_bytes())).display()
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn hard_link(&self, source: &OsStr, target: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -397,9 +510,163 @@ impl PinnedPrivateDirectory {
         self.unlink(name)
     }
 
+    pub(crate) fn unlink_regular_file_if_same_any_mode(
+        &self,
+        name: &OsStr,
+        opened: &fs::Metadata,
+    ) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let c_name = c_name(name)?;
+            self.validate_regular_file_identity_any_mode(c_name.as_c_str(), opened)?;
+            self.unlink(name)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, opened);
+            Err(unsupported())
+        }
+    }
+
     pub(crate) fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
+
+    pub(crate) fn for_each_entry_name<F>(&self, mut visit: F) -> io::Result<()>
+    where
+        F: FnMut(&OsStr) -> io::Result<()>,
+    {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        ))]
+        {
+            let dot = c".";
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            // SAFETY: the pinned dirfd and static C string are valid. Opening `.` creates a fresh
+            // file description, so directory iteration cannot share or retain the pinned fd's
+            // stream offset across aggregate scans.
+            let duplicate = unsafe { libc::openat(self.file.as_raw_fd(), dot.as_ptr(), flags) };
+            if duplicate < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let duplicate_file = unsafe { fs::File::from_raw_fd(duplicate) };
+            let duplicate_metadata = duplicate_file.metadata()?;
+            let pinned_metadata = self.file.metadata()?;
+            if !same_file_identity(&duplicate_metadata, &pinned_metadata) {
+                return Err(invalid(format!(
+                    "private run directory identity changed before enumeration: {}",
+                    self.path.display()
+                )));
+            }
+            let duplicate = duplicate_file.as_raw_fd();
+            std::mem::forget(duplicate_file);
+            // SAFETY: duplicate is an owned directory descriptor. fdopendir takes ownership.
+            let stream = unsafe { libc::fdopendir(duplicate) };
+            if stream.is_null() {
+                let error = io::Error::last_os_error();
+                // SAFETY: fdopendir failed, so duplicate remains owned here.
+                unsafe { libc::close(duplicate) };
+                return Err(error);
+            }
+            let iteration_result = loop {
+                // Clear errno so a null result can distinguish EOF from failure.
+                set_errno(0);
+                // SAFETY: stream remains valid until closed below.
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let error = get_errno();
+                    if error == 0 {
+                        break Ok(());
+                    }
+                    break Err(io::Error::from_raw_os_error(error));
+                }
+                // SAFETY: d_name is NUL-terminated for a successful readdir result.
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                    if let Err(error) = visit(OsStr::from_bytes(name.to_bytes())) {
+                        break Err(error);
+                    }
+                }
+            };
+            // SAFETY: stream is valid and uniquely owned.
+            let close_result = unsafe { libc::closedir(stream) };
+            iteration_result?;
+            if close_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.validate_identity()?;
+            Ok(())
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        )))]
+        {
+            let _ = visit;
+            Err(unsupported())
+        }
+    }
+
+    pub(crate) fn entry_kind(&self, name: &OsStr) -> io::Result<PinnedEntryKind> {
+        #[cfg(unix)]
+        {
+            let name = c_name(name)?;
+            let mut current: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: stat is initialized on success; dirfd and name are valid.
+            let result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut current,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(match current.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => PinnedEntryKind::Directory,
+                libc::S_IFREG => PinnedEntryKind::RegularFile,
+                _ => PinnedEntryKind::Other,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(unsupported())
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_errno(value: libc::c_int) {
+    // SAFETY: libc exposes the calling thread's errno pointer.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn set_errno(value: libc::c_int) {
+    // SAFETY: libc exposes the calling thread's errno pointer.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_errno() -> libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno pointer.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn get_errno() -> libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno pointer.
+    unsafe { *libc::__error() }
 }
 
 #[cfg(unix)]
@@ -439,6 +706,7 @@ pub(crate) fn ensure_private_standalone_directory(path: &Path) -> io::Result<()>
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_private_child_directory(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         invalid(format!(
@@ -611,7 +879,13 @@ pub(crate) fn make_private_directory_fixture(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

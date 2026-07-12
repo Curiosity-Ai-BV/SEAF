@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, fs, path::Component};
+use std::{error::Error, fmt};
 
 use seaf_core::{canonical_json_bytes, canonical_sha256_digest, LoopStepName};
 use serde::Serialize;
@@ -49,35 +49,12 @@ impl ValidatedRoleArtifact {
         expected_step: LoopStepName,
         expected_role: Role,
     ) -> Result<Self, RoleArtifactError> {
-        let relative = std::path::Path::new(artifact_path);
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(RoleArtifactError::Invalid(format!(
-                "artifact path is not a safe relative path: {artifact_path}"
-            )));
-        }
-        let path = workspace.run_directory().join(relative);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            RoleArtifactError::Invalid(format!(
-                "required {expected_step:?} artifact {artifact_path} could not be inspected: {error}"
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(RoleArtifactError::Invalid(format!(
-                "required {expected_step:?} artifact is not a real regular file: {artifact_path}"
-            )));
-        }
-        let canonical_run = workspace.run_directory().canonicalize()?;
-        let canonical_path = path.canonicalize()?;
-        if !canonical_path.starts_with(&canonical_run) {
-            return Err(RoleArtifactError::Invalid(format!(
-                "required {expected_step:?} artifact resolves outside the loop workspace: {artifact_path}"
-            )));
-        }
-        let bytes = fs::read(&canonical_path)?;
+        let bytes = crate::immutable_artifact::read_verified_regular_file(
+            workspace.run_directory(),
+            artifact_path,
+            &format!("required {expected_step:?} artifact"),
+        )
+        .map_err(|error| RoleArtifactError::Invalid(error.to_string()))?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
             RoleArtifactError::Invalid(format!("invalid role artifact JSON: {error}"))
         })?;
@@ -197,5 +174,39 @@ impl From<std::io::Error> for RoleArtifactError {
 impl From<serde_json::Error> for RoleArtifactError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn sparse_oversized_role_artifact_rejects_before_allocation_or_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(&temp.path().join("runs"), "role-cap").unwrap();
+        let relative = "artifacts/01-research.json";
+        let path = workspace.run_directory().join(relative);
+        crate::artifact_safety::write_private_fixture(&path, b"").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = ValidatedRoleArtifact::load(
+            &workspace,
+            relative,
+            &"0".repeat(64),
+            "role-cap",
+            LoopStepName::Research,
+            Role::Researcher,
+        )
+        .expect_err("oversized role artifact must fail from metadata");
+
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(fs::metadata(path).unwrap().len(), 2 * 1024 * 1024 + 1);
     }
 }

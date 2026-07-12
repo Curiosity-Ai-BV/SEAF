@@ -147,16 +147,14 @@ fn symlinked_expansion_publication_target_is_a_hard_stop_without_terminal_claim(
         .run_next_step()
         .expect_err("unsafe publication must stop");
 
-    assert!(error
-        .to_string()
-        .contains("durable context expansion write failed"));
+    assert!(error.to_string().contains("run artifact"), "{error}");
     assert_eq!(provider.requests().len(), 1);
     assert_eq!(
         std::fs::read_to_string(&outside).expect("outside"),
         "outside unchanged"
     );
     let run = read_run(&runs_root.join(run_id));
-    assert_eq!(run.provider_exchange_records.len(), 2);
+    assert_eq!(run.provider_exchange_records.len(), 1);
     let research = run
         .steps
         .iter()
@@ -589,7 +587,7 @@ fn initial_request_collision_prevents_the_first_provider_call_and_terminal_claim
         .with_context_pack_request(context_request(&repository, &ticket));
     let mut loop_runner =
         LoopRunner::start(config(&runs_root, run_id, &ticket), &mut step_runner).expect("start");
-    std::fs::write(
+    crate::artifact_safety::write_private_fixture(
         runs_root
             .join(run_id)
             .join("prompts/01-research.attempt-001.exchange-001.initial.request.md"),
@@ -631,7 +629,10 @@ fn resume_reuses_attempt_one_after_conventional_prompt_crash_before_first_exchan
         .with_context_pack_request(context_request(&repository, &ticket));
     let mut first =
         LoopRunner::start(config(&runs_root, run_id, &ticket), &mut first_runner).expect("start");
-    std::fs::write(runs_root.join(run_id).join(exchange_request), "collision")
+    crate::artifact_safety::write_private_fixture(
+        runs_root.join(run_id).join(exchange_request),
+        "collision",
+    )
         .expect("inject collision");
     first.run_next_step().expect_err("pre-exchange crash cut");
     drop(first);
@@ -676,7 +677,10 @@ fn resume_rejects_a_skipped_conventional_prompt_attempt_before_any_exchange_writ
         .with_context_pack_request(context_request(&repository, &ticket));
     let mut loop_runner =
         LoopRunner::start(config(&runs_root, run_id, &ticket), &mut runner).expect("start");
-    std::fs::write(runs_root.join(run_id).join(exchange_request), "collision")
+    crate::artifact_safety::write_private_fixture(
+        runs_root.join(run_id).join(exchange_request),
+        "collision",
+    )
         .expect("inject collision");
     loop_runner.run_next_step().expect_err("prompt crash cut");
     drop(loop_runner);

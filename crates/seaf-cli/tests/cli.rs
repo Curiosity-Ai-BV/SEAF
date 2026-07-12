@@ -10,9 +10,10 @@ use std::{
 };
 
 use seaf_core::{canonical_json_bytes, canonical_sha256_digest, templates, Policy, ProjectConfig};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[test]
 fn validates_goal_json_output() {
@@ -1769,12 +1770,15 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
     let head = evaluated["human_approval"]["starting_head"]
         .as_str()
         .unwrap();
+    let repository_lock = open_repository_operation_lock(&evaluated);
+    repository_lock
+        .lock()
+        .expect("hold repository operation lock");
     let provider_lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(run_dir.join("provider-exchange.lock"))
         .expect("provider lock");
-    provider_lock.lock().expect("hold final publication lock");
 
     let mut command = seaf_in(&repo);
     command.args([
@@ -1797,6 +1801,22 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
     let mut child = command
         .spawn()
         .expect("start promotion held before state publication");
+    let intent = run_dir.join("artifacts/09-promotion.intent.json");
+    for _ in 0..500 {
+        if intent.is_file() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "promotion exited before intent"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(intent.is_file(), "promotion did not durably publish intent");
+    provider_lock.lock().expect("hold final publication lock");
+    repository_lock
+        .unlock()
+        .expect("release repository operation lock");
     let applied = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
     for _ in 0..500 {
         if applied.is_file() {
@@ -1813,7 +1833,7 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
         "promotion did not reach the source apply boundary"
     );
     assert!(
-        run_dir.join("artifacts/09-promotion.intent.json").is_file(),
+        intent.is_file(),
         "durable intent must precede source mutation"
     );
     assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
@@ -1870,12 +1890,13 @@ fn loop_promote_rechecks_intent_while_waiting_for_final_state_publication() {
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
     let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
     let run_dir = runs_root.join(run_id);
+    let repository_lock = open_repository_operation_lock(&evaluated);
+    repository_lock.lock().unwrap();
     let provider_lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(run_dir.join("provider-exchange.lock"))
         .unwrap();
-    provider_lock.lock().unwrap();
     let mut command = seaf_in(&repo);
     command
         .args([
@@ -1909,6 +1930,16 @@ fn loop_promote_rechecks_intent_while_waiting_for_final_state_publication() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn().unwrap();
+    let intent = run_dir.join("artifacts/09-promotion.intent.json");
+    for _ in 0..500 {
+        if intent.is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(intent.is_file());
+    provider_lock.lock().unwrap();
+    repository_lock.unlock().unwrap();
     let applied = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
     for _ in 0..500 {
         if applied.is_file() {
@@ -1917,7 +1948,6 @@ fn loop_promote_rechecks_intent_while_waiting_for_final_state_publication() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(applied.is_file());
-    let intent = run_dir.join("artifacts/09-promotion.intent.json");
     let mut substituted: serde_json::Value =
         serde_json::from_slice(&fs::read(&intent).unwrap()).unwrap();
     substituted["run_id"] = serde_json::json!("substituted-final-run");
@@ -9463,6 +9493,203 @@ fn promotion_intent_json(evaluated: &serde_json::Value, reviewer: &str) -> serde
         "target_head": evaluated["human_approval"]["starting_head"],
         "eval_passed_run_digest": canonical_sha256_digest(evaluated).unwrap(),
     })
+}
+
+fn open_repository_operation_lock(evaluated: &serde_json::Value) -> fs::File {
+    let git_common_dir = PathBuf::from(
+        evaluated["candidate_workspace"]["git_common_dir"]
+            .as_str()
+            .expect("candidate Git common directory"),
+    );
+    let canonical = git_common_dir
+        .canonicalize()
+        .expect("canonical Git common directory");
+    assert_eq!(canonical, git_common_dir);
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = std::env::temp_dir()
+        .join("seaf-candidates")
+        .join(".repository-operation-locks")
+        .join(digest)
+        .join(".repository-operation.lock");
+    open_repository_operation_lock_path(&path).expect("repository operation lock")
+}
+
+fn open_repository_operation_lock_path(path: &Path) -> std::io::Result<fs::File> {
+    for directory in path
+        .ancestors()
+        .skip(1)
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        ensure_private_test_directory(directory)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    match options.create_new(true).open(path) {
+        Ok(file) => validate_private_test_lock(path, file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = fs::OpenOptions::new();
+            existing.read(true).write(true);
+            #[cfg(unix)]
+            existing.custom_flags(libc::O_NOFOLLOW);
+            validate_private_test_lock(path, existing.open(path)?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_private_test_directory(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_private_test_directory(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            let metadata = fs::symlink_metadata(path)?;
+            validate_private_test_directory(path, &metadata)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_private_test_directory(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "test repository lock directory is not a real 0700 directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(not(unix))]
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "test repository lock directory is unsafe: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_test_lock(path: &Path, file: fs::File) -> std::io::Result<fs::File> {
+    let opened = file.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    if !opened.is_file()
+        || current.file_type().is_symlink()
+        || !current.is_file()
+        || opened.mode() & 0o7777 != 0o600
+        || current.mode() & 0o7777 != 0o600
+        || opened.nlink() != 1
+        || current.nlink() != 1
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "test repository lock is not the same real single-link 0600 file: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(not(unix))]
+    if !opened.is_file() || current.file_type().is_symlink() || !current.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("test repository lock is unsafe: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_operation_lock_test_helper_rejects_unsafe_existing_layout_without_mutation() {
+    for case in ["broad-dir", "symlink-dir", "broad-lock", "symlink-lock"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("authority");
+        let namespace = root.join("locks");
+        let digest = namespace.join("digest");
+        let lock = digest.join("lock");
+        match case {
+            "broad-dir" => {
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "symlink-dir" => {
+                let outside = temp.path().join("outside");
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("sentinel"), b"outside").unwrap();
+                symlink(&outside, &root).unwrap();
+            }
+            "broad-lock" | "symlink-lock" => {
+                for directory in [&root, &namespace, &digest] {
+                    let mut builder = fs::DirBuilder::new();
+                    builder.mode(0o700).create(directory).unwrap();
+                }
+                if case == "broad-lock" {
+                    fs::write(&lock, b"broad").unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+                } else {
+                    let outside = temp.path().join("outside-lock");
+                    fs::write(&outside, b"outside").unwrap();
+                    symlink(&outside, &lock).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        let before_root_mode = fs::symlink_metadata(&root).unwrap().mode() & 0o7777;
+
+        let error = open_repository_operation_lock_path(&lock)
+            .expect_err("unsafe helper layout must fail closed");
+
+        assert!(
+            error.kind() == std::io::ErrorKind::InvalidInput
+                || error.raw_os_error() == Some(libc::ELOOP),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&root).unwrap().mode() & 0o7777,
+            before_root_mode,
+            "{case}"
+        );
+        if case == "broad-lock" {
+            assert_eq!(fs::read(&lock).unwrap(), b"broad");
+            assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o7777, 0o644);
+        }
+        if case == "symlink-dir" {
+            assert_eq!(
+                fs::read(temp.path().join("outside/sentinel")).unwrap(),
+                b"outside"
+            );
+        }
+        if case == "symlink-lock" {
+            assert_eq!(
+                fs::read(temp.path().join("outside-lock")).unwrap(),
+                b"outside"
+            );
+        }
+    }
 }
 
 fn git_cached_diff_binary(root: &Path) -> Vec<u8> {

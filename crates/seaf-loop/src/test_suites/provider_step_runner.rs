@@ -1758,8 +1758,11 @@ fn provider_development_is_proposal_only_even_when_artifact_persistence_fails() 
     .expect("start loop");
     finish_steps_before_development(&mut loop_runner);
     let run_dir = runs_root.join("proposal-only-persistence-failure");
-    std::fs::create_dir(run_dir.join("artifacts/05-development.json"))
-        .expect("force Development artifact persistence failure");
+    crate::artifact_safety::write_private_fixture(
+        run_dir.join("artifacts/05-development.json"),
+        b"occupied development artifact",
+    )
+    .expect("force Development artifact persistence failure");
 
     let error = loop_runner
         .run_next_step()
@@ -1767,7 +1770,7 @@ fn provider_development_is_proposal_only_even_when_artifact_persistence_fails() 
     drop(loop_runner);
     drop(step_runner);
 
-    assert!(error.to_string().contains("not a regular file"), "{error}");
+    assert!(error.to_string().contains("collision"), "{error}");
     let decision: PolicyDecision = serde_json::from_slice(
         &std::fs::read(
             run_dir.join("artifacts/proposal-only-persistence-failure.policy-decision.json"),

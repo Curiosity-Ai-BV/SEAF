@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     context::{CandidateContextAuthority, CandidateContextAuthorityKind},
-    immutable_artifact::{publish_create_only, read_verified_regular_file},
-    workspace::{LoopWorkspace, ARTIFACTS_DIR},
+    immutable_artifact::read_verified_regular_file,
+    workspace::{LoopWorkspace, ARTIFACTS_DIR, CANDIDATE_LOCK_FILE},
     DevelopmentEvidence, PatchDecisionKind, PolicyDecision, ReviewDecision, Role, RoleResponse,
     ValidatedRoleArtifact,
 };
@@ -37,7 +37,6 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub const CANDIDATE_WORKSPACE_SCHEMA_VERSION: u32 = 2;
 const CANDIDATE_ROOT_DIR: &str = "seaf-candidates";
-const CANDIDATE_LOCK_FILE: &str = ".candidate-workspace.lock";
 const REPOSITORY_OPERATION_LOCKS_DIR: &str = ".repository-operation-locks";
 const REPOSITORY_OPERATION_LOCK_FILE: &str = ".repository-operation.lock";
 const PATCH_INTENT_PATH: &str = "artifacts/candidate-patch.intent.json";
@@ -255,7 +254,6 @@ where
                 .to_string(),
         ));
     }
-    preflight_workspace_run_directory_authority(workspace)?;
     let lock = acquire_candidate_lock(workspace)?;
     let result = approve_candidate_for_testing_locked(
         workspace,
@@ -626,7 +624,6 @@ pub fn verify_candidate_patch_evidence(
     workspace: &LoopWorkspace,
     source_worktree_root: &Path,
 ) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
-    preflight_workspace_run_directory_authority(workspace)?;
     let lock = acquire_candidate_lock(workspace)?;
     let result = verify_candidate_patch_evidence_locked(workspace, source_worktree_root);
     let unlock = lock.unlock();
@@ -772,7 +769,6 @@ fn apply_candidate_development_evidence_with_hook<F>(
 where
     F: FnMut(CandidatePatchApplicationPhase) -> Result<(), CandidateWorkspaceError>,
 {
-    preflight_workspace_run_directory_authority(workspace)?;
     let lock = acquire_candidate_lock(workspace)?;
     let result =
         apply_candidate_development_evidence_locked(workspace, source_worktree_root, &mut hook);
@@ -1077,32 +1073,66 @@ fn plan_candidate_patch(
     candidate: &CandidateWorkspaceState,
     evidence: &DevelopmentEvidence,
 ) -> Result<CandidatePatchPlan, CandidateWorkspaceError> {
-    let index_path = unique_patch_plan_index(workspace.run_directory())?;
+    plan_candidate_patch_with_hooks(workspace, candidate, evidence, || Ok(()), || Ok(()))
+}
+
+fn plan_candidate_patch_with_hooks<BeforeGit, BeforeCleanup>(
+    workspace: &LoopWorkspace,
+    candidate: &CandidateWorkspaceState,
+    evidence: &DevelopmentEvidence,
+    before_git: BeforeGit,
+    before_cleanup: BeforeCleanup,
+) -> Result<CandidatePatchPlan, CandidateWorkspaceError>
+where
+    BeforeGit: FnOnce() -> Result<(), CandidateWorkspaceError>,
+    BeforeCleanup: FnOnce() -> Result<(), CandidateWorkspaceError>,
+{
+    let authority = existing_candidate_parent(&candidate.repository_identity_digest)?;
+    let expected_candidate = authority.join(safe_run_id(workspace.run_directory())?);
+    if expected_candidate != Path::new(&candidate.path)
+        || authority.starts_with(workspace.run_directory())
+        || authority.starts_with(Path::new(&candidate.source_worktree_root))
+    {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch planning authority does not match the private external candidate parent"
+                .to_string(),
+        ));
+    }
+    let reservation = reserve_unique_patch_plan_index(&authority, workspace.run_directory())?;
+    let index_path = reservation.index_path().to_path_buf();
     let candidate_path = Path::new(&candidate.path);
     let result = (|| {
-        git_success_with_index(candidate_path, &["read-tree", "HEAD"], &index_path)?;
-        git_apply_cached(
-            candidate_path,
-            &evidence.patch,
-            Some(&index_path),
-            &evidence.changed_paths,
-        )?;
-        let expected_tree = git_text_with_index(candidate_path, &["write-tree"], &index_path)?;
+        before_git()?;
+        reservation.run_validated(|| {
+            git_success_with_index(candidate_path, &["read-tree", "HEAD"], &index_path)
+        })?;
+        reservation.run_validated(|| {
+            git_apply_cached(
+                candidate_path,
+                &evidence.patch,
+                Some(&index_path),
+                &evidence.changed_paths,
+            )
+        })?;
+        let expected_tree = reservation
+            .run_validated(|| git_text_with_index(candidate_path, &["write-tree"], &index_path))?;
         validate_object_id(&expected_tree, "planned candidate tree")?;
-        let expected_diff = git_bytes_with_index(
-            candidate_path,
-            &[
-                "diff",
-                "--cached",
-                "--binary",
-                "--full-index",
-                "--no-ext-diff",
-                "--no-textconv",
-                "HEAD",
-                "--",
-            ],
-            &index_path,
-        )?;
+        let expected_diff = reservation.run_validated(|| {
+            git_bytes_with_index(
+                candidate_path,
+                &[
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--full-index",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                ],
+                &index_path,
+            )
+        })?;
         if expected_tree == candidate.starting_tree || expected_diff.is_empty() {
             return Err(CandidateWorkspaceError::Mismatch(
                 "Development patch produced no candidate tree transition".to_string(),
@@ -1113,23 +1143,112 @@ fn plan_candidate_patch(
             expected_diff,
         })
     })();
-    match fs::remove_file(&index_path) {
+    let before_cleanup_result = before_cleanup();
+    let result = match (result, before_cleanup_result) {
+        (Ok(plan), Ok(())) => Ok(plan),
+        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+    };
+    match reservation.cleanup() {
         Ok(()) => result,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
-        Err(error) => Err(CandidateWorkspaceError::Io(error)),
+        Err(error) => Err(error),
     }
 }
 
-fn unique_patch_plan_index(run_directory: &Path) -> Result<PathBuf, CandidateWorkspaceError> {
+struct PatchPlanIndexReservation {
+    authority: crate::artifact_safety::PinnedPrivateDirectory,
+    name: OsString,
+    directory: crate::artifact_safety::PinnedPrivateDirectory,
+    index: PathBuf,
+}
+
+impl PatchPlanIndexReservation {
+    fn index_path(&self) -> &Path {
+        &self.index
+    }
+
+    #[cfg(test)]
+    fn reservation_directory(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn cleanup(&self) -> Result<(), CandidateWorkspaceError> {
+        self.validate_binding()?;
+        for name in [OsStr::new("index"), OsStr::new("index.lock")] {
+            self.validate_binding()?;
+            match self.directory.open_existing_regular_file_any_mode(name) {
+                Ok(file) => {
+                    let identity = file.metadata()?;
+                    self.validate_binding()?;
+                    self.directory
+                        .unlink_regular_file_if_same_any_mode(name, &identity)?;
+                    self.validate_binding()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+            }
+        }
+        self.directory.sync_all()?;
+        self.validate_binding()?;
+        self.authority
+            .remove_child_directory_if_same(&self.name, &self.directory)?;
+        self.authority.sync_all()?;
+        Ok(())
+    }
+
+    fn validate_binding(&self) -> Result<(), CandidateWorkspaceError> {
+        self.authority.validate_identity()?;
+        self.directory.validate_identity()?;
+        let identity = self.directory.metadata()?;
+        self.authority
+            .validate_child_directory(&self.name, &identity)?;
+        Ok(())
+    }
+
+    fn run_validated<T, F>(&self, operation: F) -> Result<T, CandidateWorkspaceError>
+    where
+        F: FnOnce() -> Result<T, CandidateWorkspaceError>,
+    {
+        self.validate_binding()?;
+        let result = operation();
+        let validation = self.validate_binding();
+        match (result, validation) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        }
+    }
+}
+
+fn reserve_unique_patch_plan_index(
+    authority: &Path,
+    run_directory: &Path,
+) -> Result<PatchPlanIndexReservation, CandidateWorkspaceError> {
+    validate_private_directory(authority)?;
+    crate::artifact_safety::validate_private_directory(run_directory)?;
+    let authority = canonical_real_directory(authority, "candidate patch-plan authority")?;
+    let run_directory = canonical_real_directory(run_directory, "run directory")?;
+    if authority.starts_with(&run_directory) || run_directory.starts_with(&authority) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate patch-plan authority must be outside the durable run tree".to_string(),
+        ));
+    }
+    let authority = crate::artifact_safety::PinnedPrivateDirectory::open(&authority)?;
     loop {
         let sequence = PATCH_PLAN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = run_directory.join(format!(
+        let name = OsString::from(format!(
             ".candidate-patch-plan.index-{}-{sequence}",
             std::process::id()
         ));
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
-            Ok(_) => continue,
+        match authority.create_child_directory(&name) {
+            Ok(directory) => {
+                let index = directory.path().join("index");
+                return Ok(PatchPlanIndexReservation {
+                    authority,
+                    name,
+                    directory,
+                    index,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(CandidateWorkspaceError::Io(error)),
         }
     }
@@ -1342,8 +1461,10 @@ fn write_create_only_artifact(
     bytes: &[u8],
 ) -> Result<ArtifactReference, CandidateWorkspaceError> {
     safe_artifact_relative_path(relative)?;
+    let guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
     let artifact_dir = workspace.run_directory().join(ARTIFACTS_DIR);
-    let artifact_dir_created = match fs::symlink_metadata(&artifact_dir) {
+    match fs::symlink_metadata(&artifact_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(CandidateWorkspaceError::Unsafe(
                 "candidate artifact directory is not a real directory".to_string(),
@@ -1351,19 +1472,16 @@ fn write_create_only_artifact(
         }
         Ok(_) => {
             crate::artifact_safety::validate_private_directory(&artifact_dir)?;
-            false
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::artifact_safety::ensure_private_child_directory(&artifact_dir)?;
-            true
+            guard
+                .ensure_child_directory(std::ffi::OsStr::new(ARTIFACTS_DIR))
+                .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
         }
         Err(error) => return Err(CandidateWorkspaceError::Io(error)),
-    };
-    if artifact_dir_created {
-        fs::File::open(workspace.run_directory())?.sync_all()?;
     }
     let digest = sha256_bytes(bytes);
-    publish_create_only(workspace.run_directory(), relative, bytes)
+    crate::immutable_artifact::publish_create_only_with_guard(&guard, relative, bytes)
         .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
     Ok(ArtifactReference {
         path: relative.to_string(),
@@ -1524,7 +1642,6 @@ fn provision_candidate_workspace_with_hook<F>(
 where
     F: FnMut(CandidateProvisionPhase) -> Result<(), CandidateWorkspaceError>,
 {
-    preflight_workspace_run_directory_authority(workspace)?;
     let lock = acquire_candidate_lock(workspace)?;
     let result = provision_candidate_workspace_locked(workspace, &mut hook);
     let unlock = lock.unlock();
@@ -1874,7 +1991,6 @@ fn cleanup_candidate_workspace_with_hook<F>(
 where
     F: FnMut(CandidateCleanupPhase) -> Result<(), CandidateWorkspaceError>,
 {
-    preflight_workspace_run_directory_authority(workspace)?;
     let lock = acquire_candidate_lock(workspace)?;
     let result = (|| {
         hook(CandidateCleanupPhase::CandidateLockAcquired)?;
@@ -2108,7 +2224,35 @@ fn run_directory_digest(run_directory: &Path) -> Result<String, CandidateWorkspa
 pub(crate) fn acquire_candidate_lock(
     workspace: &LoopWorkspace,
 ) -> Result<CandidateDirectoryLock, CandidateWorkspaceError> {
+    ensure_candidate_lock_file(workspace)?;
     acquire_candidate_directory_lock(workspace.run_directory())
+}
+
+pub(crate) fn ensure_candidate_lock_file(
+    workspace: &LoopWorkspace,
+) -> Result<(), CandidateWorkspaceError> {
+    preflight_workspace_run_directory_authority(workspace)?;
+    let directory =
+        crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
+    match directory.open_existing_file(OsStr::new(CANDIDATE_LOCK_FILE), true, true) {
+        Ok(file) => {
+            let identity = file.metadata()?;
+            directory.validate_single_link_file(OsStr::new(CANDIDATE_LOCK_FILE), &identity)?;
+            if identity.len() != 0 {
+                return Err(CandidateWorkspaceError::Unsafe(
+                    "candidate workspace lock is not empty".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+    }
+    let guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    preflight_workspace_run_directory_authority(workspace)?;
+    crate::immutable_artifact::publish_create_only_with_guard(&guard, CANDIDATE_LOCK_FILE, b"")
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))
 }
 
 fn acquire_candidate_directory_lock(
@@ -2124,7 +2268,12 @@ fn acquire_candidate_directory_lock_with_hook<F>(
 where
     F: FnOnce() -> Result<(), CandidateWorkspaceError>,
 {
-    acquire_pinned_lock(run_directory, OsStr::new(CANDIDATE_LOCK_FILE), before_open)
+    acquire_pinned_lock(
+        run_directory,
+        OsStr::new(CANDIDATE_LOCK_FILE),
+        MissingLockPolicy::Reject,
+        before_open,
+    )
 }
 
 #[derive(Debug)]
@@ -2146,6 +2295,7 @@ impl CandidateDirectoryLock {
 fn acquire_pinned_lock<F>(
     parent: &Path,
     name: &OsStr,
+    missing: MissingLockPolicy,
     before_open: F,
 ) -> Result<CandidateDirectoryLock, CandidateWorkspaceError>
 where
@@ -2157,7 +2307,10 @@ where
     let mut created = false;
     let file = match directory.open_existing_file(name, true, true) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && missing == MissingLockPolicy::Create =>
+        {
             match directory.create_file(name) {
                 Ok(file) => {
                     created = true;
@@ -2168,6 +2321,15 @@ where
                 }
                 Err(error) => return Err(CandidateWorkspaceError::Io(error)),
             }
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && missing == MissingLockPolicy::Reject =>
+        {
+            return Err(CandidateWorkspaceError::Unsafe(
+                "candidate workspace lock is missing from the authenticated run scaffold"
+                    .to_string(),
+            ));
         }
         Err(error) => return Err(CandidateWorkspaceError::Io(error)),
     };
@@ -2189,6 +2351,12 @@ where
         file,
         name: name.to_os_string(),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingLockPolicy {
+    Reject,
+    Create,
 }
 
 fn validate_static_authority(
@@ -2438,6 +2606,7 @@ pub(crate) fn acquire_repository_operation_lock(
     acquire_pinned_lock(
         lock_parent,
         OsStr::new(REPOSITORY_OPERATION_LOCK_FILE),
+        MissingLockPolicy::Create,
         || Ok(()),
     )
 }
@@ -3287,7 +3456,43 @@ impl From<std::io::Error> for CandidateWorkspaceError {
 mod tests {
     use super::*;
     use seaf_core::LoopInputDigests;
-    use std::process::Command;
+    use std::{process::Command, sync::mpsc, thread, time::Duration};
+
+    #[test]
+    fn candidate_lock_acquisition_requires_a_preexisting_scaffolded_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&run).unwrap();
+
+        let error = acquire_candidate_directory_lock(&run)
+            .expect_err("candidate acquisition must never create its own run artifact");
+
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(!run.join(CANDIDATE_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn candidate_lock_acquisition_never_waits_for_the_run_mutation_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&run).unwrap();
+        crate::artifact_safety::write_private_fixture(run.join(CANDIDATE_LOCK_FILE), b"").unwrap();
+        let held_run_lock = crate::run_persistence::RunMutationGuard::acquire(&run).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker_run = run.clone();
+        let worker = thread::spawn(move || {
+            let result = acquire_candidate_directory_lock(&worker_run)
+                .and_then(|lock| lock.unlock().map_err(CandidateWorkspaceError::Io));
+            sender.send(result).unwrap();
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("candidate acquisition must not attempt the held run lock");
+        result.unwrap();
+        drop(held_run_lock);
+        worker.join().unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4259,18 +4464,97 @@ mod tests {
     #[test]
     fn candidate_patch_planning_skips_an_orphaned_private_index_name() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let authority = temp.path().join("authority");
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&authority).unwrap();
+        crate::artifact_safety::create_private_directory(&run).unwrap();
         let sequence = PATCH_PLAN_SEQUENCE.load(Ordering::Relaxed);
-        let orphan = temp.path().join(format!(
+        let orphan = authority.join(format!(
             ".candidate-patch-plan.index-{}-{sequence}",
             std::process::id()
         ));
         fs::write(&orphan, b"orphan").expect("orphaned index");
 
-        let reserved = unique_patch_plan_index(temp.path()).expect("unique planning index");
+        let reserved = reserve_unique_patch_plan_index(&authority, &run)
+            .expect("unique external planning index");
 
-        assert_ne!(reserved, orphan);
-        assert!(!reserved.exists());
+        assert_ne!(reserved.index_path(), orphan);
+        assert!(reserved
+            .index_path()
+            .starts_with(authority.canonicalize().unwrap()));
+        assert!(!reserved.index_path().starts_with(&run));
+        assert!(reserved.reservation_directory().is_dir());
+        fs::write(reserved.index_path(), b"partial index").unwrap();
+        fs::write(
+            reserved.reservation_directory().join("index.lock"),
+            b"partial lock",
+        )
+        .unwrap();
+        assert!(fs::read_dir(&run).unwrap().next().is_none());
         assert_eq!(fs::read(orphan).unwrap(), b"orphan");
+        reserved.cleanup().expect("cleanup reservation");
+        assert!(!reserved.reservation_directory().exists());
+    }
+
+    #[test]
+    fn substituted_patch_plan_directory_blocks_git_before_any_side_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority = temp.path().join("authority");
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&authority).unwrap();
+        crate::artifact_safety::create_private_directory(&run).unwrap();
+        let reserved = reserve_unique_patch_plan_index(&authority, &run).unwrap();
+        let original = reserved.reservation_directory().to_path_buf();
+        let orphan = authority.join("owned-orphan");
+        fs::rename(&original, &orphan).unwrap();
+        crate::artifact_safety::create_private_directory(&original).unwrap();
+        crate::artifact_safety::write_private_fixture(original.join("sentinel"), b"attacker")
+            .unwrap();
+        let called = std::cell::Cell::new(false);
+
+        let error = reserved
+            .run_validated(|| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("substitution must reject before Git");
+
+        assert!(error.to_string().contains("identity"), "{error}");
+        assert!(!called.get());
+        assert_eq!(fs::read(original.join("sentinel")).unwrap(), b"attacker");
+        assert!(orphan.is_dir());
+    }
+
+    #[test]
+    fn substituted_patch_plan_directory_is_never_cleaned_through_rebound_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority = temp.path().join("authority");
+        let run = temp.path().join("run");
+        crate::artifact_safety::create_private_directory(&authority).unwrap();
+        crate::artifact_safety::create_private_directory(&run).unwrap();
+        let reserved = reserve_unique_patch_plan_index(&authority, &run).unwrap();
+        crate::artifact_safety::write_private_fixture(reserved.index_path(), b"owned index")
+            .unwrap();
+        crate::artifact_safety::write_private_fixture(
+            reserved.reservation_directory().join("index.lock"),
+            b"owned lock",
+        )
+        .unwrap();
+        let original = reserved.reservation_directory().to_path_buf();
+        let orphan = authority.join("owned-orphan");
+        fs::rename(&original, &orphan).unwrap();
+        crate::artifact_safety::create_private_directory(&original).unwrap();
+        crate::artifact_safety::write_private_fixture(original.join("sentinel"), b"attacker")
+            .unwrap();
+
+        let error = reserved
+            .cleanup()
+            .expect_err("substitution must block cleanup");
+
+        assert!(error.to_string().contains("identity"), "{error}");
+        assert_eq!(fs::read(original.join("sentinel")).unwrap(), b"attacker");
+        assert_eq!(fs::read(orphan.join("index")).unwrap(), b"owned index");
+        assert_eq!(fs::read(orphan.join("index.lock")).unwrap(), b"owned lock");
     }
 
     #[test]
@@ -4598,7 +4882,7 @@ mod tests {
         .expect("evidence");
         fs::create_dir_all(workspace.run_directory().join(ARTIFACTS_DIR)).expect("artifacts");
         let evidence_path = "artifacts/05-development.json";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             workspace.run_directory().join(evidence_path),
             evidence.canonical_bytes().expect("canonical evidence"),
         )
@@ -4726,7 +5010,7 @@ mod tests {
         )
         .unwrap();
         let path = "artifacts/06-output-review.json";
-        fs::write(
+        crate::artifact_safety::write_private_fixture(
             fixture.workspace.run_directory().join(path),
             artifact.canonical_bytes().unwrap(),
         )

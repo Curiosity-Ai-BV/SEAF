@@ -108,7 +108,10 @@ pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
         Ok(_) => {
             let current_bytes = run_persistence::read_regular_file(path)?;
             let current = serde_json::from_slice::<LoopRun>(&current_bytes).ok();
-            guard_frozen_authority_direct_write(path, run)?;
+            let authenticated_current = current
+                .as_ref()
+                .filter(|current| validate_run_integrity(current).is_ok());
+            guard_frozen_authority_direct_write(authenticated_current, run)?;
             if current.as_ref() != Some(run) || current_bytes != json {
                 return Err(StateError::InvalidRun(
                     "public state writer only permits an exact idempotent retry for an existing run file"
@@ -119,7 +122,7 @@ pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            guard_frozen_authority_direct_write(path, run)?;
+            guard_frozen_authority_direct_write(None, run)?;
             run_persistence::publish_create_only(&lock, path, &json)?;
             Ok(())
         }
@@ -170,14 +173,10 @@ pub(crate) fn write_raw_canonical_run_fixture(
 }
 
 fn guard_frozen_authority_direct_write(
-    path: &Path,
+    current: Option<&LoopRun>,
     intended: &LoopRun,
 ) -> Result<bool, StateError> {
-    let current = fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<LoopRun>(&content).ok())
-        .filter(|run| validate_run_integrity(run).is_ok());
-    match &current {
+    match current {
         Some(current) if current.latest_recovery != intended.latest_recovery => {
             return Err(StateError::InvalidRun(
                 "public state writer cannot mint, replace, or clear recovery authority".to_string(),
@@ -191,7 +190,7 @@ fn guard_frozen_authority_direct_write(
         _ => {}
     }
     if is_frozen_review_or_evaluation_authority(intended) {
-        if current.as_ref() == Some(intended) {
+        if current == Some(intended) {
             return Ok(true);
         }
         return Err(StateError::InvalidRun(
@@ -199,10 +198,7 @@ fn guard_frozen_authority_direct_write(
                 .to_string(),
         ));
     }
-    if current
-        .as_ref()
-        .is_some_and(is_frozen_review_or_evaluation_authority)
-    {
+    if current.is_some_and(is_frozen_review_or_evaluation_authority) {
         return Err(StateError::InvalidRun(
             "public state writer cannot replace awaiting human review, approved authority, or final evaluation authority"
                 .to_string(),
@@ -529,6 +525,27 @@ mod recovery_authority_tests {
         let error = write_run_file(&path, &run).unwrap_err();
         assert!(error.to_string().contains("cannot begin"), "{error}");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn sparse_oversized_run_rejects_direct_write_before_allocation_or_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
+        let path = temp.path().join("run.json");
+        let run = run_with_candidate();
+        write_run_file(&path, &run).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = write_run_file(&path, &run)
+            .expect_err("oversized existing run authority must fail from metadata");
+
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(fs::metadata(path).unwrap().len(), 2 * 1024 * 1024 + 1);
     }
 
     #[test]

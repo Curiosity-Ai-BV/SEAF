@@ -312,8 +312,9 @@ fn legacy_candidate_authority_is_read_only_and_rejected_before_lock_or_git_mutat
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
     run.candidate_workspace = Some(planned.clone());
     persist_run_fixture(&workspace, &run).unwrap();
-    let before = fs::read(workspace.run_file()).unwrap();
     let lock = workspace.run_directory().join(".candidate-workspace.lock");
+    fs::remove_file(&lock).unwrap();
+    let before = fs::read(workspace.run_file()).unwrap();
 
     let error = provision_candidate_workspace(&workspace).expect_err("v1 is forensic-only");
     assert!(error.to_string().contains("start a new run"), "{error}");
