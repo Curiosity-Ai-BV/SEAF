@@ -980,6 +980,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             LoopStatus::AwaitingHumanReview
                 | LoopStatus::Approved
                 | LoopStatus::EvalPassed
+                | LoopStatus::Promoted
                 | LoopStatus::Blocked
                 | LoopStatus::Failed
                 | LoopStatus::Passed

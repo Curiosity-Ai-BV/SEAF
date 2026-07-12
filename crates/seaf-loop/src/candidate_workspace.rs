@@ -558,6 +558,7 @@ impl CandidateCleanupOutcome {
                 | LoopStatus::AwaitingHumanReview
                 | LoopStatus::Approved
                 | LoopStatus::EvalPassed
+                | LoopStatus::Promoted
         ) || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
             || run.candidate_workspace.as_ref() != Some(&candidate)
         {
@@ -1875,6 +1876,7 @@ where
                 | LoopStatus::AwaitingHumanReview
                 | LoopStatus::Approved
                 | LoopStatus::EvalPassed
+                | LoopStatus::Promoted
         ) {
             return Err(CandidateWorkspaceError::Unsafe(
                 "refusing to clean an active run candidate".to_string(),
@@ -2397,7 +2399,7 @@ fn repository_operation_lock_path(
         .join(REPOSITORY_OPERATION_LOCK_FILE))
 }
 
-fn acquire_repository_operation_lock(
+pub(crate) fn acquire_repository_operation_lock(
     git_common_dir: &Path,
 ) -> Result<fs::File, CandidateWorkspaceError> {
     let path = repository_operation_lock_path(git_common_dir)?;
@@ -2699,6 +2701,20 @@ fn load_index_entries(
     worktree: &Path,
 ) -> Result<Vec<CandidateIndexEntry>, CandidateWorkspaceError> {
     let raw_entries = git_bytes(worktree, &["ls-files", "--stage", "-z"])?;
+    parse_index_entries(&raw_entries)
+}
+
+fn load_index_entries_with_index(
+    worktree: &Path,
+    index_path: &Path,
+) -> Result<Vec<CandidateIndexEntry>, CandidateWorkspaceError> {
+    let raw_entries = git_bytes_with_index(worktree, &["ls-files", "--stage", "-z"], index_path)?;
+    parse_index_entries(&raw_entries)
+}
+
+fn parse_index_entries(
+    raw_entries: &[u8],
+) -> Result<Vec<CandidateIndexEntry>, CandidateWorkspaceError> {
     let mut entries = Vec::new();
     for entry in raw_entries
         .split(|byte| *byte == 0)
@@ -2902,9 +2918,26 @@ fn read_symlink_bytes(_path: &Path) -> Result<Vec<u8>, CandidateWorkspaceError> 
     ))
 }
 
-fn verify_worktree_matches_index(worktree: &Path) -> Result<(), CandidateWorkspaceError> {
+pub(crate) fn verify_worktree_matches_index(
+    worktree: &Path,
+) -> Result<(), CandidateWorkspaceError> {
     let entries = load_index_entries(worktree)?;
-    stream_index_blobs(worktree, &entries, |entry, size, reader| {
+    verify_worktree_matches_entries(worktree, &entries)
+}
+
+pub(crate) fn verify_worktree_matches_private_index(
+    worktree: &Path,
+    index_path: &Path,
+) -> Result<(), CandidateWorkspaceError> {
+    let entries = load_index_entries_with_index(worktree, index_path)?;
+    verify_worktree_matches_entries(worktree, &entries)
+}
+
+fn verify_worktree_matches_entries(
+    worktree: &Path,
+    entries: &[CandidateIndexEntry],
+) -> Result<(), CandidateWorkspaceError> {
+    stream_index_blobs(worktree, entries, |entry, size, reader| {
         let relative = index_relative_path(&entry.path)?;
         let path = worktree.join(&relative);
         let display = relative.to_string_lossy();

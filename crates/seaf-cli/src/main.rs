@@ -19,19 +19,20 @@ use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, sha256_digest_file, templates, AgentTaskBrief,
     AgentTaskConstraints, CandidateWorkspaceLifecycle, CheckStatus, EvalCheck, EvalConfigError,
     EvalDecision, EvalReport, FieldError, HumanApprovalEvidence, LoopInputDigests, LoopRun,
-    LoopStatus, LoopStepName, LoopStepStatus, Policy, ProjectConfig, ReleaseCapsule, RiskLevel,
-    RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext, TicketPriority, TicketSpec,
-    TicketStatus, ValidationReport,
+    LoopStatus, LoopStepName, LoopStepStatus, Policy, ProjectConfig, PromotionEvidence,
+    ReleaseCapsule, RiskLevel, RolloutChannel, RolloutPolicy, TicketAutonomy, TicketContext,
+    TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
     approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
     evaluate_zero_tolerance, execute_approved_evaluation, execute_eval_checks,
     load_agent_bench_fixture, plan_eval_checks, preflight_authoritative_run_inputs,
-    validate_human_review_execution_barrier, validate_rerun_eligibility, AgentBenchSummary,
-    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
-    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
-    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    promote_evaluated_candidate, validate_human_review_execution_barrier,
+    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
+    CandidateCleanupOutcome, ContextLimits, ContextPackRequest, EvalCheckExecution,
+    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
+    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
+    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -157,6 +158,8 @@ enum LoopCommand {
     Resume(LoopResumeArgs),
     /// Approve the exact reviewed candidate for future Testing.
     Approve(LoopApproveArgs),
+    /// Apply the exact evaluated candidate to the clean target without committing.
+    Promote(LoopPromoteArgs),
     /// Explicitly remove a terminal run's verified candidate worktree.
     Cleanup(LoopCleanupArgs),
     /// Run a deterministic smoke loop without contacting a model provider.
@@ -365,6 +368,31 @@ struct LoopApproveArgs {
 }
 
 #[derive(Debug, Args)]
+struct LoopPromoteArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Stable identity of the human reviewer freshly authorizing promotion.
+    #[arg(long)]
+    reviewer: String,
+    /// Exact candidate staged-diff SHA-256 shown to and confirmed by the reviewer.
+    #[arg(long)]
+    confirm_candidate_diff: String,
+    /// Exact passing EvalReport SHA-256 shown to and confirmed by the reviewer.
+    #[arg(long)]
+    confirm_eval_report: String,
+    /// Exact clean target HEAD shown to and confirmed by the reviewer.
+    #[arg(long)]
+    confirm_target_head: String,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct LoopSmokeArgs {
     /// Directory where loop run workspaces are written.
     #[arg(long, default_value = ".seaf/loops/runs")]
@@ -474,7 +502,21 @@ struct LoopCommandReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     candidate_diff_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_diff_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     target_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_report_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_report_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    testing_evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    testing_evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_decision_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval_passed_run_digest: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -498,6 +540,16 @@ struct LoopApprovalReport {
     run_directory: String,
     run_file: String,
     evidence: HumanApprovalEvidence,
+}
+
+#[derive(Debug, Serialize)]
+struct LoopPromotionReport {
+    command: String,
+    run_id: String,
+    status: LoopStatus,
+    run_directory: String,
+    run_file: String,
+    evidence: PromotionEvidence,
 }
 
 #[derive(Debug, Serialize)]
@@ -560,6 +612,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Approve(args),
         } => approve_loop(args),
+        Command::Loop {
+            command: LoopCommand::Promote(args),
+        } => promote_loop(args),
         Command::Loop {
             command: LoopCommand::Cleanup(args),
         } => cleanup_loop(args),
@@ -970,6 +1025,41 @@ fn approve_loop(args: LoopApproveArgs) -> Result<(), CliFailure> {
         println!("reviewer: {}", report.evidence.reviewer);
         println!("candidate diff: {}", report.evidence.candidate_diff.digest);
         println!("target HEAD: {}", report.evidence.starting_head);
+        println!("run file: {}", report.run_file);
+        Ok(())
+    }
+}
+
+fn promote_loop(args: LoopPromoteArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    let repository_root = current_cleanup_repository_root()?;
+    let outcome = promote_evaluated_candidate(
+        &workspace,
+        &repository_root,
+        &args.reviewer,
+        &args.confirm_candidate_diff,
+        &args.confirm_eval_report,
+        &args.confirm_target_head,
+    )
+    .map_err(|error| CliFailure::message(format!("candidate promotion failed: {error}")))?;
+    let report = LoopPromotionReport {
+        command: "promote".to_string(),
+        run_id: outcome.run.run_id,
+        status: outcome.run.status,
+        run_directory: workspace.run_directory().display().to_string(),
+        run_file: workspace.run_file().display().to_string(),
+        evidence: outcome.evidence,
+    };
+    if args.json {
+        print_json(&report)
+    } else {
+        println!("promoted loop {} without committing", report.run_id);
+        println!("reviewer: {}", report.evidence.reviewer);
+        println!("candidate diff: {}", report.evidence.candidate_diff.digest);
+        println!("EvalReport: {}", report.evidence.eval_report.digest);
+        println!("target HEAD: {}", report.evidence.target_head);
         println!("run file: {}", report.run_file);
         Ok(())
     }
@@ -2412,6 +2502,27 @@ fn finish_loop_command(
         if let Some(target_head) = &report.target_head {
             println!("--confirm-target-head: {target_head}");
         }
+        if let Some(eval_report_digest) = &report.eval_report_digest {
+            println!("--confirm-eval-report: {eval_report_digest}");
+        }
+        if let Some(path) = &report.candidate_diff_path {
+            println!("candidate diff artifact: {path}");
+        }
+        if let (Some(path), Some(digest)) = (
+            &report.testing_evidence_path,
+            &report.testing_evidence_digest,
+        ) {
+            println!("Testing evidence: {path} ({digest})");
+        }
+        if let Some(path) = &report.eval_report_path {
+            println!("EvalReport artifact: {path}");
+        }
+        if let Some(digest) = &report.policy_decision_digest {
+            println!("policy decision: {digest}");
+        }
+        if let Some(digest) = &report.eval_passed_run_digest {
+            println!("EvalPassed run: {digest}");
+        }
         println!("run file: {}", report.run_file);
     }
     Ok(())
@@ -2422,6 +2533,7 @@ fn loop_status_label(status: LoopStatus) -> String {
         LoopStatus::AwaitingHumanReview => "awaiting_human_review".to_string(),
         LoopStatus::Approved => "approved".to_string(),
         LoopStatus::EvalPassed => "eval_passed".to_string(),
+        LoopStatus::Promoted => "promoted".to_string(),
         legacy => format!("{legacy:?}"),
     }
 }
@@ -2430,10 +2542,28 @@ fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCo
     let run_directory = runs_root.join(&run.run_id);
     let confirmation_candidate = matches!(
         run.status,
-        LoopStatus::AwaitingHumanReview | LoopStatus::Approved
+        LoopStatus::AwaitingHumanReview
+            | LoopStatus::Approved
+            | LoopStatus::EvalPassed
+            | LoopStatus::Promoted
     )
     .then(|| run.candidate_workspace.as_ref())
     .flatten();
+    let promotion_ready = matches!(run.status, LoopStatus::EvalPassed | LoopStatus::Promoted);
+    let testing = promotion_ready
+        .then(|| {
+            run.steps
+                .iter()
+                .find(|step| step.name == LoopStepName::Testing)
+        })
+        .flatten();
+    let eval_report = promotion_ready
+        .then(|| {
+            run.steps
+                .iter()
+                .find(|step| step.name == LoopStepName::EvalReport)
+        })
+        .flatten();
     LoopCommandReport {
         command: command.to_string(),
         run_id: run.run_id.clone(),
@@ -2448,7 +2578,33 @@ fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCo
         next_action: next_loop_action(run),
         candidate_diff_digest: confirmation_candidate
             .map(|candidate| candidate.candidate_diff_digest.clone()),
+        candidate_diff_path: promotion_ready
+            .then(|| {
+                run.human_approval
+                    .as_ref()
+                    .map(|approval| approval.candidate_diff.path.clone())
+            })
+            .flatten(),
         target_head: confirmation_candidate.map(|candidate| candidate.starting_head.clone()),
+        eval_report_digest: eval_report.and_then(|step| step.artifact_digest.clone()),
+        eval_report_path: eval_report.and_then(|step| step.artifact_path.clone()),
+        testing_evidence_digest: testing.and_then(|step| step.artifact_digest.clone()),
+        testing_evidence_path: testing.and_then(|step| step.artifact_path.clone()),
+        policy_decision_digest: promotion_ready
+            .then(|| {
+                run.human_approval
+                    .as_ref()
+                    .map(|approval| approval.policy_decision_digest.clone())
+            })
+            .flatten(),
+        eval_passed_run_digest: match run.status {
+            LoopStatus::EvalPassed => canonical_sha256_digest(run).ok(),
+            LoopStatus::Promoted => run
+                .promotion
+                .as_ref()
+                .map(|evidence| evidence.eval_passed_run_digest.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -2465,6 +2621,10 @@ fn next_loop_action(run: &LoopRun) -> String {
         }
         LoopStatus::EvalPassed => {
             "integrated evaluation passed; authority is frozen pending audited promotion"
+                .to_string()
+        }
+        LoopStatus::Promoted => {
+            "candidate patch is applied without commit and remains ready for human review"
                 .to_string()
         }
         LoopStatus::Blocked => {

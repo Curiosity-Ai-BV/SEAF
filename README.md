@@ -111,6 +111,13 @@ cargo run -p seaf-cli -- loop approve --run-id <run-id> \
   --confirm-target-head <head-from-status> \
   --json
 cargo run -p seaf-cli -- loop resume --run-id <run-id> --json
+cargo run -p seaf-cli -- loop status --run-id <run-id> --json
+cargo run -p seaf-cli -- loop promote --run-id <run-id> \
+  --reviewer <reviewer> \
+  --confirm-candidate-diff <digest-from-status> \
+  --confirm-eval-report <eval-report-digest-from-status> \
+  --confirm-target-head <head-from-status> \
+  --json
 ```
 
 Approved resume uses the persisted canonical ticket and eval snapshots, not
@@ -122,5 +129,9 @@ attempt will not replay commands until M1-09 adds audited recovery.
 
 Human approval authorizes local command execution under the developer account.
 SEAF detects lasting source/candidate drift but is not an OS sandbox against
-malicious same-user commands. The original checkout is not promoted by this
-flow; explicit verified promotion is the next production-readiness slice.
+malicious same-user commands. Promotion requires a second fresh confirmation
+and a completely clean target (apart from the bound runtime directory). It
+durably records intent, applies the exact evaluated patch to the original
+checkout, and leaves it unstaged and uncommitted for review. Crash retry adopts
+only that exact patch; it does not delete the frozen candidate or contact a
+model provider.

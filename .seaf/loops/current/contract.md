@@ -44,20 +44,21 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-08 - Promotion integrity. Add an explicit human-authorized promotion
-transaction for a frozen `eval_passed` run. Require a fresh bounded reviewer
-identity and exact confirmations for the approved candidate diff, bound
-EvalReport digest, and current target HEAD. Under candidate authority, reload
-and physically verify the immutable human approval, policy decision, Testing
-evidence, EvalReport, command logs, candidate diff, source repository identity,
-and clean target worktree before any source mutation.
+M1-09 - Audited recovery operations. Add explicit inspect, revise, and rerun
+commands for blocked, failed, and interrupted attempts without editing durable
+history in place. Every revision must create a new versioned immutable attempt,
+preserve prior prompts/responses/artifacts and original input snapshots, and
+bind its reason, actor, source attempt, candidate authority, and effective-input
+digests. A change to authoritative ticket, policy, project config, repository
+identity, or eval config still requires a new run.
 
-Use candidate-to-repository-operation lock order and a full-state compare-and-
-swap. Apply only the exact already-approved staged patch to the original
-checkout without committing, merging, pushing, deploying, or deleting the
-candidate. Reverify target HEAD and cleanliness immediately before application,
-fail closed on stale/substituted authority or patch conflict, and publish a
-closed `promoted` record bound to the fresh confirmation. Exact retry must be
-byte-identical; failed, incomplete, cleaned, or non-passing runs must never
-mutate the target. Preserve the M1-07 terminal evidence and add focused
-temporary-repository regressions before implementation.
+Rerun from a named eligible step under the run/candidate authority locks. Clear
+and invalidate every downstream role result, provider exchange head, human
+approval, Testing/EvalReport, promotion intent/evidence, and terminal status
+that depended on the replaced attempt while preserving their bytes as history.
+Add an audited decision for incomplete Approved-evaluation intent: adopt only a
+fully verifiable already-completed artifact prefix, or explicitly invalidate it
+before a new execution attempt; never silently replay commands. Invalid targets,
+stale authority, exhausted attempts, and unsafe reset boundaries must fail
+before mutation. Keep recovery local and supervised; do not add automatic
+commit, merge, push, deploy, or history deletion.

@@ -22,6 +22,8 @@ cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-healt
 cargo run -p seaf-cli -- loop status --run-id local-loop-demo --json
 cargo run -p seaf-cli -- loop approve --run-id local-loop-demo --reviewer reviewer@example.invalid --confirm-candidate-diff <digest-from-status> --confirm-target-head <head-from-status> --json
 cargo run -p seaf-cli -- loop resume --run-id local-loop-demo --json
+cargo run -p seaf-cli -- loop status --run-id local-loop-demo --json
+cargo run -p seaf-cli -- loop promote --run-id local-loop-demo --reviewer reviewer@example.invalid --confirm-candidate-diff <digest-from-status> --confirm-eval-report <eval-report-digest-from-status> --confirm-target-head <head-from-status> --json
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 ```
 
@@ -37,7 +39,12 @@ replay it until audited recovery lands in M1-09.
 Review all generated evidence under `.seaf/loops/runs/local-loop-demo/`. If the
 run ID already exists, choose a new one or inspect its current state. Human
 approval authorizes local execution under your account; SEAF is not an OS
-sandbox. This flow does not promote the candidate into the original checkout.
+sandbox. After `eval_passed`, the second `loop status` exposes the EvalReport
+digest required by `loop promote`. Promotion accepts only the exact frozen
+candidate and a clean confirmed target HEAD, records intent before mutation,
+and applies the patch unstaged without committing. An exact retry after a crash
+adopts only those already-applied bytes. The candidate remains available for
+review; no model call, merge, push, or deploy occurs.
 
 ## Recovery
 

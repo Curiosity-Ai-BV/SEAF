@@ -1249,7 +1249,7 @@ Commit boundary: Approved Testing/EvalReport transaction only.
 
 Roadmap: U3. Dependencies: M1-07.
 
-Status: active. Dependencies: M1-07 (complete).
+Status: complete on 2026-07-12. Dependencies: M1-07 (complete).
 
 Objective: promote only the exact approved and evaluated candidate with a new
 human confirmation.
@@ -1278,6 +1278,8 @@ Commit boundary: promotion only.
 ### M1-09 - Audited Recovery Operations
 
 Roadmap: U5. Dependencies: M1-08.
+
+Status: active. Dependencies: M1-08 (complete).
 
 Objective: inspect, revise, and rerun blocked/failed attempts without replacing
 history.

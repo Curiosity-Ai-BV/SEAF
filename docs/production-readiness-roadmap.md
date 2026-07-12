@@ -194,8 +194,13 @@ complete preflight and a create-only execution intent. It publishes indexed
 redacted logs, canonical Testing evidence, and a bound EvalReport, then
 atomically records `eval_passed` or approval-bound reported failure. Interrupted
 attempts refuse silent replay; lasting source, candidate, command-identity, or
-artifact drift blocks terminal publication. M1-08 promotion integrity is active,
-so evaluated candidates are still not promotable.
+artifact drift blocks terminal publication. M1-08 promotion integrity is also
+complete. `loop promote` requires a fresh exact candidate/EvalReport/target-HEAD
+confirmation, publishes durable intent before mutation, applies only the frozen
+evaluated patch to a clean target, and records immutable `promoted` authority.
+Crash retry adopts only the exact already-applied patch; the result stays
+unstaged and uncommitted, and the candidate is retained. M1-09 audited recovery
+operations are active.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

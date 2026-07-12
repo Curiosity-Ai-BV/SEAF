@@ -13,6 +13,7 @@ pub mod model_runner;
 pub mod patch;
 pub mod policy;
 pub mod policy_gate;
+pub mod promotion;
 pub mod provider_exchange;
 pub mod role_artifact;
 pub mod role_response;
@@ -61,6 +62,7 @@ pub use policy_gate::{
     gate_patch, patch_digest, CommandOutput, GitCommandRunner, PatchCommand, PatchCommandRunner,
     PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision, PolicyDecisionReason,
 };
+pub use promotion::{promote_evaluated_candidate, PromotionError, PromotionOutcome};
 pub use provider_exchange::{
     classify_provider_exchange_record, load_provider_exchange_record,
     load_provider_exchange_request, persist_provider_exchange_record_reference,

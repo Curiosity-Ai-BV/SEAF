@@ -1671,3 +1671,53 @@ eval-engine 7, provider-candidate 25, provider-exchange 22, and every remaining
 Rust and doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
 formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
 through pinned pnpm 11.7.0.
+
+## 2026-07-12 implementation | M1-08 promotion integrity
+
+Added a closed versioned `promoted` state and `seaf loop promote`. Status exposes
+the exact candidate diff, Testing/EvalReport references, policy digest,
+EvalPassed run digest, and target HEAD required for a fresh bounded reviewer
+confirmation. Promotion reloads and physically verifies the complete frozen
+M1-07 authority and active candidate, requires the caller to be the exact source
+repository, and rejects tracked, staged, untracked, ignored, stale-HEAD,
+conflicting, failed, historical, cleaned, or substituted targets before source
+mutation. Only the authoritative bound runtime directory may be ignored.
+
+A canonical create-only promotion intent binds the exact EvalPassed predecessor,
+reviewer, candidate, Testing/EvalReport, policy decision, target HEAD, and
+monotonic timestamp before application. Under candidate then repository-
+operation locking, source `git apply --check` and apply run with sanitized Git
+authority and filter drivers neutralized from both current-target and evaluated-
+candidate attribute views. The patch is applied unstaged and uncommitted. Raw
+index/blob/worktree comparison verifies every regular file, executable mode,
+and symlink without filters or replace refs. The provider-lock full-state CAS
+rereads the intent and complete final authority before publishing immutable
+Promoted evidence. A crash after apply is adopted only when the source contains
+exactly the intended patch; the candidate remains frozen and present.
+
+Initial review found four authority gaps. All-path Git status/diff could execute
+or be normalized by unrelated clean filters; a staged rename pair could be
+misparsed as the excluded runtime and allow mutation before rejection; intent
+validation omitted run identity, canonical time, and nested-lock physical
+rereads; and the temporary index was world-readable. Corrections replaced
+filter-sensitive comparisons with direct indexed-blob checks, removed porcelain
+rename parsing in favor of exact index-tree equality, validated and reread the
+intent under repository and provider locks, and moved the index into a unique
+0700 directory with a 0600 file and recursive cleanup. Final re-review found and
+closed one adjacent seam: fresh apply/check now unions and neutralizes filter
+drivers from both attribute views immediately before each command.
+
+REDs cover wrong confirmations, dirty/staged/ignored/sibling-runtime state,
+stale HEAD, wrong repository, artifact/candidate/log/config tamper, conflict,
+concurrent CAS, intent-before-apply, real process-crash adoption, wrong/noncanonical
+and lock-wait-substituted intent, staged rename, filter execution/normalization,
+private-index permissions, public writer/provider/rerun/cleanup freeze, exact
+retry, candidate retention, and absence of provider calls. Both independent
+reviewers approve the corrected implementation. M1-08 is accepted and M1-09
+audited recovery operations are active.
+
+Controller verification passes CLI 119, core 50, loop unit 117, candidate 39,
+provider-candidate 25, provider-exchange 22, and every remaining Rust and
+doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
+formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
+through pinned pnpm 11.7.0.

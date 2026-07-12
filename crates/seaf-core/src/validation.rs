@@ -660,6 +660,11 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
             validate_final_eval_run(&mut errors, run, true);
             validate_human_approval_evidence(&mut errors, run);
         }
+        crate::LoopStatus::Promoted => {
+            validate_final_eval_run(&mut errors, run, true);
+            validate_human_approval_evidence(&mut errors, run);
+            validate_promotion_evidence(&mut errors, run);
+        }
         crate::LoopStatus::Failed if run.human_approval.is_some() => {
             validate_final_eval_run(&mut errors, run, false);
             validate_human_approval_evidence(&mut errors, run);
@@ -671,11 +676,164 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         _ => {}
     }
 
+    if run.status != crate::LoopStatus::Promoted && run.promotion.is_some() {
+        errors.push(FieldError::new(
+            "promotion",
+            "is valid only for promoted authority",
+        ));
+    }
+
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
 
     errors
+}
+
+fn validate_promotion_evidence(errors: &mut Vec<FieldError>, run: &LoopRun) {
+    let Some(evidence) = run.promotion.as_ref() else {
+        errors.push(FieldError::new(
+            "promotion",
+            "promoted authority requires promotion evidence",
+        ));
+        return;
+    };
+    if evidence.schema_version != 1 {
+        errors.push(FieldError::new("promotion.schema_version", "must be 1"));
+    }
+    if evidence.run_id != run.run_id {
+        errors.push(FieldError::new("promotion.run_id", "must match run_id"));
+    }
+    require_non_empty(errors, "promotion.reviewer", &evidence.reviewer);
+    if evidence.reviewer.len() > 256
+        || evidence.reviewer.trim() != evidence.reviewer
+        || evidence.reviewer.chars().any(char::is_control)
+    {
+        errors.push(FieldError::new(
+            "promotion.reviewer",
+            "must be 1..=256 bytes with no surrounding whitespace or control characters",
+        ));
+    }
+    for (field, value) in [
+        ("promotion.promoted_at", evidence.promoted_at.as_str()),
+        (
+            "promotion.eval_passed_updated_at",
+            evidence.eval_passed_updated_at.as_str(),
+        ),
+    ] {
+        require_non_empty(errors, field, value);
+        if value
+            .parse::<u64>()
+            .map_or(true, |parsed| parsed.to_string() != value)
+        {
+            errors.push(FieldError::new(
+                field,
+                "must be canonical decimal Unix seconds",
+            ));
+        }
+    }
+    if evidence
+        .promoted_at
+        .parse::<u64>()
+        .ok()
+        .zip(evidence.eval_passed_updated_at.parse::<u64>().ok())
+        .is_some_and(|(promoted, evaluated)| promoted < evaluated)
+    {
+        errors.push(FieldError::new(
+            "promotion.promoted_at",
+            "must not precede the exact EvalPassed predecessor",
+        ));
+    }
+    validate_artifact_reference(errors, "promotion.intent", &evidence.intent);
+    if evidence.intent.path != "artifacts/09-promotion.intent.json" {
+        errors.push(FieldError::new(
+            "promotion.intent.path",
+            "must select the canonical promotion intent",
+        ));
+    }
+    if evidence.promoted_at != run.updated_at {
+        errors.push(FieldError::new(
+            "promotion.promoted_at",
+            "must match the promoted LoopRun updated_at timestamp",
+        ));
+    }
+    validate_artifact_reference(errors, "promotion.candidate_diff", &evidence.candidate_diff);
+    validate_artifact_reference(
+        errors,
+        "promotion.testing_evidence",
+        &evidence.testing_evidence,
+    );
+    validate_artifact_reference(errors, "promotion.eval_report", &evidence.eval_report);
+    validate_lowercase_sha256_digest(
+        errors,
+        "promotion.policy_decision_digest",
+        &evidence.policy_decision_digest,
+    );
+    validate_lowercase_sha256_digest(
+        errors,
+        "promotion.eval_passed_run_digest",
+        &evidence.eval_passed_run_digest,
+    );
+    if !matches!(evidence.target_head.len(), 40 | 64)
+        || !evidence
+            .target_head
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        errors.push(FieldError::new(
+            "promotion.target_head",
+            "must be a lowercase Git object ID",
+        ));
+    }
+    let approval = run.human_approval.as_ref();
+    let testing = run
+        .steps
+        .iter()
+        .find(|step| step.name == crate::LoopStepName::Testing);
+    let report = run
+        .steps
+        .iter()
+        .find(|step| step.name == crate::LoopStepName::EvalReport);
+    if approval.is_none_or(|approval| {
+        evidence.candidate_diff != approval.candidate_diff
+            || evidence.policy_decision_digest != approval.policy_decision_digest
+            || evidence.target_head != approval.starting_head
+    }) {
+        errors.push(FieldError::new(
+            "promotion.candidate_diff",
+            "must preserve the exact approved candidate, policy decision, and target HEAD",
+        ));
+    }
+    if testing.is_none_or(|step| {
+        step.artifact_path.as_deref() != Some(evidence.testing_evidence.path.as_str())
+            || step.artifact_digest.as_deref() != Some(evidence.testing_evidence.digest.as_str())
+    }) {
+        errors.push(FieldError::new(
+            "promotion.testing_evidence",
+            "must match the final Testing artifact",
+        ));
+    }
+    if report.is_none_or(|step| {
+        step.artifact_path.as_deref() != Some(evidence.eval_report.path.as_str())
+            || step.artifact_digest.as_deref() != Some(evidence.eval_report.digest.as_str())
+    }) {
+        errors.push(FieldError::new(
+            "promotion.eval_report",
+            "must match the final EvalReport artifact",
+        ));
+    }
+    let mut predecessor = run.clone();
+    predecessor.status = crate::LoopStatus::EvalPassed;
+    predecessor.updated_at = evidence.eval_passed_updated_at.clone();
+    predecessor.promotion = None;
+    if crate::canonical_sha256_digest(&predecessor)
+        .map_or(true, |digest| digest != evidence.eval_passed_run_digest)
+    {
+        errors.push(FieldError::new(
+            "promotion.eval_passed_run_digest",
+            "must bind the exact EvalPassed predecessor",
+        ));
+    }
 }
 
 fn validate_final_eval_run(errors: &mut Vec<FieldError>, run: &LoopRun, passed: bool) {
@@ -2976,6 +3134,77 @@ unexpected_escape: true
     }
 
     #[test]
+    fn promoted_requires_exact_eval_passed_predecessor_and_closed_fresh_evidence() {
+        let mut predecessor = final_eval_run_fixture(true);
+        predecessor.updated_at = "10".to_string();
+        let predecessor_digest = canonical_sha256_digest(&predecessor).unwrap();
+        let approval = predecessor.human_approval.as_ref().unwrap();
+        let mut promoted = predecessor.clone();
+        promoted.status = crate::LoopStatus::Promoted;
+        promoted.updated_at = "11".to_string();
+        promoted.promotion = Some(crate::PromotionEvidence {
+            schema_version: 1,
+            run_id: promoted.run_id.clone(),
+            reviewer: "fresh-reviewer@example.invalid".to_string(),
+            promoted_at: "11".to_string(),
+            intent: crate::ArtifactReference {
+                path: "artifacts/09-promotion.intent.json".to_string(),
+                digest: "9".repeat(64),
+            },
+            candidate_diff: approval.candidate_diff.clone(),
+            testing_evidence: crate::ArtifactReference {
+                path: "artifacts/07-testing.json".to_string(),
+                digest: "7".repeat(64),
+            },
+            eval_report: crate::ArtifactReference {
+                path: "artifacts/08-eval-report.json".to_string(),
+                digest: "8".repeat(64),
+            },
+            policy_decision_digest: approval.policy_decision_digest.clone(),
+            target_head: approval.starting_head.clone(),
+            eval_passed_run_digest: predecessor_digest,
+            eval_passed_updated_at: predecessor.updated_at.clone(),
+        });
+        assert_eq!(
+            serde_json::to_value(crate::LoopStatus::Promoted).unwrap(),
+            serde_json::json!("promoted")
+        );
+        assert!(validate_loop_run(&promoted).is_empty());
+
+        let mut substituted = promoted.clone();
+        substituted
+            .promotion
+            .as_mut()
+            .unwrap()
+            .eval_passed_run_digest = "f".repeat(64);
+        assert!(validate_loop_run(&substituted)
+            .iter()
+            .any(|error| error.field == "promotion.eval_passed_run_digest"));
+        let mut stale_time = promoted.clone();
+        stale_time.promotion.as_mut().unwrap().promoted_at = "9".to_string();
+        stale_time.updated_at = "9".to_string();
+        assert!(validate_loop_run(&stale_time)
+            .iter()
+            .any(|error| error.field == "promotion.promoted_at"));
+        let mut smuggled = predecessor;
+        smuggled.promotion = promoted.promotion;
+        assert!(validate_loop_run(&smuggled)
+            .iter()
+            .any(|error| error.field == "promotion"));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/loop-run.schema.json")).unwrap();
+        assert!(schema["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("promoted")));
+        assert!(schema["allOf"].as_array().unwrap().iter().any(|branch| {
+            branch["if"]["properties"]["status"]["const"] == "promoted"
+                && branch["then"]["allOf"][0]["$ref"] == "#/allOf/3/then"
+        }));
+    }
+
+    #[test]
     fn public_loop_schema_exposes_eval_passed_and_reported_failure_branches() {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../specs/loop-run.schema.json")).unwrap();
@@ -3185,6 +3414,7 @@ unexpected_escape: true
                 output_review_response: response,
             }),
             eval_report_path: None,
+            promotion: None,
         }
     }
 

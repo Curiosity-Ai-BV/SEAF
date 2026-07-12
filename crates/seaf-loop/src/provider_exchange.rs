@@ -874,8 +874,10 @@ pub(crate) fn validate_run_for_atomic_publication(
             validate_approved_publication_evidence(workspace, run)?;
         }
     }
-    if run.status == seaf_core::LoopStatus::EvalPassed
-        || (run.status == seaf_core::LoopStatus::Failed && run.human_approval.is_some())
+    if matches!(
+        run.status,
+        seaf_core::LoopStatus::EvalPassed | seaf_core::LoopStatus::Promoted
+    ) || (run.status == seaf_core::LoopStatus::Failed && run.human_approval.is_some())
     {
         crate::load_verified_final_evaluation_authority(workspace, run).map_err(|error| {
             ProviderExchangeError::Invalid(format!(
@@ -891,10 +893,16 @@ fn validate_final_authority_cas_relation(
     current: &LoopRun,
     intended: &LoopRun,
 ) -> Result<(), ProviderExchangeError> {
-    let intended_is_final = intended.status == seaf_core::LoopStatus::EvalPassed
-        || (intended.status == seaf_core::LoopStatus::Failed && intended.human_approval.is_some());
-    let current_is_final = current.status == seaf_core::LoopStatus::EvalPassed
-        || (current.status == seaf_core::LoopStatus::Failed && current.human_approval.is_some());
+    let intended_is_final = matches!(
+        intended.status,
+        seaf_core::LoopStatus::EvalPassed | seaf_core::LoopStatus::Promoted
+    ) || (intended.status == seaf_core::LoopStatus::Failed
+        && intended.human_approval.is_some());
+    let current_is_final = matches!(
+        current.status,
+        seaf_core::LoopStatus::EvalPassed | seaf_core::LoopStatus::Promoted
+    ) || (current.status == seaf_core::LoopStatus::Failed
+        && current.human_approval.is_some());
     if current_is_final && !intended_is_final {
         return Err(ProviderExchangeError::Invalid(
             "final evaluation authority permits only its audited candidate cleanup transition"
@@ -925,7 +933,21 @@ fn validate_final_authority_cas_relation(
             }
         }
         seaf_core::LoopStatus::EvalPassed => {
-            if current != intended {
+            if intended.status == seaf_core::LoopStatus::Promoted {
+                let promotion = intended.promotion.as_ref().ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "Promoted authority lost promotion evidence".to_string(),
+                    )
+                })?;
+                if canonical_sha256_digest(current)? != promotion.eval_passed_run_digest
+                    || promotion.eval_passed_updated_at != current.updated_at
+                {
+                    return Err(ProviderExchangeError::Invalid(
+                        "Promoted authority is not bound to the exact EvalPassed predecessor"
+                            .to_string(),
+                    ));
+                }
+            } else if current != intended {
                 return Err(ProviderExchangeError::Invalid(
                     "EvalPassed authority is immutable until audited promotion".to_string(),
                 ));
@@ -939,6 +961,13 @@ fn validate_final_authority_cas_relation(
                 ))
             })?;
             validate_preserved_final_lineage(&current_authority, &intended_authority)?;
+        }
+        seaf_core::LoopStatus::Promoted => {
+            if current != intended {
+                return Err(ProviderExchangeError::Invalid(
+                    "Promoted authority is immutable".to_string(),
+                ));
+            }
         }
         seaf_core::LoopStatus::Failed if current.human_approval.is_some() => {
             let current_authority = crate::load_verified_final_evaluation_authority(
@@ -2050,7 +2079,7 @@ mod tests {
         ArtifactReference, CandidatePatchPhase, CandidatePatchTransaction,
         CandidateWorkspaceLifecycle, CandidateWorkspaceState, CheckStatus, EvalCheck, EvalDecision,
         EvalLoopEvidence, EvalReport, HumanApprovalEvidence, LoopInputDigests, LoopStatus,
-        LoopStepStatus, RiskLevel,
+        LoopStepStatus, PromotionEvidence, RiskLevel,
     };
 
     fn awaiting_human_review_run(workspace: &LoopWorkspace) -> LoopRun {
@@ -2745,6 +2774,104 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(workspace.run_file()).unwrap(), final_bytes);
+
+        let eval_passed_digest = canonical_sha256_digest(&eval_passed).unwrap();
+        let testing = eval_passed
+            .steps
+            .iter()
+            .find(|step| step.name == LoopStepName::Testing)
+            .unwrap();
+        let report = eval_passed
+            .steps
+            .iter()
+            .find(|step| step.name == LoopStepName::EvalReport)
+            .unwrap();
+        let intent = serde_json::json!({
+            "schema_version": 1,
+            "run_id": eval_passed.run_id,
+            "reviewer": "promotion-reviewer@example.invalid",
+            "started_at": "101",
+            "candidate_diff": eval_passed.human_approval.as_ref().unwrap().candidate_diff,
+            "testing_evidence": {
+                "path": testing.artifact_path,
+                "digest": testing.artifact_digest,
+            },
+            "eval_report": {
+                "path": report.artifact_path,
+                "digest": report.artifact_digest,
+            },
+            "policy_decision_digest": eval_passed.human_approval.as_ref().unwrap().policy_decision_digest,
+            "target_head": eval_passed.human_approval.as_ref().unwrap().starting_head,
+            "eval_passed_run_digest": eval_passed_digest,
+        });
+        let intent_bytes = canonical_json_bytes(&intent).unwrap();
+        let intent_reference = ArtifactReference {
+            path: "artifacts/09-promotion.intent.json".to_string(),
+            digest: canonical_sha256_digest(&intent).unwrap(),
+        };
+        fs::write(
+            workspace.run_directory().join(&intent_reference.path),
+            intent_bytes,
+        )
+        .unwrap();
+        let mut promoted = eval_passed.clone();
+        promoted.status = LoopStatus::Promoted;
+        promoted.updated_at = "101".to_string();
+        promoted.promotion = Some(PromotionEvidence {
+            schema_version: 1,
+            run_id: eval_passed.run_id.clone(),
+            reviewer: "promotion-reviewer@example.invalid".to_string(),
+            promoted_at: "101".to_string(),
+            intent: intent_reference,
+            candidate_diff: eval_passed
+                .human_approval
+                .as_ref()
+                .unwrap()
+                .candidate_diff
+                .clone(),
+            testing_evidence: ArtifactReference {
+                path: testing.artifact_path.clone().unwrap(),
+                digest: testing.artifact_digest.clone().unwrap(),
+            },
+            eval_report: ArtifactReference {
+                path: report.artifact_path.clone().unwrap(),
+                digest: report.artifact_digest.clone().unwrap(),
+            },
+            policy_decision_digest: eval_passed
+                .human_approval
+                .as_ref()
+                .unwrap()
+                .policy_decision_digest
+                .clone(),
+            target_head: eval_passed
+                .human_approval
+                .as_ref()
+                .unwrap()
+                .starting_head
+                .clone(),
+            eval_passed_run_digest: eval_passed_digest,
+            eval_passed_updated_at: eval_passed.updated_at.clone(),
+        });
+        persist_run_with_full_compare(&workspace, &eval_passed, &promoted)
+            .expect("private promotion publisher may create exact Promoted authority");
+        let promoted_bytes = fs::read(workspace.run_file()).unwrap();
+
+        let mut public_replacement = promoted.clone();
+        public_replacement.status = LoopStatus::Completed;
+        public_replacement.human_approval = None;
+        public_replacement.promotion = None;
+        state::save_run(&workspace, &public_replacement)
+            .expect_err("public state writer cannot replace Promoted");
+        persist_provider_exchange_record_reference(
+            &workspace,
+            promoted.provider_exchange_records.last().unwrap().clone(),
+        )
+        .expect_err("provider append cannot replace Promoted");
+        reconcile_provider_exchange_state_with_validator(&workspace, &promoted, |_| Ok(()))
+            .expect_err("provider reconciliation cannot replace Promoted");
+        crate::validate_rerun_eligibility(&promoted, LoopStepName::OutputReview)
+            .expect_err("runner rerun cannot replace Promoted");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), promoted_bytes);
     }
 
     #[test]

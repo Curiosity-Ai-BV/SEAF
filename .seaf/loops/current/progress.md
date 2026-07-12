@@ -30,8 +30,8 @@
 - [x] M1-07b: Immutable eval configuration authority.
 - [x] M1-07c1: Evaluation evidence and terminal contracts.
 - [x] M1-07c2: Locked Approved Testing and EvalReport transaction.
-- [ ] M1-08: Promotion integrity (active).
-- [ ] M1-09: Audited recovery operations.
+- [x] M1-08: Promotion integrity.
+- [ ] M1-09: Audited recovery operations (active).
 - [ ] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
 - [ ] M1-12: Interruption recovery acceptance.
@@ -57,7 +57,7 @@
 
 ## Current Gate
 
-M1-06 and M1-07 are complete; M1-08 is active. Public run/status output supplies
+M1-06 through M1-08 are complete; M1-09 is active. Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -83,4 +83,11 @@ executes zero commands, partial attempts refuse replay pending M1-09, ignored
 candidate build output is permitted without weakening the approved diff, and
 lasting source/candidate/artifact drift blocks final publication. Human approval
 authorizes local execution under the developer account; it is not OS
-containment. Passing authority remains frozen and cannot promote until M1-08.
+containment. M1-08 adds a fresh `loop promote` confirmation bound to the exact
+candidate diff, Testing/EvalReport, policy decision, EvalPassed predecessor, and
+clean target HEAD. A create-only intent precedes mutation; candidate,
+repository-operation, then provider locking supports exact crash adoption and
+full-state publication. Raw index/worktree verification bypasses hooks, filters,
+and replace refs; the applied patch remains unstaged, uncommitted, and exactly
+reviewable while the frozen candidate is retained. Promoted authority is
+immutable. M1-09 now owns audited revision/rerun and incomplete-eval recovery.

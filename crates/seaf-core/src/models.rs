@@ -341,6 +341,7 @@ pub enum LoopStatus {
     AwaitingHumanReview,
     Approved,
     EvalPassed,
+    Promoted,
     Blocked,
     Failed,
     Passed,
@@ -396,6 +397,8 @@ pub struct LoopRun {
     pub human_approval: Option<HumanApprovalEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_report_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<PromotionEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +426,8 @@ struct LoopRunWire {
     human_approval: Option<HumanApprovalEvidence>,
     #[serde(default)]
     eval_report_path: Option<String>,
+    #[serde(default)]
+    promotion: Option<PromotionEvidence>,
 }
 
 #[derive(Default)]
@@ -452,7 +457,10 @@ impl<'de> Deserialize<'de> for LoopRun {
             DecodedExecutionMode::Missing
                 if matches!(
                     wire.status,
-                    LoopStatus::AwaitingHumanReview | LoopStatus::Approved | LoopStatus::EvalPassed
+                    LoopStatus::AwaitingHumanReview
+                        | LoopStatus::Approved
+                        | LoopStatus::EvalPassed
+                        | LoopStatus::Promoted
                 ) =>
             {
                 return Err(serde::de::Error::custom(
@@ -489,6 +497,7 @@ impl<'de> Deserialize<'de> for LoopRun {
             candidate_workspace: wire.candidate_workspace,
             human_approval: wire.human_approval,
             eval_report_path: wire.eval_report_path,
+            promotion: wire.promotion,
         })
     }
 }
@@ -585,6 +594,23 @@ pub struct HumanApprovalEvidence {
     pub output_review: ArtifactReference,
     pub output_review_request: ProviderExchangeRecordReference,
     pub output_review_response: ProviderExchangeRecordReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionEvidence {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub reviewer: String,
+    pub promoted_at: String,
+    pub intent: ArtifactReference,
+    pub candidate_diff: ArtifactReference,
+    pub testing_evidence: ArtifactReference,
+    pub eval_report: ArtifactReference,
+    pub policy_decision_digest: String,
+    pub target_head: String,
+    pub eval_passed_run_digest: String,
+    pub eval_passed_updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

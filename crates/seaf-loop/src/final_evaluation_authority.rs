@@ -45,7 +45,7 @@ pub fn load_verified_final_evaluation_authority(
         ));
     }
     let passed = match run.status {
-        LoopStatus::EvalPassed => true,
+        LoopStatus::EvalPassed | LoopStatus::Promoted => true,
         LoopStatus::Failed if run.human_approval.is_some() => false,
         _ => {
             return Err(FinalEvaluationAuthorityError::invalid(
@@ -60,6 +60,22 @@ pub fn load_verified_final_evaluation_authority(
             format_field_errors(run_errors)
         )));
     }
+    let evaluation_run;
+    let run = if run.status == LoopStatus::Promoted {
+        let promotion = run.promotion.as_ref().ok_or_else(|| {
+            FinalEvaluationAuthorityError::invalid("Promoted authority lost promotion evidence")
+        })?;
+        evaluation_run = {
+            let mut predecessor = run.clone();
+            predecessor.status = LoopStatus::EvalPassed;
+            predecessor.updated_at = promotion.eval_passed_updated_at.clone();
+            predecessor.promotion = None;
+            predecessor
+        };
+        &evaluation_run
+    } else {
+        run
+    };
 
     let testing_reference = step_artifact_reference(run, LoopStepName::Testing)?;
     let report_reference = step_artifact_reference(run, LoopStepName::EvalReport)?;

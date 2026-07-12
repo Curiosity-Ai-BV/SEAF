@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -1193,6 +1193,1136 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     assert!(stderr.contains("start a new run"), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), historical_bytes);
     assert_eq!(git_evidence(&repo), source_before);
+}
+
+#[test]
+fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_inert() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: promotion_gate\n      command: printf promotion-ready\n",
+    )
+    .expect("passing eval config");
+    commit_all(&repo, "Configure promotion eval");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-exact-promotion";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let candidate_path = PathBuf::from(
+        evaluated["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let provider_records = evaluated["provider_exchange_records"].clone();
+    let status = seaf_in(&repo)
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("promotion status");
+    assert!(status.status.success(), "{status:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("promotion status JSON");
+    let diff = status["candidate_diff_digest"].as_str().unwrap();
+    let eval_report = status["eval_report_digest"].as_str().unwrap();
+    let head = status["target_head"].as_str().unwrap();
+    assert_eq!(status["status"], "eval_passed");
+    assert_eq!(
+        status["candidate_diff_path"],
+        evaluated["human_approval"]["candidate_diff"]["path"]
+    );
+    assert_eq!(status["eval_report_path"], "artifacts/08-eval-report.json");
+    assert_eq!(status["testing_evidence_path"], "artifacts/07-testing.json");
+    assert_eq!(
+        status["policy_decision_digest"],
+        evaluated["human_approval"]["policy_decision_digest"]
+    );
+    assert_eq!(
+        status["eval_passed_run_digest"],
+        canonical_sha256_digest(&evaluated).unwrap()
+    );
+
+    let source_before = git_evidence(&repo);
+    for (flag, value, expected) in [
+        (
+            "--confirm-candidate-diff",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "candidate diff",
+        ),
+        (
+            "--confirm-eval-report",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "EvalReport",
+        ),
+        (
+            "--confirm-target-head",
+            "0000000000000000000000000000000000000000",
+            "target HEAD",
+        ),
+    ] {
+        let candidate_confirmation = if flag == "--confirm-candidate-diff" {
+            value
+        } else {
+            diff
+        };
+        let eval_confirmation = if flag == "--confirm-eval-report" {
+            value
+        } else {
+            eval_report
+        };
+        let head_confirmation = if flag == "--confirm-target-head" {
+            value
+        } else {
+            head
+        };
+        let mut command = seaf_in(&repo);
+        command.args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "promotion-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            candidate_confirmation,
+            "--confirm-eval-report",
+            eval_confirmation,
+            "--confirm-target-head",
+            head_confirmation,
+        ]);
+        let rejected = command.output().expect("reject stale confirmation");
+        assert!(!rejected.status.success(), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(expected),
+            "{flag}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert_eq!(git_evidence(&repo), source_before, "{flag}");
+        assert_eq!(read_run_json(&run_dir)["status"], "eval_passed", "{flag}");
+    }
+
+    let promoted = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "promotion-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .expect("promote exact candidate");
+    assert!(
+        promoted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&promoted.stdout).expect("promotion report JSON");
+    assert_eq!(report["status"], "promoted");
+    assert_eq!(report["evidence"]["candidate_diff"]["digest"], diff);
+    assert_eq!(report["evidence"]["eval_report"]["digest"], eval_report);
+    assert_eq!(report["evidence"]["target_head"], head);
+    assert!(
+        candidate_path.is_dir(),
+        "promotion must retain the frozen candidate"
+    );
+    let promoted_run = read_run_json(&run_dir);
+    assert_eq!(promoted_run["status"], "promoted");
+    assert_eq!(promoted_run["provider_exchange_records"], provider_records);
+    let _expected_diff = fs::read(
+        run_dir.join(
+            promoted_run["promotion"]["candidate_diff"]["path"]
+                .as_str()
+                .unwrap(),
+        ),
+    )
+    .expect("approved diff bytes");
+    assert_eq!(
+        fs::read(repo.join("examples/local-loop/evals/fake-provider-smoke.txt")).unwrap(),
+        fs::read(candidate_path.join("examples/local-loop/evals/fake-provider-smoke.txt")).unwrap(),
+    );
+    assert!(
+        git_cached_diff_binary(&repo).is_empty(),
+        "promotion stays unstaged"
+    );
+
+    let run_bytes = read_tree_bytes(&run_dir);
+    let source_after = git_evidence(&repo);
+    let cleanup = seaf_in(&repo)
+        .args([
+            "loop",
+            "cleanup",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("Promoted cleanup remains forbidden");
+    assert!(!cleanup.status.success());
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--rerun-from",
+            "output-review",
+            "--json",
+        ])
+        .output()
+        .expect("Promoted provider rerun remains forbidden");
+    assert!(!rerun.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), run_bytes);
+    assert!(candidate_path.is_dir());
+    let retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "promotion-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .expect("retry exact promotion");
+    assert!(retry.status.success(), "{retry:?}");
+    assert_eq!(read_tree_bytes(&run_dir), run_bytes);
+    assert_eq!(git_evidence(&repo), source_after);
+}
+
+#[test]
+fn loop_promote_rejects_dirty_stale_wrong_repo_and_tampered_authority_without_source_mutation() {
+    for case in [
+        "tracked",
+        "staged",
+        "untracked",
+        "ignored",
+        "stale-head",
+        "wrong-repo",
+        "eval-config",
+        "command-log",
+        "candidate-diff",
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        init_git_repo(&repo);
+        fs::write(repo.join(".gitignore"), "ignored-promotion-marker\n").unwrap();
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: promotion_gate\n      command: printf promotion-ready\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure promotion denial fixture");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("promotion-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let evaluated =
+            run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let run_dir = runs_root.join(&run_id);
+        let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let eval_report = evaluated["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == "eval_report")
+            .unwrap()["artifact_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let head = evaluated["human_approval"]["starting_head"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let invocation_repo = if case == "wrong-repo" {
+            let other = temp_dir.path().join("other-repo");
+            fs::create_dir_all(&other).unwrap();
+            init_git_repo(&other);
+            other
+        } else {
+            repo.clone()
+        };
+        match case {
+            "tracked" => fs::write(repo.join("seaf.policy.json"), b"dirty tracked\n").unwrap(),
+            "staged" => {
+                fs::write(repo.join("staged-promotion-marker"), b"dirty\n").unwrap();
+                let add = Command::new("git")
+                    .args(["add", "staged-promotion-marker"])
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap();
+                assert!(add.status.success());
+            }
+            "untracked" => fs::write(repo.join("untracked-promotion-marker"), b"dirty\n").unwrap(),
+            "ignored" => fs::write(repo.join("ignored-promotion-marker"), b"dirty\n").unwrap(),
+            "stale-head" => {
+                fs::write(repo.join("stale-head"), b"new head\n").unwrap();
+                commit_all(&repo, "Move promotion target");
+            }
+            "eval-config" => fs::write(run_dir.join("inputs/eval-config.json"), b"{}\n").unwrap(),
+            "command-log" => {
+                let testing: serde_json::Value = serde_json::from_slice(
+                    &fs::read(run_dir.join("artifacts/07-testing.json")).unwrap(),
+                )
+                .unwrap();
+                let path = testing["checks"][0]["stdout_path"].as_str().unwrap();
+                fs::write(run_dir.join(path), b"tampered log\n").unwrap();
+            }
+            "candidate-diff" => {
+                let path = evaluated["human_approval"]["candidate_diff"]["path"]
+                    .as_str()
+                    .unwrap();
+                fs::write(run_dir.join(path), b"tampered diff\n").unwrap();
+            }
+            "wrong-repo" => {}
+            _ => unreachable!(),
+        }
+        let run_before = read_tree_bytes(&run_dir);
+        let source_before = git_evidence(&repo);
+        let rejected = seaf_in(&invocation_repo)
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                "promotion-reviewer@example.invalid",
+                "--confirm-candidate-diff",
+                &diff,
+                "--confirm-eval-report",
+                &eval_report,
+                "--confirm-target-head",
+                &head,
+                "--json",
+            ])
+            .output()
+            .expect("reject unsafe promotion");
+        assert!(!rejected.status.success(), "{case}: {rejected:?}");
+        assert_eq!(git_evidence(&repo), source_before, "{case}");
+        assert_eq!(read_tree_bytes(&run_dir), run_before, "{case}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn loop_promote_never_executes_unrelated_filters_or_accepts_normalized_extra_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(repo.join("unrelated.txt"), b"canonical\n").unwrap();
+    fs::write(repo.join(".gitattributes"), b"unrelated.txt filter=evil\n").unwrap();
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: filter_free_promotion\n      command: printf ready\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure unrelated filtered path");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "promotion-filter-free";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let reviewer = "filter-reviewer@example.invalid";
+    fs::write(
+        run_dir.join("artifacts/09-promotion.intent.json"),
+        canonical_json_bytes(&promotion_intent_json(&evaluated, reviewer)).unwrap(),
+    )
+    .unwrap();
+    let patch_path = run_dir.join(
+        evaluated["human_approval"]["candidate_diff"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let apply = Command::new("git")
+        .args(["apply", "--whitespace=nowarn", patch_path.to_str().unwrap()])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(apply.status.success(), "{apply:?}");
+    let marker = temp_dir.path().join("filter-executed");
+    let filter = temp_dir.path().join("evil-filter.sh");
+    write_executable_script(
+        &filter,
+        &format!(
+            "#!/bin/sh\nprintf executed > '{}'\nprintf 'canonical\\n'\n",
+            marker.display()
+        ),
+    );
+    for (key, value) in [
+        ("filter.evil.clean", filter.to_str().unwrap()),
+        ("filter.evil.smudge", "cat"),
+        ("filter.evil.required", "true"),
+    ] {
+        let configured = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(configured.status.success());
+    }
+    fs::write(
+        repo.join("unrelated.txt"),
+        b"extra physical bytes hidden by filter\n",
+    )
+    .unwrap();
+    let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+        .as_str()
+        .unwrap();
+    let eval_report = evaluated["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "eval_report")
+        .unwrap()["artifact_digest"]
+        .as_str()
+        .unwrap();
+    let head = evaluated["human_approval"]["starting_head"]
+        .as_str()
+        .unwrap();
+    let before = read_tree_bytes(&run_dir);
+    let rejected = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            reviewer,
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(!marker.exists(), "repository filter helper executed");
+    assert_eq!(
+        fs::read(repo.join("unrelated.txt")).unwrap(),
+        b"extra physical bytes hidden by filter\n"
+    );
+    assert!(repo
+        .join("examples/local-loop/evals/fake-provider-smoke.txt")
+        .exists());
+    assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
+fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_process_crash() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: crash_boundary\n      command: printf ready\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure crash-boundary eval");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "promotion-crash-adoption";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+        .as_str()
+        .unwrap();
+    let eval_report = evaluated["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "eval_report")
+        .unwrap()["artifact_digest"]
+        .as_str()
+        .unwrap();
+    let head = evaluated["human_approval"]["starting_head"]
+        .as_str()
+        .unwrap();
+    let provider_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("provider-exchange.lock"))
+        .expect("provider lock");
+    provider_lock.lock().expect("hold final publication lock");
+
+    let mut command = seaf_in(&repo);
+    command.args([
+        "loop",
+        "promote",
+        "--run-id",
+        run_id,
+        "--runs-root",
+        runs_root.to_str().unwrap(),
+        "--reviewer",
+        "crash-reviewer@example.invalid",
+        "--confirm-candidate-diff",
+        diff,
+        "--confirm-eval-report",
+        eval_report,
+        "--confirm-target-head",
+        head,
+        "--json",
+    ]);
+    let mut child = command
+        .spawn()
+        .expect("start promotion held before state publication");
+    let applied = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
+    for _ in 0..500 {
+        if applied.is_file() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "promotion exited before apply"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        applied.is_file(),
+        "promotion did not reach the source apply boundary"
+    );
+    assert!(
+        run_dir.join("artifacts/09-promotion.intent.json").is_file(),
+        "durable intent must precede source mutation"
+    );
+    assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
+    child.kill().expect("simulate crash after apply");
+    child.wait().expect("reap crashed promotion");
+    provider_lock
+        .unlock()
+        .expect("release final publication lock");
+
+    let interrupted_bytes = fs::read(&applied).unwrap();
+    let retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "crash-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .expect("adopt exact applied patch");
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(fs::read(&applied).unwrap(), interrupted_bytes);
+    assert_eq!(read_run_json(&run_dir)["status"], "promoted");
+}
+
+#[test]
+fn loop_promote_rechecks_intent_while_waiting_for_final_state_publication() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: final_intent_recheck\n      command: printf ready\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure final intent recheck");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "promotion-final-intent-recheck";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let provider_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("provider-exchange.lock"))
+        .unwrap();
+    provider_lock.lock().unwrap();
+    let mut command = seaf_in(&repo);
+    command
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "final-intent-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            evaluated["human_approval"]["candidate_diff"]["digest"]
+                .as_str()
+                .unwrap(),
+            "--confirm-eval-report",
+            evaluated["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["name"] == "eval_report")
+                .unwrap()["artifact_digest"]
+                .as_str()
+                .unwrap(),
+            "--confirm-target-head",
+            evaluated["human_approval"]["starting_head"]
+                .as_str()
+                .unwrap(),
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    let applied = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
+    for _ in 0..500 {
+        if applied.is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(applied.is_file());
+    let intent = run_dir.join("artifacts/09-promotion.intent.json");
+    let mut substituted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&intent).unwrap()).unwrap();
+    substituted["run_id"] = serde_json::json!("substituted-final-run");
+    let replacement = intent.with_extension("replacement");
+    fs::write(&replacement, canonical_json_bytes(&substituted).unwrap()).unwrap();
+    fs::rename(&replacement, &intent).unwrap();
+    provider_lock.unlock().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
+    assert!(
+        applied.is_file(),
+        "exact crash-adoptable source patch remains"
+    );
+}
+
+#[test]
+fn loop_promote_rejects_wrong_run_and_noncanonical_intent_before_source_mutation() {
+    for case in ["noncanonical-time", "wrong-run"] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: intent_validation\n      command: printf ready\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure intent validation");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("promotion-intent-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let evaluated =
+            run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let run_dir = runs_root.join(&run_id);
+        let reviewer = "intent-reviewer@example.invalid";
+        let mut intent = promotion_intent_json(&evaluated, reviewer);
+        match case {
+            "wrong-run" => intent["run_id"] = serde_json::json!("another-run"),
+            "noncanonical-time" => {
+                intent["started_at"] =
+                    serde_json::json!(format!("0{}", evaluated["updated_at"].as_str().unwrap()));
+            }
+            _ => unreachable!(),
+        }
+        fs::write(
+            run_dir.join("artifacts/09-promotion.intent.json"),
+            canonical_json_bytes(&intent).unwrap(),
+        )
+        .unwrap();
+        let source_before = git_evidence(&repo);
+        let run_before = read_tree_bytes(&run_dir);
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                reviewer,
+                "--confirm-candidate-diff",
+                evaluated["human_approval"]["candidate_diff"]["digest"]
+                    .as_str()
+                    .unwrap(),
+                "--confirm-eval-report",
+                evaluated["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|step| step["name"] == "eval_report")
+                    .unwrap()["artifact_digest"]
+                    .as_str()
+                    .unwrap(),
+                "--confirm-target-head",
+                evaluated["human_approval"]["starting_head"]
+                    .as_str()
+                    .unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{case}: {rejected:?}");
+        assert_eq!(git_evidence(&repo), source_before, "{case}");
+        assert_eq!(read_tree_bytes(&run_dir), run_before, "{case}");
+    }
+}
+
+#[test]
+fn loop_promote_excludes_only_its_bound_runtime_inside_the_clean_target() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(repo.join(".gitignore"), ".seaf/loops/runs/\n").unwrap();
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: in_repo_runtime\n      command: printf ready\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure in-repository runtime");
+    let runs_root = repo.join(".seaf/loops/runs");
+    let run_id = "promotion-in-repository-runtime";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+        .as_str()
+        .unwrap();
+    let eval_report = evaluated["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "eval_report")
+        .unwrap()["artifact_digest"]
+        .as_str()
+        .unwrap();
+    let head = evaluated["human_approval"]["starting_head"]
+        .as_str()
+        .unwrap();
+    let sibling = runs_root.join("unrelated-sibling-run/ignored.txt");
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    fs::write(&sibling, b"unrelated ignored runtime bytes\n").unwrap();
+    let rejected = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "runtime-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .expect("reject unrelated ignored runtime sibling");
+    assert!(!rejected.status.success());
+    assert_eq!(
+        read_run_json(&runs_root.join(run_id))["status"],
+        "eval_passed"
+    );
+    fs::remove_dir_all(sibling.parent().unwrap()).unwrap();
+    let promoted = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "runtime-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .expect("promote with bound runtime inside source");
+    assert!(
+        promoted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    assert_eq!(read_run_json(&runs_root.join(run_id))["status"], "promoted");
+}
+
+#[test]
+fn loop_promote_rejects_staged_rename_pair_from_non_runtime_into_bound_runtime() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let run_id = "promotion-staged-rename";
+    let deceptive_source = repo.join(format!("xxx.seaf/loops/runs/{run_id}/outside.txt"));
+    fs::create_dir_all(deceptive_source.parent().unwrap()).unwrap();
+    fs::write(&deceptive_source, b"tracked outside runtime\n").unwrap();
+    fs::write(repo.join(".gitignore"), ".seaf/loops/runs/\n").unwrap();
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: staged_rename_guard\n      command: printf ready\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure staged rename promotion guard");
+    let runs_root = repo.join(".seaf/loops/runs");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let deceptive_destination = run_dir.join("outside.txt");
+    let rename = Command::new("git")
+        .args([
+            "mv",
+            deceptive_source
+                .strip_prefix(&repo)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            deceptive_destination
+                .strip_prefix(&repo)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(rename.status.success(), "{rename:?}");
+    let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+        .as_str()
+        .unwrap();
+    let eval_report = evaluated["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "eval_report")
+        .unwrap()["artifact_digest"]
+        .as_str()
+        .unwrap();
+    let head = evaluated["human_approval"]["starting_head"]
+        .as_str()
+        .unwrap();
+    let run_before = read_tree_bytes(&run_dir);
+    let rejected = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "rename-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(!repo
+        .join("examples/local-loop/evals/fake-provider-smoke.txt")
+        .exists());
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+}
+
+#[test]
+fn loop_promote_revalidates_conflict_and_run_cas_inside_repository_lock_before_apply() {
+    for case in ["patch-conflict", "run-change", "intent-replacement"] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: locked_revalidation\n      command: printf ready\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure locked promotion revalidation");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("promotion-locked-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let evaluated =
+            run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let run_dir = runs_root.join(&run_id);
+        let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+            .as_str()
+            .unwrap();
+        let eval_report = evaluated["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == "eval_report")
+            .unwrap()["artifact_digest"]
+            .as_str()
+            .unwrap();
+        let head = evaluated["human_approval"]["starting_head"]
+            .as_str()
+            .unwrap();
+        let repository_lock_path = find_named_file(
+            &repo.parent().unwrap().join("seaf-test-tmp"),
+            ".repository-operation.lock",
+        );
+        let repository_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(repository_lock_path)
+            .unwrap();
+        repository_lock.lock().unwrap();
+        let mut command = seaf_in(&repo);
+        command
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                "locked-reviewer@example.invalid",
+                "--confirm-candidate-diff",
+                diff,
+                "--confirm-eval-report",
+                eval_report,
+                "--confirm-target-head",
+                head,
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("start blocked promotion");
+        let intent = run_dir.join("artifacts/09-promotion.intent.json");
+        for _ in 0..500 {
+            if intent.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            intent.is_file(),
+            "{case}: intent was not persisted before lock"
+        );
+        let target = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
+        match case {
+            "patch-conflict" => {
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(&target, b"concurrent conflicting bytes\n").unwrap();
+            }
+            "run-change" => {
+                let mut changed = read_run_json(&run_dir);
+                changed["updated_at"] = serde_json::json!("9999999999");
+                fs::write(
+                    run_dir.join("run.json"),
+                    format!("{}\n", serde_json::to_string_pretty(&changed).unwrap()),
+                )
+                .unwrap();
+            }
+            "intent-replacement" => {
+                let mut substituted: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&intent).unwrap()).unwrap();
+                substituted["run_id"] = serde_json::json!("substituted-run");
+                let replacement = intent.with_extension("replacement");
+                fs::write(&replacement, canonical_json_bytes(&substituted).unwrap()).unwrap();
+                fs::rename(&replacement, &intent).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        repository_lock.unlock().unwrap();
+        let output = child.wait_with_output().expect("finish rejected promotion");
+        assert!(!output.status.success(), "{case}");
+        assert_eq!(read_run_json(&run_dir)["status"], "eval_passed", "{case}");
+        if case == "patch-conflict" {
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                b"concurrent conflicting bytes\n"
+            );
+        } else {
+            assert!(
+                !target.exists(),
+                "concurrent run or intent change must precede apply"
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_promote_rejects_historical_failed_and_cleaned_runs_byte_identically() {
+    for case in ["historical", "failed", "cleaned"] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        let command = if case == "failed" { "false" } else { "printf" };
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            format!(
+                "evals:\n  allow_commands: [{command}]\n  required:\n    - name: terminal_denial\n      command: {command}\n"
+            ),
+        )
+        .unwrap();
+        commit_all(&repo, "Configure terminal promotion denial");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("promotion-terminal-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        if case == "failed" {
+            let ticket = fs::read_to_string(&ticket_path)
+                .unwrap()
+                .replace("    - printf", "    - false");
+            fs::write(&ticket_path, ticket).unwrap();
+        }
+        let approved = run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let run_dir = runs_root.join(&run_id);
+        match case {
+            "historical" => {
+                let mut historical = approved;
+                historical["input_digests"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("eval_config");
+                fs::write(
+                    run_dir.join("run.json"),
+                    format!("{}\n", serde_json::to_string_pretty(&historical).unwrap()),
+                )
+                .unwrap();
+            }
+            "failed" => {
+                let resume = seaf_in(&repo)
+                    .args([
+                        "loop",
+                        "resume",
+                        "--run-id",
+                        &run_id,
+                        "--runs-root",
+                        runs_root.to_str().unwrap(),
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(resume.status.success());
+                assert_eq!(read_run_json(&run_dir)["status"], "failed");
+            }
+            "cleaned" => {
+                mark_run_completed_for_cleanup_compatibility(&run_dir);
+                let mut completed = read_run_json(&run_dir);
+                completed.as_object_mut().unwrap().remove("human_approval");
+                fs::write(
+                    run_dir.join("run.json"),
+                    format!("{}\n", serde_json::to_string_pretty(&completed).unwrap()),
+                )
+                .unwrap();
+                let cleanup = seaf_in(&repo)
+                    .args([
+                        "loop",
+                        "cleanup",
+                        "--run-id",
+                        &run_id,
+                        "--runs-root",
+                        runs_root.to_str().unwrap(),
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(cleanup.status.success(), "{cleanup:?}");
+                assert_eq!(
+                    read_run_json(&run_dir)["candidate_workspace"]["lifecycle"],
+                    "cleaned"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let run_before = read_tree_bytes(&run_dir);
+        let source_before = git_evidence(&repo);
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                "terminal-reviewer@example.invalid",
+                "--confirm-candidate-diff",
+                &"f".repeat(64),
+                "--confirm-eval-report",
+                &"e".repeat(64),
+                "--confirm-target-head",
+                "0000000000000000000000000000000000000000",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{case}");
+        assert_eq!(read_tree_bytes(&run_dir), run_before, "{case}");
+        assert_eq!(git_evidence(&repo), source_before, "{case}");
+    }
 }
 
 #[test]
@@ -6706,6 +7836,81 @@ fn run_and_approve_provider_loop(
     approved
 }
 
+fn run_approve_and_evaluate_provider_loop(
+    repo: &Path,
+    ticket_path: &Path,
+    runs_root: &Path,
+    run_id: &str,
+) -> serde_json::Value {
+    run_and_approve_provider_loop(repo, ticket_path, runs_root, run_id);
+    let evaluated = seaf_in(repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("evaluate approved provider loop");
+    assert!(
+        evaluated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&evaluated.stderr)
+    );
+    let run = read_run_json(&runs_root.join(run_id));
+    assert_eq!(run["status"], "eval_passed");
+    run
+}
+
+fn promotion_intent_json(evaluated: &serde_json::Value, reviewer: &str) -> serde_json::Value {
+    let step_reference = |name: &str| {
+        let step = evaluated["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == name)
+            .unwrap();
+        serde_json::json!({
+            "path": step["artifact_path"],
+            "digest": step["artifact_digest"],
+        })
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "run_id": evaluated["run_id"],
+        "reviewer": reviewer,
+        "started_at": evaluated["updated_at"],
+        "candidate_diff": evaluated["human_approval"]["candidate_diff"],
+        "testing_evidence": step_reference("testing"),
+        "eval_report": step_reference("eval_report"),
+        "policy_decision_digest": evaluated["human_approval"]["policy_decision_digest"],
+        "target_head": evaluated["human_approval"]["starting_head"],
+        "eval_passed_run_digest": canonical_sha256_digest(evaluated).unwrap(),
+    })
+}
+
+fn git_cached_diff_binary(root: &Path) -> Vec<u8> {
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("index diff");
+    assert!(output.status.success(), "{output:?}");
+    output.stdout
+}
+
 fn resume_provider_run(
     repo: &Path,
     ticket_path: &Path,
@@ -6753,6 +7958,24 @@ fn read_tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     visit(root, root, &mut files);
     files
+}
+
+fn find_named_file(root: &Path, name: &str) -> PathBuf {
+    let mut matches = Vec::new();
+    fn visit(root: &Path, name: &str, matches: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(root).expect("read lock search directory") {
+            let entry = entry.expect("lock search entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, name, matches);
+            } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+                matches.push(path);
+            }
+        }
+    }
+    visit(root, name, &mut matches);
+    assert_eq!(matches.len(), 1, "expected one {name}: {matches:?}");
+    matches.pop().unwrap()
 }
 
 fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {

@@ -63,6 +63,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
         candidate_workspace: None,
         human_approval: None,
         eval_report_path: None,
+        promotion: None,
     }
 }
 
@@ -134,7 +135,10 @@ fn guard_frozen_authority_direct_write(
 pub(crate) fn is_frozen_review_or_evaluation_authority(run: &LoopRun) -> bool {
     matches!(
         run.status,
-        LoopStatus::AwaitingHumanReview | LoopStatus::Approved | LoopStatus::EvalPassed
+        LoopStatus::AwaitingHumanReview
+            | LoopStatus::Approved
+            | LoopStatus::EvalPassed
+            | LoopStatus::Promoted
     ) || (run.status == LoopStatus::Failed
         && run.current_step == LoopStepName::EvalReport
         && run.human_approval.is_some()
