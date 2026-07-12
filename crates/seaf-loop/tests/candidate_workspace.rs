@@ -81,6 +81,7 @@ fn candidate_plan_is_durable_authority_before_provisioning_creates_the_worktree(
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: digest,
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -121,6 +122,7 @@ fn candidate_authority_versions_are_closed_and_match_the_public_schema() {
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: identity_digest(&source),
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -304,6 +306,7 @@ fn legacy_candidate_authority_is_read_only_and_rejected_before_lock_or_git_mutat
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: identity_digest(&source),
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -402,6 +405,7 @@ fn copied_provisioning_authority_cannot_create_or_adopt_a_crash_remnant() {
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: digest.clone(),
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -466,6 +470,7 @@ fn provisioning_uses_the_persisted_starting_head_instead_of_resnapshotting_sourc
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: digest,
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -501,6 +506,7 @@ fn provisioning_runtime_and_schema_contracts_are_closed() {
             policy: "2".repeat(64),
             config: "3".repeat(64),
             repository: digest,
+            eval_config: None,
         },
     });
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -1395,6 +1401,7 @@ fn candidate_contract_is_closed_and_rust_schema_invariants_stay_aligned() {
             policy: identity_digest(Path::new("policy")),
             config: identity_digest(Path::new("config")),
             repository: digest,
+            eval_config: None,
         },
     });
     run.candidate_workspace = Some(candidate.clone());
@@ -1601,6 +1608,7 @@ fn applying_candidate_patch_transaction_is_closed_and_keeps_parent_evidence_pris
             policy: identity_digest(Path::new("policy")),
             config: identity_digest(Path::new("config")),
             repository: digest,
+            eval_config: None,
         },
     });
     run.candidate_workspace = Some(candidate.clone());
@@ -1750,6 +1758,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     authoritative.policy_decisions.push(
         serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
     );
+    authoritative.input_digests.eval_config = Some("4".repeat(64));
     seaf_loop::state::save_run(&workspace, &authoritative).expect("Development authority");
 
     let applied =
@@ -2312,6 +2321,7 @@ fn persisted_candidate_workspace(
             policy: identity_digest(Path::new("policy")),
             config: identity_digest(Path::new("config")),
             repository: repository.clone(),
+            eval_config: None,
         },
     });
     run.candidate_workspace = Some(planned);
@@ -2379,6 +2389,7 @@ fn prepare_candidate_workspace(
                 policy: "2".repeat(64),
                 config: "3".repeat(64),
                 repository: repository.to_string(),
+                eval_config: None,
             },
         });
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;

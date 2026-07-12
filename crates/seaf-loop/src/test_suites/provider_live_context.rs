@@ -2312,6 +2312,7 @@ fn config(runs_root: &Path, run_id: &str, ticket: &TicketSpec) -> LoopRunnerConf
             policy: "b".repeat(64),
             config: "c".repeat(64),
             repository: "d".repeat(64),
+            eval_config: None,
         },
     )
 }

@@ -153,6 +153,7 @@ fn loop_run_validation_rejects_exchange_gaps_reordering_identity_and_malformed_p
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     let valid = ProviderExchangeRecordReference {
@@ -333,6 +334,7 @@ fn state_append_is_ordered_durable_and_distinguishes_staged_records() {
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save run");
@@ -373,6 +375,7 @@ fn append_transitions_follow_the_prior_parsed_outcome() {
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save run");
@@ -499,6 +502,7 @@ fn a_new_step_group_starts_at_initial_index_one_but_links_the_run_wide_head() {
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save run");
@@ -571,6 +575,7 @@ fn loading_run_state_rejects_tampered_authoritative_exchange_records() {
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save run");
@@ -884,6 +889,7 @@ fn response_cannot_substitute_the_authoritative_request_reference() {
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save");
@@ -1169,6 +1175,7 @@ fn seeded_response_audit_run(
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save");
@@ -1222,6 +1229,7 @@ fn assert_wrong_reviewer_decision_is_terminal(
             policy: digest('b'),
             config: digest('c'),
             repository: digest('d'),
+            eval_config: None,
         },
     });
     seaf_loop::state::save_run(&workspace, &run).expect("save");

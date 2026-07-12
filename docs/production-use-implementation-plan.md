@@ -1137,7 +1137,8 @@ only. No run snapshots, new states, or Approved execution.
 
 ### M1-07b - Immutable Eval Configuration Authority
 
-Status: active. Dependencies: M1-07a (complete).
+Status: complete on 2026-07-12. Dependencies: M1-07a (complete). M1-07c is
+active.
 
 Objective: bind the exact eval program before candidate or provider work so
 later Approved execution never rereads mutable live or candidate YAML.
@@ -1166,7 +1167,7 @@ Commit boundary: immutable eval input authority only. No command execution.
 
 ### M1-07c - Approved Testing And EvalReport Transaction
 
-Status: pending. Dependencies: M1-07b.
+Status: active. Dependencies: M1-07b (complete).
 
 Objective: execute the canonical checks only in the exact Approved candidate
 and durably publish one approval-bound Testing/EvalReport terminal transaction.

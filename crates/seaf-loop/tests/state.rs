@@ -37,6 +37,11 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
         "repository": source.canonicalize().unwrap()
     }))
     .unwrap();
+    let eval_config = seaf_core::parse_eval_config(
+        "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
+    )
+    .unwrap();
+    let eval_config_bytes = seaf_core::canonical_json_bytes(&eval_config).unwrap();
     let digest = |bytes: &[u8]| {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
@@ -52,6 +57,7 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
             policy: digest(&policy_bytes),
             config: digest(&config_bytes),
             repository: digest(&repository_bytes),
+            eval_config: Some(digest(&eval_config_bytes)),
         },
     );
 
@@ -99,6 +105,7 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
             policy: policy_bytes,
             config: config_bytes,
             repository: repository_bytes,
+            eval_config: eval_config_bytes,
             provider_ticket: ticket_bytes,
         })
         .expect("publish exact input set");
@@ -121,6 +128,27 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
         .clone();
     drop(runner);
     git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn isolated_initialization_requires_eval_authority_before_run_directory_creation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runs_root = temp.path().join("runs");
+    let error = InitializedLoopRun::create_isolated(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "missing-eval-authority",
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        temp.path(),
+    )
+    .expect_err("isolated provider authority must include eval config");
+
+    assert!(error.to_string().contains("eval config"), "{error}");
+    assert!(!runs_root.join("missing-eval-authority").exists());
 }
 
 #[test]
@@ -213,6 +241,7 @@ fn input_snapshots_recover_exact_prefix_and_preflight_collision_before_new_publi
         "inputs/policy.json",
         "inputs/config.json",
         "inputs/repository.json",
+        "inputs/eval-config.json",
         "ticket.snapshot.json",
     ] {
         assert!(run_dir.join(relative).is_file(), "missing {relative}");
@@ -230,7 +259,7 @@ fn input_snapshots_recover_exact_prefix_and_preflight_collision_before_new_publi
     let scaffolded = initialized.scaffold().unwrap();
     let run_dir = scaffolded.workspace().run_directory().to_path_buf();
     fs::create_dir(run_dir.join("inputs")).unwrap();
-    fs::write(run_dir.join("inputs/config.json"), b"partial").unwrap();
+    fs::write(run_dir.join("inputs/eval-config.json"), b"partial").unwrap();
     let error = scaffolded
         .publish_authoritative_inputs(snapshots)
         .expect_err("collision must fail before publishing missing snapshots");
@@ -238,12 +267,67 @@ fn input_snapshots_recover_exact_prefix_and_preflight_collision_before_new_publi
     for relative in [
         "inputs/ticket.json",
         "inputs/policy.json",
+        "inputs/config.json",
         "inputs/repository.json",
         "ticket.snapshot.json",
     ] {
         assert!(!run_dir.join(relative).exists(), "unexpected {relative}");
     }
     git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+
+    let (source, initialized, snapshots) = isolated_fixture(temp.path(), "snapshot-hole");
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let scaffolded = initialized.scaffold().unwrap();
+    let run_dir = scaffolded.workspace().run_directory().to_path_buf();
+    fs::create_dir(run_dir.join("inputs")).unwrap();
+    fs::write(run_dir.join("inputs/config.json"), &snapshots.config).unwrap();
+    let before = read_tree_bytes(&run_dir);
+    let error = scaffolded
+        .publish_authoritative_inputs(snapshots)
+        .expect_err("a matching snapshot after a missing entry is not an exact prefix");
+    assert!(error.to_string().contains("exact prefix"), "{error}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn authoritative_eval_snapshot_requires_the_shared_typed_contract() {
+    let temp = tempfile::tempdir().expect("temp");
+    for (run_id, value) in [
+        ("typed-eval-unknown", serde_json::json!({"forged": true})),
+        (
+            "typed-eval-empty-required",
+            serde_json::json!({"evals": {"allow_commands": [], "required": []}}),
+        ),
+    ] {
+        let forged = seaf_core::canonical_json_bytes(&value).unwrap();
+        let (source, initialized, snapshots) =
+            isolated_fixture_with_eval_bytes(temp.path(), run_id, forged);
+        let candidate = initialized
+            .run()
+            .candidate_workspace
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let scaffolded = initialized.scaffold().unwrap();
+        let run_dir = scaffolded.workspace().run_directory().to_path_buf();
+
+        let error = scaffolded
+            .publish_authoritative_inputs(snapshots)
+            .expect_err("generic canonical JSON cannot forge typed eval authority");
+
+        assert!(error.to_string().contains("eval config"), "{error}");
+        assert!(!run_dir.join("inputs").exists());
+        assert!(!run_dir.join("ticket.snapshot.json").exists());
+        git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+    }
 }
 
 #[test]
@@ -441,6 +525,7 @@ fn state_creation_preserves_exact_effective_input_digests() {
         policy: "b".repeat(64),
         config: "c".repeat(64),
         repository: "d".repeat(64),
+        eval_config: None,
     };
 
     let run = create_run(NewLoopRun {
@@ -1279,6 +1364,7 @@ fn test_input_digests() -> LoopInputDigests {
         policy: "b".repeat(64),
         config: "c".repeat(64),
         repository: "d".repeat(64),
+        eval_config: None,
     }
 }
 
@@ -1299,6 +1385,23 @@ fn git_ok(root: &Path, args: &[&str]) {
 fn isolated_fixture(
     root: &Path,
     run_id: &str,
+) -> (
+    std::path::PathBuf,
+    InitializedLoopRun,
+    AuthoritativeRunInputSnapshots,
+) {
+    let eval_config = seaf_core::parse_eval_config(
+        "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
+    )
+    .unwrap();
+    let eval_config = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+    isolated_fixture_with_eval_bytes(root, run_id, eval_config)
+}
+
+fn isolated_fixture_with_eval_bytes(
+    root: &Path,
+    run_id: &str,
+    eval_config: Vec<u8>,
 ) -> (
     std::path::PathBuf,
     InitializedLoopRun,
@@ -1336,6 +1439,7 @@ fn isolated_fixture(
                 policy: digest(&policy),
                 config: digest(&config),
                 repository: digest(&repository),
+                eval_config: Some(digest(&eval_config)),
             },
         ),
         &source,
@@ -1350,6 +1454,7 @@ fn isolated_fixture(
             policy,
             config,
             repository,
+            eval_config,
         },
     )
 }

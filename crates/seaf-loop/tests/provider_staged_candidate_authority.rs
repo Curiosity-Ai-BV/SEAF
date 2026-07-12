@@ -135,12 +135,18 @@ impl Fixture {
         let policy_bytes = canonical_json_bytes(&policy).expect("policy bytes");
         let config_bytes = canonical_json_bytes(&config).expect("config bytes");
         let repository_bytes = canonical_json_bytes(&repository).expect("repository bytes");
+        let eval_config = seaf_core::parse_eval_config(
+            "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
+        )
+        .expect("eval config");
+        let eval_config_bytes = canonical_json_bytes(&eval_config).expect("eval config bytes");
         let snapshots = AuthoritativeRunInputSnapshots {
             ticket: ticket_bytes.clone(),
             provider_ticket: ticket_bytes,
             policy: policy_bytes,
             config: config_bytes,
             repository: repository_bytes,
+            eval_config: eval_config_bytes,
         };
         let runs_root = temp.path().join("runs");
         let initialized = InitializedLoopRun::create_isolated(
@@ -155,6 +161,9 @@ impl Fixture {
                     policy: canonical_sha256_digest(&policy).expect("policy digest"),
                     config: canonical_sha256_digest(&config).expect("config digest"),
                     repository: canonical_sha256_digest(&repository).expect("repository digest"),
+                    eval_config: Some(
+                        canonical_sha256_digest(&eval_config).expect("eval config digest"),
+                    ),
                 },
             ),
             &source,

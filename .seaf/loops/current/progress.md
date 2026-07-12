@@ -27,8 +27,8 @@
 - [x] M1-06a: Stop isolated runs for human review.
 - [x] M1-06b: Record exact human candidate approvals.
 - [x] M1-07a: Reusable controlled eval engine.
-- [ ] M1-07b: Immutable eval configuration authority (active).
-- [ ] M1-07c: Approved Testing and EvalReport transaction.
+- [x] M1-07b: Immutable eval configuration authority.
+- [ ] M1-07c: Approved Testing and EvalReport transaction (active).
 - [ ] M1-08: Promotion integrity.
 - [ ] M1-09: Audited recovery operations.
 - [ ] M1-10: Atomic state and run locking.
@@ -56,8 +56,8 @@
 
 ## Current Gate
 
-M1-06 and M1-07a are complete; M1-07b is active. Public run/status output
-supplies the exact staged-diff digest and target HEAD required by
+M1-06, M1-07a, and M1-07b are complete; M1-07c is active. Public run/status
+output supplies the exact staged-diff digest and target HEAD required by
 `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -70,5 +70,8 @@ loop crate while preserving valid standalone behavior. Every check is planned
 before execution; both allowlists are intersected; candidate-relative cwd and
 executables stay inside the canonical root; output is redacted before its
 persisted cap; and ambiguous log identities fail before filesystem or process
-side effects. M1-07b now binds canonical eval configuration before candidate or
-provider work.
+side effects. M1-07b now requires a normalized repository-root eval path before
+workspace or provider work, reads it through a verified no-follow handle,
+persists canonical typed JSON with a bound digest, and preflights exact snapshot
+prefixes before any resume recovery. Historical runs without this authority
+stay inert. M1-07c now owns the approval-bound Testing/EvalReport transaction.

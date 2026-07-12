@@ -379,6 +379,9 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         "input_digests.repository",
         &run.input_digests.repository,
     );
+    if let Some(eval_config) = &run.input_digests.eval_config {
+        validate_lowercase_sha256_digest(&mut errors, "input_digests.eval_config", eval_config);
+    }
     require_non_empty(&mut errors, "started_at", &run.started_at);
     require_non_empty(&mut errors, "updated_at", &run.updated_at);
 
@@ -2046,6 +2049,7 @@ unexpected_escape: true
 
         assert_eq!(run.run_id, "loop_20260701_001");
         assert_eq!(run.input_digests.repository, "d".repeat(64));
+        assert_eq!(run.input_digests.eval_config, None);
         assert!(validate_loop_run(&run).is_empty());
     }
 
@@ -2522,6 +2526,7 @@ unexpected_escape: true
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
             execution_mode: crate::LoopExecutionMode::IsolatedCandidate,
             status: crate::LoopStatus::Approved,

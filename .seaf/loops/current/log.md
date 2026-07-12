@@ -1542,3 +1542,42 @@ formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
 The first pnpm launcher on `PATH` lacked its managed binary; the exact pinned
 11.7.0 binary from the active Node installation ran the package gate. M1-07a is
 accepted and M1-07b immutable eval configuration authority is active.
+
+## 2026-07-12 implementation | M1-07b immutable eval configuration authority
+
+New provider runs now require `ticket.eval.config` before run-directory,
+candidate, or provider side effects. The portable repository-relative spelling
+rejects empty, absolute, traversal, dot-segment, repeated/trailing separator,
+backslash, colon/drive, control, symlink, missing, directory, non-UTF-8, and
+malformed authority. Supported platforms open the exact file with no-follow,
+bind pre/open/post file identity, and read only from the verified handle; other
+platforms fail closed. The shared typed config is parsed once, serialized as
+canonical JSON at `inputs/eval-config.json`, and bound through an optional
+historical-compatible input digest that is mandatory at every current isolated
+provider entrypoint.
+
+Incomplete resume compares live typed authority and preflights the complete
+intended snapshot set before candidate recovery, scaffold, reconciliation,
+logs, or provider work. Direct isolated resume independently verifies persisted
+canonical digests and typed eval bytes before recovery. Create-only repair now
+accepts only a contiguous missing suffix; interior holes, collisions,
+substitution, noncanonical bytes, forged generic JSON, and digest mismatch stay
+byte-identical failures. Historical Approved runs without eval authority remain
+readable and inert with start-new-run guidance.
+
+Initial spec and quality review found four related gaps: interior snapshot holes
+were silently filled, collision checks occurred after resume mutation, the
+public snapshot seam accepted generic JSON instead of typed EvalConfig, and raw
+path normalization plus an lstat/canonicalize/read race allowed ambiguous or
+replaced authority. Correction REDs reproduced dot-path acceptance, interior
+repair, later-file prefix gaps, and forged canonical JSON. Exact-prefix
+preflight, the redundant direct-resume gate, shared typed validation, raw
+portable checks, and deterministic no-follow replacement proof closed them.
+Both re-reviews approve the result.
+
+Controller verification passes CLI 102 plus the deterministic binary unit,
+core 37, loop 109, state 31, candidate 39, provider candidate 17, provider
+exchange 22, and every remaining Rust/doc-test suite. Strict all-target/all-
+feature Clippy, Rust/Prettier formatting, package lint/typecheck, 8 SDK tests,
+SDK build, and diff checks pass through the pinned pnpm 11.7.0 binary. M1-07b is
+accepted and M1-07c Approved Testing/EvalReport is active.

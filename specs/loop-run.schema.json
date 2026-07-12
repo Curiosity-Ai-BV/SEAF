@@ -34,7 +34,8 @@
         "ticket": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "policy": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "config": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-        "repository": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        "repository": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "eval_config": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       },
       "additionalProperties": false
     },

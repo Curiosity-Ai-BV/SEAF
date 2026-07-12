@@ -69,9 +69,9 @@ pub use role_response::{
     MAX_CONTEXT_REQUEST_REASON_CHARS,
 };
 pub use runner::{
-    validate_human_review_execution_barrier, validate_rerun_eligibility,
-    AuthoritativeRunInputSnapshots, InitializedLoopRun, LoopRunner, LoopRunnerConfig,
-    PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
+    preflight_authoritative_run_inputs, validate_human_review_execution_barrier,
+    validate_rerun_eligibility, AuthoritativeRunInputSnapshots, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
 };
 pub use seaf_core::ArtifactReference;
 pub use workspace::{LoopWorkspace, WorkspaceError};

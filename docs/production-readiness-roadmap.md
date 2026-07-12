@@ -180,12 +180,14 @@ The engine extraction is complete: shared typed configuration and controlled
 planning/execution preserve valid standalone behavior, preflight all checks,
 intersect both allowlists, confine candidate-relative execution paths, redact
 before the persisted output cap, and reject ambiguous log identities without
-side effects. Immutable eval authority is active. The candidate is still not
-executable until the complete controlled eval boundary lands, and it is not
-promotable before M1-08. Human approval authorizes local execution under the
-developer account: SEAF validates command configuration and detects repository
-drift, but it does not contain approved code from malicious same-user filesystem
-access.
+side effects. Immutable eval authority is also complete: new provider runs
+require a normalized repository-root config, bind its canonical typed bytes and
+digest, and preflight an exact snapshot prefix before resume recovery. The
+approved Testing/EvalReport transaction is active. The candidate is still not
+executable until that boundary lands, and it is not promotable before M1-08.
+Human approval authorizes local execution under the developer account: SEAF
+validates command configuration and detects repository drift, but it does not
+contain approved code from malicious same-user filesystem access.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

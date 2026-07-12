@@ -218,6 +218,7 @@ pub struct AuthoritativeRunInputSnapshots {
     pub policy: Vec<u8>,
     pub config: Vec<u8>,
     pub repository: Vec<u8>,
+    pub eval_config: Vec<u8>,
     pub provider_ticket: Vec<u8>,
 }
 
@@ -226,6 +227,11 @@ impl InitializedLoopRun {
         config: LoopRunnerConfig,
         source_worktree_root: &Path,
     ) -> Result<Self, RunnerError> {
+        if config.input_digests.eval_config.is_none() {
+            return Err(RunnerError::Step(
+                "isolated provider run requires an authoritative eval config digest".to_string(),
+            ));
+        }
         let workspace = LoopWorkspace::create_minimal(&config.runs_root, &config.run_id)?;
         let result =
             Self::create_isolated_in_workspace(workspace.clone(), config, source_worktree_root);
@@ -299,6 +305,12 @@ impl InitializedLoopRun {
                     .to_string(),
             ));
         }
+        if verified_run.input_digests.eval_config.is_none() {
+            return Err(RunnerError::Step(
+                "isolated provider run has no authoritative eval config; start a new run"
+                    .to_string(),
+            ));
+        }
         validate_human_review_execution_barrier(&verified_run)?;
         let workspace = LoopWorkspace::open_minimal(runs_root, &verified_run.run_id)?;
         let persisted = state::load_run_before_provider_reconciliation(&workspace)?;
@@ -307,6 +319,7 @@ impl InitializedLoopRun {
                 "persisted run changed before candidate recovery".to_string(),
             ));
         }
+        preflight_persisted_authoritative_snapshot_prefix(&workspace, &persisted)?;
         let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
             RunnerError::Step("isolated run has no candidate authority".to_string())
         })?;
@@ -505,7 +518,53 @@ fn ensure_authoritative_run_inputs(
     run: &LoopRun,
     snapshots: &AuthoritativeRunInputSnapshots,
 ) -> Result<(), RunnerError> {
-    let entries = [
+    validate_authoritative_run_input_payloads(run, snapshots)?;
+    preflight_authoritative_snapshot_prefix(workspace, run, snapshots)?;
+
+    let inputs = workspace.run_directory().join("inputs");
+    if !inputs.exists() {
+        fs::create_dir(&inputs).map_err(|error| RunnerError::Step(error.to_string()))?;
+    }
+    fs::File::open(workspace.run_directory())
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| RunnerError::Step(error.to_string()))?;
+    for (name, bytes, _) in authoritative_run_input_entries(run, snapshots)? {
+        crate::immutable_artifact::publish_create_only(workspace.run_directory(), name, bytes)
+            .map_err(|error| {
+                RunnerError::Step(format!("failed to publish authoritative {name}: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+pub fn preflight_authoritative_run_inputs(
+    runs_root: &Path,
+    verified_run: &LoopRun,
+    snapshots: &AuthoritativeRunInputSnapshots,
+) -> Result<(), RunnerError> {
+    let workspace = LoopWorkspace::open_minimal(runs_root, &verified_run.run_id)?;
+    let persisted = state::load_run_before_provider_reconciliation(&workspace)?;
+    if persisted != *verified_run {
+        return Err(RunnerError::Step(
+            "persisted run changed before authoritative input preflight".to_string(),
+        ));
+    }
+    validate_authoritative_run_input_payloads(&persisted, snapshots)?;
+    preflight_authoritative_snapshot_prefix(&workspace, &persisted, snapshots)
+}
+
+type AuthoritativeRunInputEntry<'a> = (&'static str, &'a Vec<u8>, &'a String);
+
+fn authoritative_run_input_entries<'a>(
+    run: &'a LoopRun,
+    snapshots: &'a AuthoritativeRunInputSnapshots,
+) -> Result<[AuthoritativeRunInputEntry<'a>; 6], RunnerError> {
+    let eval_config_digest = run.input_digests.eval_config.as_ref().ok_or_else(|| {
+        RunnerError::Step(
+            "isolated provider run has no authoritative eval config digest".to_string(),
+        )
+    })?;
+    Ok([
         (
             "inputs/ticket.json",
             &snapshots.ticket,
@@ -527,12 +586,46 @@ fn ensure_authoritative_run_inputs(
             &run.input_digests.repository,
         ),
         (
+            "inputs/eval-config.json",
+            &snapshots.eval_config,
+            eval_config_digest,
+        ),
+        (
             "ticket.snapshot.json",
             &snapshots.provider_ticket,
             &run.input_digests.ticket,
         ),
-    ];
-    for (name, bytes, expected_digest) in entries {
+    ])
+}
+
+fn validate_authoritative_run_input_payloads(
+    run: &LoopRun,
+    snapshots: &AuthoritativeRunInputSnapshots,
+) -> Result<(), RunnerError> {
+    let eval_config: seaf_core::EvalConfig = serde_json::from_slice(&snapshots.eval_config)
+        .map_err(|error| {
+            RunnerError::Step(format!(
+                "authoritative inputs/eval-config.json is not a typed eval config: {error}"
+            ))
+        })?;
+    seaf_core::validate_eval_config(&eval_config).map_err(|error| {
+        RunnerError::Step(format!(
+            "authoritative inputs/eval-config.json is not a valid eval config: {error}"
+        ))
+    })?;
+    let typed_bytes = seaf_core::canonical_json_bytes(&eval_config).map_err(|error| {
+        RunnerError::Step(format!(
+            "authoritative inputs/eval-config.json cannot be canonicalized: {error}"
+        ))
+    })?;
+    if typed_bytes != snapshots.eval_config {
+        return Err(RunnerError::Step(
+            "authoritative inputs/eval-config.json bytes are not canonical typed eval config"
+                .to_string(),
+        ));
+    }
+
+    for (name, bytes, expected_digest) in authoritative_run_input_entries(run, snapshots)? {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             RunnerError::Step(format!("authoritative {name} is not JSON: {error}"))
         })?;
@@ -560,7 +653,14 @@ fn ensure_authoritative_run_inputs(
             "provider ticket snapshot differs from the authoritative ticket".to_string(),
         ));
     }
+    Ok(())
+}
 
+fn preflight_authoritative_snapshot_prefix(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    snapshots: &AuthoritativeRunInputSnapshots,
+) -> Result<(), RunnerError> {
     let inputs = workspace.run_directory().join("inputs");
     match fs::symlink_metadata(&inputs) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -572,7 +672,8 @@ fn ensure_authoritative_run_inputs(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(RunnerError::Step(error.to_string())),
     }
-    for (name, bytes, _) in entries {
+    let mut missing_suffix_started = false;
+    for (name, bytes, _) in authoritative_run_input_entries(run, snapshots)? {
         let path = workspace.run_directory().join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -582,6 +683,12 @@ fn ensure_authoritative_run_inputs(
                 )));
             }
             Ok(_) => {
+                if missing_suffix_started {
+                    return Err(RunnerError::Step(format!(
+                        "authoritative snapshots are not an exact prefix: {} exists after a missing entry",
+                        path.display()
+                    )));
+                }
                 if fs::read(&path).map_err(|error| RunnerError::Step(error.to_string()))? != *bytes
                 {
                     return Err(RunnerError::Step(format!(
@@ -590,22 +697,103 @@ fn ensure_authoritative_run_inputs(
                     )));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_suffix_started = true;
+            }
             Err(error) => return Err(RunnerError::Step(error.to_string())),
         }
     }
+    Ok(())
+}
 
-    if !inputs.exists() {
-        fs::create_dir(&inputs).map_err(|error| RunnerError::Step(error.to_string()))?;
+fn preflight_persisted_authoritative_snapshot_prefix(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<(), RunnerError> {
+    let eval_config_digest = run.input_digests.eval_config.as_ref().ok_or_else(|| {
+        RunnerError::Step(
+            "isolated provider run has no authoritative eval config digest".to_string(),
+        )
+    })?;
+    let entries = [
+        ("inputs/ticket.json", &run.input_digests.ticket),
+        ("inputs/policy.json", &run.input_digests.policy),
+        ("inputs/config.json", &run.input_digests.config),
+        ("inputs/repository.json", &run.input_digests.repository),
+        ("inputs/eval-config.json", eval_config_digest),
+        ("ticket.snapshot.json", &run.input_digests.ticket),
+    ];
+    let inputs = workspace.run_directory().join("inputs");
+    match fs::symlink_metadata(&inputs) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(RunnerError::Step(
+                "authoritative input directory is not a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(RunnerError::Step(error.to_string())),
     }
-    fs::File::open(workspace.run_directory())
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| RunnerError::Step(error.to_string()))?;
-    for (name, bytes, _) in entries {
-        crate::immutable_artifact::publish_create_only(workspace.run_directory(), name, bytes)
-            .map_err(|error| {
-                RunnerError::Step(format!("failed to publish authoritative {name}: {error}"))
-            })?;
+
+    let mut missing_suffix_started = false;
+    for (relative, expected_digest) in entries {
+        let path = workspace.run_directory().join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(RunnerError::Step(format!(
+                    "authoritative snapshot collision at {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                if missing_suffix_started {
+                    return Err(RunnerError::Step(format!(
+                        "authoritative snapshots are not an exact prefix: {} exists after a missing entry",
+                        path.display()
+                    )));
+                }
+                let bytes =
+                    fs::read(&path).map_err(|error| RunnerError::Step(error.to_string()))?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    RunnerError::Step(format!("authoritative {relative} is not JSON: {error}"))
+                })?;
+                if seaf_core::canonical_json_bytes(&value)
+                    .map_err(|error| RunnerError::Step(error.to_string()))?
+                    != bytes
+                    || seaf_core::canonical_sha256_digest(&value)
+                        .map_err(|error| RunnerError::Step(error.to_string()))?
+                        != *expected_digest
+                {
+                    return Err(RunnerError::Step(format!(
+                        "authoritative snapshot collision at {}",
+                        path.display()
+                    )));
+                }
+                if relative == "inputs/eval-config.json" {
+                    let eval_config: seaf_core::EvalConfig = serde_json::from_slice(&bytes)
+                        .map_err(|error| {
+                            RunnerError::Step(format!(
+                                "authoritative eval config is not typed: {error}"
+                            ))
+                        })?;
+                    seaf_core::validate_eval_config(&eval_config).map_err(|error| {
+                        RunnerError::Step(format!("authoritative eval config is invalid: {error}"))
+                    })?;
+                    if seaf_core::canonical_json_bytes(&eval_config)
+                        .map_err(|error| RunnerError::Step(error.to_string()))?
+                        != bytes
+                    {
+                        return Err(RunnerError::Step(
+                            "authoritative eval config is not canonical typed input".to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_suffix_started = true;
+            }
+            Err(error) => return Err(RunnerError::Step(error.to_string())),
+        }
     }
     Ok(())
 }

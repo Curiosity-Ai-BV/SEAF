@@ -1,9 +1,17 @@
 use std::{
     collections::BTreeMap,
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io::{self, Read},
+    path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode},
     time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::{
+    MetadataExt as WindowsMetadataExt, OpenOptionsExt as WindowsOpenOptionsExt,
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -18,11 +26,12 @@ use seaf_core::{
 use seaf_loop::{
     approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
     evaluate_zero_tolerance, execute_eval_checks, load_agent_bench_fixture, plan_eval_checks,
-    validate_human_review_execution_barrier, validate_rerun_eligibility, AgentBenchSummary,
-    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
-    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
-    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    preflight_authoritative_run_inputs, validate_human_review_execution_barrier,
+    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
+    CandidateCleanupOutcome, ContextLimits, ContextPackRequest, EvalCheckExecution,
+    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
+    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
+    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -829,6 +838,7 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
         args.json,
     )?;
     let repository_identity = current_repository_identity(&repository_root)?;
+    let eval_config = load_authoritative_eval_config(&repository_root, &ticket)?;
     ensure_clean_git_worktree(args.allow_dirty)?;
     let run = match args.provider.as_str() {
         "fake" => {
@@ -849,6 +859,7 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     policy: &effective_inputs.policy,
                     project_config: &effective_inputs.config,
                     repository_identity: &repository_identity,
+                    eval_config: &eval_config,
                 },
                 &args.provider,
                 &provider,
@@ -870,6 +881,7 @@ fn run_loop(args: LoopRunArgs) -> Result<(), CliFailure> {
                     policy: &effective_inputs.policy,
                     project_config: &effective_inputs.config,
                     repository_identity: &repository_identity,
+                    eval_config: &eval_config,
                 },
                 &args.provider,
                 &provider,
@@ -968,6 +980,11 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_provider_timeout(args.timeout_ms)?;
     let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
     validate_human_review_execution_barrier(&existing).map_err(loop_runner_failure)?;
+    if existing.status == LoopStatus::Approved && existing.input_digests.eval_config.is_none() {
+        return Err(CliFailure::message(
+            "approved historical run has no authoritative eval config; start a new run".to_string(),
+        ));
+    }
     let rerun_from = args
         .rerun_from
         .as_deref()
@@ -992,6 +1009,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
             args.json,
         )?;
         let repository_identity = current_repository_identity(&repository_root)?;
+        let eval_config = load_authoritative_eval_config(&repository_root, &ticket)?;
         validate_resume_ticket_identity(&existing, &ticket)?;
         verify_resume_current_digests(
             &existing,
@@ -999,7 +1017,17 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
             &effective_inputs.policy,
             &effective_inputs.config,
             &repository_identity,
+            &eval_config,
         )?;
+        let snapshots = authoritative_input_snapshots(
+            &ticket,
+            &effective_inputs.policy,
+            &effective_inputs.config,
+            &repository_identity,
+            &eval_config,
+        )?;
+        preflight_authoritative_run_inputs(&args.runs_root, &existing, &snapshots)
+            .map_err(loop_runner_failure)?;
         let initialized = match rerun_from {
             Some(step) => {
                 InitializedLoopRun::resume_isolated_for_rerun(&args.runs_root, existing, step)
@@ -1009,12 +1037,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         .map_err(loop_runner_failure)?;
         let scaffolded = initialized.scaffold().map_err(loop_runner_failure)?;
         let prepared = scaffolded
-            .publish_authoritative_inputs(authoritative_input_snapshots(
-                &ticket,
-                &effective_inputs.policy,
-                &effective_inputs.config,
-                &repository_identity,
-            )?)
+            .publish_authoritative_inputs(snapshots)
             .map_err(loop_runner_failure)?;
         let provider_name = prepared.run().provider.clone();
         let ticket = ticket.clone();
@@ -1041,6 +1064,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         policy: &effective_inputs.policy,
                         project_config: &effective_inputs.config,
                         repository_identity: &repository_identity,
+                        eval_config: &eval_config,
                     },
                     prepared,
                     &provider,
@@ -1064,6 +1088,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         policy: &effective_inputs.policy,
                         project_config: &effective_inputs.config,
                         repository_identity: &repository_identity,
+                        eval_config: &eval_config,
                     },
                     prepared,
                     &provider,
@@ -1270,6 +1295,7 @@ struct ProviderLoopConfig<'a> {
     policy: &'a Policy,
     project_config: &'a ProjectConfig,
     repository_identity: &'a RepositoryIdentity,
+    eval_config: &'a AuthoritativeEvalConfig,
 }
 
 fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
@@ -1284,6 +1310,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         policy,
         project_config,
         config.repository_identity,
+        Some(config.eval_config),
     )?;
     let runner_config = LoopRunnerConfig::for_ticket(
         config.runs_root,
@@ -1310,6 +1337,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
             policy,
             project_config,
             config.repository_identity,
+            config.eval_config,
         )?)
         .map_err(loop_runner_failure)?;
     let context_request = provider_context_request(&candidate_root, config.ticket, policy);
@@ -1563,11 +1591,223 @@ fn repository_relative_path(
     Ok(relative.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
+#[derive(Debug, Clone)]
+struct AuthoritativeEvalConfig {
+    bytes: Vec<u8>,
+    digest: String,
+}
+
+fn load_authoritative_eval_config(
+    repository_root: &Path,
+    ticket: &TicketSpec,
+) -> Result<AuthoritativeEvalConfig, CliFailure> {
+    load_authoritative_eval_config_with_hook(repository_root, ticket, || Ok(()))
+}
+
+fn load_authoritative_eval_config_with_hook<F>(
+    repository_root: &Path,
+    ticket: &TicketSpec,
+    before_open: F,
+) -> Result<AuthoritativeEvalConfig, CliFailure>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let configured = ticket.eval.as_ref().ok_or_else(|| {
+        CliFailure::message(
+            "ticket.eval.config is required for provider-backed loop runs".to_string(),
+        )
+    })?;
+    let raw = configured.config.as_str();
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw.contains("//")
+        || raw.contains('\\')
+        || raw.contains(':')
+        || raw.chars().any(char::is_control)
+        || raw
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(CliFailure::message(
+            "ticket.eval.config must be a normalized portable repository-relative '/' path"
+                .to_string(),
+        ));
+    }
+    let relative = Path::new(raw);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(CliFailure::message(
+            "ticket.eval.config must be a normalized repository-relative path without traversal"
+                .to_string(),
+        ));
+    }
+
+    let candidate = repository_root.join(relative);
+    let prevalidated = inspect_eval_config_path(repository_root, relative)?;
+    let canonical = candidate.canonicalize().map_err(|error| {
+        CliFailure::message(format!(
+            "could not canonicalize ticket.eval.config {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.starts_with(repository_root) || canonical != candidate {
+        return Err(CliFailure::message(format!(
+            "ticket.eval.config {} does not name its exact repository file",
+            candidate.display()
+        )));
+    }
+    before_open().map_err(|error| {
+        CliFailure::message(format!(
+            "ticket.eval.config pre-open check failed for {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    let mut file = open_eval_config_no_follow(&canonical).map_err(|error| {
+        CliFailure::message(format!(
+            "could not safely open ticket.eval.config {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        CliFailure::message(format!(
+            "could not inspect opened ticket.eval.config {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    if !opened.is_file() || !same_eval_config_file_identity(&prevalidated, &opened) {
+        return Err(CliFailure::message(format!(
+            "ticket.eval.config {} changed before its authoritative handle was opened",
+            canonical.display()
+        )));
+    }
+    let revalidated = inspect_eval_config_path(repository_root, relative)?;
+    if !same_eval_config_file_identity(&opened, &revalidated) {
+        return Err(CliFailure::message(format!(
+            "ticket.eval.config {} changed while its authoritative handle was opened",
+            canonical.display()
+        )));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| {
+        CliFailure::message(format!(
+            "could not read ticket.eval.config {} as UTF-8: {error}",
+            canonical.display()
+        ))
+    })?;
+    let parsed = seaf_core::parse_eval_config(&text)
+        .map_err(|error| CliFailure::message(format!("invalid ticket.eval.config: {error}")))?;
+    let bytes = canonical_json_bytes(&parsed).map_err(|error| {
+        CliFailure::message(format!(
+            "could not canonicalize ticket.eval.config: {error}"
+        ))
+    })?;
+    let digest = canonical_sha256_digest(&parsed).map_err(|error| {
+        CliFailure::message(format!("could not digest ticket.eval.config: {error}"))
+    })?;
+    Ok(AuthoritativeEvalConfig { bytes, digest })
+}
+
+fn inspect_eval_config_path(
+    repository_root: &Path,
+    relative: &Path,
+) -> Result<fs::Metadata, CliFailure> {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut candidate = repository_root.to_path_buf();
+    let mut final_metadata = None;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(CliFailure::message(
+                "ticket.eval.config must be a normalized repository-relative path without traversal"
+                    .to_string(),
+            ));
+        };
+        candidate.push(component);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+            CliFailure::message(format!(
+                "could not resolve ticket.eval.config {}: {error}",
+                candidate.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliFailure::message(format!(
+                "ticket.eval.config {} must not use a symlink alias",
+                candidate.display()
+            )));
+        }
+        if index + 1 == components.len() {
+            if !metadata.is_file() {
+                return Err(CliFailure::message(format!(
+                    "ticket.eval.config {} is not a real regular file",
+                    candidate.display()
+                )));
+            }
+            final_metadata = Some(metadata);
+        } else if !metadata.is_dir() {
+            return Err(CliFailure::message(format!(
+                "ticket.eval.config parent {} is not a real directory",
+                candidate.display()
+            )));
+        }
+    }
+    final_metadata
+        .ok_or_else(|| CliFailure::message("ticket.eval.config must not be empty".to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn open_eval_config_no_follow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(0x100);
+    options.open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_eval_config_no_follow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(0x20_000);
+    options.open(path)
+}
+
+#[cfg(target_os = "windows")]
+fn open_eval_config_no_follow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(0x0020_0000);
+    options.open(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn open_eval_config_no_follow(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure eval config opening is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn same_eval_config_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(target_os = "windows")]
+fn same_eval_config_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn same_eval_config_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
 fn current_input_digests<T: Serialize, R: Serialize>(
     ticket: &TicketSpec,
     policy: &Policy,
     project_config: &T,
     repository_identity: &R,
+    eval_config: Option<&AuthoritativeEvalConfig>,
 ) -> Result<LoopInputDigests, CliFailure> {
     Ok(LoopInputDigests {
         ticket: canonical_sha256_digest(ticket).map_err(canonical_digest_failure("ticket"))?,
@@ -1576,6 +1816,7 @@ fn current_input_digests<T: Serialize, R: Serialize>(
             .map_err(canonical_digest_failure("config"))?,
         repository: canonical_sha256_digest(repository_identity)
             .map_err(canonical_digest_failure("repository identity"))?,
+        eval_config: eval_config.map(|authority| authority.digest.clone()),
     })
 }
 
@@ -1585,9 +1826,15 @@ fn verify_resume_current_digests(
     policy: &Policy,
     project_config: &ProjectConfig,
     repository_identity: &RepositoryIdentity,
+    eval_config: &AuthoritativeEvalConfig,
 ) -> Result<(), CliFailure> {
-    let current_digests =
-        current_input_digests(ticket, policy, project_config, repository_identity)?;
+    let current_digests = current_input_digests(
+        ticket,
+        policy,
+        project_config,
+        repository_identity,
+        Some(eval_config),
+    )?;
     verify_current_digest("ticket", &run.input_digests.ticket, &current_digests.ticket)?;
     verify_current_digest("policy", &run.input_digests.policy, &current_digests.policy)?;
     verify_current_digest("config", &run.input_digests.config, &current_digests.config)?;
@@ -1595,6 +1842,19 @@ fn verify_resume_current_digests(
         "repository",
         &run.input_digests.repository,
         &current_digests.repository,
+    )?;
+    let persisted_eval = run.input_digests.eval_config.as_deref().ok_or_else(|| {
+        CliFailure::message(
+            "resume run has no authoritative eval config digest; start a new run".to_string(),
+        )
+    })?;
+    verify_current_digest(
+        "eval config",
+        persisted_eval,
+        current_digests
+            .eval_config
+            .as_deref()
+            .expect("current provider inputs include eval config"),
     )?;
 
     Ok(())
@@ -1605,6 +1865,7 @@ fn authoritative_input_snapshots(
     policy: &Policy,
     project_config: &ProjectConfig,
     repository_identity: &RepositoryIdentity,
+    eval_config: &AuthoritativeEvalConfig,
 ) -> Result<AuthoritativeRunInputSnapshots, CliFailure> {
     let ticket = canonical_json_bytes(ticket).map_err(|error| {
         CliFailure::message(format!("could not serialize effective ticket: {error}"))
@@ -1621,6 +1882,7 @@ fn authoritative_input_snapshots(
         repository: canonical_json_bytes(repository_identity).map_err(|error| {
             CliFailure::message(format!("could not serialize repository identity: {error}"))
         })?,
+        eval_config: eval_config.bytes.clone(),
     })
 }
 
@@ -1998,7 +2260,13 @@ fn start_deterministic_loop_to_completion(
         ticket,
         provider.to_string(),
         model.to_string(),
-        current_input_digests(ticket, &policy, &no_project_config, &repository_identity)?,
+        current_input_digests(
+            ticket,
+            &policy,
+            &no_project_config,
+            &repository_identity,
+            None,
+        )?,
     );
     let mut runner = LoopRunner::start(config, &mut step_runner).map_err(loop_runner_failure)?;
     let run = runner
@@ -2715,5 +2983,63 @@ impl CliFailure {
         if let Some(message) = &self.message {
             eprintln!("{message}");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn eval_authority_rejects_a_symlink_replacement_at_the_pre_open_cut() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repository_root = temp.path().join("repo");
+        fs::create_dir(&repository_root).expect("repository root");
+        let eval_path = repository_root.join("seaf.evals.yaml");
+        let outside = temp.path().join("outside.evals.yaml");
+        let config = "evals:\n  allow_commands: [cargo]\n  required:\n    - name: tests\n      command: cargo test\n";
+        fs::write(&eval_path, config).expect("eval config");
+        fs::write(&outside, config).expect("outside eval config");
+        let ticket = TicketSpec {
+            ticket_id: "T-EVAL-SWAP".to_string(),
+            goal_id: "bind-eval-authority".to_string(),
+            title: "Bind eval authority".to_string(),
+            status: TicketStatus::Ready,
+            priority: TicketPriority::P1,
+            problem: "The opened file must be the prevalidated file.".to_string(),
+            research_questions: Vec::new(),
+            context: TicketContext {
+                relevant_files: Vec::new(),
+                forbidden_files: Vec::new(),
+            },
+            autonomy: TicketAutonomy {
+                level: 1,
+                apply_patch: false,
+                allow_shell_commands: vec!["cargo".to_string()],
+            },
+            acceptance_criteria: vec!["Reject replacement.".to_string()],
+            eval: Some(seaf_core::TicketEval {
+                config: "seaf.evals.yaml".to_string(),
+            }),
+        };
+
+        let error = load_authoritative_eval_config_with_hook(
+            &repository_root.canonicalize().unwrap(),
+            &ticket,
+            || {
+                fs::remove_file(&eval_path)?;
+                symlink(&outside, &eval_path)
+            },
+        )
+        .expect_err("replacement must not become authoritative");
+
+        assert!(
+            error
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("safely open")),
+            "{error:?}"
+        );
     }
 }

@@ -26,6 +26,7 @@ fn production_provider_constructor_rejects_fresh_legacy_loop_without_side_effect
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         ),
         &mut runner,

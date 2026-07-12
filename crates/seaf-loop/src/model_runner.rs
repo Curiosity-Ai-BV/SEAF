@@ -795,11 +795,17 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 "provider context and patch roots must both equal the active candidate".to_string(),
             ));
         }
+        let eval_config_digest = run.input_digests.eval_config.as_ref().ok_or_else(|| {
+            RunnerError::Step(
+                "isolated provider run has no authoritative eval config digest".to_string(),
+            )
+        })?;
         for (relative, expected) in [
             ("inputs/ticket.json", &run.input_digests.ticket),
             ("inputs/policy.json", &run.input_digests.policy),
             ("inputs/config.json", &run.input_digests.config),
             ("inputs/repository.json", &run.input_digests.repository),
+            ("inputs/eval-config.json", eval_config_digest),
             ("ticket.snapshot.json", &run.input_digests.ticket),
         ] {
             let bytes = crate::immutable_artifact::read_verified_regular_file(
@@ -2789,6 +2795,7 @@ mod live_context_cap_tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         crate::state::save_run(&workspace, &run).expect("save");
@@ -2951,6 +2958,7 @@ mod live_context_cap_tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         crate::state::save_run(&workspace, &run).expect("save run");

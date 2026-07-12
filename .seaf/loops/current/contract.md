@@ -44,20 +44,22 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-07b - Immutable eval configuration authority. For every new provider run,
-resolve `ticket.eval.config` before run-directory, candidate, or provider work
-as a real regular file contained by the authoritative repository root. Reject
-absolute, traversal, backslash-ambiguous, missing, malformed, and symlink-escape
-authority without side effects. Parse the shared typed config once,
-canonicalize it to JSON, publish it create-only as `inputs/eval-config.json`,
-and bind its digest in the run input contract. Keep the new digest optional only
-for historical deserialization; new provider runs require it. Incomplete resume
-must compare live authority with the bound digest. Historical Approved runs
-without this authority remain byte-identical, execute no command, and instruct
-the user to start a new run; never backfill from mutable live or candidate YAML.
-Do not execute checks, add eval terminal states, publish Testing/EvalReport
-evidence, promote, or contact a model beyond the existing pre-eval provider
-workflow in this slice.
-
-Next, M1-07c executes one approval-bound Testing/EvalReport transaction from the
-canonical ticket and eval snapshots inside the exact candidate.
+M1-07c - Approved Testing and EvalReport transaction. `seaf loop resume` on an
+exact Approved run must execute only the canonical ticket and eval snapshots in
+the exact candidate, without a model call. Preflight every check and both
+allowlists before intent or execution. Under candidate authority, reauthenticate
+the human approval, current OutputReview/provider chain, exact policy decision,
+source HEAD/tree, candidate staged diff, and physical workspace immediately
+before commands and again before final publication. Publish a create-only
+execution intent before the first command so an interrupted attempt never
+silently replays side effects. Publish indexed create-only redacted logs,
+canonical Testing evidence, and a backward-compatible EvalReport binding the
+run, ticket/config digests, candidate diff, approval, policy decision, and
+Testing artifact. After those artifacts are durable, use candidate-to-provider
+lock order and full-state compare-and-swap to publish the Testing/EvalReport
+step results, `eval_report_path`, and terminal `eval_passed` or reported `failed`
+together. Direct provider Testing/EvalReport,
+unapproved or historical runs, substitutions, failed checks, timeout, source or
+candidate drift, and partial prior attempts must never claim eval success.
+Preserve the source checkout; do not promote, commit, merge, deploy, or contact
+a model in Testing/EvalReport.

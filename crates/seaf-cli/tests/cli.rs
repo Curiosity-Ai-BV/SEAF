@@ -1055,6 +1055,35 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     assert!(String::from_utf8_lossy(&resume.stdout).contains("Testing has not run"));
     assert_eq!(read_tree_bytes(&run_dir), approved_bytes);
     assert_eq!(git_evidence(&repo), source_before);
+
+    let mut historical = read_run_json(&run_dir);
+    historical["input_digests"]
+        .as_object_mut()
+        .unwrap()
+        .remove("eval_config");
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&historical).unwrap(),
+    )
+    .unwrap();
+    let historical_bytes = read_tree_bytes(&run_dir);
+    let historical_resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("historical approved resume is rejected inertly");
+    assert!(!historical_resume.status.success());
+    let stderr = String::from_utf8(historical_resume.stderr).unwrap();
+    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), historical_bytes);
+    assert_eq!(git_evidence(&repo), source_before);
 }
 
 #[test]
@@ -1741,6 +1770,195 @@ fn loop_run_persists_canonical_effective_inputs_and_matching_digests() {
         run["input_digests"]["repository"],
         canonical_sha256_digest(&repository_identity).expect("repository identity digest")
     );
+}
+
+#[test]
+fn provider_loop_requires_and_binds_canonical_repository_eval_config_before_workspace_creation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+
+    let missing_eval_ticket = write_provider_loop_ticket_without_eval(temp_dir.path(), false);
+    let missing = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            missing_eval_ticket.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "missing-eval-authority",
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run without eval config");
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("ticket.eval.config"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(!runs_root.join("missing-eval-authority").exists());
+
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        r#"evals:
+  required:
+    - command: cargo test
+      name: tests
+  allow_commands:
+    - cargo
+"#,
+    )
+    .expect("write eval config");
+    let ticket_path =
+        write_provider_loop_ticket_with_eval_config(temp_dir.path(), "seaf.evals.yaml", false);
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "bound-eval-authority",
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with eval config");
+    assert!(output.status.success(), "{output:?}");
+
+    let run_dir = runs_root.join("bound-eval-authority");
+    let snapshot = fs::read(run_dir.join("inputs/eval-config.json")).expect("eval snapshot");
+    let parsed = seaf_core::parse_eval_config(
+        &fs::read_to_string(repo.join("seaf.evals.yaml")).expect("eval yaml"),
+    )
+    .expect("parse eval config");
+    let expected = canonical_json_bytes(&parsed).expect("canonical eval config");
+    assert_eq!(snapshot, expected);
+    let run = read_run_json(&run_dir);
+    assert_eq!(
+        run["input_digests"]["eval_config"],
+        canonical_sha256_digest(&parsed).expect("eval config digest")
+    );
+
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        r#"evals:
+  allow_commands:
+    - cargo
+  required:
+    - name: tests
+      command: cargo test
+"#,
+    )
+    .expect("rewrite equivalent eval config");
+    let reordered = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            "reordered-eval-authority",
+            "--allow-dirty",
+            "--json",
+        ])
+        .output()
+        .expect("run with reordered eval config");
+    assert!(reordered.status.success(), "{reordered:?}");
+    let reordered_dir = runs_root.join("reordered-eval-authority");
+    assert_eq!(
+        fs::read(reordered_dir.join("inputs/eval-config.json")).unwrap(),
+        snapshot
+    );
+    assert_eq!(
+        read_run_json(&reordered_dir)["input_digests"]["eval_config"],
+        run["input_digests"]["eval_config"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_loop_rejects_unsafe_or_invalid_eval_authority_without_side_effects() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(repo.join("malformed.yaml"), "evals: [").expect("malformed eval config");
+    fs::create_dir(repo.join("eval-dir")).expect("eval directory");
+    fs::create_dir(repo.join("sub")).expect("subdirectory");
+    fs::copy(repo.join("seaf.evals.yaml"), repo.join("sub/eval.yaml")).expect("sub eval config");
+    fs::create_dir(repo.join("C:")).expect("drive-like directory");
+    fs::copy(repo.join("seaf.evals.yaml"), repo.join("C:/eval.yaml"))
+        .expect("drive-like eval config");
+    fs::copy(repo.join("seaf.evals.yaml"), repo.join("bad\u{1}path.yaml"))
+        .expect("control-character eval config");
+    let outside = temp_dir.path().join("outside.yaml");
+    fs::write(
+        &outside,
+        "evals:\n  required:\n    - name: tests\n      command: cargo test\n",
+    )
+    .expect("outside eval config");
+    symlink(&outside, repo.join("eval-link.yaml")).expect("eval symlink");
+    let absolute = outside.to_str().unwrap().to_string();
+    let cases = [
+        ("empty", r#""""#),
+        ("absolute", absolute.as_str()),
+        ("traversal", "../outside.yaml"),
+        ("backslash", "sub\\eval.yaml"),
+        ("symlink", "eval-link.yaml"),
+        ("missing", "missing.yaml"),
+        ("directory", "eval-dir"),
+        ("malformed", "malformed.yaml"),
+        ("dot-segment", "sub/./eval.yaml"),
+        ("repeated-slash", "sub//eval.yaml"),
+        ("trailing-slash", "seaf.evals.yaml/"),
+        ("control", r#""bad\x01path.yaml""#),
+        ("drive-prefix", "C:/eval.yaml"),
+    ];
+    let runs_root = repo.join("runs");
+    for (case, configured) in cases {
+        fs::create_dir(temp_dir.path().join(case)).expect("ticket fixture directory");
+        let ticket = write_provider_loop_ticket_with_eval_config(
+            &temp_dir.path().join(case),
+            configured,
+            false,
+        );
+        let output = seaf_in(&repo)
+            .args([
+                "loop",
+                "run",
+                "--ticket",
+                ticket.to_str().unwrap(),
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--run-id",
+                case,
+                "--allow-dirty",
+                "--json",
+            ])
+            .output()
+            .expect("run with invalid eval authority");
+        assert!(!output.status.success(), "{case}: {output:?}");
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostic.contains("eval.config"), "{case}: {diagnostic}");
+        assert!(!runs_root.join(case).exists(), "{case} created workspace");
+    }
 }
 
 #[test]
@@ -2815,6 +3033,103 @@ fn loop_resume_rejects_mutated_same_path_policy_before_any_side_effect() {
 }
 
 #[test]
+fn loop_resume_rejects_mutated_eval_config_before_candidate_or_provider_side_effects() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-mutated-eval-config";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let original_eval = fs::read_to_string(repo.join("seaf.evals.yaml")).expect("original eval");
+    let base_url = start_fake_ollama_server_sequence(provider_loop_model_responses());
+    let run = seaf_in(&repo)
+        .args([
+            "loop",
+            "run",
+            "--ticket",
+            ticket_path.to_str().unwrap(),
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--provider",
+            "ollama",
+            "--model",
+            "mocked-ollama",
+            "--base-url",
+            &base_url,
+            "--allow-dirty",
+        ])
+        .output()
+        .expect("start eval-bound run");
+    assert!(run.status.success(), "{run:?}");
+
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [cargo]\n  required:\n    - name: changed\n      command: cargo check\n",
+    )
+    .expect("mutate eval config");
+    let before = read_tree_bytes(&run_dir);
+    let candidate = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let candidate_before = git_evidence(&candidate);
+    let (probe, probe_url) = provider_call_probe();
+    let resume = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--base-url", &probe_url],
+    );
+
+    assert!(!resume.status.success(), "{resume:?}");
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("eval config") && stderr.contains("start a new run"),
+        "{stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(git_evidence(&candidate), candidate_before);
+    assert_no_provider_call(&probe);
+
+    fs::write(repo.join("seaf.evals.yaml"), &original_eval).expect("restore eval config");
+    fs::write(repo.join("alternate.evals.yaml"), &original_eval).expect("alternate eval config");
+    let substituted_ticket = temp_dir.path().join("substituted-eval-path-ticket.yaml");
+    fs::write(
+        &substituted_ticket,
+        fs::read_to_string(&ticket_path)
+            .unwrap()
+            .replace("config: seaf.evals.yaml", "config: alternate.evals.yaml"),
+    )
+    .expect("substitute eval config path");
+    let before_path_substitution = read_tree_bytes(&run_dir);
+    let candidate_before_path_substitution = git_evidence(&candidate);
+    let (path_probe, path_probe_url) = provider_call_probe();
+    let path_resume = resume_provider_run(
+        &repo,
+        &substituted_ticket,
+        &runs_root,
+        run_id,
+        &["--base-url", &path_probe_url],
+    );
+    assert!(!path_resume.status.success(), "{path_resume:?}");
+    let stderr = String::from_utf8(path_resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("ticket") && stderr.contains("start a new run"),
+        "{stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before_path_substitution);
+    assert_eq!(git_evidence(&candidate), candidate_before_path_substitution);
+    assert_no_provider_call(&path_probe);
+}
+
+#[test]
 fn loop_resume_rejects_mutated_config_even_when_effective_policy_is_unchanged() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
@@ -2860,8 +3175,14 @@ fn loop_resume_rejects_mutated_config_even_when_effective_policy_is_unchanged() 
 }
 
 #[test]
-fn loop_resume_repairs_missing_input_but_rejects_noncanonical_collision() {
-    for case in ["missing-policy", "noncanonical-config"] {
+fn loop_resume_rejects_snapshot_holes_and_noncanonical_collisions() {
+    for case in [
+        "missing-policy",
+        "noncanonical-config",
+        "missing-eval",
+        "noncanonical-eval",
+        "substituted-eval",
+    ] {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let repo = temp_dir.path().join("repo");
         fs::create_dir_all(&repo).expect("repo dir");
@@ -2872,41 +3193,53 @@ fn loop_resume_repairs_missing_input_but_rejects_noncanonical_collision() {
         run_fake_provider(&repo, &ticket_path, &runs_root, case, &[]);
         let run_dir = runs_root.join(case);
         mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
-        let removed = match case {
+        match case {
             "missing-policy" => {
                 let path = run_dir.join("inputs/policy.json");
-                let bytes = fs::read(&path).unwrap();
                 fs::remove_file(path).expect("remove policy snapshot");
-                Some(bytes)
             }
             "noncanonical-config" => {
                 let path = run_dir.join("inputs/config.json");
                 let mut bytes = fs::read(&path).expect("config snapshot");
                 bytes.push(b'\n');
                 fs::write(path, bytes).expect("tamper config snapshot");
-                None
+            }
+            "missing-eval" => {
+                let path = run_dir.join("inputs/eval-config.json");
+                fs::remove_file(path).expect("remove eval config snapshot");
+            }
+            "noncanonical-eval" => {
+                let path = run_dir.join("inputs/eval-config.json");
+                let mut bytes = fs::read(&path).expect("eval config snapshot");
+                bytes.push(b'\n');
+                fs::write(path, bytes).expect("tamper eval config snapshot");
+                fs::remove_file(run_dir.join("context-manifest.json"))
+                    .expect("remove scaffold suffix marker");
+            }
+            "substituted-eval" => {
+                let path = run_dir.join("inputs/eval-config.json");
+                let bytes = canonical_json_bytes(&serde_json::json!({
+                    "evals": {
+                        "allow_commands": ["cargo"],
+                        "required": [{"name": "substituted", "command": "cargo check"}]
+                    }
+                }))
+                .unwrap();
+                fs::write(path, bytes).expect("substitute eval config snapshot");
             }
             _ => unreachable!(),
-        };
+        }
         let before = read_tree_bytes(&run_dir);
 
         let resume = resume_provider_run(&repo, &ticket_path, &runs_root, case, &[]);
 
-        if let Some(expected) = removed {
-            assert!(resume.status.success(), "{resume:?}");
-            assert_eq!(
-                fs::read(run_dir.join("inputs/policy.json")).unwrap(),
-                expected
-            );
-        } else {
-            assert!(!resume.status.success(), "{resume:?}");
-            let stderr = String::from_utf8(resume.stderr).expect("stderr");
-            assert!(
-                stderr.contains("collision"),
-                "noncanonical snapshot must collide: {stderr}"
-            );
-            assert_eq!(read_tree_bytes(&run_dir), before);
-        }
+        assert!(!resume.status.success(), "{resume:?}");
+        let stderr = String::from_utf8(resume.stderr).expect("stderr");
+        assert!(
+            stderr.contains("collision") || stderr.contains("exact prefix"),
+            "noncanonical snapshot must collide: {stderr}"
+        );
+        assert_eq!(read_tree_bytes(&run_dir), before);
     }
 }
 
@@ -2938,6 +3271,38 @@ fn loop_resume_rejects_input_digest_mismatch_without_mutation() {
     assert!(
         stderr.contains("policy digest") && stderr.contains("start a new run"),
         "run digest mismatch must be actionable, got {stderr}"
+    );
+    assert_eq!(read_tree_bytes(&run_dir), before);
+}
+
+#[test]
+fn loop_resume_rejects_eval_snapshot_digest_mismatch_without_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    let runs_root = repo.join("runs");
+    let run_id = "resume-eval-digest-mismatch";
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_analysis(&run_dir.join("run.json"));
+    let mut run = read_run_json(&run_dir);
+    run["input_digests"]["eval_config"] = serde_json::json!("0".repeat(64));
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&run).expect("serialize run"),
+    )
+    .expect("write mismatched eval digest");
+    let before = read_tree_bytes(&run_dir);
+
+    let resume = resume_provider_run(&repo, &ticket_path, &runs_root, run_id, &[]);
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).expect("stderr");
+    assert!(
+        stderr.contains("eval config digest") && stderr.contains("start a new run"),
+        "{stderr}"
     );
     assert_eq!(read_tree_bytes(&run_dir), before);
 }
@@ -5492,6 +5857,10 @@ fn agent_bench_fixture_path() -> PathBuf {
 }
 
 fn write_provider_loop_ticket(root: &Path, apply_patch: bool) -> PathBuf {
+    write_provider_loop_ticket_with_eval_config(root, "seaf.evals.yaml", apply_patch)
+}
+
+fn write_provider_loop_ticket_without_eval(root: &Path, apply_patch: bool) -> PathBuf {
     let ticket_path = root.join(if apply_patch {
         "provider-loop-apply-ticket.yaml"
     } else {
@@ -5523,6 +5892,18 @@ acceptance_criteria:
         ),
     )
     .expect("write provider loop ticket");
+    ticket_path
+}
+
+fn write_provider_loop_ticket_with_eval_config(
+    root: &Path,
+    eval_config: &str,
+    apply_patch: bool,
+) -> PathBuf {
+    let ticket_path = write_provider_loop_ticket_without_eval(root, apply_patch);
+    let mut ticket = fs::read_to_string(&ticket_path).expect("read provider loop ticket");
+    ticket.push_str(&format!("eval:\n  config: {eval_config}\n"));
+    fs::write(&ticket_path, ticket).expect("write provider loop ticket eval config");
     ticket_path
 }
 
@@ -5778,6 +6159,8 @@ autonomy:
     - printf
 acceptance_criteria:
   - "Provider-backed loop execution records real policy evidence."
+eval:
+  config: seaf.evals.yaml
 "#,
     )
     .expect("write provider loop mutated same-identity ticket");
@@ -5807,6 +6190,8 @@ autonomy:
     - printf
 acceptance_criteria:
   - "Provider-backed loop execution records real policy evidence."
+eval:
+  config: seaf.evals.yaml
 "#,
     )
     .expect("write provider loop mismatch ticket");
@@ -5842,6 +6227,8 @@ autonomy:
     - printf
 acceptance_criteria:
   - "Provider-backed loop execution records real policy evidence."
+eval:
+  config: seaf.evals.yaml
 "#
         ),
     )
@@ -6192,8 +6579,24 @@ fn init_git_repo(path: &Path) {
         templates::DEFAULT_POLICY_JSON,
     )
     .expect("write root test policy");
+    fs::write(
+        path.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [cargo]\n  required:\n    - name: tests\n      command: cargo test\n",
+    )
+    .expect("write root test eval config");
+    fs::create_dir_all(path.join("examples/local-loop")).expect("local loop eval directory");
+    fs::write(
+        path.join("examples/local-loop/seaf.evals.yaml"),
+        "evals:\n  allow_commands: [cargo test]\n  required:\n    - name: local_loop_smoke\n      command: cargo test -p seaf-core validate_eval_report --quiet\n",
+    )
+    .expect("write local loop test eval config");
     let add = Command::new("git")
-        .args(["add", "seaf.policy.json"])
+        .args([
+            "add",
+            "seaf.policy.json",
+            "seaf.evals.yaml",
+            "examples/local-loop/seaf.evals.yaml",
+        ])
         .current_dir(path)
         .output()
         .expect("git add test policy");

@@ -1769,6 +1769,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
@@ -2030,6 +2031,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         state::save_run(&workspace, &run).expect("initial run");
@@ -2102,6 +2104,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         state::save_run(&workspace, &run).expect("initial run");
@@ -2174,6 +2177,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         authoritative.status = LoopStatus::Completed;
@@ -2273,6 +2277,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         state::save_run(&workspace, &run).expect("initial run");
@@ -2403,6 +2408,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         state::save_run(&workspace, &run).expect("initial run");
@@ -2444,6 +2450,7 @@ mod tests {
                 policy: "b".repeat(64),
                 config: "c".repeat(64),
                 repository: "d".repeat(64),
+                eval_config: None,
             },
         });
         state::mark_step_running(&mut previous, LoopStepName::Research).expect("running");

@@ -1631,6 +1631,10 @@ fn fixture(run_id: &str) -> Fixture {
     let policy = policy();
     let config = serde_json::json!({"policy_path":"seaf.policy.json"});
     let repository = serde_json::json!({"source":source.canonicalize().unwrap()});
+    let eval_config = seaf_core::parse_eval_config(
+        "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
+    )
+    .unwrap();
     let ticket_bytes = canonical_json_bytes(&ticket).unwrap();
     let policy_bytes = canonical_json_bytes(&policy).unwrap();
     let config_bytes = canonical_json_bytes(&config).unwrap();
@@ -1648,6 +1652,7 @@ fn fixture(run_id: &str) -> Fixture {
                 policy: canonical_sha256_digest(&policy).unwrap(),
                 config: canonical_sha256_digest(&config).unwrap(),
                 repository: canonical_sha256_digest(&repository).unwrap(),
+                eval_config: Some(canonical_sha256_digest(&eval_config).unwrap()),
             },
         ),
         &source,
@@ -1663,6 +1668,7 @@ fn fixture(run_id: &str) -> Fixture {
             policy: policy_bytes,
             config: config_bytes,
             repository: repository_bytes,
+            eval_config: canonical_json_bytes(&eval_config).unwrap(),
         })
         .unwrap();
     Fixture {
@@ -1690,6 +1696,13 @@ fn authoritative_snapshots(
             .unwrap(),
         repository: canonical_json_bytes(
             &serde_json::json!({"source":source.canonicalize().unwrap()}),
+        )
+        .unwrap(),
+        eval_config: canonical_json_bytes(
+            &seaf_core::parse_eval_config(
+                "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
+            )
+            .unwrap(),
         )
         .unwrap(),
     }

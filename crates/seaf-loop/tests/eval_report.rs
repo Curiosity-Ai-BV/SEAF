@@ -108,6 +108,7 @@ fn passing_run(ticket: &TicketSpec) -> seaf_core::LoopRun {
             policy: "b".repeat(64),
             config: "c".repeat(64),
             repository: "d".repeat(64),
+            eval_config: None,
         },
     });
     for step in &mut run.steps {

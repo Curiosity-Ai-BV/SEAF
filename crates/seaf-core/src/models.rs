@@ -646,6 +646,8 @@ pub struct LoopInputDigests {
     pub policy: String,
     pub config: String,
     pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_config: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

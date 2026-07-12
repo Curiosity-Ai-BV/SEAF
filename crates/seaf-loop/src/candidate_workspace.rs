@@ -3135,6 +3135,7 @@ mod tests {
                     policy: "2".repeat(64),
                     config: "3".repeat(64),
                     repository: identity.clone(),
+                    eval_config: None,
                 },
             });
             run.execution_mode = LoopExecutionMode::IsolatedCandidate;
@@ -3324,6 +3325,7 @@ mod tests {
                 policy: "2".repeat(64),
                 config: "3".repeat(64),
                 repository,
+                eval_config: None,
             },
         });
         run.execution_mode = LoopExecutionMode::IsolatedCandidate;
@@ -3787,6 +3789,7 @@ mod tests {
                 policy: "2".repeat(64),
                 config: "3".repeat(64),
                 repository: repository_identity_digest.clone(),
+                eval_config: None,
             },
         });
         run.candidate_workspace = Some(planned);
@@ -3902,6 +3905,7 @@ mod tests {
                 policy: "2".repeat(64),
                 config: "3".repeat(64),
                 repository: repository_identity_digest.clone(),
+                eval_config: None,
             },
         });
         run.candidate_workspace = Some(planned);
@@ -4199,6 +4203,41 @@ mod tests {
         applied.cleanup();
     }
 
+    #[test]
+    fn isolated_resume_rejects_historical_missing_eval_authority_without_mutation() {
+        let historical = application_fixture("resume-missing-eval-authority");
+        let mut run = crate::state::load_run(&historical.workspace).expect("historical run");
+        run.input_digests.eval_config = None;
+        crate::state::save_run(&historical.workspace, &run).expect("historical state");
+        let before_run = fs::read(historical.workspace.run_file()).expect("run bytes");
+        let before_candidate = git_text(
+            Path::new(&historical.candidate.path),
+            &["status", "--porcelain=v1"],
+        )
+        .expect("candidate status");
+
+        let error = crate::runner::InitializedLoopRun::resume_isolated(
+            historical.workspace.run_directory().parent().unwrap(),
+            run,
+        )
+        .expect_err("historical incomplete authority must not be backfilled");
+
+        assert!(error.to_string().contains("start a new run"), "{error}");
+        assert_eq!(
+            fs::read(historical.workspace.run_file()).expect("unchanged run"),
+            before_run
+        );
+        assert_eq!(
+            git_text(
+                Path::new(&historical.candidate.path),
+                &["status", "--porcelain=v1"]
+            )
+            .expect("candidate status"),
+            before_candidate
+        );
+        historical.cleanup();
+    }
+
     struct ApplicationFixture {
         _temp: tempfile::TempDir,
         source: PathBuf,
@@ -4254,6 +4293,7 @@ mod tests {
                 policy: "2".repeat(64),
                 config: "3".repeat(64),
                 repository: repository_identity_digest.clone(),
+                eval_config: Some("4".repeat(64)),
             },
         });
         run.candidate_workspace = Some(planned);
