@@ -25,7 +25,7 @@ use seaf_core::{
 };
 use seaf_loop::{
     approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
-    evaluate_zero_tolerance, execute_approved_evaluation, execute_eval_checks,
+    evaluate_zero_tolerance, execute_approved_evaluation, execute_eval_checks, inspect_loop_run,
     load_agent_bench_fixture, plan_eval_checks, preflight_authoritative_run_inputs,
     promote_evaluated_candidate, validate_human_review_execution_barrier,
     validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
@@ -154,6 +154,8 @@ enum LoopCommand {
     Run(LoopRunArgs),
     /// Print persisted loop run status.
     Status(LoopStatusArgs),
+    /// Inspect persisted loop authority without changing it.
+    Inspect(LoopInspectArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
     /// Approve the exact reviewed candidate for future Testing.
@@ -290,6 +292,19 @@ struct LoopRunArgs {
 
 #[derive(Debug, Args)]
 struct LoopStatusArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopInspectArgs {
     /// Run ID under --runs-root.
     #[arg(long)]
     run_id: String,
@@ -606,6 +621,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Status(args),
         } => loop_status(args),
+        Command::Loop {
+            command: LoopCommand::Inspect(args),
+        } => loop_inspect(args),
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
@@ -956,6 +974,113 @@ fn loop_status(args: LoopStatusArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
     let run = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
     finish_loop_command("status", &args.runs_root, &run, args.json)
+}
+
+fn loop_inspect(args: LoopInspectArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let report = inspect_loop_run(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("loop inspection failed: {error}")))?;
+    if args.json {
+        return print_json(&report);
+    }
+
+    println!(
+        "loop inspect {}: status {}, current step {:?}",
+        report.run_id,
+        loop_status_label(report.status),
+        report.current_step
+    );
+    println!("canonical run digest: {}", report.run_digest);
+    println!("integrity: {:?}", report.integrity);
+    println!(
+        "bounds: provider attempts {}/{}; provider exchanges {}/{}; artifact history {}/{}; evaluation prefix {}/{}; integrity messages {}/{}; ambiguity messages {}/{}",
+        report.provider_attempts.len(),
+        report.bounds.provider_attempts_total,
+        report.bounds.provider_exchanges_total - report.bounds.provider_exchanges_truncated,
+        report.bounds.provider_exchanges_total,
+        report.bounds.artifact_history_total - report.bounds.artifact_history_truncated,
+        report.bounds.artifact_history_total,
+        report.evaluation_prefix.len(),
+        report.bounds.evaluation_prefix_total,
+        report.bounds.integrity_messages_total - report.bounds.integrity_messages_truncated,
+        report.bounds.integrity_messages_total,
+        report.bounds.ambiguity_messages_total - report.bounds.ambiguity_messages_truncated,
+        report.bounds.ambiguity_messages_total,
+    );
+    println!("immutable inputs:");
+    for (name, input) in &report.input_digests {
+        println!(
+            "  {name}: {} ({:?}, {})",
+            input.digest, input.verification, input.path
+        );
+    }
+    if let Some(candidate) = &report.candidate {
+        println!(
+            "candidate: {:?}, recorded head {}, recorded tree {}, recorded diff {} ({:?})",
+            candidate.lifecycle,
+            candidate.recorded_current_head,
+            candidate.recorded_current_tree,
+            candidate.recorded_diff_digest,
+            candidate.verification
+        );
+        println!(
+            "candidate observed: head {:?}, staged diff {:?}",
+            candidate.observed_head, candidate.observed_staged_diff_digest
+        );
+        println!(
+            "candidate start: head {}, tree {}; patch phase {:?}",
+            candidate.starting_head, candidate.starting_tree, candidate.patch_phase
+        );
+    }
+    println!("steps:");
+    for step in &report.steps {
+        println!(
+            "  {:?}: {:?}, artifact {:?} {:?}",
+            step.name, step.status, step.artifact_path, step.artifact_digest
+        );
+        for artifact in &step.artifact_history {
+            println!(
+                "    attempt {}: {} ({:?})",
+                artifact.attempt, artifact.path, artifact.classification
+            );
+        }
+    }
+    println!(
+        "provider attempts: showing {} of {}",
+        report.provider_attempts.len(),
+        report.bounds.provider_attempts_total
+    );
+    for attempt in &report.provider_attempts {
+        println!("  {:?} attempt {}:", attempt.step, attempt.attempt);
+        for exchange in &attempt.exchanges {
+            println!(
+                "    exchange {} {:?}/{:?}: outcome {:?}, head {}, {:?}",
+                exchange.exchange_index,
+                exchange.kind,
+                exchange.phase,
+                exchange.outcome,
+                exchange.ledger_head,
+                exchange.verification
+            );
+        }
+    }
+    println!(
+        "evaluation prefix: showing {} of {}",
+        report.evaluation_prefix.len(),
+        report.bounds.evaluation_prefix_total
+    );
+    for entry in &report.evaluation_prefix {
+        println!("  {} ({:?})", entry.path, entry.classification);
+    }
+    for message in &report.integrity_messages {
+        println!("integrity message: {message}");
+    }
+    for message in &report.ambiguity_messages {
+        println!("ambiguity message: {message}");
+    }
+    println!("run directory: {}", report.run_directory);
+    println!("run file: {}", report.run_file);
+    Ok(())
 }
 
 fn cleanup_loop(args: LoopCleanupArgs) -> Result<(), CliFailure> {

@@ -766,10 +766,7 @@ fn resume_rejects_a_skipped_conventional_prompt_attempt_before_any_exchange_writ
     let error = LoopRunner::resume(&runs_root, run_id, &mut resumed_runner)
         .expect_err("skipped attempt must fail preflight");
 
-    assert!(
-        error.to_string().contains("expected recovery attempt 1"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("skipped attempt"), "{error}");
     assert!(provider.requests().is_empty());
     assert_eq!(snapshot_tree(&run_directory), before);
     assert!(!run_directory
@@ -954,10 +951,7 @@ fn explicit_rerun_rejects_orphaned_skipped_conventional_history_before_authoriza
         .rerun_from(LoopStepName::Research)
         .expect_err("skipped rerun attempt must reject");
 
-    assert!(
-        error.to_string().contains("exact next durable attempt 2"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("skipped attempt"), "{error}");
     assert!(provider.requests().is_empty());
     assert_eq!(snapshot_tree(&run_directory), before);
     assert!(!run_directory

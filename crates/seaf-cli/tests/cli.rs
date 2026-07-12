@@ -4402,12 +4402,11 @@ fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tamp
     )
     .expect("write interrupted run");
 
+    let exact_output_review = provider_loop_model_responses()
+        .pop()
+        .expect("OutputReview response");
     let (resume_url, captured) =
-        start_recording_fake_ollama_server_sequence(vec![reviewer_response(
-            "output_reviewer",
-            "approve_for_tests",
-            "Recovered exact durable request.",
-        )]);
+        start_recording_fake_ollama_server_sequence(vec![exact_output_review]);
     let resume = seaf_in(&repo)
         .args([
             "loop",
@@ -4595,7 +4594,7 @@ fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_ch
     fs::write(&context_path, "changed live repository bytes\n").expect("mutate repository");
     let mut resume_responses = vec![agent_response(
         "researcher",
-        "Recovered research.",
+        "Research complete.",
         "Continue.",
     )];
     resume_responses.extend(provider_loop_model_responses().into_iter().skip(1));
@@ -5718,6 +5717,429 @@ fn loop_smoke_produces_json_artifacts_without_ollama() {
     assert!(human.status.success());
     let stdout = String::from_utf8(human.stdout).unwrap();
     assert!(stdout.contains("status Completed"), "{stdout}");
+}
+
+#[test]
+fn loop_inspect_is_factual_and_byte_identical_in_json_and_human_modes() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "inspect-provider-run";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    fs::write(
+        run_dir.join("artifacts/07-testing.attempt-002.json"),
+        b"historical testing evidence",
+    )
+    .expect("historical testing prefix");
+    fs::write(
+        run_dir.join("artifacts/08-eval-report.json"),
+        b"historical eval prefix",
+    )
+    .expect("historical eval prefix");
+    let before = read_tree_bytes(&run_dir);
+    let persisted = read_run_json(&run_dir);
+    let candidate = PathBuf::from(persisted["candidate_workspace"]["path"].as_str().unwrap());
+    let candidate_before = read_tree_bytes(&candidate);
+    let source_before = git_evidence(&repo);
+
+    let json = seaf_in(&repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("inspect JSON");
+    assert!(json.status.success(), "{json:?}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(read_tree_bytes(&candidate), candidate_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("inspect report");
+    assert_eq!(report["command"], "inspect");
+    assert_eq!(report["run_id"], run_id);
+    assert_eq!(report["integrity"], "verified");
+    assert!(report["run_digest"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+    assert_eq!(report["candidate"]["lifecycle"], "active");
+    assert!(report["input_digests"]["ticket"]["verification"] == "verified");
+    assert!(report["provider_attempts"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+    assert_eq!(report["evaluation_prefix"].as_array().unwrap().len(), 2);
+    assert_eq!(report["steps"][0]["artifact_history"][0]["attempt"], 1);
+    assert_eq!(
+        report["steps"][0]["artifact_history"][0]["classification"],
+        "current"
+    );
+    let rendered = String::from_utf8(json.stdout).unwrap();
+    for secret in [
+        "Research complete.",
+        "Analyze the repository",
+        "raw_response",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "inspect leaked provider body: {secret}"
+        );
+    }
+
+    let human = seaf_in(&repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inspect human");
+    assert!(human.status.success(), "{human:?}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert_eq!(read_tree_bytes(&candidate), candidate_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("canonical run digest"), "{human}");
+    assert!(human.contains("provider attempts"), "{human}");
+    assert!(human.contains("evaluation prefix"), "{human}");
+    assert!(!human.contains("Research complete."), "{human}");
+}
+
+#[test]
+fn loop_inspect_reports_bounded_tamper_classifications_without_repair_or_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "inspect-tampered-run";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    fs::write(run_dir.join("inputs/ticket.json"), b"tampered input").unwrap();
+    let run = read_run_json(&run_dir);
+    let ledger_path = run["provider_exchange_records"][0]["path"]
+        .as_str()
+        .unwrap();
+    fs::write(run_dir.join(ledger_path), b"tampered ledger").unwrap();
+    let artifact_path = run["steps"][0]["artifact_path"].as_str().unwrap();
+    fs::write(run_dir.join(artifact_path), b"tampered artifact").unwrap();
+    let candidate = PathBuf::from(run["candidate_workspace"]["path"].as_str().unwrap());
+    fs::write(candidate.join("README.md"), "candidate tamper\n").unwrap();
+    let add = Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&candidate)
+        .output()
+        .expect("stage candidate tamper");
+    assert!(add.status.success(), "{add:?}");
+    let before = read_tree_bytes(&run_dir);
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("inspect tamper");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["integrity"], "degraded");
+    assert_eq!(
+        report["input_digests"]["ticket"]["verification"],
+        "tampered"
+    );
+    assert_eq!(report["candidate"]["verification"], "tampered");
+    assert!(report["provider_attempts"].to_string().contains("tampered"));
+    assert!(report["steps"].to_string().contains("tampered"));
+    assert!(report["integrity_messages"]
+        .as_array()
+        .is_some_and(|items| items.len() >= 4));
+}
+
+#[test]
+fn loop_inspect_rejects_unsafe_run_id_and_run_directory_without_writing() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    fs::create_dir_all(&runs_root).unwrap();
+    let before = read_tree_bytes(&runs_root);
+
+    let unsafe_id = seaf()
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            "../escape",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("unsafe id");
+    assert!(!unsafe_id.status.success());
+    assert_eq!(read_tree_bytes(&runs_root), before);
+
+    #[cfg(unix)]
+    {
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, runs_root.join("linked")).unwrap();
+        let before = read_tree_bytes(&outside);
+        let unsafe_directory = seaf()
+            .args([
+                "loop",
+                "inspect",
+                "--run-id",
+                "linked",
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+            ])
+            .output()
+            .expect("unsafe directory");
+        assert!(!unsafe_directory.status.success());
+        assert_eq!(read_tree_bytes(&outside), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn loop_inspect_never_executes_candidate_filters_fsmonitor_or_inherited_git_config() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    run_fake_provider(&repo, &ticket, &runs_root, "inspect-hostile-git", &[]);
+    let run_dir = runs_root.join("inspect-hostile-git");
+    let run = read_run_json(&run_dir);
+    let candidate = PathBuf::from(run["candidate_workspace"]["path"].as_str().unwrap());
+    let marker = temp.path().join("git-side-effect");
+    let script = temp.path().join("hostile-git.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(candidate.join(".gitattributes"), "*.md filter=hostile\n").unwrap();
+    let config = Command::new("git")
+        .args(["config", "filter.hostile.clean", script.to_str().unwrap()])
+        .current_dir(&candidate)
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    let config = Command::new("git")
+        .args(["config", "filter.hostile.process", script.to_str().unwrap()])
+        .current_dir(&candidate)
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    let config = Command::new("git")
+        .args(["config", "core.fsmonitor", script.to_str().unwrap()])
+        .current_dir(&candidate)
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    fs::write(candidate.join("README.md"), "unstaged hostile diff\n").unwrap();
+    let _ = fs::remove_file(&marker);
+    let run_before = read_tree_bytes(&run_dir);
+    let candidate_before = read_tree_bytes(&candidate);
+    let source_policy = fs::read(repo.join("seaf.policy.json")).unwrap();
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            "inspect-hostile-git",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", script.to_str().unwrap())
+        .env("GIT_DIR", temp.path().join("redirected-git-dir"))
+        .output()
+        .expect("inspect hostile Git");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !marker.exists(),
+        "inspection executed hostile Git configuration"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["candidate"]["verification"], "tampered");
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(read_tree_bytes(&candidate), candidate_before);
+    assert_eq!(
+        fs::read(repo.join("seaf.policy.json")).unwrap(),
+        source_policy
+    );
+}
+
+#[test]
+fn loop_inspect_degrades_a_canonical_provider_record_with_a_broken_global_chain() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    run_fake_provider(&repo, &ticket, &runs_root, "inspect-chain", &[]);
+    let run_dir = runs_root.join("inspect-chain");
+    let mut run = read_run_json(&run_dir);
+    let path = run["provider_exchange_records"][1]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join(&path)).unwrap()).unwrap();
+    record["previous_record_digest"] = serde_json::json!("f".repeat(64));
+    let bytes = canonical_json_bytes(&record).unwrap();
+    fs::write(run_dir.join(&path), &bytes).unwrap();
+    run["provider_exchange_records"][1]["digest"] =
+        serde_json::json!(canonical_sha256_digest(&record).unwrap());
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap(),
+    )
+    .unwrap();
+    let before = read_tree_bytes(&run_dir);
+
+    let output = seaf_in(&repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            "inspect-chain",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["integrity"], "degraded");
+    assert!(report["provider_attempts"].to_string().contains("tampered"));
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Research complete."));
+}
+
+#[test]
+fn loop_inspect_caps_large_inventories_deterministically_in_both_modes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp.path().join("runs");
+    let smoke = seaf()
+        .args([
+            "loop",
+            "smoke",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(smoke.status.success());
+    let smoke: serde_json::Value = serde_json::from_slice(&smoke.stdout).unwrap();
+    let run_id = smoke["run_id"].as_str().unwrap();
+    let run_dir = runs_root.join(run_id);
+    for index in 0..100 {
+        fs::write(
+            run_dir.join(format!("artifacts/07-testing.extra-{index:03}.json")),
+            format!("item {index}"),
+        )
+        .unwrap();
+    }
+    let before = read_tree_bytes(&run_dir);
+    let invoke = |json: bool| {
+        let mut command = seaf();
+        command.args([
+            "loop",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ]);
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+    let json = invoke(true);
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["evaluation_prefix"].as_array().unwrap().len(), 64);
+    assert_eq!(
+        report["evaluation_prefix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["classification"] == "current")
+            .count(),
+        2,
+        "current Testing and EvalReport authority must displace historical prefix entries"
+    );
+    assert_eq!(report["bounds"]["evaluation_prefix_total"], 102);
+    assert_eq!(report["bounds"]["evaluation_prefix_truncated"], 38);
+    let human = invoke(false);
+    assert!(human.status.success(), "{human:?}");
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains("evaluation prefix: showing 64 of 102"));
+    let human = String::from_utf8(invoke(false).stdout).unwrap();
+    assert!(human.contains("bounds: provider attempts"));
+    assert!(human.contains("provider exchanges"));
+    assert!(human.contains("artifact history"));
+    assert!(human.contains("integrity messages"));
+    assert!(human.contains("ambiguity messages"));
+    assert_eq!(read_tree_bytes(&run_dir), before);
+
+    let persisted = read_run_json(&run_dir);
+    for step in persisted["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| matches!(step["name"].as_str(), Some("testing" | "eval_report")))
+    {
+        fs::remove_file(run_dir.join(step["artifact_path"].as_str().unwrap())).unwrap();
+    }
+    let missing_before = read_tree_bytes(&run_dir);
+    let missing = invoke(true);
+    assert!(missing.status.success(), "{missing:?}");
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["bounds"]["evaluation_prefix_total"], 102);
+    assert_eq!(
+        missing["evaluation_prefix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["classification"] == "missing")
+            .count(),
+        2
+    );
+    assert_eq!(read_tree_bytes(&run_dir), missing_before);
 }
 
 #[test]

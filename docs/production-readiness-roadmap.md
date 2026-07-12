@@ -199,8 +199,16 @@ complete. `loop promote` requires a fresh exact candidate/EvalReport/target-HEAD
 confirmation, publishes durable intent before mutation, applies only the frozen
 evaluated patch to a clean target, and records immutable `promoted` authority.
 Crash retry adopts only the exact already-applied patch; the result stays
-unstaged and uncommitted, and the candidate is retained. M1-09 audited recovery
-operations are active.
+unstaged and uncommitted, and the candidate is retained. M1-09a attempt-safe
+history and factual inspection is complete. Structured role artifacts now bind
+the exact durable attempt with create-only paths; ambiguous fixed-name reuse is
+forensic-only and blocks rerun before reset. `loop inspect` is byte-inert,
+authenticates the provider chain, safely verifies physical candidate authority
+without executing repository helpers, and retains current/head evidence under
+deterministic output caps. M1-09b audited provider revise/rerun is active, then
+M1-09c owns Approved-evaluation adoption/invalidation. Authoritative input
+changes still require a new run; EvalPassed/Promoted and M1-08 promotion intent
+remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

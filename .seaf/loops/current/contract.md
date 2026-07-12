@@ -44,21 +44,19 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09 - Audited recovery operations. Add explicit inspect, revise, and rerun
-commands for blocked, failed, and interrupted attempts without editing durable
-history in place. Every revision must create a new versioned immutable attempt,
-preserve prior prompts/responses/artifacts and original input snapshots, and
-bind its reason, actor, source attempt, candidate authority, and effective-input
-digests. A change to authoritative ticket, policy, project config, repository
-identity, or eval config still requires a new run.
+M1-09b - Audited provider revise and rerun. Add one versioned, create-only
+`RecoveryAttemptV1` authorization plus its exact source-run snapshot. Bind the
+sequential recovery ID, actor/reason/time, selected provider step, source and
+next attempts, immutable input and candidate authority, prior provider/recovery
+heads, and expected reset-state digest. Existing ticket, policy, config,
+repository, eval config, provider/model, candidate, and artifact bytes cannot be
+revised; changing any of them requires a new run.
 
-Rerun from a named eligible step under the run/candidate authority locks. Clear
-and invalidate every downstream role result, provider exchange head, human
-approval, Testing/EvalReport, promotion intent/evidence, and terminal status
-that depended on the replaced attempt while preserving their bytes as history.
-Add an audited decision for incomplete Approved-evaluation intent: adopt only a
-fully verifiable already-completed artifact prefix, or explicitly invalidate it
-before a new execution attempt; never silently replay commands. Invalid targets,
-stale authority, exhausted attempts, and unsafe reset boundaries must fail
-before mutation. Keep recovery local and supervised; do not add automatic
-commit, merge, push, deploy, or history deletion.
+`seaf loop revise` must publish the recovery evidence and pure reset under the
+candidate-to-provider compare-and-swap boundary without calling a provider.
+Only `seaf loop rerun --recovery N` may consume a pending recovery before its
+first durable request. Ordinary resume rejects that cut, then may recover after
+the exact request is durable. Preserve every historical file and provider
+record, clear only the selected/downstream current pointers and their dependent
+policy/approval/eval references, retire new `resume --rerun-from` use with
+migration guidance, and keep evaluation/promotion recovery out of this slice.

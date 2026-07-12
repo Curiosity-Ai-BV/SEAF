@@ -9,6 +9,7 @@ pub mod eval_engine;
 pub mod eval_report;
 pub mod final_evaluation_authority;
 mod immutable_artifact;
+pub mod inspect;
 pub mod model_runner;
 pub mod patch;
 pub mod policy;
@@ -55,6 +56,12 @@ pub use eval_report::build_loop_eval_report;
 pub use final_evaluation_authority::{
     load_verified_final_evaluation_authority, FinalEvaluationAuthorityError,
     VerifiedFinalEvaluationAuthority,
+};
+pub use inspect::{
+    inspect_loop_run, ArtifactHistoryInspection, CandidateInspection, EvaluationPrefixInspection,
+    EvidenceClassification, InputDigestInspection, InspectError, InspectionBounds,
+    InspectionIntegrity, LoopInspection, ProviderAttemptInspection, ProviderExchangeInspection,
+    StepInspection,
 };
 pub use model_runner::{ProviderPatchGateConfig, ProviderStepRunner};
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};

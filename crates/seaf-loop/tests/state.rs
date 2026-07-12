@@ -981,6 +981,156 @@ fn state_artifact_extensions_fall_back_to_bin_when_invalid() {
 }
 
 #[test]
+fn state_second_attempt_preserves_first_artifact_and_selects_new_exact_extension() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "run-attempt-safe-artifacts";
+    let mut first_runner = RecordingStepRunner::with_prefix("first")
+        .with_artifact(ArtifactContent::new("json", b"first artifact"));
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut first_runner,
+    )
+    .expect("start run");
+    runner.run_next_step().expect("finish first attempt");
+    drop(runner);
+
+    let run_dir = runs_root.join(run_id);
+    let first_path = run_dir.join("artifacts/01-research.json");
+    let first_bytes = std::fs::read(&first_path).expect("first artifact");
+    let mut persisted = read_run(&run_dir);
+    seaf_loop::state::reset_from_step(&mut persisted, LoopStepName::Research)
+        .expect("reset test fixture");
+    seaf_loop::state::save_run(
+        &LoopWorkspace::open(&runs_root, run_id).expect("workspace"),
+        &persisted,
+    )
+    .expect("save reset fixture");
+
+    let mut second_runner = RecordingStepRunner::with_prefix("second")
+        .with_artifact(ArtifactContent::new("yaml", b"second artifact"));
+    let mut resumed = LoopRunner::resume(&runs_root, run_id, &mut second_runner).expect("resume");
+    resumed.run_next_step().expect("finish second attempt");
+    drop(resumed);
+
+    assert_eq!(
+        std::fs::read(first_path).expect("preserved first"),
+        first_bytes
+    );
+    assert_eq!(
+        std::fs::read(run_dir.join("artifacts/01-research.attempt-002.yaml"))
+            .expect("second artifact"),
+        b"second artifact"
+    );
+    let current = read_run(&run_dir);
+    let research = current
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::Research)
+        .expect("research step");
+    assert_eq!(
+        research.artifact_path.as_deref(),
+        Some("artifacts/01-research.attempt-002.yaml")
+    );
+    let second_digest = ArtifactContent::new("yaml", b"second artifact").digest();
+    assert_eq!(
+        research.artifact_digest.as_deref(),
+        Some(second_digest.as_str())
+    );
+}
+
+#[test]
+fn rerun_rejects_fixed_artifact_reuse_before_reset_can_clear_the_ambiguity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "pre-reset-fixed-ambiguity";
+    let mut first_runner = RecordingStepRunner::with_prefix("first");
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut first_runner,
+    )
+    .unwrap();
+    runner.run_next_step().unwrap();
+    drop(runner);
+    let run_dir = runs_root.join(run_id);
+    fs::write(
+        run_dir.join("prompts/01-research.attempt-002.prompt.md"),
+        "historical second attempt",
+    )
+    .unwrap();
+    let mut historical = read_run(&run_dir);
+    historical.status = LoopStatus::Blocked;
+    historical.current_step = LoopStepName::Research;
+    historical.steps[0].status = LoopStepStatus::Blocked;
+    seaf_loop::state::save_run(
+        &LoopWorkspace::open(&runs_root, run_id).unwrap(),
+        &historical,
+    )
+    .unwrap();
+    let mut resumed_runner = RecordingStepRunner::with_prefix("must-not-run");
+    let resumed = LoopRunner::resume(&runs_root, run_id, &mut resumed_runner).unwrap();
+    let before = read_tree_bytes(&run_dir);
+
+    let error = resumed
+        .rerun_from(LoopStepName::Research)
+        .expect_err("pre-reset fixed reuse must remain visible");
+
+    assert!(error.to_string().contains("ambiguous fixed"), "{error}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    assert!(resumed_runner.calls.is_empty());
+}
+
+#[test]
+fn rerun_from_legitimate_attempt_one_allows_attempt_two_before_reset() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "legitimate-attempt-two-rerun";
+    let mut first_runner = RecordingStepRunner::with_prefix("first");
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            test_input_digests(),
+        ),
+        &mut first_runner,
+    )
+    .unwrap();
+    runner.run_next_step().unwrap();
+    drop(runner);
+    let mut second_runner = RecordingStepRunner::with_prefix("second");
+    let resumed = LoopRunner::resume(&runs_root, run_id, &mut second_runner).unwrap();
+
+    let mut rerun = resumed
+        .rerun_from(LoopStepName::Research)
+        .expect("fixed attempt one is normal authority for the first rerun");
+    rerun.run_next_step().unwrap();
+    drop(rerun);
+
+    let run = read_run(&runs_root.join(run_id));
+    assert_eq!(
+        run.steps[0].artifact_path.as_deref(),
+        Some("artifacts/01-research.attempt-002.md")
+    );
+}
+
+#[test]
 fn state_resume_missing_run_directory_reports_clear_error() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");

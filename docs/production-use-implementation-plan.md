@@ -1279,10 +1279,14 @@ Commit boundary: promotion only.
 
 Roadmap: U5. Dependencies: M1-08.
 
-Status: active. Dependencies: M1-08 (complete).
+Status: active. Split into M1-09a attempt-safe history/inspect, M1-09b provider
+revise/rerun, and M1-09c Approved-evaluation recovery. Dependencies: M1-08
+(complete).
 
 Objective: inspect, revise, and rerun blocked/failed attempts without replacing
-history.
+history. Authoritative ticket, policy, project config, repository identity, eval
+config, provider/model, and candidate changes require a new run. EvalPassed and
+Promoted remain immutable; M1-08 retains promotion-intent recovery.
 
 Acceptance criteria:
 
@@ -1305,6 +1309,117 @@ check.
 Docs/tracker: recovery commands and M1-09 status.
 
 Commit boundary: recovery operations only.
+
+### M1-09a - Attempt-Safe Role Artifacts And Factual Inspect
+
+Status: complete. Dependencies: M1-08 (complete).
+
+Objective: close the current structured-artifact overwrite seam and make durable
+attempt history inspectable before any new recovery mutation exists.
+
+Acceptance criteria:
+
+- Structured role artifacts receive the real step attempt. Attempt 1 preserves
+  the historical fixed name; attempts 2+ use create-only
+  `artifacts/<step>.attempt-NNN.<validated-extension>` paths.
+- Preserve the exact validated `ArtifactContent` extension. Exact retry is
+  idempotent; collision, symlink, directory, different bytes, skipped/exhausted
+  attempts, or ambiguous historical reuse fails closed without rewriting files.
+- `loop inspect` reports only factual authority: canonical run digest,
+  status/current step, input digests, candidate lifecycle/head/diff, current step
+  references, authenticated provider attempt summaries, and evaluation-prefix
+  inventory. It emits no raw bodies, eligibility decision, or reset preview.
+- Inspection performs no writes, log append, provider/model call, candidate or
+  source mutation. Historical fixed-name attempt 1 remains readable; ambiguous
+  later reuse is forensic-only.
+
+RED: OutputReview attempt 2 preserves attempt-1 bytes and selects the new
+artifact; exact retry/collision/symlink/directory/exhaustion; historical
+compatibility/ambiguity; tampered authority classification; byte-identical
+human/JSON inspect.
+
+Verification: artifact/provider/state/CLI suites, full workspace tests, format,
+Clippy, and diff check.
+
+Commit boundary: attempt-safe role artifacts and read-only inspect only. No
+recovery schema or state mutation.
+
+### M1-09b - Audited Provider Revise And Rerun
+
+Status: active. Dependencies: M1-09a (complete).
+
+Objective: publish one actor/reason-bound recovery decision, reset current
+provider pointers without deleting history, then consume exactly that decision
+for a new provider attempt.
+
+Acceptance criteria:
+
+- Add versioned create-only source-run snapshot and `RecoveryAttemptV1` bound to
+  sequential recovery ID, action/step, actor/reason/time, exact source-run and
+  input/candidate digests, source/next step attempts, previous recovery/provider
+  heads, and expected reset-state digest.
+- `loop revise` publishes recovery plus pure reset under candidate-to-provider
+  full CAS and performs no provider call. `loop rerun --recovery N` alone may
+  consume the active recovery before its first durable request; ordinary resume
+  rejects pending recovery, then may resume after that request exists.
+- Eligible: active schema-v2 isolated Blocked/unapproved Failed with pristine
+  candidate through Development; exact Applied candidate only OutputReview;
+  AwaitingHumanReview or Approved with no eval prefix only OutputReview. Pending,
+  Running, Applying, non-Active, approval-bound final Failed, EvalPassed,
+  Promoted, legacy/ambiguous, or exhausted history is ineligible.
+- Preserve every file and the complete provider ledger. Clear only selected and
+  downstream current pointers, matching policy decisions, and OutputReview
+  approval/eval refs. New recovery uses one authorization contract; historical
+  provider rerun authorization remains readable but is not newly published.
+- New use of `resume --rerun-from` returns migration guidance. Inputs,
+  provider/model, candidate bytes, and promotion authority cannot be revised.
+
+RED: eligible Blocked/Failed steps and Applied OutputReview; active-recovery
+resume gate; note exactly once; mutation/substitution/gap/exhaustion; downstream
+clearing with old bytes/ledger preserved; CAS race; ineligible terminal/lifecycle
+matrix; source checkout unchanged.
+
+Verification: recovery/provider/candidate/CLI suites, full workspace tests,
+format, Clippy, and diff check.
+
+Commit boundary: provider revise/rerun only. No eval or promotion recovery.
+
+### M1-09c - Approved-Evaluation Recovery
+
+Status: pending. Dependencies: M1-09b.
+
+Objective: adopt complete verified interrupted evaluation evidence with zero
+commands, or explicitly invalidate it before one fresh attempt.
+
+Acceptance criteria:
+
+- Add attempt-indexed create-only evaluation intent/log/Testing/EvalReport paths.
+  ApprovedEvaluationIntent v2 binds evaluation attempt and recovery reference;
+  TestingEvidence v2 binds exact intent and invalidation authorization. V1 fixed
+  paths remain readable, and promotion/final validation select the bound intent.
+- `loop revise --from-step testing --eval-recovery adopt|invalidate` publishes
+  audited authority. Adoption requires exact intent, complete planned checks,
+  canonical TestingEvidence and every log; it executes zero commands and may
+  deterministically create only a missing EvalReport. Intent/log-only prefixes
+  never adopt.
+- Invalidation preserves every prior byte and exact candidate/approval/policy/
+  input authority, resets only current Testing/EvalReport/final-eval refs, and
+  gates the fresh attempt behind `loop rerun --recovery N`. Active Approved with
+  an incomplete prefix and active approval-bound final Failed are eligible;
+  EvalPassed/Promoted and historical missing-eval authority are not.
+- Candidate-to-provider recovery CAS reconstructs the exact execution-time
+  Approved predecessor from the recovery source snapshot; it does not weaken
+  final EvalPassed/Promoted or M1-08 promotion-intent relations.
+
+RED: every interruption prefix, zero-command adopt, passing/failing evidence,
+attempt-2 byte preservation, cross-run/tampered/gapped authority, candidate/
+source/input drift, CAS race, explicit-rerun gate, final-failed retry, and frozen
+EvalPassed/Promoted/M1-08 regression.
+
+Verification: recovery/eval/promotion/provider/CLI suites, full workspace tests,
+format, Clippy, and diff check.
+
+Commit boundary: Approved-evaluation adoption/invalidation/rerun only.
 
 ### M1-10 - Atomic State And Run Locking
 

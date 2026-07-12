@@ -949,6 +949,9 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             }
         }
         let attempt = next_step_attempt(&self.workspace, step)?;
+        if attempt >= 3 {
+            crate::artifacts::refuse_ambiguous_fixed_pointer_in_run(&self.run, step, attempt)?;
+        }
         let previous = self.run.clone();
         self.step_runner
             .prepare_rerun(&self.workspace, &self.run, step, attempt)?;
@@ -1026,7 +1029,12 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         append_policy_decisions(&mut self.run, self.step_runner.drain_policy_decisions()?)?;
         let (artifact_path, artifact_digest) = match &output.artifact {
             Some(artifact) => (
-                Some(write_step_artifact(&self.workspace, step, artifact)?),
+                Some(write_step_artifact(
+                    &self.workspace,
+                    step,
+                    attempt,
+                    artifact,
+                )?),
                 Some(artifact.digest()),
             ),
             None => (None, None),
