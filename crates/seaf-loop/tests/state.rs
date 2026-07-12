@@ -744,74 +744,6 @@ fn state_failed_step_updates_run_json_and_stops_execution() {
 }
 
 #[test]
-fn state_rerun_from_repeats_selected_step_without_repeating_prior_steps() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let runs_root = temp_dir.path().join("runs");
-    let ticket = ticket();
-
-    let mut initial_runner = RecordingStepRunner::with_prefix("initial");
-    let mut run = LoopRunner::start(
-        LoopRunnerConfig::for_ticket(
-            &runs_root,
-            "run-rerun",
-            &ticket,
-            "fake-provider",
-            "fake-model",
-            test_input_digests(),
-        ),
-        &mut initial_runner,
-    )
-    .expect("start run");
-    run.run_to_completion().expect("complete initial run");
-
-    let run_dir = runs_root.join("run-rerun");
-    assert_file_contains(
-        &run_dir.join("prompts/03-spec.prompt.md"),
-        "initial request for spec creation",
-    );
-    assert_file_contains(
-        &run_dir.join("responses/03-spec.raw.txt"),
-        "initial response for spec creation",
-    );
-
-    let mut rerun_runner = RecordingStepRunner::with_prefix("rerun");
-    let mut rerun = LoopRunner::resume(&runs_root, "run-rerun", &mut rerun_runner)
-        .expect("resume run")
-        .rerun_from(LoopStepName::SpecCreation)
-        .expect("reset from spec creation");
-
-    rerun.run_to_completion().expect("complete rerun");
-    drop(rerun);
-
-    assert_eq!(
-        rerun_runner.calls.first(),
-        Some(&LoopStepName::SpecCreation),
-        "rerun should restart at the requested step"
-    );
-    assert!(
-        !rerun_runner.calls.contains(&LoopStepName::Research)
-            && !rerun_runner.calls.contains(&LoopStepName::Analysis),
-        "rerun should preserve completed steps before the requested step"
-    );
-    assert_file_contains(
-        &run_dir.join("prompts/03-spec.prompt.md"),
-        "initial request for spec creation",
-    );
-    assert_file_contains(
-        &run_dir.join("responses/03-spec.raw.txt"),
-        "initial response for spec creation",
-    );
-    assert_file_contains(
-        &run_dir.join("prompts/03-spec.attempt-002.prompt.md"),
-        "rerun request for spec creation",
-    );
-    assert_file_contains(
-        &run_dir.join("responses/03-spec.attempt-002.raw.txt"),
-        "rerun response for spec creation",
-    );
-}
-
-#[test]
 fn state_writes_run_workspace_prompt_response_artifact_and_log() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
@@ -1047,7 +979,7 @@ fn state_second_attempt_preserves_first_artifact_and_selects_new_exact_extension
 }
 
 #[test]
-fn rerun_rejects_fixed_artifact_reuse_before_reset_can_clear_the_ambiguity() {
+fn public_legacy_rerun_api_is_retired_without_mutation() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
     let run_id = "pre-reset-fixed-ambiguity";
@@ -1087,47 +1019,14 @@ fn rerun_rejects_fixed_artifact_reuse_before_reset_can_clear_the_ambiguity() {
 
     let error = resumed
         .rerun_from(LoopStepName::Research)
-        .expect_err("pre-reset fixed reuse must remain visible");
+        .expect_err("public legacy rerun must return migration guidance");
 
-    assert!(error.to_string().contains("ambiguous fixed"), "{error}");
+    assert!(
+        error.to_string().contains("legacy rerun is retired"),
+        "{error}"
+    );
     assert_eq!(read_tree_bytes(&run_dir), before);
     assert!(resumed_runner.calls.is_empty());
-}
-
-#[test]
-fn rerun_from_legitimate_attempt_one_allows_attempt_two_before_reset() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let runs_root = temp_dir.path().join("runs");
-    let run_id = "legitimate-attempt-two-rerun";
-    let mut first_runner = RecordingStepRunner::with_prefix("first");
-    let mut runner = LoopRunner::start(
-        LoopRunnerConfig::for_ticket(
-            &runs_root,
-            run_id,
-            &ticket(),
-            "fake-provider",
-            "fake-model",
-            test_input_digests(),
-        ),
-        &mut first_runner,
-    )
-    .unwrap();
-    runner.run_next_step().unwrap();
-    drop(runner);
-    let mut second_runner = RecordingStepRunner::with_prefix("second");
-    let resumed = LoopRunner::resume(&runs_root, run_id, &mut second_runner).unwrap();
-
-    let mut rerun = resumed
-        .rerun_from(LoopStepName::Research)
-        .expect("fixed attempt one is normal authority for the first rerun");
-    rerun.run_next_step().unwrap();
-    drop(rerun);
-
-    let run = read_run(&runs_root.join(run_id));
-    assert_eq!(
-        run.steps[0].artifact_path.as_deref(),
-        Some("artifacts/01-research.attempt-002.md")
-    );
 }
 
 #[test]

@@ -25,14 +25,14 @@ use seaf_core::{
 };
 use seaf_loop::{
     approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
-    evaluate_zero_tolerance, execute_approved_evaluation, execute_eval_checks, inspect_loop_run,
-    load_agent_bench_fixture, plan_eval_checks, preflight_authoritative_run_inputs,
-    promote_evaluated_candidate, validate_human_review_execution_barrier,
-    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
-    CandidateCleanupOutcome, ContextLimits, ContextPackRequest, EvalCheckExecution,
-    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
-    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
-    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    ensure_no_pending_recovery, evaluate_zero_tolerance, execute_approved_evaluation,
+    execute_eval_checks, inspect_loop_run, load_agent_bench_fixture, plan_eval_checks,
+    preflight_authoritative_run_inputs, promote_evaluated_candidate, revise_provider_step,
+    validate_human_review_execution_barrier, validate_requested_recovery, AgentBenchSummary,
+    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
+    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
+    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -158,6 +158,10 @@ enum LoopCommand {
     Inspect(LoopInspectArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
+    /// Publish an audited provider-step revision without contacting a provider.
+    Revise(LoopReviseArgs),
+    /// Consume one exact audited recovery authorization.
+    Rerun(LoopRerunArgs),
     /// Approve the exact reviewed candidate for future Testing.
     Approve(LoopApproveArgs),
     /// Apply the exact evaluated candidate to the clean target without committing.
@@ -343,6 +347,44 @@ struct LoopResumeArgs {
     #[arg(long)]
     rerun_from: Option<String>,
     /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopReviseArgs {
+    #[arg(long)]
+    run_id: String,
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    #[arg(long)]
+    from_step: String,
+    #[arg(long)]
+    actor: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopRerunArgs {
+    #[arg(long)]
+    run_id: String,
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    #[arg(long)]
+    recovery: u32,
+    #[arg(long)]
+    ticket: Option<PathBuf>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_OLLAMA_BASE_URL)]
+    base_url: String,
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
     #[arg(long)]
     json: bool,
 }
@@ -627,6 +669,12 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
+        Command::Loop {
+            command: LoopCommand::Revise(args),
+        } => revise_loop(args),
+        Command::Loop {
+            command: LoopCommand::Rerun(args),
+        } => rerun_loop(args),
         Command::Loop {
             command: LoopCommand::Approve(args),
         } => approve_loop(args),
@@ -1083,6 +1131,57 @@ fn loop_inspect(args: LoopInspectArgs) -> Result<(), CliFailure> {
     Ok(())
 }
 
+fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let step = parse_provider_rerun_step(&args.from_step)?;
+    let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    let outcome = revise_provider_step(&workspace, step, &args.actor, &args.reason)
+        .map_err(|error| CliFailure::message(error.to_string()))?;
+    let report = serde_json::json!({
+        "command": "revise",
+        "run_id": outcome.run.run_id,
+        "status": outcome.run.status,
+        "current_step": outcome.run.current_step,
+        "recovery_id": outcome.reference.recovery_id,
+        "recovery": outcome.reference.artifact,
+        "source_step_attempt": outcome.recovery.source_step_attempt,
+        "next_step_attempt": outcome.recovery.next_step_attempt,
+    });
+    if args.json {
+        print_json(&report)
+    } else {
+        println!(
+            "revised loop {} from {:?} as recovery {}",
+            outcome.run.run_id, step, outcome.reference.recovery_id
+        );
+        println!("recovery artifact: {}", outcome.reference.artifact.path);
+        println!(
+            "provider was not called; run `seaf loop rerun --recovery {}`",
+            outcome.reference.recovery_id
+        );
+        Ok(())
+    }
+}
+
+fn rerun_loop(args: LoopRerunArgs) -> Result<(), CliFailure> {
+    let recovery_id = args.recovery;
+    resume_loop_with_recovery(
+        LoopResumeArgs {
+            run_id: args.run_id,
+            runs_root: args.runs_root,
+            ticket: args.ticket,
+            config: args.config,
+            policy: args.policy,
+            base_url: args.base_url,
+            timeout_ms: args.timeout_ms,
+            rerun_from: None,
+            json: args.json,
+        },
+        Some(recovery_id),
+    )
+}
+
 fn cleanup_loop(args: LoopCleanupArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
     let workspace = LoopWorkspace::open_minimal(&args.runs_root, &args.run_id)
@@ -1192,23 +1291,43 @@ fn promote_loop(args: LoopPromoteArgs) -> Result<(), CliFailure> {
 
 fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
+    if args.rerun_from.is_some() {
+        return Err(CliFailure::message(
+            "--rerun-from is retired; use `seaf loop revise --from-step <step> --actor <actor> --reason <reason>` then `seaf loop rerun --recovery <id>`"
+                .to_string(),
+        ));
+    }
+    resume_loop_with_recovery(args, None)
+}
+
+fn resume_loop_with_recovery(
+    args: LoopResumeArgs,
+    requested_recovery: Option<u32>,
+) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
     validate_provider_timeout(args.timeout_ms)?;
     let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    let recovery_attempt = match requested_recovery {
+        Some(recovery_id) => {
+            let recovery = validate_requested_recovery(&workspace, &existing, recovery_id)
+                .map_err(|error| CliFailure::message(error.to_string()))?;
+            Some((recovery.step, recovery.next_step_attempt))
+        }
+        None => {
+            ensure_no_pending_recovery(&workspace, &existing)
+                .map_err(|error| CliFailure::message(error.to_string()))?;
+            None
+        }
+    };
     validate_human_review_execution_barrier(&existing).map_err(loop_runner_failure)?;
     if existing.status == LoopStatus::Approved && existing.input_digests.eval_config.is_none() {
         return Err(CliFailure::message(
             "approved historical run has no authoritative eval config; start a new run".to_string(),
         ));
     }
-    let rerun_from = args
-        .rerun_from
-        .as_deref()
-        .map(parse_provider_rerun_step)
-        .transpose()?;
-    if let Some(step) = rerun_from {
-        validate_rerun_eligibility(&existing, step).map_err(loop_runner_failure)?;
-    }
-    let run = if rerun_from.is_none()
+    let run = if requested_recovery.is_none()
         && (existing.status == LoopStatus::Approved
             || existing.status == LoopStatus::EvalPassed
             || (existing.status == LoopStatus::Failed && existing.human_approval.is_some()))
@@ -1219,7 +1338,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         execute_approved_evaluation(&workspace, &repository_root).map_err(|error| {
             CliFailure::message(format!("approved local evaluation failed: {error}"))
         })?
-    } else if loop_run_needs_provider_resume(&existing) || rerun_from.is_some() {
+    } else if loop_run_needs_provider_resume(&existing) || requested_recovery.is_some() {
         let Some(ticket_path) = args.ticket.as_ref() else {
             return Err(CliFailure::message(
                 "--ticket is required to resume an incomplete provider-backed run".to_string(),
@@ -1254,13 +1373,8 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         )?;
         preflight_authoritative_run_inputs(&args.runs_root, &existing, &snapshots)
             .map_err(loop_runner_failure)?;
-        let initialized = match rerun_from {
-            Some(step) => {
-                InitializedLoopRun::resume_isolated_for_rerun(&args.runs_root, existing, step)
-            }
-            None => InitializedLoopRun::resume_isolated(&args.runs_root, existing),
-        }
-        .map_err(loop_runner_failure)?;
+        let initialized = InitializedLoopRun::resume_isolated(&args.runs_root, existing)
+            .map_err(loop_runner_failure)?;
         let scaffolded = initialized.scaffold().map_err(loop_runner_failure)?;
         let prepared = scaffolded
             .publish_authoritative_inputs(snapshots)
@@ -1274,7 +1388,8 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                         "--base-url is only used with --provider ollama".to_string(),
                     ));
                 }
-                let next_step = rerun_from
+                let next_step = recovery_attempt
+                    .map(|(step, _)| step)
                     .or_else(|| next_pending_model_step(prepared.run()))
                     .unwrap_or(LoopStepName::Research);
                 let provider = FakeProvider::new(fake_provider_script_from(next_step));
@@ -1294,7 +1409,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     },
                     prepared,
                     &provider,
-                    rerun_from,
+                    recovery_attempt,
                 )?
             }
             "ollama" => {
@@ -1318,7 +1433,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
                     },
                     prepared,
                     &provider,
-                    rerun_from,
+                    recovery_attempt,
                 )?
             }
             provider => {
@@ -1330,7 +1445,16 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     } else {
         existing
     };
-    finish_loop_command("resume", &args.runs_root, &run, args.json)
+    finish_loop_command(
+        if requested_recovery.is_some() {
+            "rerun"
+        } else {
+            "resume"
+        },
+        &args.runs_root,
+        &run,
+        args.json,
+    )
 }
 
 fn smoke_loop(args: LoopSmokeArgs) -> Result<(), CliFailure> {
@@ -1586,7 +1710,7 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     config: ProviderLoopConfig<'_>,
     prepared: PreparedLoopRun,
     provider: &P,
-    rerun_from: Option<LoopStepName>,
+    recovery_attempt: Option<(LoopStepName, u32)>,
 ) -> Result<LoopRun, CliFailure> {
     let policy = config.policy;
     let candidate_root = PathBuf::from(
@@ -1606,12 +1730,12 @@ fn resume_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         .with_ticket(config.ticket.clone())
         .with_context_pack_request(context_request)
         .with_patch_gate(patch_gate_config, &mut patch_runner);
+    if let Some((step, attempt)) = recovery_attempt {
+        step_runner = step_runner.with_recovery_attempt(step, attempt);
+    }
     let runner =
         LoopRunner::resume_initialized(prepared, &mut step_runner).map_err(loop_runner_failure)?;
-    let mut runner = match rerun_from {
-        Some(step) => runner.rerun_from(step).map_err(loop_runner_failure)?,
-        None => runner,
-    };
+    let mut runner = runner;
     runner
         .run_to_completion()
         .map_err(loop_runner_failure)

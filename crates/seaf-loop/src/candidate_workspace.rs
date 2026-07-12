@@ -60,7 +60,7 @@ pub struct VerifiedCandidatePatchEvidence {
     pub applied_diff_content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SourceWorktreeAuthority {
     // This witnesses lasting practical Git worktree state. It is not OS containment and cannot
     // distinguish a same-user command that mutates and restores the exact bytes before recheck.
@@ -71,7 +71,7 @@ pub(crate) struct SourceWorktreeAuthority {
     untracked: Vec<SourceUntrackedEvidence>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct SourceUntrackedEvidence {
     path: PathBuf,
     kind: SourceUntrackedKind,
@@ -80,7 +80,8 @@ struct SourceUntrackedEvidence {
     mode: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 enum SourceUntrackedKind {
     Regular,
     Symlink,

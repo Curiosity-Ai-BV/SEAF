@@ -14,7 +14,7 @@ use crate::provider_exchange::{
     classify_provider_exchange_response, load_provider_exchange_record,
     load_provider_exchange_request, load_provider_exchange_response_audit,
     persist_provider_exchange_record_reference,
-    persist_provider_exchange_record_reference_with_validator, persist_provider_rerun_reset,
+    persist_provider_exchange_record_reference_with_validator,
     preflight_provider_exchange_reconciliation, reconcile_provider_exchange_state_with_validator,
     stage_provider_exchange_record, stage_provider_exchange_response_record,
     validate_recovered_conventional_attempt, write_provider_exchange_request,
@@ -23,7 +23,7 @@ use crate::provider_exchange::{
 };
 use crate::role_response::{parse_role_response, repair_prompt, RoleResponseError};
 use crate::{
-    artifacts::latest_step_attempt,
+    artifacts::{latest_step_attempt, next_step_attempt},
     context::{
         pack_live_context, CandidateContextAuthority, CandidateContextAuthorityKind, ContextBundle,
         ContextFile, ContextLimits, ContextPackRequest,
@@ -34,8 +34,8 @@ use crate::{
     },
     parse_role_response_with_repair,
     policy_gate::{
-        gate_patch_proposal, CommandOutput, PatchCommand, PatchCommandRunner, PatchDecisionKind,
-        PatchGateError, PatchGateRequest, PolicyDecision,
+        gate_patch_proposal_attempt, CommandOutput, PatchCommand, PatchCommandRunner,
+        PatchDecisionKind, PatchGateError, PatchGateRequest, PolicyDecision,
     },
     runner::{RunnerError, StepRunner},
     state::step_file_stem,
@@ -121,6 +121,7 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     last_error_response: Option<String>,
     fresh_exchange_run: bool,
     recovered_step_attempt: Option<(LoopStepName, u32)>,
+    authorized_recovery_attempt: Option<(LoopStepName, u32)>,
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
@@ -198,6 +199,7 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             last_error_response: None,
             fresh_exchange_run: false,
             recovered_step_attempt: None,
+            authorized_recovery_attempt: None,
             exchange_workspace: None,
             step_attempt: None,
             durable_provider_exchange_records: None,
@@ -206,6 +208,11 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             #[cfg(test)]
             after_response_persist: None,
         }
+    }
+
+    pub fn with_recovery_attempt(mut self, step: LoopStepName, attempt: u32) -> Self {
+        self.authorized_recovery_attempt = Some((step, attempt));
+        self
     }
 
     #[cfg(test)]
@@ -298,12 +305,13 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             policy: &config.policy,
             apply_patch: config.apply_patch,
         };
+        let artifact_attempt = self.step_attempt.unwrap_or(1);
 
         let decision = if config.apply_patch && !config.worktree_clean {
             let mut guard = DirtyWorktreePatchRunner;
-            gate_patch_proposal(request, &mut guard)
+            gate_patch_proposal_attempt(request, &mut guard, artifact_attempt)
         } else {
-            gate_patch_proposal(request, &mut *patch_gate.runner)
+            gate_patch_proposal_attempt(request, &mut *patch_gate.runner, artifact_attempt)
         }
         .map_err(|error| RunnerError::Step(format!("patch gate failed: {error}")))?;
 
@@ -398,48 +406,74 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         } else {
             run.clone()
         };
+        if let Some((step, attempt)) = self.authorized_recovery_attempt {
+            if crate::state::next_runnable_step(&reconciled) != Some(step) {
+                return Err(RunnerError::Step(
+                    "recovery attempt does not match the exact next runnable step".to_string(),
+                ));
+            }
+            crate::recovery::verify_latest_recovery_authorization(
+                workspace,
+                &reconciled,
+                step,
+                attempt,
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+            let next_attempt = next_step_attempt(workspace, step)?;
+            let latest_attempt = latest_step_attempt(workspace, step)?;
+            if next_attempt != attempt && latest_attempt != Some(attempt) {
+                return Err(RunnerError::Step(
+                    "recovery attempt does not match prompt attempt authority".to_string(),
+                ));
+            }
+            self.recovered_step_attempt = Some((step, attempt));
+        }
         if reconciled.provider_exchange_records != run.provider_exchange_records {
             self.durable_provider_exchange_records =
                 Some(reconciled.provider_exchange_records.clone());
         }
         self.fresh_exchange_run = crate::state::next_runnable_step(&reconciled).is_some()
             || !reconciled.provider_exchange_records.is_empty();
-        if let Some(step) = crate::state::next_runnable_step(&reconciled) {
-            let running = reconciled
-                .steps
-                .iter()
-                .any(|record| record.name == step && record.status == LoopStepStatus::Running);
-            if running {
-                let latest = latest_step_attempt(workspace, step)?;
-                let durable_attempt = reconciled
-                    .provider_exchange_records
+        if self.recovered_step_attempt.is_none() {
+            if let Some(step) = crate::state::next_runnable_step(&reconciled) {
+                let running = reconciled
+                    .steps
                     .iter()
-                    .filter(|reference| reference.step == step)
-                    .map(|reference| reference.step_attempt)
-                    .max()
-                    .unwrap_or(0);
-                if let Some(attempt) = latest.filter(|attempt| *attempt > durable_attempt) {
-                    let expected = durable_attempt.checked_add(1).ok_or_else(|| {
-                        RunnerError::Step("provider step attempt sequence is exhausted".to_string())
-                    })?;
-                    if attempt != expected {
-                        return Err(RunnerError::Step(format!(
+                    .any(|record| record.name == step && record.status == LoopStepStatus::Running);
+                if running {
+                    let latest = latest_step_attempt(workspace, step)?;
+                    let durable_attempt = reconciled
+                        .provider_exchange_records
+                        .iter()
+                        .filter(|reference| reference.step == step)
+                        .map(|reference| reference.step_attempt)
+                        .max()
+                        .unwrap_or(0);
+                    if let Some(attempt) = latest.filter(|attempt| *attempt > durable_attempt) {
+                        let expected = durable_attempt.checked_add(1).ok_or_else(|| {
+                            RunnerError::Step(
+                                "provider step attempt sequence is exhausted".to_string(),
+                            )
+                        })?;
+                        if attempt != expected {
+                            return Err(RunnerError::Step(format!(
                             "conventional provider prompt attempt {attempt} is not the expected recovery attempt {expected}"
                         )));
-                    }
-                    if attempt > 1 {
-                        validate_recovered_conventional_attempt(
-                            workspace,
-                            &reconciled,
-                            step,
-                            attempt,
-                        )
-                        .map_err(exchange_recovery_error)?;
-                    }
-                    self.recovered_step_attempt = Some((step, attempt));
-                } else if let Some(last) = reconciled.provider_exchange_records.last() {
-                    if last.step == step {
-                        self.recovered_step_attempt = Some((step, last.step_attempt));
+                        }
+                        if attempt > 1 {
+                            validate_recovered_conventional_attempt(
+                                workspace,
+                                &reconciled,
+                                step,
+                                attempt,
+                            )
+                            .map_err(exchange_recovery_error)?;
+                        }
+                        self.recovered_step_attempt = Some((step, attempt));
+                    } else if let Some(last) = reconciled.provider_exchange_records.last() {
+                        if last.step == step {
+                            self.recovered_step_attempt = Some((step, last.step_attempt));
+                        }
                     }
                 }
             }
@@ -521,106 +555,6 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         self.recovered_step_attempt
             .filter(|(candidate, _)| *candidate == step)
             .map(|(_, attempt)| attempt)
-    }
-
-    fn prepare_rerun(
-        &mut self,
-        workspace: &LoopWorkspace,
-        run: &LoopRun,
-        step: LoopStepName,
-        attempt: u32,
-    ) -> Result<(), RunnerError> {
-        if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate
-            && !self.legacy_unit_test_harness_enabled()
-        {
-            return Err(RunnerError::Step(
-                "legacy provider run cannot be rerun; start a new isolated run".to_string(),
-            ));
-        }
-        if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
-            let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
-                RunnerError::Step("isolated rerun lost candidate authority".to_string())
-            })?;
-            if candidate.patch_transaction.is_some()
-                && (step != LoopStepName::OutputReview
-                    || candidate
-                        .patch_transaction
-                        .as_ref()
-                        .is_none_or(|transaction| {
-                            transaction.phase != seaf_core::CandidatePatchPhase::Applied
-                        }))
-            {
-                return Err(RunnerError::Step(
-                    "isolated candidate rerun is limited to OutputReview over exact Applied evidence; start a new run"
-                        .to_string(),
-                ));
-            }
-            if step == LoopStepName::OutputReview {
-                self.verified_candidate_patch = Some(
-                    crate::verify_candidate_patch_evidence(
-                        workspace,
-                        Path::new(&candidate.source_worktree_root),
-                    )
-                    .map_err(|error| RunnerError::Step(error.to_string()))?,
-                );
-            }
-        }
-        self.run = Some(run.clone());
-        self.fresh_exchange_run = true;
-        self.recovered_step_attempt = None;
-        self.step_attempt = Some(attempt);
-        if let Some(run) = &self.run {
-            if let Some(durable_attempt) = run
-                .provider_exchange_records
-                .iter()
-                .filter(|reference| reference.step == step)
-                .map(|reference| reference.step_attempt)
-                .max()
-            {
-                let expected = durable_attempt.checked_add(1).ok_or_else(|| {
-                    RunnerError::Step("provider rerun attempt sequence is exhausted".to_string())
-                })?;
-                if attempt != expected {
-                    return Err(RunnerError::Step(format!(
-                        "provider rerun attempt {attempt} is not the exact next durable attempt {expected}"
-                    )));
-                }
-            }
-            if run
-                .provider_exchange_records
-                .iter()
-                .any(|reference| reference.step == step && reference.step_attempt == attempt)
-            {
-                return Err(RunnerError::Step(
-                    "rerun attempt already has provider exchange history".to_string(),
-                ));
-            }
-        }
-        if self.context_bundle.is_none() {
-            if let Some(request) = &self.context_pack_request {
-                let mut request = request.clone();
-                request.run_directory = workspace.run_directory().to_path_buf();
-                self.context_bundle = Some(pack_live_context(&request).map_err(|error| {
-                    RunnerError::Step(format!(
-                        "failed to pack context for explicit provider rerun: {error}"
-                    ))
-                })?);
-            }
-        }
-        Ok(())
-    }
-
-    fn persist_rerun_reset(
-        &mut self,
-        workspace: &LoopWorkspace,
-        previous: &LoopRun,
-        reset: &LoopRun,
-        step: LoopStepName,
-        attempt: u32,
-    ) -> Result<bool, RunnerError> {
-        persist_provider_rerun_reset(workspace, previous, reset, step, attempt)
-            .map_err(exchange_recovery_error)?;
-        Ok(true)
     }
 
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError> {

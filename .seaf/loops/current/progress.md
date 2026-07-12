@@ -32,8 +32,8 @@
 - [x] M1-07c2: Locked Approved Testing and EvalReport transaction.
 - [x] M1-08: Promotion integrity.
 - [x] M1-09a: Attempt-safe role artifacts and factual inspect.
-- [ ] M1-09b: Audited provider revise and rerun (active).
-- [ ] M1-09c: Approved-evaluation adoption and invalidation.
+- [x] M1-09b: Audited provider revise and rerun.
+- [ ] M1-09c: Approved-evaluation adoption and invalidation (active).
 - [ ] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
 - [ ] M1-12: Interruption recovery acceptance.
@@ -98,6 +98,12 @@ read-only `loop inspect` authenticates the full provider chain, reports
 run/input/candidate/current artifact authority without raw model bodies, retains
 current/head evidence under deterministic output caps, and classifies missing,
 tampered, unsafe, and ambiguous history without executing repository filters or
-changing any byte. Ambiguous fixed-name reuse blocks rerun before reset can
-erase the evidence. M1-09b is active for the versioned, actor-bound revise/rerun
-transaction; M1-09c retains incomplete-eval recovery.
+changing any byte. Ambiguous fixed-name reuse blocks recovery before reset can
+erase the evidence. M1-09b now publishes versioned, actor-bound provider
+recovery with a create-only source snapshot, exact
+candidate/input/provider/recovery bindings, and one candidate-to-provider CAS.
+`revise` is provider-free; exact `rerun --recovery` owns the first request, then
+ordinary resume may continue it. Every prior role, policy, and provider artifact
+remains byte-identical, downstream current pointers are reset, and the old
+public/CLI rerun writer is retired while its historical reader remains. M1-09c
+is active for incomplete-evaluation recovery.

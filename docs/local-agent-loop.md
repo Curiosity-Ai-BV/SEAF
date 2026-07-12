@@ -32,6 +32,7 @@ git switch codex/seaf-foundation-agent-loop
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
 cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id p2-011-demo --allow-dirty --json
 cargo run -p seaf-cli -- loop status --run-id p2-011-demo --json
+cargo run -p seaf-cli -- loop inspect --run-id p2-011-demo --json
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
 cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --loop-run .seaf/loops/runs/p2-011-demo/run.json --ticket examples/local-loop/tickets/add-health-command.yaml --output .seaf/evals/p2-011-demo-eval-report.json --json
 ```
@@ -104,20 +105,34 @@ open next. For a failed run, inspect `log.md`, the failed step response under
 `responses/`, the matching prompt under `prompts/`, and any step artifact under
 `artifacts/`.
 
-Resume only after the blocker is understood:
+For a blocked or unapproved failed provider step, publish an audited revision
+only after the blocker is understood. This records the operator and reason and
+performs no provider call:
 
 ```bash
-cargo run -p seaf-cli -- loop resume --run-id p2-011-demo --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --json
+cargo run -p seaf-cli -- loop revise --run-id p2-011-demo \
+  --from-step <provider-step> --actor <operator> --reason <reason> --json
+cargo run -p seaf-cli -- loop rerun --run-id p2-011-demo \
+  --recovery <recovery-id> \
+  --ticket examples/local-loop/tickets/add-health-command.yaml \
+  --policy examples/adaptive-notes/seaf.policy.json --json
 ```
 
-`loop resume` validates the persisted `run.json` before scaffolding or mutating
-a workspace. Invalid JSON, missing run files, invalid run IDs, and mismatched
-run IDs fail closed. An incomplete provider run also requires the original
-ticket and the same effective config/policy authority used by `loop run`. Pass
-matching `--config` or `--policy` arguments when the run used explicit
-authority; discovered Git-root authority needs no extra flag.
+Only `loop rerun --recovery <id>` may consume a pending revision before its
+first durable provider request. After that request exists, ordinary `loop
+resume` continues the exact attempt. The former `loop resume --rerun-from`
+path is retired. Recovery currently covers provider steps through OutputReview;
+interrupted Approved evaluation is owned by M1-09c.
 
-Resume canonically verifies all four input snapshots, the four `LoopRun`
+Recovery validates the persisted `run.json` before scaffolding or mutating a
+workspace. Invalid JSON, missing run files, invalid run IDs, mismatched run IDs,
+ambiguous attempt history, and changed candidate authority fail closed. The
+rerun requires the original ticket and the same effective config/policy
+authority used by `loop run`. Pass matching `--config` or `--policy` arguments
+when the run used explicit authority; discovered Git-root authority needs no
+extra flag.
+
+Recovery canonically verifies all four input snapshots, the four `LoopRun`
 digests, and repository identity before appending the run log, contacting a
 provider, rebuilding context, or applying a patch. Missing, noncanonical,
 tampered, changed, unsafe, or cross-repository inputs are rejected with

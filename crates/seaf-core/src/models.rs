@@ -399,6 +399,8 @@ pub struct LoopRun {
     pub eval_report_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promotion: Option<PromotionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_recovery: Option<RecoveryReference>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +430,8 @@ struct LoopRunWire {
     eval_report_path: Option<String>,
     #[serde(default)]
     promotion: Option<PromotionEvidence>,
+    #[serde(default)]
+    latest_recovery: Option<RecoveryReference>,
 }
 
 #[derive(Default)]
@@ -498,6 +502,7 @@ impl<'de> Deserialize<'de> for LoopRun {
             human_approval: wire.human_approval,
             eval_report_path: wire.eval_report_path,
             promotion: wire.promotion,
+            latest_recovery: wire.latest_recovery,
         })
     }
 }
@@ -579,6 +584,13 @@ pub enum CandidateWorkspaceLifecycle {
 pub struct ArtifactReference {
     pub path: String,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryReference {
+    pub recovery_id: u32,
+    pub artifact: ArtifactReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -312,6 +312,9 @@ Acceptance criteria:
   `seaf loop resume --rerun-from <step>` and create a new immutable audited
   attempt; supported values are `research`, `analysis`, `spec`, `spec-review`,
   `development`, and `output-review`.
+- Superseded by M1-09b: new recovery uses actor/reason-bound `loop revise`
+  followed by `loop rerun --recovery <id>`. The old public/CLI rerun writer is
+  retired; its artifacts remain readable for historical runs.
 - Every model request and response is stored.
 - Run status is updated after each step.
 - Run workspace includes `run.json`, `context-manifest.json`, prompts,
@@ -431,6 +434,9 @@ Acceptance criteria:
   provider attempt by publishing the old-head authorization and reset state in
   one exchange-locked transaction, while preserving prior exchange history and
   context caps.
+- Superseded by M1-09b: the supported provider recovery commands are `loop
+revise` and `loop rerun --recovery <id>`; new legacy authorization
+  publication is disabled.
 - CLI returns nonzero on validation failures.
 - JSON output is available for automation.
 - Human-readable output summarizes next action.

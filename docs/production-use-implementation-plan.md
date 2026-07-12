@@ -1279,9 +1279,9 @@ Commit boundary: promotion only.
 
 Roadmap: U5. Dependencies: M1-08.
 
-Status: active. Split into M1-09a attempt-safe history/inspect, M1-09b provider
-revise/rerun, and M1-09c Approved-evaluation recovery. Dependencies: M1-08
-(complete).
+Status: active. M1-09a attempt-safe history/inspect and M1-09b provider
+revise/rerun are complete; M1-09c Approved-evaluation recovery is active.
+Dependencies: M1-08 (complete).
 
 Objective: inspect, revise, and rerun blocked/failed attempts without replacing
 history. Authoritative ticket, policy, project config, repository identity, eval
@@ -1346,7 +1346,7 @@ recovery schema or state mutation.
 
 ### M1-09b - Audited Provider Revise And Rerun
 
-Status: active. Dependencies: M1-09a (complete).
+Status: complete. Dependencies: M1-09a (complete).
 
 Objective: publish one actor/reason-bound recovery decision, reset current
 provider pointers without deleting history, then consume exactly that decision
@@ -1386,7 +1386,7 @@ Commit boundary: provider revise/rerun only. No eval or promotion recovery.
 
 ### M1-09c - Approved-Evaluation Recovery
 
-Status: pending. Dependencies: M1-09b.
+Status: active. Dependencies: M1-09b (complete).
 
 Objective: adopt complete verified interrupted evaluation evidence with zero
 commands, or explicitly invalidate it before one fresh attempt.

@@ -105,6 +105,7 @@ candidate:
 ```bash
 cargo run -p seaf-cli -- loop run --ticket <ticket.yaml> --run-id <run-id> --json
 cargo run -p seaf-cli -- loop status --run-id <run-id> --json
+cargo run -p seaf-cli -- loop inspect --run-id <run-id> --json
 cargo run -p seaf-cli -- loop approve --run-id <run-id> \
   --reviewer <reviewer> \
   --confirm-candidate-diff <digest-from-status> \
@@ -120,12 +121,28 @@ cargo run -p seaf-cli -- loop promote --run-id <run-id> \
   --json
 ```
 
+Blocked or failed provider steps use an audited two-command recovery. `revise`
+records the operator, reason, exact source state, and next attempt without
+calling the provider; `rerun` consumes that exact authorization:
+
+```bash
+cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+  --from-step <provider-step> --actor <operator> --reason <reason> --json
+cargo run -p seaf-cli -- loop rerun --run-id <run-id> \
+  --recovery <recovery-id> --ticket <ticket.yaml> --json
+```
+
+Use the same explicit `--config` or `--policy` authority as the original run.
+Changing authoritative inputs, provider/model, repository, or candidate requires
+a new run. The former `loop resume --rerun-from` path is retired.
+
 Approved resume uses the persisted canonical ticket and eval snapshots, not
 live files, and makes no model-provider call. Before any check it publishes a
 create-only execution intent; it then records indexed redacted logs, canonical
 Testing evidence, and a bound EvalReport. A passing run becomes `eval_passed`;
 a failed check becomes an approval-bound reported failure. An interrupted
-attempt will not replay commands until M1-09 adds audited recovery.
+evaluation attempt will not replay commands until M1-09c adds audited adoption
+and invalidation.
 
 Human approval authorizes local command execution under the developer account.
 SEAF detects lasting source/candidate drift but is not an OS sandbox against

@@ -1721,3 +1721,43 @@ provider-candidate 25, provider-exchange 22, and every remaining Rust and
 doc-test suite. Strict all-target/all-feature Clippy, Rust and Prettier
 formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass
 through pinned pnpm 11.7.0.
+
+## 2026-07-12 implementation | M1-09b audited provider recovery
+
+Added closed `latest_recovery` authority plus versioned create-only source-run
+snapshots and `RecoveryAttemptV1`. Each recovery binds its sequential ID,
+actor/reason/time, selected provider step and attempts, exact source run and
+input/candidate/source-worktree state, prior provider and recovery heads, and
+the expected pure-reset projection. `loop revise` takes the candidate then
+provider lock, publishes this evidence and reset through full CAS, and performs
+no provider call. Only exact `loop rerun --recovery <id>` may publish the first
+request; once that request is durable, ordinary resume owns the established
+provider and candidate crash-recovery seams.
+
+Recovery preserves the complete provider ledger and every historical byte.
+Role and Development policy artifacts are create-only and attempt-indexed after
+attempt 1. The reset clears only selected/downstream current pointers and their
+dependent policy, approval, and evaluation references. Historical legacy rerun
+authorization remains readable, but the CLI and public runner writer now return
+migration guidance before mutation and production cannot publish a new legacy
+authorization. Blocked/failed pristine provider steps and exact Applied
+OutputReview review states are eligible; active recovery, input/candidate/source
+substitution, evaluation prefixes, lifecycle/final states, gaps, collisions,
+ambiguous history, and exhausted attempts fail closed.
+
+Review found and closed staged-request reconciliation, prompt-only retry,
+historical-chain authorization, pending-retry physical validation, macOS
+filename portability, source-checkout proof, Applying-resume composition, public
+legacy-writer bypass, and fixed policy-artifact overwrite seams. A full earlier-
+step replay proves downstream attempt progression while old ledger and artifact
+bytes remain a prefix. Competing revisions publish exactly one actor/reason
+winner. Independent specification and quality re-review approve the final slice
+with no remaining blockers.
+
+Controller verification passes the full workspace: CLI 133, core 51, loop unit
+130, candidate 39, context expansion 22, policy 13, provider-candidate 22,
+provider-exchange 22, state 32, and every remaining Rust integration and doc-test
+suite. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
+package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass through
+pinned pnpm 11.7.0. M1-09b is accepted and M1-09c Approved-evaluation recovery
+is active.

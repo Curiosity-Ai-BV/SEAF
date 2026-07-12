@@ -1791,19 +1791,6 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     )
     .expect("ordinary resume accepts exact Applied evidence");
     assert_eq!(resumed.run(), &persisted);
-    let mut noop = NoopStepRunner;
-    let runner = seaf_loop::LoopRunner::resume_verified(
-        temp.path().join("runs"),
-        persisted.clone(),
-        &mut noop,
-    )
-    .expect("generic resume");
-    let before_rerun = fs::read(workspace.run_file()).unwrap();
-    let error = runner
-        .rerun_from(seaf_core::LoopStepName::Development)
-        .expect_err("Applied transaction permits only OutputReview rerun");
-    assert!(error.to_string().contains("start a new run"), "{error}");
-    assert_eq!(fs::read(workspace.run_file()).unwrap(), before_rerun);
     let verified = seaf_loop::verify_candidate_patch_evidence(&workspace, &source)
         .expect("exact Applied review projection");
     assert_eq!(verified.candidate_tree, applied.candidate_tree);
@@ -1926,25 +1913,6 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
         "coherently rewritten intent/diff/index must not replace authoritative Development"
     );
     remove_worktree(&source, Path::new(&candidate.path));
-}
-
-struct NoopStepRunner;
-
-impl seaf_loop::StepRunner for NoopStepRunner {
-    fn step_request(
-        &mut self,
-        _step: seaf_core::LoopStepName,
-    ) -> Result<String, seaf_loop::RunnerError> {
-        Ok(String::new())
-    }
-
-    fn run_step(
-        &mut self,
-        _step: seaf_core::LoopStepName,
-        _request: &str,
-    ) -> Result<seaf_loop::StepOutput, seaf_loop::RunnerError> {
-        Ok(seaf_loop::StepOutput::completed("noop"))
-    }
 }
 
 #[test]

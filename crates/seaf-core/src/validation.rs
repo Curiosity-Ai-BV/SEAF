@@ -683,6 +683,31 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         ));
     }
 
+    if let Some(recovery) = &run.latest_recovery {
+        if recovery.recovery_id == 0 {
+            errors.push(FieldError::new(
+                "latest_recovery.recovery_id",
+                "must be at least 1",
+            ));
+        }
+        validate_artifact_reference(&mut errors, "latest_recovery.artifact", &recovery.artifact);
+        let expected = format!("artifacts/recovery-{:03}.json", recovery.recovery_id);
+        if recovery.artifact.path != expected {
+            errors.push(FieldError::new(
+                "latest_recovery.artifact.path",
+                format!("must be {expected}"),
+            ));
+        }
+        if run.execution_mode != crate::LoopExecutionMode::IsolatedCandidate
+            || run.candidate_workspace.is_none()
+        {
+            errors.push(FieldError::new(
+                "latest_recovery",
+                "requires isolated_candidate authority",
+            ));
+        }
+    }
+
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
@@ -3415,6 +3440,7 @@ unexpected_escape: true
             }),
             eval_report_path: None,
             promotion: None,
+            latest_recovery: None,
         }
     }
 
@@ -3536,5 +3562,27 @@ unexpected_escape: true
             .errors
             .iter()
             .any(|error| error.field == "file" && error.message.contains("unexpected_escape")));
+    }
+
+    #[test]
+    fn loop_run_accepts_one_closed_latest_recovery_reference_without_breaking_old_shape() {
+        let mut run = serde_json::to_value(approved_run_fixture()).expect("run value");
+        run["status"] = serde_json::json!("blocked");
+        run["current_step"] = serde_json::json!("output_review");
+        run.as_object_mut()
+            .expect("run object")
+            .remove("human_approval");
+        run["latest_recovery"] = serde_json::json!({
+            "recovery_id": 1,
+            "artifact": {
+                "path": "artifacts/recovery-001.json",
+                "digest": "a".repeat(64)
+            }
+        });
+
+        let decoded: LoopRun =
+            serde_json::from_value(run).expect("latest recovery is a backward-compatible field");
+
+        assert!(validate_loop_run(&decoded).is_empty());
     }
 }

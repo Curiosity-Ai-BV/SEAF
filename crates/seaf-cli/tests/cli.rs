@@ -812,7 +812,7 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
         .expect("reject unaudited rerun");
     assert!(!rerun.status.success());
     let stderr = String::from_utf8(rerun.stderr).unwrap();
-    assert!(stderr.contains("awaiting human review"), "{stderr}");
+    assert!(stderr.contains("--rerun-from is retired"), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), before_resume);
 }
 
@@ -4038,7 +4038,7 @@ fn loop_resume_rejects_completed_analysis_rerun_before_ticket_or_mutation() {
     assert!(!missing_ticket.status.success());
     let stderr = String::from_utf8(missing_ticket.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("start a new run"),
+        stderr.contains("--rerun-from is retired"),
         "forbidden rerun must reject before ticket handling, got {stderr}"
     );
     assert_eq!(read_tree_bytes(&run_dir), before);
@@ -4061,7 +4061,7 @@ fn loop_resume_rejects_completed_analysis_rerun_before_ticket_or_mutation() {
         .expect("resume loop with ticket");
     assert!(!resume.status.success(), "{resume:?}");
     let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert!(stderr.contains("--rerun-from is retired"), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), before);
 }
 
@@ -4096,7 +4096,7 @@ fn loop_resume_rejects_completed_research_rerun_before_any_mutation() {
 
     assert!(!rerun.status.success(), "{rerun:?}");
     let stderr = String::from_utf8(rerun.stderr).expect("stderr");
-    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert!(stderr.contains("--rerun-from is retired"), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), before_tree);
     assert_eq!(git_evidence(&repo), source_before);
     assert_eq!(git_evidence(&candidate), candidate_before);
@@ -4164,10 +4164,28 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
         "researcher",
         "three.txt",
     )]);
+    let revise = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--from-step",
+            "research",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Retry within the durable context cap.",
+        ])
+        .output()
+        .expect("revise at cap");
+    assert!(revise.status.success(), "{revise:?}");
     let rerun = seaf_in(&repo)
         .args([
             "loop",
-            "resume",
+            "rerun",
             "--ticket",
             ticket_path.to_str().unwrap(),
             "--runs-root",
@@ -4176,8 +4194,8 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
             run_id,
             "--base-url",
             &rerun_url,
-            "--rerun-from",
-            "research",
+            "--recovery",
+            "1",
         ])
         .output()
         .expect("rerun at cap");
@@ -4241,7 +4259,7 @@ fn loop_resume_rejects_output_review_rerun_while_awaiting_without_mutation() {
 
     assert!(!rerun.status.success(), "{rerun:?}");
     let stderr = String::from_utf8(rerun.stderr).unwrap();
-    assert!(stderr.contains("awaiting human review"), "{stderr}");
+    assert!(stderr.contains("--rerun-from is retired"), "{stderr}");
     let after = read_run_json(&run_dir);
     assert_eq!(after, before);
     let output_review_records = after["provider_exchange_records"]
@@ -4449,21 +4467,21 @@ fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tamp
         let original = fs::read(&path).expect("tamper target");
         fs::write(&path, "tampered durable artifact").expect("tamper artifact");
         let before = read_tree_bytes(&run_dir);
-        let (probe, probe_url) = provider_call_probe();
+        let (probe, _probe_url) = provider_call_probe();
         let rejected = seaf_in(&repo)
             .args([
                 "loop",
-                "resume",
-                "--ticket",
-                ticket_path.to_str().unwrap(),
+                "revise",
                 "--runs-root",
                 runs_root.to_str().unwrap(),
                 "--run-id",
                 run_id,
-                "--base-url",
-                &probe_url,
-                "--rerun-from",
+                "--from-step",
                 "research",
+                "--actor",
+                "operator@example.invalid",
+                "--reason",
+                "Tamper probe.",
             ])
             .output()
             .expect("tampered resume");
@@ -5037,7 +5055,9 @@ fn loop_resume_rejects_snapshot_holes_and_noncanonical_collisions() {
         assert!(!resume.status.success(), "{resume:?}");
         let stderr = String::from_utf8(resume.stderr).expect("stderr");
         assert!(
-            stderr.contains("collision") || stderr.contains("exact prefix"),
+            stderr.contains("collision")
+                || stderr.contains("exact prefix")
+                || stderr.contains("required regular file"),
             "noncanonical snapshot must collide: {stderr}"
         );
         assert_eq!(read_tree_bytes(&run_dir), before);
@@ -5132,12 +5152,7 @@ fn loop_resume_accepts_matching_explicit_policy_authority() {
         &ticket_path,
         &runs_root,
         run_id,
-        &[
-            "--policy",
-            policy_path.to_str().unwrap(),
-            "--rerun-from",
-            "analysis",
-        ],
+        &["--policy", policy_path.to_str().unwrap()],
     );
 
     assert!(resume.status.success(), "{resume:?}");
@@ -5210,8 +5225,6 @@ fn loop_resume_mocked_ollama_uses_verified_project_policy() {
             run_id,
             "--base-url",
             &resume_url,
-            "--rerun-from",
-            "development",
         ])
         .output()
         .expect("resume Ollama run");
@@ -5620,6 +5633,857 @@ fn loop_resume_json_rejects_missing_run_file_without_scaffolding_mutation() {
 
     assert_loop_run_validation_failure(output);
     assert!(!runs_root.join("missing-run").exists());
+}
+
+#[test]
+fn loop_resume_rerun_from_returns_migration_guidance_before_run_lookup_or_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+
+    let output = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            "missing-run",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--rerun-from",
+            "research",
+        ])
+        .output()
+        .expect("retired rerun flag");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("loop revise"), "{stderr}");
+    assert!(stderr.contains("loop rerun --recovery"), "{stderr}");
+    assert!(
+        !runs_root.exists(),
+        "migration guidance must precede run lookup"
+    );
+}
+
+#[test]
+fn loop_revise_and_rerun_publish_the_audited_recovery_cli_contract() {
+    for (command, required) in [
+        ("revise", ["--from-step", "--actor", "--reason"].as_slice()),
+        ("rerun", ["--recovery"].as_slice()),
+    ] {
+        let output = seaf()
+            .args(["loop", command, "--help"])
+            .output()
+            .expect("recovery command help");
+        assert!(output.status.success(), "{command}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("help stdout");
+        for flag in required {
+            assert!(
+                stdout.contains(flag),
+                "{command} help is missing {flag}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    let run_id = "audited-provider-recovery";
+    run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let candidate_root = PathBuf::from(
+        read_run_json(&run_dir)["candidate_workspace"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let source_before = git_evidence(&candidate_root);
+    let source_repo_before = git_evidence(&repo);
+    let source_tracked_before = (
+        source_repo_before.0.clone(),
+        source_repo_before.2.clone(),
+        source_repo_before.3.clone(),
+    );
+    let fixed_review = fs::read(run_dir.join("artifacts/06-output-review.json")).unwrap();
+    let ledger_len = read_run_json(&run_dir)["provider_exchange_records"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    let revised = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Reviewer requested one correction.",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(revised.status.success(), "{revised:?}");
+    let revised_report: serde_json::Value = serde_json::from_slice(&revised.stdout).unwrap();
+    assert_eq!(revised_report["recovery_id"], 1);
+    assert_eq!(git_evidence(&candidate_root), source_before);
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/06-output-review.json")).unwrap(),
+        fixed_review
+    );
+    let reset = read_run_json(&run_dir);
+    assert_eq!(reset["status"], "pending");
+    assert_eq!(reset["current_step"], "output_review");
+    assert_eq!(
+        reset["provider_exchange_records"].as_array().unwrap().len(),
+        ledger_len
+    );
+    assert_eq!(reset["latest_recovery"]["recovery_id"], 1);
+    assert_eq!(reset["human_approval"], serde_json::Value::Null);
+    let reset_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    let recovery_bytes = fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap();
+    let source_bytes = fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap();
+
+    let exact_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Reviewer requested one correction.",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(exact_retry.status.success(), "{exact_retry:?}");
+    assert_eq!(fs::read(run_dir.join("run.json")).unwrap(), reset_bytes);
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap(),
+        recovery_bytes
+    );
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap(),
+        source_bytes
+    );
+
+    let substituted_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Different reason.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!substituted_retry.status.success());
+    assert_eq!(fs::read(run_dir.join("run.json")).unwrap(), reset_bytes);
+
+    for mutation_target in [
+        candidate_root.join("examples/local-loop/evals/fake-provider-smoke.txt"),
+        repo.join("seaf.policy.json"),
+    ] {
+        let original = fs::read(&mutation_target).unwrap();
+        let mut mutated = original.clone();
+        mutated.extend_from_slice(b"\nrecovery mutation probe\n");
+        fs::write(&mutation_target, mutated).unwrap();
+        let mutated_retry = seaf_in(&repo)
+            .args([
+                "loop",
+                "revise",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--from-step",
+                "output-review",
+                "--actor",
+                "operator@example.invalid",
+                "--reason",
+                "Reviewer requested one correction.",
+            ])
+            .output()
+            .unwrap();
+        assert!(!mutated_retry.status.success(), "{mutated_retry:?}");
+        assert_eq!(fs::read(run_dir.join("run.json")).unwrap(), reset_bytes);
+        let mutated_rerun = seaf_in(&repo)
+            .args([
+                "loop",
+                "rerun",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--recovery",
+                "1",
+                "--ticket",
+                ticket.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!mutated_rerun.status.success(), "{mutated_rerun:?}");
+        assert_eq!(fs::read(run_dir.join("run.json")).unwrap(), reset_bytes);
+        assert!(!run_dir
+            .join("artifacts/06-output-review.attempt-002.exchange-001.initial.request.record.json")
+            .exists());
+        fs::write(mutation_target, original).unwrap();
+    }
+
+    let mut substituted_input = reset.clone();
+    substituted_input["input_digests"]["ticket"] = serde_json::json!("0".repeat(64));
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&substituted_input).unwrap(),
+    )
+    .unwrap();
+    let input_rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--ticket",
+            ticket.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!input_rerun.status.success(), "{input_rerun:?}");
+    fs::write(run_dir.join("run.json"), &reset_bytes).unwrap();
+
+    let ordinary = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!ordinary.status.success());
+    let stderr = String::from_utf8(ordinary.stderr).unwrap();
+    assert!(stderr.contains("pending recovery"), "{stderr}");
+    assert!(!stderr.contains("--ticket is required"), "{stderr}");
+
+    let attempt_two_prompt = run_dir.join("prompts/06-output-review.attempt-002.prompt.md");
+    fs::write(&attempt_two_prompt, b"substituted prompt").unwrap();
+    let substituted_prompt = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--ticket",
+            ticket.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !substituted_prompt.status.success(),
+        "{substituted_prompt:?}"
+    );
+    assert_eq!(
+        read_run_json(&run_dir)["provider_exchange_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        ledger_len
+    );
+    assert!(!run_dir
+        .join("artifacts/06-output-review.attempt-002.exchange-001.initial.request.record.json")
+        .exists());
+    let pre_request_run_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    fs::write(
+        &attempt_two_prompt,
+        fs::read(run_dir.join("prompts/06-output-review.prompt.md")).unwrap(),
+    )
+    .unwrap();
+
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--ticket",
+            ticket.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(rerun.status.success(), "{rerun:?}");
+    let completed = read_run_json(&run_dir);
+    assert_eq!(completed["status"], "awaiting_human_review");
+    assert_eq!(completed["latest_recovery"]["recovery_id"], 1);
+    assert_eq!(git_evidence(&candidate_root), source_before);
+    let source_repo_after = git_evidence(&repo);
+    assert_eq!(
+        (
+            source_repo_after.0,
+            source_repo_after.2,
+            source_repo_after.3,
+        ),
+        source_tracked_before
+    );
+    assert_eq!(
+        completed["provider_exchange_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        ledger_len + 2
+    );
+    assert!(!run_dir
+        .join("artifacts/06-output-review.attempt-002.rerun-authorization.json")
+        .exists());
+
+    fs::write(run_dir.join("run.json"), &pre_request_run_bytes).unwrap();
+    for relative in [
+        "artifacts/06-output-review.attempt-002.exchange-001.initial.response.record.json",
+        "artifacts/06-output-review.attempt-002.json",
+        "responses/06-output-review.attempt-002.exchange-001.initial.response.json",
+        "responses/06-output-review.attempt-002.raw.txt",
+    ] {
+        let path = run_dir.join(relative);
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let first_request_cut_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--ticket",
+            ticket.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first_request_cut_retry.status.success(),
+        "{first_request_cut_retry:?}"
+    );
+    assert_eq!(
+        read_run_json(&run_dir)["provider_exchange_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        ledger_len + 2
+    );
+
+    let ordinary_after_consumption = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ordinary_after_consumption.status.success(),
+        "{ordinary_after_consumption:?}"
+    );
+
+    let awaiting_after_recovery = read_run_json(&run_dir);
+    let candidate_diff = awaiting_after_recovery["candidate_workspace"]["candidate_diff_digest"]
+        .as_str()
+        .unwrap();
+    let starting_head = awaiting_after_recovery["candidate_workspace"]["starting_head"]
+        .as_str()
+        .unwrap();
+    let approval = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "recovery-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            candidate_diff,
+            "--confirm-target-head",
+            starting_head,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(approval.status.success(), "{approval:?}");
+    let approved = read_run_json(&run_dir);
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(approved["latest_recovery"]["recovery_id"], 1);
+
+    let second = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Reviewer requested a second correction.",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "{second:?}");
+    let second_report: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_report["recovery_id"], 2);
+    let second_recovery: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join("artifacts/recovery-002.json")).unwrap())
+            .unwrap();
+    assert_eq!(second_recovery["previous_recovery"]["recovery_id"], 1);
+
+    let pending_second_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    fs::write(
+        run_dir.join("artifacts/recovery-001.json"),
+        b"{\"tampered\":true}",
+    )
+    .unwrap();
+    let tampered_history_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Reviewer requested a second correction.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!tampered_history_retry.status.success());
+    assert_eq!(
+        fs::read(run_dir.join("run.json")).unwrap(),
+        pending_second_bytes
+    );
+}
+
+#[test]
+fn loop_revise_adopts_exact_source_and_recovery_publication_crash_cuts() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    let run_id = "audited-recovery-publication-cuts";
+    run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let source_run_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    let revise = || {
+        seaf_in(&repo)
+            .args([
+                "loop",
+                "revise",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--from-step",
+                "output-review",
+                "--actor",
+                "operator@example.invalid",
+                "--reason",
+                "Crash-cut retry.",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let initial = revise();
+    assert!(initial.status.success(), "{initial:?}");
+    let source_snapshot = fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap();
+
+    fs::write(run_dir.join("run.json"), &source_run_bytes).unwrap();
+    fs::remove_file(run_dir.join("artifacts/recovery-001.json")).unwrap();
+    let after_source_publish = revise();
+    assert!(
+        after_source_publish.status.success(),
+        "{after_source_publish:?}"
+    );
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap(),
+        source_snapshot
+    );
+    let recovery = fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap();
+
+    fs::write(run_dir.join("run.json"), &source_run_bytes).unwrap();
+    let after_recovery_publish = revise();
+    assert!(
+        after_recovery_publish.status.success(),
+        "{after_recovery_publish:?}"
+    );
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap(),
+        recovery
+    );
+    assert_eq!(read_run_json(&run_dir)["latest_recovery"]["recovery_id"], 1);
+}
+
+#[test]
+fn loop_revise_rejects_applied_earlier_steps_and_any_factual_evaluation_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    let run_id = "audited-recovery-eligibility";
+    run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let before = read_tree_bytes(&run_dir);
+
+    let applied_earlier_step = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "development",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Invalid earlier-step retry.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!applied_earlier_step.status.success());
+    assert_eq!(read_tree_bytes(&run_dir), before);
+
+    fs::write(
+        run_dir.join("artifacts/07-testing.orphan.json"),
+        b"factual evaluation prefix",
+    )
+    .unwrap();
+    let run_before_prefix_rejection = fs::read(run_dir.join("run.json")).unwrap();
+    let evaluation_prefix = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Evaluation prefix must reject.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!evaluation_prefix.status.success());
+    let stderr = String::from_utf8(evaluation_prefix.stderr).unwrap();
+    assert!(stderr.contains("evaluation prefix"), "{stderr}");
+    assert_eq!(
+        fs::read(run_dir.join("run.json")).unwrap(),
+        run_before_prefix_rejection
+    );
+}
+
+#[test]
+fn loop_revise_failed_development_clears_only_current_policy_and_preserves_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let policy = repo.join("reject-development.json");
+    write_policy(
+        &policy,
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    let ticket = write_provider_loop_ticket(temp.path(), true);
+    let runs_root = repo.join("runs");
+    let run_id = "failed-development-recovery";
+    run_fake_provider(
+        &repo,
+        &ticket,
+        &runs_root,
+        run_id,
+        &["--policy", policy.to_str().unwrap()],
+    );
+    let run_dir = runs_root.join(run_id);
+    let failed = read_run_json(&run_dir);
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["current_step"], "development");
+    assert!(failed["candidate_workspace"]["patch_transaction"].is_null());
+    assert_eq!(failed["policy_decisions"].as_array().unwrap().len(), 1);
+    let ledger = failed["provider_exchange_records"].clone();
+    let historical_artifacts = read_tree_bytes(&run_dir.join("artifacts"));
+
+    let revised = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "development",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Retry rejected Development with revised instructions.",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(revised.status.success(), "{revised:?}");
+    let reset = read_run_json(&run_dir);
+    assert_eq!(reset["status"], "pending");
+    assert_eq!(reset["current_step"], "development");
+    assert!(reset["policy_decisions"].as_array().unwrap().is_empty());
+    assert_eq!(reset["provider_exchange_records"], ledger);
+    let after_artifacts = read_tree_bytes(&run_dir.join("artifacts"));
+    for (path, bytes) in historical_artifacts {
+        let preserved = after_artifacts
+            .iter()
+            .find(|(candidate, _)| candidate == &path)
+            .map(|(_, bytes)| bytes);
+        assert_eq!(preserved, Some(&bytes), "{path:?}");
+    }
+}
+
+#[test]
+fn loop_revise_research_replays_failed_development_downstream_at_exact_attempt_two() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let policy = repo.join("reject-development-replay.json");
+    write_policy(
+        &policy,
+        &["examples/local-loop/evals/fake-provider-smoke.txt"],
+        &[],
+    );
+    let ticket = write_provider_loop_ticket(temp.path(), true);
+    let runs_root = repo.join("runs");
+    let run_id = "failed-development-research-replay";
+    run_fake_provider(
+        &repo,
+        &ticket,
+        &runs_root,
+        run_id,
+        &["--policy", policy.to_str().unwrap()],
+    );
+    let run_dir = runs_root.join(run_id);
+    let failed = read_run_json(&run_dir);
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["current_step"], "development");
+    let old_ledger = failed["provider_exchange_records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let old_artifacts = read_tree_bytes(&run_dir.join("artifacts"));
+    let source_before = git_evidence(&repo);
+    let source_tracked_before = (
+        source_before.0.clone(),
+        source_before.2.clone(),
+        source_before.3.clone(),
+    );
+
+    let revised = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "research",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "Replay the provider chain from Research.",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(revised.status.success(), "{revised:?}");
+
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--ticket",
+            ticket.to_str().unwrap(),
+            "--policy",
+            policy.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(rerun.status.success(), "{rerun:?}");
+
+    let replayed = read_run_json(&run_dir);
+    assert_eq!(replayed["status"], "failed");
+    assert_eq!(replayed["current_step"], "development");
+    let ledger = replayed["provider_exchange_records"].as_array().unwrap();
+    assert_eq!(&ledger[..old_ledger.len()], old_ledger.as_slice());
+    for step in [
+        "research",
+        "analysis",
+        "spec_creation",
+        "spec_review",
+        "development",
+    ] {
+        let attempt_two = ledger
+            .iter()
+            .filter(|record| record["step"] == step && record["step_attempt"] == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempt_two.len(),
+            2,
+            "{step} must have request and response attempt 2"
+        );
+    }
+    assert!(!ledger
+        .iter()
+        .any(|record| record["step"] == "output_review" && record["step_attempt"] == 2));
+
+    let artifacts = read_tree_bytes(&run_dir.join("artifacts"));
+    for (path, bytes) in old_artifacts {
+        let preserved = artifacts
+            .iter()
+            .find(|(candidate, _)| candidate == &path)
+            .map(|(_, bytes)| bytes);
+        assert_eq!(
+            preserved,
+            Some(&bytes),
+            "historical artifact changed: {path:?}"
+        );
+    }
+    assert!(!artifacts.iter().any(|(path, _)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".rerun-authorization.json"))
+    }));
+    let source_after = git_evidence(&repo);
+    assert_eq!(
+        (source_after.0, source_after.2, source_after.3),
+        source_tracked_before
+    );
+}
+
+#[test]
+fn competing_revise_commands_publish_exactly_one_recovery_cas_winner() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let ticket = write_provider_loop_ticket(temp.path(), false);
+    let runs_root = repo.join("runs");
+    let run_id = "competing-revise-cas";
+    run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+
+    let spawn_revise = |reason: &'static str| {
+        let mut command = seaf_in(&repo);
+        command.args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            reason,
+            "--json",
+        ]);
+        command.spawn().unwrap()
+    };
+    let first = spawn_revise("Competing reason A.");
+    let second = spawn_revise("Competing reason B.");
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_ne!(first.status.success(), second.status.success());
+
+    let run_dir = runs_root.join(run_id);
+    let run = read_run_json(&run_dir);
+    assert_eq!(run["latest_recovery"]["recovery_id"], 1);
+    assert!(!run_dir.join("artifacts/recovery-002.json").exists());
+    let recovery: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap())
+            .unwrap();
+    let expected_reason = if first.status.success() {
+        "Competing reason A."
+    } else {
+        "Competing reason B."
+    };
+    assert_eq!(recovery["reason"], expected_reason);
 }
 
 #[test]

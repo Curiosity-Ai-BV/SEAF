@@ -16,7 +16,7 @@ use seaf_loop::{
     load_provider_exchange_record, stage_provider_exchange_record,
     write_provider_exchange_response, ContextLimits, ContextPackRequest, LoopRunner,
     LoopRunnerConfig, ProviderExchangeCoordinates, ProviderExchangeResponseAudit,
-    ProviderStepRunner, Role, ValidatedRoleArtifact, PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    ProviderStepRunner, PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use seaf_models::{ModelError, ModelProvider, ModelRequest, ModelResponse};
 use serde_json::json;
@@ -661,75 +661,6 @@ fn resume_reuses_attempt_one_after_conventional_prompt_crash_before_first_exchan
 }
 
 #[test]
-fn resume_reuses_authorized_attempt_two_after_rerun_prompt_crash_before_exchange() {
-    let temp = tempfile::tempdir().expect("temp");
-    let repository = temp.path().join("repository");
-    std::fs::create_dir(&repository).expect("repository");
-    let runs_root = temp.path().join("runs");
-    let run_id = "resume-pre-exchange-attempt-two";
-    let ticket = ticket(Vec::new());
-    let initial_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![1],
-        vec![Ok(response(passed()))],
-    );
-    let mut initial_runner = ProviderStepRunner::new_legacy_unit_test_harness(&initial_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut initial =
-        LoopRunner::start(config(&runs_root, run_id, &ticket), &mut initial_runner).expect("start");
-    initial.run_next_step().expect("attempt one");
-    drop(initial);
-    let run_directory = runs_root.join(run_id);
-    let prior_records = read_run(&run_directory).provider_exchange_records.len();
-    let exchange_request = "prompts/01-research.attempt-002.exchange-001.initial.request.md";
-    let collision_provider = InspectingProvider::new(run_directory.clone(), Vec::new(), Vec::new());
-    let mut collision_runner = ProviderStepRunner::new_legacy_unit_test_harness(&collision_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut rerun = LoopRunner::resume(&runs_root, run_id, &mut collision_runner)
-        .expect("resume")
-        .rerun_from(LoopStepName::Research)
-        .expect("authorize attempt two");
-    std::fs::write(run_directory.join(exchange_request), "collision").expect("inject collision");
-    rerun.run_next_step().expect_err("attempt two prompt cut");
-    drop(rerun);
-    std::fs::remove_file(run_directory.join(exchange_request)).expect("remove cut");
-    let conventional =
-        std::fs::read(run_directory.join("prompts/01-research.attempt-002.prompt.md"))
-            .expect("attempt two prompt");
-
-    let provider = InspectingProvider::new(
-        run_directory.clone(),
-        vec![prior_records + 1],
-        vec![Ok(response(passed()))],
-    );
-    let mut resumed_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut resumed = LoopRunner::resume(&runs_root, run_id, &mut resumed_runner)
-        .expect("resume authorized attempt two");
-    resumed.run_next_step().expect("finish attempt two");
-
-    let run = read_run(&run_directory);
-    assert_eq!(
-        run.provider_exchange_records
-            .last()
-            .expect("response")
-            .step_attempt,
-        2
-    );
-    assert_eq!(
-        std::fs::read(run_directory.join("prompts/01-research.attempt-002.prompt.md"))
-            .expect("attempt two prompt"),
-        conventional
-    );
-    assert!(!run_directory
-        .join("prompts/01-research.attempt-003.prompt.md")
-        .exists());
-}
-
-#[test]
 fn resume_rejects_a_skipped_conventional_prompt_attempt_before_any_exchange_write() {
     let temp = tempfile::tempdir().expect("temp");
     let repository = temp.path().join("repository");
@@ -912,52 +843,6 @@ fn resume_rejects_expected_attempt_two_without_matching_rerun_authorization() {
         .exists());
 }
 
-#[test]
-fn explicit_rerun_rejects_orphaned_skipped_conventional_history_before_authorization_or_reset() {
-    let temp = tempfile::tempdir().expect("temp");
-    let repository = temp.path().join("repository");
-    std::fs::create_dir(&repository).expect("repository");
-    let runs_root = temp.path().join("runs");
-    let run_id = "reject-orphaned-rerun-attempt";
-    let ticket = ticket(Vec::new());
-    let initial_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![1],
-        vec![Ok(response(passed()))],
-    );
-    let mut initial_runner = ProviderStepRunner::new_legacy_unit_test_harness(&initial_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut initial =
-        LoopRunner::start(config(&runs_root, run_id, &ticket), &mut initial_runner).expect("start");
-    initial.run_next_step().expect("attempt one");
-    drop(initial);
-    let run_directory = runs_root.join(run_id);
-    let attempt_one =
-        std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("attempt one");
-    std::fs::write(
-        run_directory.join("prompts/01-research.attempt-003.prompt.md"),
-        attempt_one,
-    )
-    .expect("orphan attempt three");
-    let provider = InspectingProvider::new(run_directory.clone(), Vec::new(), Vec::new());
-    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let resumed = LoopRunner::resume(&runs_root, run_id, &mut runner).expect("resume");
-    let before = snapshot_tree(&run_directory);
-
-    let error = resumed
-        .rerun_from(LoopStepName::Research)
-        .expect_err("skipped rerun attempt must reject");
-
-    assert!(error.to_string().contains("skipped attempt"), "{error}");
-    assert!(provider.requests().is_empty());
-    assert_eq!(snapshot_tree(&run_directory), before);
-    assert!(!run_directory
-        .join("artifacts/01-research.attempt-004.rerun-authorization.json")
-        .exists());
-}
 
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
@@ -1662,151 +1547,6 @@ fn recovery_rejects_a_staged_next_role_attempt_999_without_advancing_the_head() 
 }
 
 #[test]
-fn explicit_rerun_uses_a_new_audited_attempt_and_preserves_the_step_context_cap() {
-    let temp = tempfile::tempdir().expect("temp");
-    let repository = temp.path().join("repository");
-    std::fs::create_dir(&repository).expect("repository");
-    for name in ["one.txt", "two.txt", "three.txt"] {
-        std::fs::write(repository.join(name), name).expect("context");
-    }
-    let runs_root = temp.path().join("runs");
-    let run_id = "rerun-preserves-context-cap";
-    let ticket = ticket(Vec::new());
-    let first_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![1, 3, 5],
-        vec![
-            Ok(response(needs_context(&["one.txt"]))),
-            Ok(response(needs_context(&["two.txt"]))),
-            Ok(response(passed())),
-        ],
-    );
-    let mut first_step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&first_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut first = LoopRunner::start(config(&runs_root, run_id, &ticket), &mut first_step_runner)
-        .expect("start");
-    first.run_next_step().expect("first attempt");
-    drop(first);
-
-    let rerun_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![7],
-        vec![Ok(response(needs_context(&["three.txt"])))],
-    );
-    let mut rerun_step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&rerun_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut rerun = LoopRunner::resume(&runs_root, run_id, &mut rerun_step_runner)
-        .expect("resume")
-        .rerun_from(LoopStepName::Research)
-        .expect("explicit rerun");
-    rerun.run_next_step().expect("cap denial on rerun");
-
-    let run = read_run(&runs_root.join(run_id));
-    assert_eq!(rerun_provider.requests().len(), 1);
-    assert_eq!(run.provider_exchange_records.len(), 8);
-    assert_eq!(
-        step_status(&run, LoopStepName::Research),
-        LoopStepStatus::Blocked
-    );
-    assert!(run_directory_has_attempt(
-        &runs_root.join(run_id),
-        "attempt-002"
-    ));
-}
-
-#[test]
-fn legacy_terminal_needs_context_history_stays_inert_until_explicit_audited_rerun() {
-    let temp = tempfile::tempdir().expect("temp");
-    let repository = temp.path().join("repository");
-    std::fs::create_dir(&repository).expect("repository");
-    let runs_root = temp.path().join("runs");
-    let run_id = "legacy-needs-context-rerun";
-    let ticket = ticket(Vec::new());
-    let first_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![1],
-        vec![Ok(response(needs_context(&["missing.txt"])))],
-    );
-    let mut first_runner = ProviderStepRunner::new_legacy_unit_test_harness(&first_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut first =
-        LoopRunner::start(config(&runs_root, run_id, &ticket), &mut first_runner).expect("start");
-    first.run_next_step().expect("terminal context denial");
-    drop(first);
-    let run_directory = runs_root.join(run_id);
-    let mut legacy = read_run(&run_directory);
-    legacy.provider_exchange_records.clear();
-    let parsed = seaf_loop::parse_role_response(Role::Researcher, &needs_context(&["missing.txt"]))
-        .expect("legacy needs_context response");
-    let artifact =
-        ValidatedRoleArtifact::new(run_id, LoopStepName::Research, Role::Researcher, parsed)
-            .expect("legacy artifact");
-    let research = legacy
-        .steps
-        .iter_mut()
-        .find(|record| record.name == LoopStepName::Research)
-        .expect("research");
-    let artifact_path = research.artifact_path.clone().expect("artifact path");
-    std::fs::write(
-        run_directory.join(&artifact_path),
-        artifact.canonical_bytes().expect("artifact bytes"),
-    )
-    .expect("write legacy artifact");
-    research.artifact_digest = Some(artifact.artifact_digest().expect("artifact digest"));
-    seaf_loop::state::write_run_file(&run_directory.join("run.json"), &legacy)
-        .expect("write legacy run shape");
-    remove_exchange_family_files(&run_directory);
-    let original_prompt =
-        std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("legacy request");
-
-    let inert_provider = InspectingProvider::new(run_directory.clone(), Vec::new(), Vec::new());
-    let mut inert_runner = ProviderStepRunner::new_legacy_unit_test_harness(&inert_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut inert = LoopRunner::resume(&runs_root, run_id, &mut inert_runner).expect("resume");
-    assert!(!inert.run_next_step().expect("terminal remains inert"));
-    assert!(inert_provider.requests().is_empty());
-    drop(inert);
-
-    let rerun_provider =
-        InspectingProvider::new(run_directory.clone(), vec![1], vec![Ok(response(passed()))]);
-    let mut rerun_runner = ProviderStepRunner::new_legacy_unit_test_harness(&rerun_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut rerun = LoopRunner::resume(&runs_root, run_id, &mut rerun_runner)
-        .expect("resume for explicit rerun")
-        .rerun_from(LoopStepName::Research)
-        .expect("authorize rerun");
-    rerun.run_next_step().expect("audited rerun");
-
-    assert_eq!(rerun_provider.requests().len(), 1);
-    let run = read_run(&run_directory);
-    assert_eq!(run.provider_exchange_records.len(), 2);
-    assert_eq!(run.provider_exchange_records[0].step_attempt, 2);
-    assert_eq!(
-        std::fs::read(run_directory.join("prompts/01-research.prompt.md"))
-            .expect("legacy request remains"),
-        original_prompt
-    );
-    drop(rerun);
-    std::fs::remove_file(
-        run_directory.join("artifacts/01-research.attempt-002.rerun-authorization.json"),
-    )
-    .expect("remove rerun authorization");
-    let rejected_provider = InspectingProvider::new(run_directory.clone(), Vec::new(), Vec::new());
-    let mut rejected_runner = ProviderStepRunner::new_legacy_unit_test_harness(&rejected_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let error = LoopRunner::resume(&runs_root, run_id, &mut rejected_runner)
-        .expect_err("legacy attempt-two history requires its rerun authorization");
-    assert!(error.to_string().contains("rerun authorization"), "{error}");
-    assert!(rejected_provider.requests().is_empty());
-}
-
-#[test]
 fn incomplete_empty_ledger_resume_starts_with_an_audited_initial_request() {
     let temp = tempfile::tempdir().expect("temp");
     let repository = temp.path().join("repository");
@@ -1907,102 +1647,6 @@ fn empty_legacy_ledger_rejects_an_unauthorized_staged_attempt_two_request() {
     assert!(read_run(&runs_root.join(run_id))
         .provider_exchange_records
         .is_empty());
-}
-
-#[test]
-fn explicit_rerun_after_resume_preserves_the_run_wide_eight_expansion_cap() {
-    let temp = tempfile::tempdir().expect("temp");
-    let repository = temp.path().join("repository");
-    std::fs::create_dir(&repository).expect("repository");
-    for index in 1..=9 {
-        std::fs::write(
-            repository.join(format!("context-{index}.txt")),
-            format!("context {index}\n"),
-        )
-        .expect("context");
-    }
-    let runs_root = temp.path().join("runs");
-    let run_id = "run-wide-cap-rerun";
-    let ticket = ticket(Vec::new());
-    let script = vec![
-        Ok(response(agent_needs_context("researcher", "context-1.txt"))),
-        Ok(response(agent_needs_context("researcher", "context-2.txt"))),
-        Ok(response(agent_passed("researcher"))),
-        Ok(response(agent_needs_context("analyzer", "context-3.txt"))),
-        Ok(response(agent_needs_context("analyzer", "context-4.txt"))),
-        Ok(response(agent_passed("analyzer"))),
-        Ok(response(agent_needs_context(
-            "spec_writer",
-            "context-5.txt",
-        ))),
-        Ok(response(agent_needs_context(
-            "spec_writer",
-            "context-6.txt",
-        ))),
-        Ok(response(agent_passed("spec_writer"))),
-        Ok(response(reviewer_approval("spec_reviewer", "approve_spec"))),
-        Ok(response(developer_needs_context("context-7.txt"))),
-        Ok(response(developer_needs_context("context-8.txt"))),
-        Ok(response(developer_blocked())),
-    ];
-    let provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        (0..script.len()).map(|index| index * 2 + 1).collect(),
-        script,
-    );
-    let mut runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut loop_runner =
-        LoopRunner::start(config(&runs_root, run_id, &ticket), &mut runner).expect("start");
-    loop_runner
-        .run_to_completion()
-        .expect("reach blocked development");
-    drop(loop_runner);
-    let before = read_run(&runs_root.join(run_id));
-    assert_eq!(
-        before
-            .provider_exchange_records
-            .iter()
-            .filter(|record| {
-                record.phase == ProviderExchangePhase::Request
-                    && record.kind == ProviderExchangeKind::ContextRetry
-            })
-            .count(),
-        8
-    );
-
-    let rerun_provider = InspectingProvider::new(
-        runs_root.join(run_id),
-        vec![before.provider_exchange_records.len() + 1],
-        vec![Ok(response(agent_needs_context(
-            "researcher",
-            "context-9.txt",
-        )))],
-    );
-    let mut rerun_runner = ProviderStepRunner::new_legacy_unit_test_harness(&rerun_provider, "fake-model", 30_000)
-        .with_ticket(ticket.clone())
-        .with_context_pack_request(context_request(&repository, &ticket));
-    let mut rerun = LoopRunner::resume(&runs_root, run_id, &mut rerun_runner)
-        .expect("resume")
-        .rerun_from(LoopStepName::Research)
-        .expect("rerun");
-    rerun.run_next_step().expect("run-wide cap denial");
-
-    let after = read_run(&runs_root.join(run_id));
-    assert_eq!(rerun_provider.requests().len(), 1);
-    assert_eq!(
-        after.provider_exchange_records.len(),
-        before.provider_exchange_records.len() + 2
-    );
-    assert_eq!(
-        step_status(&after, LoopStepName::Research),
-        LoopStepStatus::Blocked
-    );
-    assert!(!runs_root
-        .join(run_id)
-        .join("artifacts/01-research.attempt-002.context-round-001.json")
-        .exists());
 }
 
 #[test]
@@ -2143,29 +1787,6 @@ fn resume_adopts_a_staged_json_repair_response_without_recalling_provider() {
     assert_eq!(read_run(&run_directory).provider_exchange_records.len(), 4);
 }
 
-fn remove_exchange_family_files(run_directory: &Path) {
-    for directory in ["prompts", "responses", "artifacts"] {
-        for entry in std::fs::read_dir(run_directory.join(directory)).expect("artifact directory") {
-            let entry = entry.expect("artifact entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.contains(".exchange-") || name.contains(".context-round-") {
-                std::fs::remove_file(entry.path()).expect("remove modern exchange artifact");
-            }
-        }
-    }
-}
-
-fn run_directory_has_attempt(run_directory: &Path, attempt: &str) -> bool {
-    ["prompts", "responses", "artifacts"]
-        .into_iter()
-        .any(|name| {
-            std::fs::read_dir(run_directory.join(name))
-                .expect("read artifact directory")
-                .filter_map(Result::ok)
-                .any(|entry| entry.file_name().to_string_lossy().contains(attempt))
-        })
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("test mutex")
 }
@@ -2214,59 +1835,6 @@ fn needs_context(paths: &[&str]) -> String {
             "paths": paths,
             "reason": "The requested file is required to answer the ticket."
         }
-    })
-    .to_string()
-}
-
-fn agent_needs_context(role: &str, path: &str) -> String {
-    json!({
-        "role": role,
-        "status": "needs_context",
-        "summary": "More evidence is required.",
-        "findings": [],
-        "risks": [],
-        "next_step_recommendation": "Load context.",
-        "context_request": {
-            "paths": [path],
-            "reason": "This path is required for the current role."
-        }
-    })
-    .to_string()
-}
-
-fn developer_needs_context(path: &str) -> String {
-    json!({
-        "role": "developer",
-        "status": "needs_context",
-        "summary": "More evidence is required.",
-        "changed_files": [],
-        "requires_human_review": false,
-        "context_request": {
-            "paths": [path],
-            "reason": "This path is required to propose the patch."
-        }
-    })
-    .to_string()
-}
-
-fn developer_blocked() -> String {
-    json!({
-        "role": "developer",
-        "status": "blocked",
-        "summary": "Stop after establishing the run-wide cap.",
-        "changed_files": [],
-        "requires_human_review": false
-    })
-    .to_string()
-}
-
-fn reviewer_approval(role: &str, decision: &str) -> String {
-    json!({
-        "role": role,
-        "decision": decision,
-        "summary": "Approved.",
-        "blocking_issues": [],
-        "non_blocking_issues": []
     })
     .to_string()
 }

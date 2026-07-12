@@ -714,6 +714,20 @@
         },
         { "type": "null" }
       ]
+    },
+    "latest_recovery": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["recovery_id", "artifact"],
+          "properties": {
+            "recovery_id": { "type": "integer", "minimum": 1 },
+            "artifact": { "$ref": "#/$defs/artifactReference" }
+          },
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
     }
   },
   "allOf": [

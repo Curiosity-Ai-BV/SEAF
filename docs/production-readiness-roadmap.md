@@ -112,9 +112,12 @@ only the exact byte-identical authorized attempt. Structured metadata inside
 the immutable initial request binds the one content-bearing repository-context
 payload, so resumed rounds reconstruct accepted bytes and original limits
 without rereading changed sources. Context-free roles remain recoverable.
-`seaf loop resume --rerun-from <step>` publishes an immutable rerun
-authorization and reset state in one exchange-locked transaction, then uses a
-fresh exact attempt while preserving the two-per-step and eight-per-run caps.
+At this historical M1-04 boundary, `seaf loop resume --rerun-from <step>`
+published an immutable rerun authorization and reset state in one
+exchange-locked transaction. M1-09b now retires that writer in both the CLI and
+public runner API; historical authorization remains readable, while all new
+provider recovery uses actor/reason-bound `loop revise` followed by exact
+`loop rerun --recovery <id>`.
 Recovery validates the exact conventional prompt before staged-head adoption.
 Terminal legacy `needs_context` history stays inert until that explicit rerun.
 Real CLI tests cover default resume, repository changes, cap exhaustion, and
@@ -205,8 +208,13 @@ the exact durable attempt with create-only paths; ambiguous fixed-name reuse is
 forensic-only and blocks rerun before reset. `loop inspect` is byte-inert,
 authenticates the provider chain, safely verifies physical candidate authority
 without executing repository helpers, and retains current/head evidence under
-deterministic output caps. M1-09b audited provider revise/rerun is active, then
-M1-09c owns Approved-evaluation adoption/invalidation. Authoritative input
+deterministic output caps. M1-09b audited provider recovery is complete.
+`loop revise` publishes a create-only source snapshot and recovery decision
+under candidate-to-provider full CAS without a provider call; only exact `loop
+rerun --recovery <id>` may consume its first request. Attempts, provider ledger,
+role artifacts, and policy artifacts remain immutable, while selected and
+downstream current pointers are reset. The legacy rerun writer is retired.
+M1-09c is active for Approved-evaluation adoption/invalidation. Authoritative input
 changes still require a new run; EvalPassed/Promoted and M1-08 promotion intent
 remain frozen.
 Human approval authorizes local execution under the developer account: SEAF

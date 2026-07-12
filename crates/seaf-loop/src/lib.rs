@@ -16,6 +16,7 @@ pub mod policy;
 pub mod policy_gate;
 pub mod promotion;
 pub mod provider_exchange;
+pub mod recovery;
 pub mod role_artifact;
 pub mod role_response;
 pub mod runner;
@@ -77,6 +78,11 @@ pub use provider_exchange::{
     write_provider_exchange_request, write_provider_exchange_response, ProviderExchangeCoordinates,
     ProviderExchangeError, ProviderExchangeRecordState, ProviderExchangeResponseAudit,
     PROVIDER_EXCHANGE_SCHEMA_VERSION,
+};
+pub use recovery::{
+    ensure_no_pending_recovery, load_verified_latest_recovery, revise_provider_step,
+    validate_requested_recovery, RecoveryAction, RecoveryAttemptV1, RecoveryError,
+    RecoveryRevisionOutcome, RecoverySourceRunV1, RECOVERY_SCHEMA_VERSION,
 };
 pub use role_artifact::{RoleArtifactError, ValidatedRoleArtifact};
 pub use role_response::{

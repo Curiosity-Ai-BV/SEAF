@@ -485,13 +485,6 @@ fn human_approval_binds_the_exact_reviewed_candidate_without_running_tests() {
     assert!(!resumed
         .run_next_step()
         .expect("Approved has no runnable step"));
-    let rerun_error = resumed
-        .rerun_from(LoopStepName::OutputReview)
-        .expect_err("Approved rerun requires future audited invalidation");
-    assert!(
-        rerun_error.to_string().contains("approved authority"),
-        "{rerun_error}"
-    );
     assert_eq!(snapshot_files(workspace.run_directory()), approved_snapshot);
     remove_candidate(&fixture.source, &fixture.candidate);
 }
@@ -626,10 +619,6 @@ fn eval_passed_authority_is_inert_frozen_and_non_cleanable() {
     let mut resumed = LoopRunner::resume(runs_root, "eval-passed-frozen", &mut inert)
         .expect("EvalPassed resumes inertly");
     assert!(!resumed.run_next_step().unwrap());
-    let rerun_error = resumed
-        .rerun_from(LoopStepName::OutputReview)
-        .expect_err("EvalPassed cannot rerun");
-    assert!(rerun_error.to_string().contains("final evaluation"));
     assert_eq!(snapshot_files(fixture.workspace.run_directory()), before);
     fixture.cleanup();
 }
@@ -1166,63 +1155,6 @@ fn recovery_rejects_a_staged_output_review_subject_substitution_before_cas() {
 }
 
 #[test]
-fn awaiting_human_review_rejects_output_review_rerun_without_mutation() {
-    let fixture = fixture("candidate-output-review-rerun");
-    let source_before = source_evidence(&fixture.source);
-    let provider = FakeProvider::new(candidate_responses(true));
-    let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-        .with_ticket(fixture.ticket.clone())
-        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
-        .with_patch_gate(
-            ProviderPatchGateConfig::for_ticket(
-                &fixture.candidate,
-                &fixture.ticket,
-                fixture.policy.clone(),
-                true,
-            ),
-            &mut patch_runner,
-        );
-    let mut loop_runner =
-        LoopRunner::start_initialized(fixture.prepared, &mut step_runner).expect("start");
-    for _ in 0..6 {
-        assert!(loop_runner.run_next_step().expect("through OutputReview"));
-    }
-    let before = loop_runner.run().clone();
-    let workspace = LoopWorkspace::open(&fixture.runs_root, "candidate-output-review-rerun")
-        .expect("workspace");
-    let run_bytes_before = fs::read(workspace.run_file()).unwrap();
-    let candidate_before = source_evidence(&fixture.candidate);
-    seaf_loop::state::save_run(&workspace, loop_runner.run())
-        .expect("identical Awaiting save is idempotent");
-    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
-    let provider_calls_before = provider.requests().unwrap().len();
-    let error = loop_runner
-        .rerun_from(LoopStepName::OutputReview)
-        .expect_err("awaiting review cannot invalidate authenticated review evidence");
-    assert!(
-        error.to_string().contains("awaiting human review"),
-        "{error}"
-    );
-    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
-    assert_eq!(
-        seaf_loop::state::load_run(&workspace).unwrap(),
-        before,
-        "rerun refusal must preserve the full approval subject"
-    );
-    assert_eq!(provider.requests().unwrap().len(), provider_calls_before);
-    assert_eq!(source_evidence(&fixture.source), source_before);
-    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
-    drop(step_runner);
-    assert_eq!(
-        patch_runner.calls.len(),
-        1,
-        "rerun refusal never repeats patch gating"
-    );
-    remove_candidate(&fixture.source, &fixture.candidate);
-}
-
-#[test]
 fn historical_isolated_testing_or_eval_prefix_rejects_before_recovery_mutation() {
     for next_step in [LoopStepName::Testing, LoopStepName::EvalReport] {
         let run_id = format!("historical-unapproved-{next_step:?}").to_ascii_lowercase();
@@ -1433,31 +1365,10 @@ fn non_approving_authenticated_review_cannot_be_relabelled_passed_by_a_custom_ru
     assert_eq!(fs::read(workspace.run_file()).unwrap(), blocked_bytes);
     drop(runner);
     drop(provider_runner);
-    let source_before = source_evidence(&fixture.source);
-    let candidate_before = source_evidence(&fixture.candidate);
-    let mut custom = UnauthenticatedOutputReview;
-    let resumed = LoopRunner::resume(
-        &fixture.runs_root,
-        "non-approving-review-custom-pass",
-        &mut custom,
-    )
-    .expect("resume blocked review");
-    let mut rerun = resumed
-        .rerun_from(LoopStepName::OutputReview)
-        .expect("reset OutputReview with the same Applied candidate");
-
-    let error = rerun
-        .run_next_step()
-        .expect_err("RequestChanges audit cannot authorize Awaiting");
-
-    assert!(error.to_string().contains("ApproveForTests"), "{error}");
-    drop(rerun);
     assert_ne!(
         seaf_loop::state::load_run(&workspace).unwrap().status,
         seaf_core::LoopStatus::AwaitingHumanReview
     );
-    assert_eq!(source_evidence(&fixture.source), source_before);
-    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
     remove_candidate(&fixture.source, &fixture.candidate);
 }
 
@@ -1530,47 +1441,6 @@ fn pre_b3_completed_development_with_output_review_history_is_rejected_before_sc
     assert_eq!(snapshot_files(workspace.run_directory()), before);
     assert_eq!(source_evidence(&fixture.source).1, "");
     assert_eq!(source_evidence(&fixture.candidate).1, "");
-    remove_candidate(&fixture.source, &fixture.candidate);
-}
-
-#[test]
-fn applied_candidate_rejects_development_rerun_without_mutation() {
-    let fixture = fixture("candidate-development-rerun-rejected");
-    let source_before = source_evidence(&fixture.source);
-    let provider = FakeProvider::new(candidate_responses(false));
-    let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-        .with_ticket(fixture.ticket.clone())
-        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
-        .with_patch_gate(
-            ProviderPatchGateConfig::for_ticket(
-                &fixture.candidate,
-                &fixture.ticket,
-                fixture.policy.clone(),
-                true,
-            ),
-            &mut patch_runner,
-        );
-    let mut loop_runner =
-        LoopRunner::start_initialized(fixture.prepared, &mut step_runner).expect("start");
-    for _ in 0..5 {
-        assert!(loop_runner.run_next_step().expect("through Development"));
-    }
-    let candidate_before = source_evidence(&fixture.candidate);
-    let workspace =
-        LoopWorkspace::open(&fixture.runs_root, "candidate-development-rerun-rejected").unwrap();
-    let run_tree_before = snapshot_files(workspace.run_directory());
-    let provider_calls_before = provider.requests().unwrap();
-    let error = loop_runner
-        .rerun_from(LoopStepName::Development)
-        .expect_err("Development rerun requires a new candidate run");
-    assert!(error.to_string().contains("start a new run"), "{error}");
-    drop(step_runner);
-    assert_eq!(snapshot_files(workspace.run_directory()), run_tree_before);
-    assert_eq!(provider.requests().unwrap(), provider_calls_before);
-    assert_eq!(patch_runner.calls.len(), 1);
-    assert_eq!(source_evidence(&fixture.source), source_before);
-    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
     remove_candidate(&fixture.source, &fixture.candidate);
 }
 
@@ -1708,80 +1578,6 @@ fn development_apply_failure_keeps_durable_evidence_but_withholds_finish_and_out
     assert!(!log.contains("finished step Development"));
     assert_eq!(provider.requests().unwrap().len(), 5);
     assert_eq!(source_evidence(&fixture.source), source_before);
-    remove_candidate(&fixture.source, &fixture.candidate);
-}
-
-#[test]
-fn blocked_output_review_can_resume_and_rerun_only_the_same_applied_subject() {
-    let fixture = fixture("candidate-output-review-blocked-resume");
-    let source_before = source_evidence(&fixture.source);
-    let mut responses = candidate_responses(false);
-    responses.push(response(
-        r#"{"role":"output_reviewer","decision":"request_changes","summary":"Review again.","blocking_issues":[{"summary":"Recheck","evidence":"candidate diff"}],"non_blocking_issues":[]}"#,
-    ));
-    responses.push(response(
-        r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"The same applied subject now passes review.","blocking_issues":[],"non_blocking_issues":[]}"#,
-    ));
-    let provider = FakeProvider::new(responses);
-    let mut first_patch_runner = RecordingPatchRunner::default();
-    let mut first_step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-        .with_ticket(fixture.ticket.clone())
-        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
-        .with_patch_gate(
-            ProviderPatchGateConfig::for_ticket(
-                &fixture.candidate,
-                &fixture.ticket,
-                fixture.policy.clone(),
-                true,
-            ),
-            &mut first_patch_runner,
-        );
-    let mut first =
-        LoopRunner::start_initialized(fixture.prepared, &mut first_step_runner).expect("start");
-    for _ in 0..6 {
-        assert!(first.run_next_step().expect("through blocked OutputReview"));
-    }
-    assert_eq!(first.run().status, seaf_core::LoopStatus::Blocked);
-    let blocked = first.run().clone();
-    let applied_before = blocked.candidate_workspace.clone();
-    drop(first);
-    drop(first_step_runner);
-    assert_eq!(first_patch_runner.calls.len(), 1);
-
-    let prepared = InitializedLoopRun::resume_isolated(&fixture.runs_root, blocked)
-        .expect("Applied blocked run resumes read-only")
-        .scaffold()
-        .unwrap()
-        .publish_authoritative_inputs(authoritative_snapshots(
-            &fixture.source,
-            &fixture.ticket,
-            &fixture.policy,
-        ))
-        .unwrap();
-    let mut resumed_patch_runner = RecordingPatchRunner::default();
-    let mut resumed_step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
-        .with_ticket(fixture.ticket.clone())
-        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
-        .with_patch_gate(
-            ProviderPatchGateConfig::for_ticket(
-                &fixture.candidate,
-                &fixture.ticket,
-                fixture.policy.clone(),
-                true,
-            ),
-            &mut resumed_patch_runner,
-        );
-    let resumed = LoopRunner::resume_initialized(prepared, &mut resumed_step_runner)
-        .expect("resume exact blocked history");
-    let mut rerun = resumed
-        .rerun_from(LoopStepName::OutputReview)
-        .expect("rerun OutputReview after terminal resume");
-    assert!(rerun.run_next_step().expect("OutputReview attempt two"));
-    assert_eq!(rerun.run().candidate_workspace, applied_before);
-    assert_eq!(source_evidence(&fixture.source), source_before);
-    drop(rerun);
-    drop(resumed_step_runner);
-    assert!(resumed_patch_runner.calls.is_empty());
     remove_candidate(&fixture.source, &fixture.candidate);
 }
 
@@ -2229,32 +2025,6 @@ fn fixture(run_id: &str) -> Fixture {
         ticket,
         policy,
         prepared,
-    }
-}
-
-fn authoritative_snapshots(
-    source: &Path,
-    ticket: &TicketSpec,
-    policy: &Policy,
-) -> AuthoritativeRunInputSnapshots {
-    let ticket_bytes = canonical_json_bytes(ticket).unwrap();
-    AuthoritativeRunInputSnapshots {
-        ticket: ticket_bytes.clone(),
-        provider_ticket: ticket_bytes,
-        policy: canonical_json_bytes(policy).unwrap(),
-        config: canonical_json_bytes(&serde_json::json!({"policy_path":"seaf.policy.json"}))
-            .unwrap(),
-        repository: canonical_json_bytes(
-            &serde_json::json!({"source":source.canonicalize().unwrap()}),
-        )
-        .unwrap(),
-        eval_config: canonical_json_bytes(
-            &seaf_core::parse_eval_config(
-                "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
-            )
-            .unwrap(),
-        )
-        .unwrap(),
     }
 }
 

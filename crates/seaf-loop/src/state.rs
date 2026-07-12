@@ -64,6 +64,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
         human_approval: None,
         eval_report_path: None,
         promotion: None,
+        latest_recovery: None,
     }
 }
 
@@ -111,6 +112,19 @@ fn guard_frozen_authority_direct_write(
         .ok()
         .and_then(|content| serde_json::from_str::<LoopRun>(&content).ok())
         .filter(|run| validate_run_integrity(run).is_ok());
+    match &current {
+        Some(current) if current.latest_recovery != intended.latest_recovery => {
+            return Err(StateError::InvalidRun(
+                "public state writer cannot mint, replace, or clear recovery authority".to_string(),
+            ));
+        }
+        None if intended.latest_recovery.is_some() => {
+            return Err(StateError::InvalidRun(
+                "a new run file cannot begin with recovery authority".to_string(),
+            ));
+        }
+        _ => {}
+    }
     if is_frozen_review_or_evaluation_authority(intended) {
         if current.as_ref() == Some(intended) {
             return Ok(true);
@@ -346,5 +360,100 @@ impl From<std::io::Error> for StateError {
 impl From<serde_json::Error> for StateError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+#[cfg(test)]
+mod recovery_authority_tests {
+    use super::*;
+    use seaf_core::{
+        ArtifactReference, CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopExecutionMode,
+        RecoveryReference,
+    };
+
+    fn run_with_candidate() -> LoopRun {
+        let mut run = create_run(NewLoopRun {
+            run_id: "direct-writer-recovery".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        run.execution_mode = LoopExecutionMode::IsolatedCandidate;
+        run.candidate_workspace = Some(CandidateWorkspaceState {
+            schema_version: 2,
+            run_directory_digest: Some("1".repeat(64)),
+            path: "/tmp/candidate".to_string(),
+            source_worktree_root: "/tmp/source".to_string(),
+            git_common_dir: "/tmp/source/.git".to_string(),
+            repository_identity_digest: "d".repeat(64),
+            starting_head: "3".repeat(40),
+            starting_tree: "4".repeat(40),
+            candidate_head: "3".repeat(40),
+            candidate_tree: "4".repeat(40),
+            candidate_diff_digest:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            patch_transaction: None,
+            lifecycle: CandidateWorkspaceLifecycle::Active,
+            cleanup_started_at: None,
+            cleaned_at: None,
+        });
+        run
+    }
+
+    fn recovery(id: u32, digest: char) -> RecoveryReference {
+        RecoveryReference {
+            recovery_id: id,
+            artifact: ArtifactReference {
+                path: format!("artifacts/recovery-{id:03}.json"),
+                digest: digest.to_string().repeat(64),
+            },
+        }
+    }
+
+    #[test]
+    fn public_direct_writer_cannot_mint_change_or_clear_recovery_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let run = run_with_candidate();
+        write_run_file(&path, &run).unwrap();
+
+        let mut minted = run.clone();
+        minted.latest_recovery = Some(recovery(1, '6'));
+        let error = write_run_file(&path, &minted).unwrap_err();
+        assert!(error.to_string().contains("recovery authority"), "{error}");
+
+        let mut authoritative_bytes = serde_json::to_vec_pretty(&minted).unwrap();
+        authoritative_bytes.push(b'\n');
+        fs::write(&path, authoritative_bytes).unwrap();
+        write_run_file(&path, &minted).unwrap();
+
+        let mut changed = minted.clone();
+        changed.latest_recovery = Some(recovery(2, '7'));
+        let error = write_run_file(&path, &changed).unwrap_err();
+        assert!(error.to_string().contains("recovery authority"), "{error}");
+
+        let mut cleared = minted;
+        cleared.latest_recovery = None;
+        let error = write_run_file(&path, &cleared).unwrap_err();
+        assert!(error.to_string().contains("recovery authority"), "{error}");
+    }
+
+    #[test]
+    fn new_run_file_cannot_begin_with_recovery_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let mut run = run_with_candidate();
+        run.latest_recovery = Some(recovery(1, '6'));
+        let error = write_run_file(&path, &run).unwrap_err();
+        assert!(error.to_string().contains("cannot begin"), "{error}");
+        assert!(!path.exists());
     }
 }

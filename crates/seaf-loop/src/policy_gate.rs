@@ -143,29 +143,45 @@ pub fn gate_patch<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
 ) -> Result<PolicyDecision, PatchGateError> {
-    gate_patch_with_execution(request, runner, true)
+    gate_patch_with_execution(request, runner, true, 1)
 }
 
-pub(crate) fn gate_patch_proposal<R: PatchCommandRunner + ?Sized>(
+pub(crate) fn gate_patch_proposal_attempt<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
+    attempt: u32,
 ) -> Result<PolicyDecision, PatchGateError> {
-    gate_patch_with_execution(request, runner, false)
+    if attempt == 0 {
+        return Err(PatchGateError::Artifact(
+            "policy artifact attempt must be positive".to_string(),
+        ));
+    }
+    gate_patch_with_execution(request, runner, false, attempt)
 }
 
 fn gate_patch_with_execution<R: PatchCommandRunner + ?Sized>(
     request: PatchGateRequest<'_>,
     runner: &mut R,
     execute_apply: bool,
+    artifact_attempt: u32,
 ) -> Result<PolicyDecision, PatchGateError> {
     fs::create_dir_all(request.artifact_dir).map_err(PatchGateError::Io)?;
 
-    let artifact_stem = safe_artifact_stem(request.patch_id);
-    fs::write(
-        request.artifact_dir.join(format!("{artifact_stem}.diff")),
-        request.patch,
+    let artifact_stem = match artifact_attempt {
+        attempt if attempt > 1 => {
+            format!(
+                "{}.attempt-{attempt:03}",
+                safe_artifact_stem(request.patch_id)
+            )
+        }
+        _ => safe_artifact_stem(request.patch_id),
+    };
+    crate::immutable_artifact::publish_create_only(
+        request.artifact_dir,
+        &format!("{artifact_stem}.diff"),
+        request.patch.as_bytes(),
     )
-    .map_err(PatchGateError::Io)?;
+    .map_err(|error| PatchGateError::Artifact(error.to_string()))?;
 
     let mut decision = PolicyDecision {
         patch_id: request.patch_id.to_string(),
@@ -507,11 +523,12 @@ fn write_decision_artifact(
 ) -> Result<(), PatchGateError> {
     let mut json = serde_json::to_vec_pretty(decision).map_err(PatchGateError::Json)?;
     json.push(b'\n');
-    fs::write(
-        artifact_dir.join(format!("{artifact_stem}.policy-decision.json")),
-        json,
+    crate::immutable_artifact::publish_create_only(
+        artifact_dir,
+        &format!("{artifact_stem}.policy-decision.json"),
+        &json,
     )
-    .map_err(PatchGateError::Io)
+    .map_err(|error| PatchGateError::Artifact(error.to_string()))
 }
 
 fn reason(
@@ -591,6 +608,7 @@ pub enum PatchGateError {
     Json(serde_json::Error),
     CommandIo(std::io::Error),
     Command(String),
+    Artifact(String),
 }
 
 impl fmt::Display for PatchGateError {
@@ -600,8 +618,76 @@ impl fmt::Display for PatchGateError {
             Self::Json(error) => write!(formatter, "patch gate JSON error: {error}"),
             Self::CommandIo(error) => write!(formatter, "patch command I/O error: {error}"),
             Self::Command(message) => write!(formatter, "patch command error: {message}"),
+            Self::Artifact(message) => write!(formatter, "patch artifact error: {message}"),
         }
     }
 }
 
 impl Error for PatchGateError {}
+
+#[cfg(test)]
+mod attempt_artifact_tests {
+    use super::*;
+
+    struct UnusedRunner;
+
+    impl PatchCommandRunner for UnusedRunner {
+        fn run(
+            &mut self,
+            _repo_root: &Path,
+            _command: PatchCommand,
+            _patch: &str,
+        ) -> Result<CommandOutput, PatchGateError> {
+            panic!("proposal-only denied policy must not execute patch commands")
+        }
+    }
+
+    fn policy() -> Policy {
+        Policy {
+            policy_id: "attempt-artifacts".to_string(),
+            default_autonomy_level: 1,
+            forbidden_paths: vec!["blocked.txt".to_string()],
+            requires_human_review: vec!["dependency_changes".to_string()],
+            allowed_without_review: vec!["tests".to_string()],
+        }
+    }
+
+    #[test]
+    fn later_attempt_policy_outputs_are_create_only_exact_and_collision_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let policy = policy();
+        let patch = "diff --git a/blocked.txt b/blocked.txt\nnew file mode 100644\n--- /dev/null\n+++ b/blocked.txt\n@@ -0,0 +1 @@\n+blocked\n";
+        let request = |patch| PatchGateRequest {
+            repo_root: temp.path(),
+            artifact_dir: &artifacts,
+            patch_id: "run-1",
+            patch,
+            policy: &policy,
+            apply_patch: false,
+        };
+        let mut runner = UnusedRunner;
+
+        let first = gate_patch_proposal_attempt(request(patch), &mut runner, 2).unwrap();
+        let diff_path = artifacts.join("run-1.attempt-002.diff");
+        let decision_path = artifacts.join("run-1.attempt-002.policy-decision.json");
+        let diff_bytes = fs::read(&diff_path).unwrap();
+        let decision_bytes = fs::read(&decision_path).unwrap();
+        let exact = gate_patch_proposal_attempt(request(patch), &mut runner, 2).unwrap();
+        assert_eq!(exact, first);
+        assert_eq!(fs::read(&diff_path).unwrap(), diff_bytes);
+        assert_eq!(fs::read(&decision_path).unwrap(), decision_bytes);
+        assert!(!artifacts.join("run-1.diff").exists());
+        assert!(!artifacts.join("run-1.policy-decision.json").exists());
+
+        let substituted = patch.replace("blocked\n", "substituted\n");
+        let error = gate_patch_proposal_attempt(request(&substituted), &mut runner, 2)
+            .expect_err("different bytes cannot replace attempt-two evidence");
+        assert!(error.to_string().contains("collision"), "{error}");
+        assert_eq!(fs::read(diff_path).unwrap(), diff_bytes);
+
+        let error = gate_patch_proposal_attempt(request(patch), &mut runner, 0)
+            .expect_err("attempt zero cannot alias fixed attempt-one evidence");
+        assert!(error.to_string().contains("positive"), "{error}");
+    }
+}

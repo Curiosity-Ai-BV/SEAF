@@ -44,19 +44,20 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09b - Audited provider revise and rerun. Add one versioned, create-only
-`RecoveryAttemptV1` authorization plus its exact source-run snapshot. Bind the
-sequential recovery ID, actor/reason/time, selected provider step, source and
-next attempts, immutable input and candidate authority, prior provider/recovery
-heads, and expected reset-state digest. Existing ticket, policy, config,
-repository, eval config, provider/model, candidate, and artifact bytes cannot be
-revised; changing any of them requires a new run.
+M1-09c - Approved-evaluation recovery. Add attempt-indexed create-only
+evaluation intent, log, Testing, and EvalReport paths. ApprovedEvaluationIntent
+v2 must bind its evaluation attempt and recovery reference; TestingEvidence v2
+must bind the exact intent and invalidation authority. Historical v1 fixed paths
+remain readable and final validation selects only the bound attempt.
 
-`seaf loop revise` must publish the recovery evidence and pure reset under the
-candidate-to-provider compare-and-swap boundary without calling a provider.
-Only `seaf loop rerun --recovery N` may consume a pending recovery before its
-first durable request. Ordinary resume rejects that cut, then may recover after
-the exact request is durable. Preserve every historical file and provider
-record, clear only the selected/downstream current pointers and their dependent
-policy/approval/eval references, retire new `resume --rerun-from` use with
-migration guidance, and keep evaluation/promotion recovery out of this slice.
+`seaf loop revise --from-step testing --eval-recovery adopt|invalidate` must
+publish audited authority under the candidate-to-provider recovery CAS.
+Adoption accepts only a complete verified intent/check/log/Testing prefix,
+executes zero commands, and may deterministically create only a missing
+EvalReport. Invalidation preserves every byte and exact candidate, approval,
+policy, input, and provider authority; clears only current Testing/EvalReport
+and final-eval references; and gates one fresh attempt behind `loop rerun
+--recovery N`. Active Approved incomplete prefixes and active approval-bound
+final Failed are eligible. EvalPassed, Promoted, historical missing-eval
+authority, partial adoptable evidence, gaps, substitution, or physical drift
+fail closed. Do not weaken M1-08 promotion-intent or final-state relations.

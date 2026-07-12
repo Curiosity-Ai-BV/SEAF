@@ -1608,62 +1608,6 @@ fn development_evidence_preserves_exact_malformed_and_binary_gate_rejections() {
 }
 
 #[test]
-fn provider_step_runner_replaces_stale_policy_decision_when_development_is_rerun() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let repo = temp_dir.path().join("repo");
-    let runs_root = temp_dir.path().join("runs");
-    std::fs::create_dir_all(&repo).expect("repo dir");
-    let rejected_patch = forbidden_patch();
-
-    let provider = FakeProvider::new(vec![
-        Ok(model_response(fixture("research.valid.json"))),
-        Ok(model_response(fixture("analyzer.valid.json"))),
-        Ok(model_response(&spec_writer_response())),
-        Ok(model_response(&spec_review_approved_response())),
-        Ok(model_response(&developer_response(&rejected_patch))),
-        Ok(model_response(&developer_response(fixture(
-            "allowed-doc.diff",
-        )))),
-    ]);
-    let mut patch_runner = RecordingPatchRunner::default();
-    let mut step_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
-        .with_ticket(ticket())
-        .with_patch_gate(patch_gate_config(&repo, false, true), &mut patch_runner);
-    let mut loop_runner = LoopRunner::start(
-        LoopRunnerConfig::for_ticket(
-            &runs_root,
-            "rerun-policy-run",
-            &ticket(),
-            "fake-provider",
-            "fake-model",
-            test_input_digests(),
-        ),
-        &mut step_runner,
-    )
-    .expect("start loop");
-    finish_steps_before_development(&mut loop_runner);
-    loop_runner
-        .run_next_step()
-        .expect("first development attempt records rejection");
-    assert_eq!(loop_runner.run().status, LoopStatus::Failed);
-
-    let mut loop_runner = loop_runner
-        .rerun_from(LoopStepName::Development)
-        .expect("rerun development");
-    loop_runner
-        .run_next_step()
-        .expect("second development attempt records replacement decision");
-    drop(loop_runner);
-    drop(step_runner);
-
-    let persisted = read_run(&runs_root.join("rerun-policy-run"));
-    let decision = single_policy_decision(&persisted);
-    assert_eq!(decision.patch_id, "rerun-policy-run");
-    assert_eq!(decision.decision, PatchDecisionKind::Allowed);
-    assert_eq!(decision.changed_paths, vec!["docs/example.md"]);
-}
-
-#[test]
 fn provider_step_runner_human_review_patch_may_reach_output_review_without_applying() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");

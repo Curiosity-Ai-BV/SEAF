@@ -92,27 +92,6 @@ pub trait StepRunner {
         None
     }
 
-    fn prepare_rerun(
-        &mut self,
-        _workspace: &LoopWorkspace,
-        _run: &LoopRun,
-        _step: LoopStepName,
-        _attempt: u32,
-    ) -> Result<(), RunnerError> {
-        Ok(())
-    }
-
-    fn persist_rerun_reset(
-        &mut self,
-        _workspace: &LoopWorkspace,
-        _previous: &LoopRun,
-        _reset: &LoopRun,
-        _step: LoopStepName,
-        _attempt: u32,
-    ) -> Result<bool, RunnerError> {
-        Ok(false)
-    }
-
     fn step_request(&mut self, step: LoopStepName) -> Result<String, RunnerError>;
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError>;
@@ -937,40 +916,10 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         Ok(runner)
     }
 
-    pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
-        validate_rerun_eligibility(&self.run, step)?;
-        if let Some(candidate) = self.run.candidate_workspace.as_ref() {
-            if candidate.patch_transaction.is_some() {
-                crate::candidate_workspace::verify_candidate_patch_evidence(
-                    &self.workspace,
-                    Path::new(&candidate.source_worktree_root),
-                )
-                .map_err(|error| RunnerError::Step(error.to_string()))?;
-            }
-        }
-        let attempt = next_step_attempt(&self.workspace, step)?;
-        if attempt >= 3 {
-            crate::artifacts::refuse_ambiguous_fixed_pointer_in_run(&self.run, step, attempt)?;
-        }
-        let previous = self.run.clone();
-        self.step_runner
-            .prepare_rerun(&self.workspace, &self.run, step, attempt)?;
-        self.next_attempt = Some((step, attempt));
-        state::reset_from_step(&mut self.run, step)?;
-        clear_current_run_policy_decisions_from_step(&mut self.run, step)?;
-        let reset_persisted = self.step_runner.persist_rerun_reset(
-            &self.workspace,
-            &previous,
-            &self.run,
-            step,
-            attempt,
-        )?;
-        if !reset_persisted {
-            self.persist_run_state()?;
-        }
-        self.workspace
-            .append_log(&format!("reset run from {step:?}"))?;
-        Ok(self)
+    pub fn rerun_from(self, _step: LoopStepName) -> Result<Self, RunnerError> {
+        Err(RunnerError::Step(
+            "legacy rerun is retired; use audited revise and rerun recovery commands".to_string(),
+        ))
     }
 
     pub fn run(&self) -> &LoopRun {
@@ -1159,18 +1108,6 @@ fn append_policy_decisions(
         run.policy_decisions
             .retain(|existing| policy_decision_patch_id(existing) != Some(patch_id.as_str()));
         run.policy_decisions.push(entry);
-    }
-    Ok(())
-}
-
-fn clear_current_run_policy_decisions_from_step(
-    run: &mut LoopRun,
-    step: LoopStepName,
-) -> Result<(), RunnerError> {
-    if state::step_index(step)? <= state::step_index(LoopStepName::Development)? {
-        let run_id = run.run_id.clone();
-        run.policy_decisions
-            .retain(|decision| policy_decision_patch_id(decision) != Some(run_id.as_str()));
     }
     Ok(())
 }

@@ -95,6 +95,7 @@ pub(crate) fn authorize_provider_exchange_rerun(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn persist_provider_rerun_reset(
     workspace: &LoopWorkspace,
     previous: &LoopRun,
@@ -112,6 +113,7 @@ pub(crate) fn persist_provider_rerun_reset(
     )
 }
 
+#[cfg(test)]
 fn persist_provider_rerun_reset_with_hook<F>(
     workspace: &LoopWorkspace,
     previous: &LoopRun,
@@ -459,6 +461,12 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
                 "candidate workspace changed before ordinary state publication".to_string(),
             ));
         }
+        if current.latest_recovery != intended.latest_recovery {
+            return Err(ProviderExchangeError::Invalid(
+                "ordinary state publication cannot mint, replace, or clear recovery authority"
+                    .to_string(),
+            ));
+        }
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');
@@ -495,12 +503,55 @@ pub(crate) fn persist_run_with_full_compare_and_validator<F>(
 where
     F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
 {
+    persist_run_with_full_compare_and_validator_mode(
+        workspace,
+        expected,
+        intended,
+        false,
+        validate_current,
+    )
+}
+
+pub(crate) fn persist_recovery_reset_with_full_compare_and_validator<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+    validate_current: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
+    persist_run_with_full_compare_and_validator_mode(
+        workspace,
+        expected,
+        intended,
+        true,
+        validate_current,
+    )
+}
+
+fn persist_run_with_full_compare_and_validator_mode<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+    allow_recovery_advance: bool,
+    validate_current: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let current = state::load_run(workspace)?;
         if &current != expected {
             return Err(ProviderExchangeError::Invalid(
                 "LoopRun changed before compare-and-swap publication".to_string(),
+            ));
+        }
+        if !allow_recovery_advance && current.latest_recovery != intended.latest_recovery {
+            return Err(ProviderExchangeError::Invalid(
+                "latest recovery authority is immutable outside audited recovery creation"
+                    .to_string(),
             ));
         }
         validate_current(&current)?;
@@ -1408,11 +1459,12 @@ fn validate_append_link(
                     "new provider exchange group must use exact step attempt {expected_attempt}"
                 )));
             }
+            let rerun_authorization =
+                verify_attempt_authorization(workspace, run, record.step, record.step_attempt);
             let authorized_rerun = record.kind == ProviderExchangeKind::Initial
                 && record.exchange_index == 1
                 && record.step_attempt > previous_attempt_for_step
-                && verify_rerun_authorization(workspace, run, record.step, record.step_attempt)
-                    .is_ok();
+                && rerun_authorization.is_ok();
             if authorized_rerun {
                 if enforce_empty_current {
                     let status = run
@@ -1436,6 +1488,15 @@ fn validate_append_link(
                     }
                 }
                 return Ok(());
+            }
+            if record.step == previous.step
+                && record.kind == ProviderExchangeKind::Initial
+                && record.exchange_index == 1
+                && record.step_attempt > previous_attempt_for_step
+            {
+                return Err(rerun_authorization.expect_err(
+                    "failed authorization is required when same-step rerun is not authorized",
+                ));
             }
             if !is_advancing_outcome(previous_record.role, outcome)
                 || next_provider_step(previous_record.step) != Some(record.step)
@@ -1521,7 +1582,7 @@ fn validate_append_link(
             ));
         }
         if record.step_attempt > 1 {
-            verify_rerun_authorization(workspace, run, record.step, record.step_attempt)?;
+            verify_attempt_authorization(workspace, run, record.step, record.step_attempt)?;
         }
     } else {
         if record.kind != ProviderExchangeKind::Initial || record.exchange_index != 1 {
@@ -1531,7 +1592,7 @@ fn validate_append_link(
             ));
         }
         if record.step_attempt > 1 {
-            verify_rerun_authorization(workspace, run, record.step, record.step_attempt)?;
+            verify_attempt_authorization(workspace, run, record.step, record.step_attempt)?;
         }
     }
     Ok(())
@@ -1569,13 +1630,35 @@ pub(crate) fn verify_rerun_authorization(
     Ok(())
 }
 
+fn verify_attempt_authorization(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    step: LoopStepName,
+    step_attempt: u32,
+) -> Result<(), ProviderExchangeError> {
+    match verify_rerun_authorization(workspace, run, step, step_attempt) {
+        Ok(()) => Ok(()),
+        Err(historical_error) => crate::recovery::verify_recovery_authorization(
+            workspace,
+            run,
+            step,
+            step_attempt,
+        )
+        .map_err(|recovery_error| {
+            ProviderExchangeError::Invalid(format!(
+                "provider attempt has neither historical nor recovery authorization: {historical_error}; {recovery_error}"
+            ))
+        }),
+    }
+}
+
 pub(crate) fn validate_recovered_conventional_attempt(
     workspace: &LoopWorkspace,
     run: &LoopRun,
     step: LoopStepName,
     step_attempt: u32,
 ) -> Result<(), ProviderExchangeError> {
-    if verify_rerun_authorization(workspace, run, step, step_attempt).is_ok() {
+    if verify_attempt_authorization(workspace, run, step, step_attempt).is_ok() {
         return Ok(());
     }
     let Some(head) = run.provider_exchange_records.last() else {
