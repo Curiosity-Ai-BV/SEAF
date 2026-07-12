@@ -530,7 +530,8 @@ fn loop_run_refuses_dirty_worktree_unless_allowed() {
     assert!(allowed.status.success());
     let stdout = String::from_utf8(allowed.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"run_id\": \"dirty-allowed\""));
-    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(stdout.contains("\"status\": \"awaiting_human_review\""));
+    assert!(stdout.contains("human approval is required"));
     assert!(runs_root.join("dirty-allowed/run.json").exists());
 }
 
@@ -650,7 +651,8 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
 
     assert!(run.status.success());
     let stdout = String::from_utf8(run.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(stdout.contains("\"status\": \"awaiting_human_review\""));
+    assert!(stdout.contains("human approval is required"));
     let run_dir = runs_root.join(run_id);
     assert!(run_dir.join("run.json").exists());
     assert!(
@@ -701,6 +703,8 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
         canonical_sha256_digest(&effective_config).expect("effective config digest")
     );
     assert_eq!(persisted_run["execution_mode"], "isolated_candidate");
+    assert_eq!(persisted_run["status"], "awaiting_human_review");
+    assert_eq!(persisted_run["current_step"], "testing");
     assert_eq!(persisted_run["candidate_workspace"]["lifecycle"], "active");
     let role_input: serde_json::Value =
         serde_json::from_str(request["messages"][0]["content"].as_str().unwrap())
@@ -727,6 +731,16 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
             .exists(),
         "real patch gate decisions should be persisted as artifacts"
     );
+    for absent in [
+        "prompts/07-testing.prompt.md",
+        "responses/07-testing.raw.txt",
+        "artifacts/07-testing.md",
+        "prompts/08-eval-report.prompt.md",
+        "responses/08-eval-report.raw.txt",
+        "artifacts/08-eval-report.md",
+    ] {
+        assert!(!run_dir.join(absent).exists(), "{absent} must not exist");
+    }
 
     let status = seaf()
         .args([
@@ -743,8 +757,26 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
     assert!(status.status.success());
     let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"run_id\": \"cli-loop-json\""));
-    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(stdout.contains("\"status\": \"awaiting_human_review\""));
+    assert!(stdout.contains("human approval is required"));
 
+    let human_status = seaf()
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run human loop status");
+    assert!(human_status.status.success());
+    let human_stdout = String::from_utf8(human_status.stdout).unwrap();
+    assert!(human_stdout.contains("status awaiting_human_review"));
+    assert!(human_stdout.contains("human approval is required; Testing has not run"));
+
+    let before_resume = read_tree_bytes(&run_dir);
     let resume = seaf()
         .args([
             "loop",
@@ -760,7 +792,28 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
     assert!(resume.status.success());
     let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"command\": \"resume\""));
-    assert!(stdout.contains("\"status\": \"completed\""));
+    assert!(stdout.contains("\"status\": \"awaiting_human_review\""));
+    assert!(stdout.contains("human approval is required"));
+    assert_eq!(read_tree_bytes(&run_dir), before_resume);
+
+    let rerun = seaf()
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--rerun-from",
+            "output-review",
+            "--json",
+        ])
+        .output()
+        .expect("reject unaudited rerun");
+    assert!(!rerun.status.success());
+    let stderr = String::from_utf8(rerun.stderr).unwrap();
+    assert!(stderr.contains("awaiting human review"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), before_resume);
 }
 
 #[test]
@@ -775,8 +828,24 @@ fn loop_cleanup_json_removes_only_a_terminal_candidate_and_reports_cleaned_autho
     run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
 
     let run_dir = runs_root.join(run_id);
+    mark_run_completed_for_cleanup_compatibility(&run_dir);
     let before = read_run_json(&run_dir);
     assert_eq!(before["status"], "completed");
+    assert_eq!(before["current_step"], "eval_report");
+    let legacy = seaf_core::load_loop_run_file(&run_dir.join("run.json"))
+        .expect("exact pre-06 Completed run remains loadable");
+    for step in [
+        seaf_core::LoopStepName::Testing,
+        seaf_core::LoopStepName::EvalReport,
+    ] {
+        let record = legacy
+            .steps
+            .iter()
+            .find(|record| record.name == step)
+            .unwrap();
+        assert_eq!(record.status, seaf_core::LoopStepStatus::Completed);
+        assert!(record.artifact_path.is_none() && record.artifact_digest.is_none());
+    }
     assert_eq!(before["candidate_workspace"]["lifecycle"], "active");
     let candidate_path = PathBuf::from(
         before["candidate_workspace"]["path"]
@@ -941,6 +1010,7 @@ fn loop_cleanup_uses_the_current_repository_as_witness_and_rejects_another_repo(
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
     run_fake_provider(&source_repo, &ticket_path, &runs_root, run_id, &[]);
     let run_dir = runs_root.join(run_id);
+    mark_run_completed_for_cleanup_compatibility(&run_dir);
     let candidate_path = PathBuf::from(
         read_run_json(&run_dir)["candidate_workspace"]["path"]
             .as_str()
@@ -1041,6 +1111,7 @@ fn loop_cleanup_rejects_a_persisted_run_id_mismatch_before_any_lock_or_checkout_
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
     run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
     let run_dir = runs_root.join(run_id);
+    mark_run_completed_for_cleanup_compatibility(&run_dir);
     let mut run = read_run_json(&run_dir);
     let candidate_path = PathBuf::from(
         run["candidate_workspace"]["path"]
@@ -1105,6 +1176,7 @@ fn loop_cleanup_ignores_inherited_git_redirection_when_resolving_the_caller_repo
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
     run_fake_provider(&source_repo, &ticket_path, &runs_root, run_id, &[]);
     let run_dir = runs_root.join(run_id);
+    mark_run_completed_for_cleanup_compatibility(&run_dir);
     let candidate_path = PathBuf::from(
         read_run_json(&run_dir)["candidate_workspace"]["path"]
             .as_str()
@@ -1647,7 +1719,7 @@ fn loop_run_ollama_completes_against_fake_server_with_provider_artifacts() {
         serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).expect("run json"))
             .expect("persisted run json");
     assert_eq!(persisted_run["provider"], "ollama");
-    assert_eq!(persisted_run["status"], "completed");
+    assert_eq!(persisted_run["status"], "awaiting_human_review");
     assert_eq!(persisted_run["policy_decisions"][0]["patch_id"], run_id);
 }
 
@@ -1866,7 +1938,7 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
 }
 
 #[test]
-fn loop_resume_reruns_only_output_review_as_attempt_two_without_overwriting_attempt_one() {
+fn loop_resume_rejects_output_review_rerun_while_awaiting_without_mutation() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -1877,6 +1949,10 @@ fn loop_resume_reruns_only_output_review_as_attempt_two_without_overwriting_atte
     run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
     let run_dir = runs_root.join(run_id);
     let before = read_run_json(&run_dir);
+    let before_tree = read_tree_bytes(&run_dir);
+    let source_before = git_evidence(&repo);
+    let candidate = PathBuf::from(before["candidate_workspace"]["path"].as_str().unwrap());
+    let candidate_before = git_evidence(&candidate);
     let attempt_one = before["provider_exchange_records"]
         .as_array()
         .expect("provider records")
@@ -1887,17 +1963,26 @@ fn loop_resume_reruns_only_output_review_as_attempt_two_without_overwriting_atte
     assert_eq!(attempt_one.len(), 2);
     assert!(attempt_one.iter().all(|record| record["step_attempt"] == 1));
 
-    let rerun = resume_provider_run(
-        &repo,
-        &ticket_path,
-        &runs_root,
-        run_id,
-        &["--rerun-from", "output-review", "--json"],
-    );
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--rerun-from",
+            "output-review",
+            "--json",
+        ])
+        .output()
+        .expect("reject OutputReview rerun");
 
-    assert!(rerun.status.success(), "{rerun:?}");
+    assert!(!rerun.status.success(), "{rerun:?}");
+    let stderr = String::from_utf8(rerun.stderr).unwrap();
+    assert!(stderr.contains("awaiting human review"), "{stderr}");
     let after = read_run_json(&run_dir);
-    assert_eq!(after["status"], "completed");
+    assert_eq!(after, before);
     let output_review_records = after["provider_exchange_records"]
         .as_array()
         .expect("provider records")
@@ -1906,16 +1991,62 @@ fn loop_resume_reruns_only_output_review_as_attempt_two_without_overwriting_atte
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(&output_review_records[..attempt_one.len()], attempt_one);
-    assert_eq!(output_review_records.len(), 4);
-    assert!(output_review_records[attempt_one.len()..]
-        .iter()
-        .all(|record| record["step_attempt"] == 2));
+    assert_eq!(output_review_records.len(), 2);
     assert!(run_dir
         .join("prompts/06-output-review.attempt-001.exchange-001.initial.request.md")
         .exists());
-    assert!(run_dir
+    assert!(!run_dir
         .join("prompts/06-output-review.attempt-002.exchange-001.initial.request.md")
         .exists());
+    assert_eq!(read_tree_bytes(&run_dir), before_tree);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate), candidate_before);
+}
+
+#[test]
+fn loop_resume_rejects_historical_unapproved_testing_before_ticket_or_mutation() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "cli-historical-unapproved-testing";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let mut historical = read_run_json(&run_dir);
+    historical["status"] = serde_json::json!("running");
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&historical).unwrap(),
+    )
+    .unwrap();
+    let candidate = PathBuf::from(historical["candidate_workspace"]["path"].as_str().unwrap());
+    let run_before = read_tree_bytes(&run_dir);
+    let source_before = git_evidence(&repo);
+    let candidate_before = git_evidence(&candidate);
+
+    let resume = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("reject historical prefix without ticket");
+
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr).unwrap();
+    assert!(stderr.contains("human approval"), "{stderr}");
+    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert!(!stderr.contains("--ticket is required"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), run_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate), candidate_before);
 }
 
 #[test]
@@ -2046,7 +2177,7 @@ fn loop_cli_resume_continues_a_consistent_durable_request_and_rejects_later_tamp
         expected_user_input
     );
     drop(requests);
-    assert_eq!(read_run_json(&run_dir)["status"], "completed");
+    assert_eq!(read_run_json(&run_dir)["status"], "awaiting_human_review");
 
     for relative in [
         "prompts/01-research.attempt-001.exchange-001.initial.request.md",
@@ -3164,6 +3295,21 @@ fn loop_smoke_produces_json_artifacts_without_ollama() {
     assert_eq!(report["command"], "smoke");
     assert_eq!(report["status"], "completed");
     assert!(runs_root.join(run_id).join("run.json").exists());
+
+    let human = seaf()
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("human legacy status");
+    assert!(human.status.success());
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(stdout.contains("status Completed"), "{stdout}");
 }
 
 #[test]
@@ -5053,6 +5199,24 @@ fn write_policy(path: &Path, forbidden_paths: &[&str], requires_human_review: &[
 fn read_run_json(run_dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).expect("run json"))
         .expect("valid run json")
+}
+
+fn mark_run_completed_for_cleanup_compatibility(run_dir: &Path) {
+    let mut run = read_run_json(run_dir);
+    run["status"] = serde_json::json!("completed");
+    run["current_step"] = serde_json::json!("eval_report");
+    for record in run["steps"].as_array_mut().unwrap() {
+        if matches!(record["name"].as_str(), Some("testing" | "eval_report")) {
+            record["status"] = serde_json::json!("completed");
+            record.as_object_mut().unwrap().remove("artifact_path");
+            record.as_object_mut().unwrap().remove("artifact_digest");
+        }
+    }
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap(),
+    )
+    .unwrap();
 }
 
 fn run_fake_provider(

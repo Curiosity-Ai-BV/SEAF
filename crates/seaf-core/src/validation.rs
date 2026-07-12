@@ -475,11 +475,155 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
         _ => {}
     }
 
+    if run.status == crate::LoopStatus::AwaitingHumanReview {
+        validate_awaiting_human_review_run(&mut errors, run);
+    }
+
     if let Some(eval_report_path) = &run.eval_report_path {
         require_non_empty(&mut errors, "eval_report_path", eval_report_path);
     }
 
     errors
+}
+
+fn validate_awaiting_human_review_run(errors: &mut Vec<FieldError>, run: &LoopRun) {
+    if run.execution_mode != crate::LoopExecutionMode::IsolatedCandidate {
+        errors.push(FieldError::new(
+            "execution_mode",
+            "awaiting_human_review is valid only for isolated_candidate execution",
+        ));
+    }
+    if run.current_step != crate::LoopStepName::Testing {
+        errors.push(FieldError::new(
+            "current_step",
+            "awaiting_human_review must stop at Testing before it runs",
+        ));
+    }
+    match run.candidate_workspace.as_ref() {
+        Some(candidate)
+            if candidate.schema_version == 2
+                && candidate.lifecycle == crate::CandidateWorkspaceLifecycle::Active
+                && candidate
+                    .patch_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| {
+                        transaction.phase == crate::CandidatePatchPhase::Applied
+                    }) => {}
+        _ => errors.push(FieldError::new(
+            "candidate_workspace",
+            "awaiting_human_review requires active v2 candidate authority with an Applied transaction",
+        )),
+    }
+
+    validate_awaiting_step(
+        errors,
+        run,
+        crate::LoopStepName::Development,
+        crate::LoopStepStatus::Completed,
+        None,
+    );
+    validate_awaiting_step(
+        errors,
+        run,
+        crate::LoopStepName::OutputReview,
+        crate::LoopStepStatus::Passed,
+        Some(true),
+    );
+    validate_awaiting_step(
+        errors,
+        run,
+        crate::LoopStepName::Testing,
+        crate::LoopStepStatus::Pending,
+        Some(false),
+    );
+    validate_awaiting_step(
+        errors,
+        run,
+        crate::LoopStepName::EvalReport,
+        crate::LoopStepStatus::Pending,
+        Some(false),
+    );
+    if run.eval_report_path.is_some() {
+        errors.push(FieldError::new(
+            "eval_report_path",
+            "must be absent before approved Testing and EvalReport execute",
+        ));
+    }
+    validate_awaiting_output_review_ledger(errors, run);
+}
+
+fn validate_awaiting_output_review_ledger(errors: &mut Vec<FieldError>, run: &LoopRun) {
+    let Some(last) = run.provider_exchange_records.last() else {
+        errors.push(FieldError::new(
+            "provider_exchange_records",
+            "awaiting_human_review requires authenticated OutputReview request and response evidence",
+        ));
+        return;
+    };
+    if last.step != crate::LoopStepName::OutputReview
+        || last.role != ProviderRole::OutputReviewer
+        || last.phase != ProviderExchangePhase::Response
+        || last.step_attempt == 0
+    {
+        errors.push(FieldError::new(
+            "provider_exchange_records",
+            "awaiting_human_review requires the ledger to end in an OutputReview OutputReviewer response",
+        ));
+        return;
+    }
+    let has_initial_request = run.provider_exchange_records.iter().any(|reference| {
+        reference.step == crate::LoopStepName::OutputReview
+            && reference.role == ProviderRole::OutputReviewer
+            && reference.step_attempt == last.step_attempt
+            && reference.kind == ProviderExchangeKind::Initial
+            && reference.phase == ProviderExchangePhase::Request
+    });
+    if !has_initial_request {
+        errors.push(FieldError::new(
+            "provider_exchange_records",
+            "awaiting_human_review requires the same OutputReview attempt's Initial request",
+        ));
+    }
+}
+
+fn validate_awaiting_step(
+    errors: &mut Vec<FieldError>,
+    run: &LoopRun,
+    name: crate::LoopStepName,
+    expected_status: crate::LoopStepStatus,
+    requires_artifact: Option<bool>,
+) {
+    let matches = run
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.name == name)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        errors.push(FieldError::new(
+            "steps",
+            format!("awaiting_human_review requires exactly one {name:?} record"),
+        ));
+        return;
+    }
+    let (index, record) = matches[0];
+    if record.status != expected_status {
+        errors.push(FieldError::new(
+            format!("steps[{index}].status"),
+            format!("must be {expected_status:?} while awaiting human review"),
+        ));
+    }
+    let has_pair = record.artifact_path.is_some() && record.artifact_digest.is_some();
+    if requires_artifact.is_some_and(|required| has_pair != required) {
+        errors.push(FieldError::new(
+            format!("steps[{index}].artifact_path"),
+            if requires_artifact == Some(true) {
+                "must preserve the reviewed OutputReview artifact and digest"
+            } else {
+                "must be absent before this step executes"
+            },
+        ));
+    }
 }
 
 fn validate_candidate_workspace_state(
@@ -1896,6 +2040,154 @@ unexpected_escape: true
             }),
             "schema must retain the valid both-absent representation"
         );
+    }
+
+    #[test]
+    fn awaiting_human_review_status_is_closed_and_has_schema_shape_constraints() {
+        assert_eq!(
+            serde_json::to_value(crate::LoopStatus::AwaitingHumanReview).unwrap(),
+            serde_json::json!("awaiting_human_review")
+        );
+        assert!(serde_json::from_str::<crate::LoopStatus>(r#""awaiting_approval""#).is_err());
+        let missing_mode = serde_json::json!({
+            "run_id": "waiting",
+            "ticket_id": "T-1",
+            "goal_id": "G-1",
+            "provider": "fake",
+            "model": "fake",
+            "input_digests": {
+                "ticket": "a".repeat(64),
+                "policy": "b".repeat(64),
+                "config": "c".repeat(64),
+                "repository": "d".repeat(64)
+            },
+            "status": "awaiting_human_review",
+            "current_step": "testing",
+            "started_at": "1",
+            "updated_at": "2",
+            "steps": [],
+            "policy_decisions": [],
+            "candidate_workspace": null
+        });
+        assert!(serde_json::from_value::<crate::LoopRun>(missing_mode)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit isolated_candidate"));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../specs/loop-run.schema.json"))
+                .expect("loop run schema");
+        assert!(schema["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("awaiting_human_review")));
+        let awaiting = schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| {
+                branch["if"]["properties"]["status"]["const"]
+                    == serde_json::json!("awaiting_human_review")
+            })
+            .expect("awaiting state must have a public schema branch");
+        assert_eq!(
+            awaiting["then"]["properties"]["execution_mode"]["const"],
+            serde_json::json!("isolated_candidate")
+        );
+        assert_eq!(
+            awaiting["then"]["properties"]["current_step"]["const"],
+            serde_json::json!("testing")
+        );
+        assert_eq!(
+            awaiting["then"]["properties"]["candidate_workspace"]["properties"]["lifecycle"]
+                ["const"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            awaiting["then"]["properties"]["eval_report_path"]["type"],
+            serde_json::json!("null")
+        );
+        assert!(awaiting["then"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("provider_exchange_records")));
+        let ledger = &awaiting["then"]["properties"]["provider_exchange_records"];
+        assert_eq!(ledger["minItems"], 2);
+        let ledger_rules = ledger["allOf"].as_array().unwrap();
+        assert!(ledger_rules.iter().any(|rule| {
+            rule["contains"]["properties"]
+                == serde_json::json!({
+                    "step": { "const": "output_review" },
+                    "role": { "const": "output_reviewer" },
+                    "kind": { "const": "initial" },
+                    "phase": { "const": "request" }
+                })
+        }));
+        assert!(ledger_rules.iter().any(|rule| {
+            rule["contains"]["properties"]
+                == serde_json::json!({
+                    "step": { "const": "output_review" },
+                    "role": { "const": "output_reviewer" },
+                    "phase": { "const": "response" }
+                })
+        }));
+        let steps = &awaiting["then"]["properties"]["steps"];
+        let occurrence_rules = steps["allOf"]
+            .as_array()
+            .expect("awaiting steps must close duplicate occurrences by name");
+        let shape_rules = steps["items"]["allOf"]
+            .as_array()
+            .expect("awaiting steps must validate every occurrence by name");
+        for (name, status) in [
+            ("development", "completed"),
+            ("output_review", "passed"),
+            ("testing", "pending"),
+            ("eval_report", "pending"),
+        ] {
+            let occurrence = occurrence_rules
+                .iter()
+                .find(|rule| rule["contains"]["properties"]["name"]["const"] == name)
+                .expect("name-only occurrence rule");
+            assert_eq!(
+                occurrence["contains"]["required"],
+                serde_json::json!(["name"])
+            );
+            assert_eq!(
+                occurrence["contains"]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(occurrence["minContains"], 1);
+            assert_eq!(occurrence["maxContains"], 1);
+
+            let shape = shape_rules
+                .iter()
+                .find(|rule| rule["if"]["properties"]["name"]["const"] == name)
+                .expect("per-name shape rule");
+            assert_eq!(shape["if"]["required"], serde_json::json!(["name"]));
+            assert_eq!(shape["then"]["properties"]["status"]["const"], status);
+        }
+        let output_shape = shape_rules
+            .iter()
+            .find(|rule| rule["if"]["properties"]["name"]["const"] == "output_review")
+            .unwrap();
+        assert_eq!(
+            output_shape["then"]["required"],
+            serde_json::json!(["artifact_path", "artifact_digest"])
+        );
+        for name in ["testing", "eval_report"] {
+            let shape = shape_rules
+                .iter()
+                .find(|rule| rule["if"]["properties"]["name"]["const"] == name)
+                .unwrap();
+            assert_eq!(shape["then"]["properties"]["artifact_path"]["type"], "null");
+            assert_eq!(
+                shape["then"]["properties"]["artifact_digest"]["type"],
+                "null"
+            );
+        }
     }
 
     #[test]

@@ -317,6 +317,7 @@ pub struct TicketEval {
 pub enum LoopStatus {
     Pending,
     Running,
+    AwaitingHumanReview,
     Blocked,
     Failed,
     Passed,
@@ -421,6 +422,11 @@ impl<'de> Deserialize<'de> for LoopRun {
         let wire = LoopRunWire::deserialize(deserializer)?;
         let execution_mode = match wire.execution_mode {
             DecodedExecutionMode::Present(mode) => mode,
+            DecodedExecutionMode::Missing if wire.status == LoopStatus::AwaitingHumanReview => {
+                return Err(serde::de::Error::custom(
+                    "awaiting_human_review requires explicit isolated_candidate execution_mode",
+                ));
+            }
             DecodedExecutionMode::Missing if wire.candidate_workspace.is_some() => {
                 LoopExecutionMode::IsolatedCandidate
             }

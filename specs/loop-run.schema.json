@@ -39,7 +39,15 @@
       "additionalProperties": false
     },
     "status": {
-      "enum": ["pending", "running", "blocked", "failed", "passed", "completed"]
+      "enum": [
+        "pending",
+        "running",
+        "awaiting_human_review",
+        "blocked",
+        "failed",
+        "passed",
+        "completed"
+      ]
     },
     "current_step": {
       "enum": [
@@ -530,6 +538,157 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "required": ["status"],
+        "properties": { "status": { "const": "awaiting_human_review" } }
+      },
+      "then": {
+        "required": [
+          "execution_mode",
+          "provider_exchange_records",
+          "candidate_workspace"
+        ],
+        "properties": {
+          "execution_mode": { "const": "isolated_candidate" },
+          "current_step": { "const": "testing" },
+          "candidate_workspace": {
+            "type": "object",
+            "required": ["schema_version", "lifecycle", "patch_transaction"],
+            "properties": {
+              "schema_version": { "const": 2 },
+              "lifecycle": { "const": "active" },
+              "patch_transaction": {
+                "type": "object",
+                "required": ["phase"],
+                "properties": { "phase": { "const": "applied" } }
+              }
+            }
+          },
+          "provider_exchange_records": {
+            "minItems": 2,
+            "allOf": [
+              {
+                "contains": {
+                  "required": ["step", "role", "kind", "phase"],
+                  "properties": {
+                    "step": { "const": "output_review" },
+                    "role": { "const": "output_reviewer" },
+                    "kind": { "const": "initial" },
+                    "phase": { "const": "request" }
+                  }
+                },
+                "minContains": 1
+              },
+              {
+                "contains": {
+                  "required": ["step", "role", "phase"],
+                  "properties": {
+                    "step": { "const": "output_review" },
+                    "role": { "const": "output_reviewer" },
+                    "phase": { "const": "response" }
+                  }
+                },
+                "minContains": 1
+              }
+            ]
+          },
+          "steps": {
+            "allOf": [
+              {
+                "contains": {
+                  "required": ["name"],
+                  "properties": { "name": { "const": "development" } }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "required": ["name"],
+                  "properties": { "name": { "const": "output_review" } }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "required": ["name"],
+                  "properties": { "name": { "const": "testing" } }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "required": ["name"],
+                  "properties": { "name": { "const": "eval_report" } }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              }
+            ],
+            "items": {
+              "allOf": [
+                {
+                  "if": {
+                    "required": ["name"],
+                    "properties": { "name": { "const": "development" } }
+                  },
+                  "then": {
+                    "properties": { "status": { "const": "completed" } }
+                  }
+                },
+                {
+                  "if": {
+                    "required": ["name"],
+                    "properties": { "name": { "const": "output_review" } }
+                  },
+                  "then": {
+                    "required": ["artifact_path", "artifact_digest"],
+                    "properties": {
+                      "status": { "const": "passed" },
+                      "artifact_path": { "type": "string", "minLength": 1 },
+                      "artifact_digest": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": ["name"],
+                    "properties": { "name": { "const": "testing" } }
+                  },
+                  "then": {
+                    "properties": {
+                      "status": { "const": "pending" },
+                      "artifact_path": { "type": "null" },
+                      "artifact_digest": { "type": "null" }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": ["name"],
+                    "properties": { "name": { "const": "eval_report" } }
+                  },
+                  "then": {
+                    "properties": {
+                      "status": { "const": "pending" },
+                      "artifact_path": { "type": "null" },
+                      "artifact_digest": { "type": "null" }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "eval_report_path": { "type": "null" }
+        }
+      }
+    },
     {
       "if": {
         "required": ["status", "candidate_workspace"],

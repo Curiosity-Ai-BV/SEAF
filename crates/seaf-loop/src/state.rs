@@ -92,10 +92,37 @@ pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateErr
 
 pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
     validate_run_integrity(run)?;
+    if guard_awaiting_human_review_direct_write(path, run)? {
+        return Ok(());
+    }
     let mut json = serde_json::to_vec_pretty(run)?;
     json.push(b'\n');
     fs::write(path, json)?;
     Ok(())
+}
+
+fn guard_awaiting_human_review_direct_write(
+    path: &Path,
+    intended: &LoopRun,
+) -> Result<bool, StateError> {
+    let current = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<LoopRun>(&content).ok())
+        .filter(|run| validate_run_integrity(run).is_ok());
+    if intended.status == LoopStatus::AwaitingHumanReview {
+        if current.as_ref() == Some(intended) {
+            return Ok(true);
+        }
+        return Err(StateError::InvalidRun(
+            "public state writer cannot create an awaiting human review barrier".to_string(),
+        ));
+    }
+    if current.is_some_and(|run| run.status == LoopStatus::AwaitingHumanReview) {
+        return Err(StateError::InvalidRun(
+            "public state writer cannot replace an awaiting human review barrier".to_string(),
+        ));
+    }
+    Ok(false)
 }
 
 pub fn next_runnable_step(run: &LoopRun) -> Option<LoopStepName> {
@@ -156,7 +183,14 @@ pub fn finish_step(
         LoopStepStatus::Completed | LoopStepStatus::Passed => {
             if let Some(next_step) = next_runnable_step(run) {
                 run.current_step = next_step;
-                run.status = LoopStatus::Running;
+                run.status = if run.execution_mode == LoopExecutionMode::IsolatedCandidate
+                    && step == LoopStepName::OutputReview
+                    && status == LoopStepStatus::Passed
+                {
+                    LoopStatus::AwaitingHumanReview
+                } else {
+                    LoopStatus::Running
+                };
             } else {
                 run.status = LoopStatus::Completed;
             }

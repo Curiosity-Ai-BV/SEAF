@@ -1439,3 +1439,35 @@ library 105, candidate integration 39, provider candidate 11, provider exchange
 targets/features and warnings denied, package lint, typecheck, SDK build,
 Rust/Prettier formatting, and diff checks pass. M1-05b4b and M1-05 are accepted;
 M1-06 human approval is active.
+
+## 2026-07-12 implementation | M1-06a stop before human review
+
+M1-06 was split so the execution stop can be reviewed independently from the
+human approval transaction. Isolated OutputReview now advances atomically to a
+closed `awaiting_human_review` state with Testing current but still pending;
+Testing and EvalReport do not execute or publish artifacts. The locked
+workspace-aware publication path reloads the immutable terminal OutputReview
+record, requires its canonical outcome to be `ApproveForTests`, and binds it to
+the latest review attempt. Provider append/reconciliation, rerun, cleanup, and
+ordinary state publication stay inert while waiting. Historical isolated
+Testing/EvalReport prefixes without approval fail before ticket or provider
+work, while exact pre-M1-06 Completed runs retain load/cleanup compatibility.
+
+The first review round found schema duplicate-name parity, a misleading cleanup
+lock assertion, unauthenticated barrier publication, late CLI preflight, and a
+public-writer replacement path. Corrections added per-name schema rules, exact
+private lock proof, authenticated ledger authority, pre-ticket rejection, and
+barrier freezing. The second round demonstrated that an authenticated
+`RequestChanges` response could be relabelled passed by a custom runner and
+that public writers could mint a forged barrier. Exact REDs now reach the
+`ApproveForTests` guard and prove both public writers reject the forged state
+without changing bytes. Only the locked provider seam can create the barrier;
+concurrent writer TOCTOU and hostile artifact replacement remain assigned to
+M1-10 and M1-11.
+
+Spec and quality re-reviews approved the frozen boundary. Controller-focused
+verification passes core 34, provider-candidate 15, state 29, and CLI 95,
+including the previously timing-sensitive descendant-pipe regression. M1-06a
+is accepted and M1-06b exact human approval is active. The final full locked
+workspace, all-target/all-feature Clippy with warnings denied, Rust/Prettier
+formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff check pass.

@@ -10,7 +10,8 @@ use seaf_core::{
     TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
 };
 use seaf_loop::{
-    artifacts::write_step_request, stage_provider_exchange_record, verify_candidate_patch_evidence,
+    artifacts::write_step_request, cleanup_candidate_workspace_outcome,
+    stage_provider_exchange_record, verify_candidate_patch_evidence,
     write_provider_exchange_request, AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits,
     ContextPackRequest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
     PatchCommand, PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
@@ -193,7 +194,129 @@ fn output_review_receives_only_the_exact_verified_applied_subject() {
     }
     let workspace = LoopWorkspace::open(&fixture.runs_root, "candidate-output-review").unwrap();
     let expected = verify_candidate_patch_evidence(&workspace, &fixture.source).unwrap();
+    let source_before_review = source_evidence(&fixture.source);
+    let candidate_before_review = source_evidence(&fixture.candidate);
     assert!(loop_runner.run_next_step().expect("OutputReview"));
+    assert_eq!(
+        serde_json::to_value(loop_runner.run().status).unwrap(),
+        serde_json::json!("awaiting_human_review"),
+        "an approved isolated OutputReview must atomically stop before Testing"
+    );
+    assert_eq!(loop_runner.run().current_step, LoopStepName::Testing);
+    assert!(
+        seaf_core::validate_loop_run(loop_runner.run()).is_empty(),
+        "the barrier must satisfy the public runtime contract"
+    );
+    let persisted_waiting = seaf_loop::state::load_run(&workspace).unwrap();
+    assert_eq!(persisted_waiting, *loop_runner.run());
+
+    let mut malformed = persisted_waiting.clone();
+    malformed.execution_mode = seaf_core::LoopExecutionMode::LegacyProposalOnly;
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field == "execution_mode"));
+    let mut malformed = persisted_waiting.clone();
+    malformed.current_step = LoopStepName::OutputReview;
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field == "current_step"));
+    let mut malformed = persisted_waiting.clone();
+    malformed
+        .steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::Testing)
+        .unwrap()
+        .status = seaf_core::LoopStepStatus::Running;
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field.ends_with(".status")));
+    let mut malformed = persisted_waiting.clone();
+    malformed.eval_report_path = Some("artifacts/08-eval-report.json".to_string());
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field == "eval_report_path"));
+    let mut malformed = persisted_waiting.clone();
+    let mut duplicate = malformed
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::Testing)
+        .unwrap()
+        .clone();
+    duplicate.status = seaf_core::LoopStepStatus::Completed;
+    duplicate.artifact_path = Some("artifacts/duplicate-testing.md".to_string());
+    duplicate.artifact_digest = Some("7".repeat(64));
+    malformed.steps.push(duplicate);
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field == "steps"));
+    let mut malformed = persisted_waiting.clone();
+    let output = malformed
+        .steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::OutputReview)
+        .unwrap();
+    output.status = seaf_core::LoopStepStatus::Blocked;
+    output.artifact_path = None;
+    output.artifact_digest = None;
+    let malformed_fields = seaf_core::validate_loop_run(&malformed)
+        .into_iter()
+        .map(|error| error.field)
+        .collect::<Vec<_>>();
+    assert!(malformed_fields
+        .iter()
+        .any(|field| field.ends_with(".status")));
+    assert!(malformed_fields
+        .iter()
+        .any(|field| field.ends_with(".artifact_path")));
+    let mut malformed = persisted_waiting.clone();
+    malformed.provider_exchange_records.clear();
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| error.field == "provider_exchange_records"));
+    let mut malformed = persisted_waiting.clone();
+    malformed.provider_exchange_records.pop();
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| {
+            error.field == "provider_exchange_records"
+                && error.message.contains("end in an OutputReview")
+        }));
+    let mut malformed = persisted_waiting.clone();
+    let last_attempt = malformed
+        .provider_exchange_records
+        .last()
+        .unwrap()
+        .step_attempt;
+    malformed.provider_exchange_records.retain(|reference| {
+        !(reference.step == LoopStepName::OutputReview
+            && reference.step_attempt == last_attempt
+            && reference.kind == ProviderExchangeKind::Initial
+            && reference.phase == ProviderExchangePhase::Request)
+    });
+    assert!(seaf_core::validate_loop_run(&malformed)
+        .iter()
+        .any(|error| {
+            error.field == "provider_exchange_records" && error.message.contains("Initial request")
+        }));
+    assert!(!loop_runner
+        .run_next_step()
+        .expect("human-review state is terminal for ordinary execution"));
+    for absent in [
+        "prompts/07-testing.prompt.md",
+        "responses/07-testing.raw.txt",
+        "artifacts/07-testing.md",
+        "prompts/08-eval-report.prompt.md",
+        "responses/08-eval-report.raw.txt",
+        "artifacts/08-eval-report.md",
+    ] {
+        assert!(
+            !workspace.run_directory().join(absent).exists(),
+            "{absent} must not exist before human approval"
+        );
+    }
+    let log = fs::read_to_string(workspace.run_directory().join("log.md")).unwrap();
+    assert!(!log.contains("started step Testing"));
+    assert!(!log.contains("started step EvalReport"));
     drop(loop_runner);
     drop(step_runner);
 
@@ -223,7 +346,8 @@ fn output_review_receives_only_the_exact_verified_applied_subject() {
     assert!(!rendered.contains("patch_proposed"));
     assert!(!rendered.contains("repository_context"));
     assert!(!rendered.contains("T-CANDIDATE"));
-    assert_eq!(source_evidence(&fixture.source).1, "");
+    assert_eq!(source_evidence(&fixture.source), source_before_review);
+    assert_eq!(source_evidence(&fixture.candidate), candidate_before_review);
     remove_candidate(&fixture.source, &fixture.candidate);
 }
 
@@ -438,14 +562,10 @@ fn recovery_rejects_a_staged_output_review_subject_substitution_before_cas() {
 }
 
 #[test]
-fn applied_candidate_allows_only_output_review_rerun_without_resetting_development() {
+fn awaiting_human_review_rejects_output_review_rerun_without_mutation() {
     let fixture = fixture("candidate-output-review-rerun");
     let source_before = source_evidence(&fixture.source);
-    let mut responses = candidate_responses(true);
-    responses.push(response(
-        r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"The same applied candidate still matches.","blocking_issues":[],"non_blocking_issues":[]}"#,
-    ));
-    let provider = FakeProvider::new(responses);
+    let provider = FakeProvider::new(candidate_responses(true));
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
         .with_ticket(fixture.ticket.clone())
@@ -465,44 +585,275 @@ fn applied_candidate_allows_only_output_review_rerun_without_resetting_developme
         assert!(loop_runner.run_next_step().expect("through OutputReview"));
     }
     let before = loop_runner.run().clone();
-    loop_runner = loop_runner
+    let workspace = LoopWorkspace::open(&fixture.runs_root, "candidate-output-review-rerun")
+        .expect("workspace");
+    let run_bytes_before = fs::read(workspace.run_file()).unwrap();
+    let candidate_before = source_evidence(&fixture.candidate);
+    seaf_loop::state::save_run(&workspace, loop_runner.run())
+        .expect("identical Awaiting save is idempotent");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
+    let provider_calls_before = provider.requests().unwrap().len();
+    let error = loop_runner
         .rerun_from(LoopStepName::OutputReview)
-        .expect("Applied candidate permits OutputReview-only rerun");
-    assert!(loop_runner
-        .run_next_step()
-        .expect("OutputReview attempt two"));
-    let after = loop_runner.run().clone();
-    assert_eq!(after.candidate_workspace, before.candidate_workspace);
-    assert_eq!(after.policy_decisions, before.policy_decisions);
-    assert_eq!(
-        after
-            .steps
-            .iter()
-            .find(|step| step.name == LoopStepName::Development),
-        before
-            .steps
-            .iter()
-            .find(|step| step.name == LoopStepName::Development)
+        .expect_err("awaiting review cannot invalidate authenticated review evidence");
+    assert!(
+        error.to_string().contains("awaiting human review"),
+        "{error}"
     );
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
+    assert_eq!(
+        seaf_loop::state::load_run(&workspace).unwrap(),
+        before,
+        "rerun refusal must preserve the full approval subject"
+    );
+    assert_eq!(provider.requests().unwrap().len(), provider_calls_before);
     assert_eq!(source_evidence(&fixture.source), source_before);
-    let output_attempts = after
-        .provider_exchange_records
-        .iter()
-        .filter(|record| {
-            record.step == LoopStepName::OutputReview
-                && record.phase == ProviderExchangePhase::Request
-                && record.kind == ProviderExchangeKind::Initial
-        })
-        .map(|record| record.step_attempt)
-        .collect::<Vec<_>>();
-    assert_eq!(output_attempts, vec![1, 2]);
-    drop(loop_runner);
+    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
     drop(step_runner);
     assert_eq!(
         patch_runner.calls.len(),
         1,
-        "rerun never repeats patch gating"
+        "rerun refusal never repeats patch gating"
     );
+    remove_candidate(&fixture.source, &fixture.candidate);
+}
+
+#[test]
+fn historical_isolated_testing_or_eval_prefix_rejects_before_recovery_mutation() {
+    for next_step in [LoopStepName::Testing, LoopStepName::EvalReport] {
+        let run_id = format!("historical-unapproved-{next_step:?}").to_ascii_lowercase();
+        let fixture = fixture(&run_id);
+        let provider = FakeProvider::new(candidate_responses(true));
+        let mut patch_runner = RecordingPatchRunner::default();
+        let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+            .with_ticket(fixture.ticket.clone())
+            .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+            .with_patch_gate(
+                ProviderPatchGateConfig::for_ticket(
+                    &fixture.candidate,
+                    &fixture.ticket,
+                    fixture.policy.clone(),
+                    true,
+                ),
+                &mut patch_runner,
+            );
+        let mut runner =
+            LoopRunner::start_initialized(fixture.prepared, &mut step_runner).expect("start");
+        for _ in 0..6 {
+            assert!(runner.run_next_step().expect("through OutputReview"));
+        }
+        let workspace = LoopWorkspace::open(&fixture.runs_root, &run_id).unwrap();
+        let mut historical = runner.run().clone();
+        historical.status = seaf_core::LoopStatus::Running;
+        if next_step == LoopStepName::EvalReport {
+            let testing = historical
+                .steps
+                .iter_mut()
+                .find(|record| record.name == LoopStepName::Testing)
+                .unwrap();
+            testing.status = seaf_core::LoopStepStatus::Completed;
+            testing.artifact_path = Some("artifacts/07-testing.md".to_string());
+            testing.artifact_digest = Some("7".repeat(64));
+            historical.current_step = LoopStepName::EvalReport;
+        }
+        drop(runner);
+        drop(step_runner);
+        let mut historical_bytes = serde_json::to_vec_pretty(&historical).unwrap();
+        historical_bytes.push(b'\n');
+        fs::write(workspace.run_file(), historical_bytes).unwrap();
+        let before = snapshot_files(workspace.run_directory());
+        let provider_calls_before = provider.requests().unwrap();
+
+        let error = InitializedLoopRun::resume_isolated(&fixture.runs_root, historical)
+            .expect_err("unapproved historical execution prefix must fail closed");
+
+        assert!(error.to_string().contains("human approval"), "{error}");
+        assert!(error.to_string().contains("start a new run"), "{error}");
+        assert_eq!(snapshot_files(workspace.run_directory()), before);
+        assert_eq!(provider.requests().unwrap(), provider_calls_before);
+        remove_candidate(&fixture.source, &fixture.candidate);
+    }
+}
+
+#[test]
+fn awaiting_human_review_cleanup_refuses_before_repository_lock_or_evidence_mutation() {
+    let fixture = fixture("awaiting-cleanup-refusal");
+    let provider = FakeProvider::new(candidate_responses(true));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        );
+    let mut runner =
+        LoopRunner::start_initialized(fixture.prepared, &mut step_runner).expect("start");
+    for _ in 0..6 {
+        assert!(runner.run_next_step().expect("through OutputReview"));
+    }
+    let workspace = LoopWorkspace::open(&fixture.runs_root, "awaiting-cleanup-refusal").unwrap();
+    let run_bytes_before = fs::read(workspace.run_file()).unwrap();
+    let source_before = source_evidence(&fixture.source);
+    let candidate_before = source_evidence(&fixture.candidate);
+    let mut false_completed = runner.run().clone();
+    false_completed.status = seaf_core::LoopStatus::Completed;
+    let error = seaf_loop::state::save_run(&workspace, &false_completed)
+        .expect_err("public save cannot bypass the review barrier");
+    assert!(
+        error.to_string().contains("awaiting human review"),
+        "{error}"
+    );
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
+    let error = seaf_loop::state::write_run_file(&workspace.run_file(), &false_completed)
+        .expect_err("public writer cannot bypass the review barrier");
+    assert!(
+        error.to_string().contains("awaiting human review"),
+        "{error}"
+    );
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
+    drop(runner);
+    drop(step_runner);
+
+    let error = cleanup_candidate_workspace_outcome(&workspace, &fixture.source)
+        .expect_err("awaiting review candidate remains active and non-cleanable");
+
+    assert!(error.to_string().contains("active run"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes_before);
+    assert_eq!(source_evidence(&fixture.source), source_before);
+    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
+    remove_candidate(&fixture.source, &fixture.candidate);
+}
+
+#[test]
+fn unauthenticated_output_review_cannot_publish_the_human_review_barrier() {
+    let fixture = fixture("unauthenticated-output-review");
+    let provider = FakeProvider::new(candidate_responses(true).into_iter().take(5).collect());
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut provider_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        );
+    let mut runner =
+        LoopRunner::start_initialized(fixture.prepared, &mut provider_runner).expect("start");
+    for _ in 0..5 {
+        assert!(runner.run_next_step().expect("through Development"));
+    }
+    drop(runner);
+    drop(provider_runner);
+    let workspace = LoopWorkspace::open(&fixture.runs_root, "unauthenticated-output-review")
+        .expect("workspace");
+    let source_before = source_evidence(&fixture.source);
+    let candidate_before = source_evidence(&fixture.candidate);
+    let mut unauthenticated = UnauthenticatedOutputReview;
+    let mut resumed = LoopRunner::resume(
+        &fixture.runs_root,
+        "unauthenticated-output-review",
+        &mut unauthenticated,
+    )
+    .expect("resume applied candidate");
+
+    let error = resumed
+        .run_next_step()
+        .expect_err("Passed review without an authenticated ledger cannot publish Awaiting");
+
+    assert!(error.to_string().contains("OutputReview"), "{error}");
+    drop(resumed);
+    let persisted = seaf_loop::state::load_run(&workspace).unwrap();
+    assert_ne!(persisted.status, seaf_core::LoopStatus::AwaitingHumanReview);
+    assert_eq!(source_evidence(&fixture.source), source_before);
+    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
+    remove_candidate(&fixture.source, &fixture.candidate);
+}
+
+#[test]
+fn non_approving_authenticated_review_cannot_be_relabelled_passed_by_a_custom_runner() {
+    let fixture = fixture("non-approving-review-custom-pass");
+    let mut responses = candidate_responses(false);
+    responses.push(response(
+        r#"{"role":"output_reviewer","decision":"request_changes","summary":"Not approved.","blocking_issues":[{"summary":"Fix required","evidence":"candidate diff"}],"non_blocking_issues":[]}"#,
+    ));
+    let provider = FakeProvider::new(responses);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut provider_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        );
+    let mut runner =
+        LoopRunner::start_initialized(fixture.prepared, &mut provider_runner).expect("start");
+    for _ in 0..6 {
+        assert!(runner.run_next_step().expect("through rejected review"));
+    }
+    assert_eq!(runner.run().status, seaf_core::LoopStatus::Blocked);
+    let workspace =
+        LoopWorkspace::open(&fixture.runs_root, "non-approving-review-custom-pass").unwrap();
+    let blocked_bytes = fs::read(workspace.run_file()).unwrap();
+    let mut forged = runner.run().clone();
+    forged.status = seaf_core::LoopStatus::AwaitingHumanReview;
+    forged.current_step = LoopStepName::Testing;
+    forged
+        .steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::OutputReview)
+        .unwrap()
+        .status = seaf_core::LoopStepStatus::Passed;
+    assert!(seaf_core::validate_loop_run(&forged).is_empty());
+    let error = seaf_loop::state::save_run(&workspace, &forged)
+        .expect_err("direct save cannot create Awaiting from RequestChanges history");
+    assert!(error.to_string().contains("cannot create"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), blocked_bytes);
+    let error = seaf_loop::state::write_run_file(&workspace.run_file(), &forged)
+        .expect_err("direct writer cannot create Awaiting from RequestChanges history");
+    assert!(error.to_string().contains("cannot create"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), blocked_bytes);
+    drop(runner);
+    drop(provider_runner);
+    let source_before = source_evidence(&fixture.source);
+    let candidate_before = source_evidence(&fixture.candidate);
+    let mut custom = UnauthenticatedOutputReview;
+    let resumed = LoopRunner::resume(
+        &fixture.runs_root,
+        "non-approving-review-custom-pass",
+        &mut custom,
+    )
+    .expect("resume blocked review");
+    let mut rerun = resumed
+        .rerun_from(LoopStepName::OutputReview)
+        .expect("reset OutputReview with the same Applied candidate");
+
+    let error = rerun
+        .run_next_step()
+        .expect_err("RequestChanges audit cannot authorize Awaiting");
+
+    assert!(error.to_string().contains("ApproveForTests"), "{error}");
+    drop(rerun);
+    assert_ne!(
+        seaf_loop::state::load_run(&workspace).unwrap().status,
+        seaf_core::LoopStatus::AwaitingHumanReview
+    );
+    assert_eq!(source_evidence(&fixture.source), source_before);
+    assert_eq!(source_evidence(&fixture.candidate), candidate_before);
     remove_candidate(&fixture.source, &fixture.candidate);
 }
 
@@ -1095,6 +1446,27 @@ impl PatchCommandRunner for RecordingPatchRunner {
     ) -> Result<CommandOutput, PatchGateError> {
         self.calls.push((root.canonicalize().unwrap(), command));
         Ok(CommandOutput::success())
+    }
+}
+
+struct UnauthenticatedOutputReview;
+
+impl StepRunner for UnauthenticatedOutputReview {
+    fn step_request(&mut self, step: LoopStepName) -> Result<String, seaf_loop::RunnerError> {
+        assert_eq!(step, LoopStepName::OutputReview);
+        Ok("unauthenticated review".to_string())
+    }
+
+    fn run_step(
+        &mut self,
+        step: LoopStepName,
+        _request: &str,
+    ) -> Result<seaf_loop::StepOutput, seaf_loop::RunnerError> {
+        assert_eq!(step, LoopStepName::OutputReview);
+        let mut output = seaf_loop::StepOutput::completed("unauthenticated pass")
+            .with_artifact(seaf_loop::ArtifactContent::markdown("not authenticated"));
+        output.status = seaf_core::LoopStepStatus::Passed;
+        Ok(output)
     }
 }
 

@@ -41,10 +41,13 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-06 - Human approval state. Add a closed durable approval contract and an
-explicit CLI operation that can approve only the exact reviewed candidate.
-Approval must bind the candidate patch digest, starting target HEAD, policy
-decision, reviewer identity, and timestamp; stale/mismatched/duplicate evidence
-fails closed. Represent awaiting-human-review and approved state explicitly.
-Do not execute model-modified code, run evals, promote, or alter the source
-checkout in this slice.
+M1-06b - Exact human approval transaction. Starting only from the closed
+M1-06a `awaiting_human_review` barrier, add a versioned compact approval record
+and explicit CLI operation that can approve only the exact reviewed candidate.
+Bind the run ID, candidate staged-diff digest, starting target HEAD, policy
+decision digest, current OutputReview artifact reference, its authenticated
+initial-request and terminal-response exchange references, reviewer identity,
+and timestamp. Publish under candidate/run locking with full-state
+compare-and-swap; stale, substituted, mismatched, or duplicate evidence fails
+closed or is an exact byte-preserving retry. Do not execute model-modified
+code, run evals, promote, or alter the source checkout in this slice.

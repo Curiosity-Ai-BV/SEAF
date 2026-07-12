@@ -377,6 +377,64 @@ fn state_finish_step_rejects_unpaired_or_malformed_artifact_integrity() {
 }
 
 #[test]
+fn state_finish_output_review_updates_barrier_fields_without_touching_downstream_steps() {
+    let mut run = create_run(NewLoopRun {
+        run_id: "atomic-human-review".to_string(),
+        ticket_id: "T-LOCAL-001".to_string(),
+        goal_id: "local_agent_loop_mvp".to_string(),
+        provider: "fake".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: test_input_digests(),
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    for record in &mut run.steps {
+        if matches!(
+            record.name,
+            LoopStepName::Research
+                | LoopStepName::Analysis
+                | LoopStepName::SpecCreation
+                | LoopStepName::SpecReview
+                | LoopStepName::Development
+        ) {
+            record.status = LoopStepStatus::Completed;
+        }
+    }
+    run.steps
+        .iter_mut()
+        .find(|record| record.name == LoopStepName::OutputReview)
+        .unwrap()
+        .status = LoopStepStatus::Running;
+    run.current_step = LoopStepName::OutputReview;
+    run.status = LoopStatus::Running;
+
+    finish_step(
+        &mut run,
+        LoopStepName::OutputReview,
+        LoopStepStatus::Passed,
+        Some("artifacts/06-output-review.md".to_string()),
+        Some("6".repeat(64)),
+    )
+    .expect("finish OutputReview");
+
+    assert_eq!(run.status, LoopStatus::AwaitingHumanReview);
+    assert_eq!(run.current_step, LoopStepName::Testing);
+    let testing = run
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::Testing)
+        .unwrap();
+    let eval = run
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::EvalReport)
+        .unwrap();
+    assert_eq!(testing.status, LoopStepStatus::Pending);
+    assert_eq!(eval.status, LoopStepStatus::Pending);
+    assert!(testing.artifact_path.is_none() && testing.artifact_digest.is_none());
+    assert!(eval.artifact_path.is_none() && eval.artifact_digest.is_none());
+}
+
+#[test]
 fn state_creation_preserves_exact_effective_input_digests() {
     let input_digests = LoopInputDigests {
         ticket: "a".repeat(64),

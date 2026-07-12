@@ -66,8 +66,10 @@ impl CandidateCleanupOutcome {
         run: &seaf_core::LoopRun,
         candidate: CandidateWorkspaceState,
     ) -> Result<Self, CandidateWorkspaceError> {
-        if matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
-            || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
+        if matches!(
+            run.status,
+            LoopStatus::Pending | LoopStatus::Running | LoopStatus::AwaitingHumanReview
+        ) || candidate.lifecycle != CandidateWorkspaceLifecycle::Cleaned
             || run.candidate_workspace.as_ref() != Some(&candidate)
         {
             return Err(CandidateWorkspaceError::Mismatch(
@@ -1343,7 +1345,10 @@ where
         let mut run = crate::state::load_run(workspace)
             .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
         validate_workspace_run_id(workspace, &run)?;
-        if matches!(run.status, LoopStatus::Pending | LoopStatus::Running) {
+        if matches!(
+            run.status,
+            LoopStatus::Pending | LoopStatus::Running | LoopStatus::AwaitingHumanReview
+        ) {
             return Err(CandidateWorkspaceError::Unsafe(
                 "refusing to clean an active run candidate".to_string(),
             ));
@@ -3015,6 +3020,78 @@ mod tests {
             source_status
         );
         assert!(!Path::new(&planned.path).exists());
+    }
+
+    #[test]
+    fn cleanup_rejects_awaiting_review_before_the_exact_repository_lock_or_evidence_mutation() {
+        let fixture = application_fixture("cleanup-awaiting-review");
+        apply_candidate_development_evidence(&fixture.workspace, &fixture.source)
+            .expect("Applied candidate");
+        let applied = crate::state::load_run(&fixture.workspace).expect("Applied run");
+        let mut run = crate::provider_exchange::persist_test_output_review_ledger(
+            &fixture.workspace,
+            &applied.run_id,
+        );
+        let output_review = run
+            .steps
+            .iter_mut()
+            .find(|record| record.name == LoopStepName::OutputReview)
+            .expect("OutputReview record");
+        output_review.status = seaf_core::LoopStepStatus::Passed;
+        output_review.artifact_path = Some("artifacts/06-output-review.json".to_string());
+        output_review.artifact_digest = Some("6".repeat(64));
+        run.status = LoopStatus::AwaitingHumanReview;
+        run.current_step = LoopStepName::Testing;
+        crate::provider_exchange::persist_run_with_provider_exchange_compare(
+            &fixture.workspace,
+            &run,
+        )
+        .expect("locked waiting publication");
+
+        let candidate = run.candidate_workspace.as_ref().expect("candidate");
+        let repository_lock =
+            repository_operation_lock_path(Path::new(&candidate.git_common_dir)).unwrap();
+        if repository_lock.exists() {
+            fs::remove_file(&repository_lock).expect("remove prior repository lock");
+        }
+        let run_before = fs::read(fixture.workspace.run_file()).expect("run bytes");
+        let source_before = (
+            git_text(&fixture.source, &["rev-parse", "HEAD"]).unwrap(),
+            git_text(&fixture.source, &["status", "--porcelain=v1"]).unwrap(),
+            fs::read(fixture.source.join("tracked.txt")).unwrap(),
+        );
+        let candidate_path = Path::new(&candidate.path);
+        let candidate_before = (
+            git_text(candidate_path, &["rev-parse", "HEAD"]).unwrap(),
+            git_text(candidate_path, &["status", "--porcelain=v1"]).unwrap(),
+            git_text(candidate_path, &["write-tree"]).unwrap(),
+            fs::read(candidate_path.join("tracked.txt")).unwrap(),
+        );
+
+        let error = cleanup_candidate_workspace(&fixture.workspace, &fixture.source)
+            .expect_err("waiting candidate is active and non-cleanable");
+
+        assert!(error.to_string().contains("active run"), "{error}");
+        assert!(!repository_lock.exists());
+        assert_eq!(fs::read(fixture.workspace.run_file()).unwrap(), run_before);
+        assert_eq!(
+            (
+                git_text(&fixture.source, &["rev-parse", "HEAD"]).unwrap(),
+                git_text(&fixture.source, &["status", "--porcelain=v1"]).unwrap(),
+                fs::read(fixture.source.join("tracked.txt")).unwrap(),
+            ),
+            source_before
+        );
+        assert_eq!(
+            (
+                git_text(candidate_path, &["rev-parse", "HEAD"]).unwrap(),
+                git_text(candidate_path, &["status", "--porcelain=v1"]).unwrap(),
+                git_text(candidate_path, &["write-tree"]).unwrap(),
+                fs::read(candidate_path.join("tracked.txt")).unwrap(),
+            ),
+            candidate_before
+        );
+        fixture.cleanup();
     }
 
     #[test]

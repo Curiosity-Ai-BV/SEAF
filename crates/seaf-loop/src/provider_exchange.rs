@@ -396,6 +396,11 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let mut run = state::load_run(workspace)?;
+        if run.status == seaf_core::LoopStatus::AwaitingHumanReview {
+            return Err(ProviderExchangeError::Invalid(
+                "provider exchange history is frozen while awaiting human review".to_string(),
+            ));
+        }
         if run.provider_exchange_records.contains(&reference) {
             return Err(ProviderExchangeError::Invalid(
                 "provider exchange record is already referenced".to_string(),
@@ -431,6 +436,12 @@ pub(crate) fn persist_run_with_provider_exchange_compare(
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let current = state::load_run(workspace)?;
+        if current.status == seaf_core::LoopStatus::AwaitingHumanReview && &current != intended {
+            return Err(ProviderExchangeError::Invalid(
+                "ordinary state publication cannot replace an awaiting human review barrier"
+                    .to_string(),
+            ));
+        }
         if current.provider_exchange_records != intended.provider_exchange_records {
             return Err(ProviderExchangeError::Invalid(
                 "provider exchange head changed before state publication".to_string(),
@@ -503,6 +514,12 @@ where
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
+        if persisted.status == seaf_core::LoopStatus::AwaitingHumanReview {
+            return Err(ProviderExchangeError::Invalid(
+                "provider exchange reconciliation is frozen while awaiting human review"
+                    .to_string(),
+            ));
+        }
         if persisted != *authoritative {
             return Err(ProviderExchangeError::Invalid(
                 "persisted LoopRun differs from the verified reconciliation authority".to_string(),
@@ -809,7 +826,31 @@ fn validate_run_for_atomic_publication(
                 .join("; "),
         ));
     }
-    validate_authoritative_provider_exchange_records(workspace, run)
+    validate_authoritative_provider_exchange_records(workspace, run)?;
+    if run.status == seaf_core::LoopStatus::AwaitingHumanReview {
+        let terminal = run.provider_exchange_records.last().ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "awaiting human review lost terminal OutputReview provider evidence".to_string(),
+            )
+        })?;
+        let record = load_provider_exchange_record(workspace.run_directory(), terminal)?;
+        if record.outcome != Some(ProviderExchangeOutcome::ApproveForTests) {
+            return Err(ProviderExchangeError::Invalid(
+                "awaiting human review requires an authenticated OutputReview ApproveForTests outcome"
+                    .to_string(),
+            ));
+        }
+        let latest_attempt =
+            crate::artifacts::latest_step_attempt(workspace, LoopStepName::OutputReview)
+                .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+        if latest_attempt != Some(terminal.step_attempt) {
+            return Err(ProviderExchangeError::Invalid(
+                "awaiting human review requires the current OutputReview attempt's authenticated response"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn replace_run_file_atomically_with_hook<F>(
@@ -1544,11 +1585,246 @@ impl From<std::io::Error> for ProviderExchangeError {
 }
 
 #[cfg(test)]
+pub(crate) fn persist_test_output_review_ledger(
+    workspace: &LoopWorkspace,
+    run_id: &str,
+) -> LoopRun {
+    let coordinates = ProviderExchangeCoordinates {
+        run_id: run_id.to_string(),
+        step: LoopStepName::OutputReview,
+        role: ProviderRole::OutputReviewer,
+        step_attempt: 1,
+        exchange_index: 1,
+        kind: ProviderExchangeKind::Initial,
+        context_round: None,
+    };
+    crate::artifacts::write_step_request(workspace, LoopStepName::OutputReview, 1, "review")
+        .unwrap();
+    let request =
+        write_provider_exchange_request(workspace.run_directory(), &coordinates, b"review")
+            .unwrap();
+    let request_record = ProviderExchangeRecord {
+        schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+        run_id: run_id.to_string(),
+        step: coordinates.step,
+        role: coordinates.role,
+        step_attempt: coordinates.step_attempt,
+        exchange_index: coordinates.exchange_index,
+        kind: coordinates.kind,
+        context_round: None,
+        phase: ProviderExchangePhase::Request,
+        previous_record_digest: None,
+        request: request.clone(),
+        response: None,
+        expansion: None,
+        outcome: None,
+    };
+    let request_reference =
+        stage_provider_exchange_record(workspace.run_directory(), &request_record).unwrap();
+    persist_provider_exchange_record_reference_with_validator(
+        workspace,
+        request_reference.clone(),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let response = write_provider_exchange_response(
+        workspace.run_directory(),
+        &coordinates,
+        &ProviderExchangeResponseAudit::ModelResponse {
+            response: ModelResponse {
+                content: serde_json::json!({
+                    "role": "output_reviewer",
+                    "decision": "approve_for_tests",
+                    "summary": "Approved for the barrier.",
+                    "blocking_issues": [],
+                    "non_blocking_issues": []
+                })
+                .to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::Value::Null,
+            },
+        },
+    )
+    .unwrap();
+    let response_record = ProviderExchangeRecord {
+        phase: ProviderExchangePhase::Response,
+        previous_record_digest: Some(request_reference.digest),
+        response: Some(response),
+        ..request_record
+    };
+    let (response_reference, _) =
+        stage_provider_exchange_response_record(workspace.run_directory(), response_record)
+            .unwrap();
+    persist_provider_exchange_record_reference_with_validator(workspace, response_reference, |_| {
+        Ok(())
+    })
+    .unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use seaf_core::{
+        ArtifactReference, CandidatePatchPhase, CandidatePatchTransaction,
         CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopInputDigests, LoopStatus,
+        LoopStepStatus,
     };
+
+    fn awaiting_human_review_run(workspace: &LoopWorkspace) -> LoopRun {
+        let mut run = state::create_run(state::NewLoopRun {
+            run_id: workspace
+                .run_directory()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+        run.status = LoopStatus::AwaitingHumanReview;
+        run.current_step = LoopStepName::Testing;
+        for record in &mut run.steps {
+            match record.name {
+                LoopStepName::Research
+                | LoopStepName::Analysis
+                | LoopStepName::SpecCreation
+                | LoopStepName::SpecReview
+                | LoopStepName::Development => record.status = LoopStepStatus::Completed,
+                LoopStepName::OutputReview => {
+                    record.status = LoopStepStatus::Passed;
+                    record.artifact_path = Some("artifacts/06-output-review.md".to_string());
+                    record.artifact_digest = Some("6".repeat(64));
+                }
+                LoopStepName::Testing | LoopStepName::EvalReport => {}
+            }
+        }
+        run.candidate_workspace = Some(CandidateWorkspaceState {
+            schema_version: 2,
+            run_directory_digest: Some("9".repeat(64)),
+            path: workspace
+                .run_directory()
+                .join("candidate")
+                .display()
+                .to_string(),
+            source_worktree_root: workspace
+                .run_directory()
+                .join("source")
+                .display()
+                .to_string(),
+            git_common_dir: workspace
+                .run_directory()
+                .join("source/.git")
+                .display()
+                .to_string(),
+            repository_identity_digest: "d".repeat(64),
+            starting_head: "e".repeat(40),
+            starting_tree: "f".repeat(40),
+            candidate_head: "e".repeat(40),
+            candidate_tree: "1".repeat(40),
+            candidate_diff_digest: "2".repeat(64),
+            patch_transaction: Some(CandidatePatchTransaction {
+                schema_version: 1,
+                phase: CandidatePatchPhase::Applied,
+                intent: ArtifactReference {
+                    path: "artifacts/candidate-patch-intent.json".to_string(),
+                    digest: "3".repeat(64),
+                },
+                applied_evidence: Some(ArtifactReference {
+                    path: "artifacts/candidate-patch-applied.json".to_string(),
+                    digest: "4".repeat(64),
+                }),
+                started_at: "1".to_string(),
+                applied_at: Some("2".to_string()),
+            }),
+            lifecycle: CandidateWorkspaceLifecycle::Active,
+            cleanup_started_at: None,
+            cleaned_at: None,
+        });
+        run
+    }
+
+    #[test]
+    fn awaiting_human_review_freezes_ordinary_publication_and_provider_suffixes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "awaiting-provider-freeze").unwrap();
+        let mut run = awaiting_human_review_run(&workspace);
+        let mut pre_review = run.clone();
+        pre_review.status = LoopStatus::Running;
+        pre_review.current_step = LoopStepName::OutputReview;
+        let output_review = pre_review
+            .steps
+            .iter_mut()
+            .find(|record| record.name == LoopStepName::OutputReview)
+            .unwrap();
+        output_review.status = LoopStepStatus::Running;
+        output_review.artifact_path = None;
+        output_review.artifact_digest = None;
+        state::save_run(&workspace, &pre_review).expect("pre-review run");
+        let with_ledger = persist_test_output_review_ledger(&workspace, &run.run_id);
+        run.provider_exchange_records = with_ledger.provider_exchange_records;
+        persist_run_with_provider_exchange_compare(&workspace, &run)
+            .expect("locked waiting publication");
+        let run_bytes = fs::read(workspace.run_file()).unwrap();
+
+        let mut stale = run.clone();
+        stale.status = LoopStatus::Running;
+        let error = persist_run_with_provider_exchange_compare(&workspace, &stale)
+            .expect_err("ordinary stale state cannot replace waiting authority");
+        assert!(
+            error.to_string().contains("awaiting human review"),
+            "{error}"
+        );
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes);
+
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request =
+            write_provider_exchange_request(workspace.run_directory(), &coordinates, b"late")
+                .unwrap();
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference = stage_provider_exchange_record(workspace.run_directory(), &record).unwrap();
+        let error = persist_provider_exchange_record_reference(&workspace, reference)
+            .expect_err("late provider suffix must remain unreferenced");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes);
+
+        let error = reconcile_provider_exchange_state_with_validator(&workspace, &run, |_| Ok(()))
+            .expect_err("reconciliation must not adopt a late suffix");
+        assert!(error.to_string().contains("frozen"), "{error}");
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), run_bytes);
+    }
 
     #[test]
     fn locked_append_validator_rejection_leaves_staged_record_unadopted() {

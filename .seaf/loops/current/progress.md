@@ -24,7 +24,8 @@
 - [x] M1-05b3: Development/output-review candidate integration.
 - [x] M1-05b4a: Authoritative run-directory binding.
 - [x] M1-05b4b: Explicit candidate cleanup CLI.
-- [ ] M1-06: Human approval state (active).
+- [x] M1-06a: Stop isolated runs for human review.
+- [ ] M1-06b: Record exact human candidate approvals (active).
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
 - [ ] M1-09: Audited recovery operations.
@@ -53,9 +54,10 @@
 
 ## Current Gate
 
-M1-05 is complete and M1-06 is active. Explicit cleanup minimally opens only
-the named run, sanitizes Git caller discovery, binds persisted run identity,
-validates static authority before repository-lock selection, and returns one
-locked Cleaned outcome. Exact retries are byte-identical; active, copied,
-wrong-repository, tampered, legacy, invalid, and missing authority fail without
-candidate removal or false success output. Human approval is the next gate.
+M1-06a is complete and M1-06b is active. An isolated run now stops atomically
+after an authenticated OutputReview `ApproveForTests` response, with Testing
+and EvalReport still pending and artifact-free. Provider, rerun,
+reconciliation, cleanup, historical-prefix, non-approving-review, and public
+writer bypasses fail without candidate or source mutation. The next gate is a
+versioned approval record and explicit CLI confirmation bound to the exact
+candidate, target, policy, and authenticated review evidence.

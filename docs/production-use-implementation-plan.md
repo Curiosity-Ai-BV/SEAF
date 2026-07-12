@@ -996,23 +996,70 @@ promotion, or eval execution.
 
 ### M1-06 - Human Approval State
 
+Status: active. Split into M1-06a stop barrier (complete) and M1-06b exact
+approval transaction (active) so execution safety is independently reviewable
+from approval evidence and CLI confirmation.
+
 Roadmap: U3. Dependencies: M1-05.
 
 Objective: require a human to approve the exact candidate before any
 model-modified code executes.
 
+### M1-06a - Stop Before Human Review
+
+Status: complete on 2026-07-12; independently approved by spec and quality
+review after two correction rounds.
+
+Acceptance criteria delivered:
+
+- Isolated OutputReview can publish `awaiting_human_review` only through the
+  locked workspace-aware state seam after the terminal immutable review record
+  canonically derives `ApproveForTests` and matches the latest review attempt.
+- The transition advances the current step to Testing without starting it;
+  Testing and EvalReport remain pending and publish no artifacts.
+- Resume, rerun, provider append/reconciliation, cleanup, and public state
+  writers cannot cross, mint, replace, or remove the barrier. Exact valid
+  public-writer retries are byte-preserving no-ops.
+- Historical isolated Testing/EvalReport prefixes without approval fail before
+  ticket, repository, provider, scaffold, or log work. Exact pre-M1-06
+  Completed runs remain loadable and cleanable.
+- No approved state, human evidence, approval CLI, eval execution, promotion,
+  or source-checkout mutation is introduced.
+
+The first review round found schema duplicate-step parity, misleading lock
+coverage, unauthenticated barrier publication, late CLI preflight, and direct
+barrier replacement. The second found that authenticated `RequestChanges`
+could be relabelled passed and that public writers could mint the barrier.
+Focused regressions close each path; the concurrent public-writer TOCTOU and
+hostile artifact replacement remain M1-10 and M1-11 scope.
+
+Verification: core/state/provider-candidate/CLI suites, full workspace tests,
+format, Clippy, package lint/typecheck/test/build, and diff check.
+
+Commit boundary: authenticated stop barrier only.
+
+### M1-06b - Exact Human Approval Transaction
+
+Status: active. Dependencies: M1-06a.
+
 Acceptance criteria:
 
-- Run state explicitly represents `awaiting_human_review` and approved.
+- Run state explicitly represents approved without weakening or replacing the
+  durable awaiting barrier.
 - Approval binds candidate patch digest, starting target HEAD, policy decision,
-  and reviewer identity/time; stale or mismatched approval fails closed.
+  current OutputReview artifact and its authenticated provider exchanges, and
+  reviewer identity/time; stale or mismatched approval fails closed.
+- The CLI requires explicit human confirmation and writes compact versioned
+  approval evidence under the candidate/run locking order with a full-state
+  compare-and-swap. Duplicate approval is byte-identical or rejected.
 - Testing and promotion remain impossible in this slice.
 
 Likely seams: core state models/schemas, CLI approval command, state machine,
-and CLI/state tests.
+candidate authority, provider exchange evidence, and CLI/state tests.
 
 RED: unapproved transition, stale HEAD, wrong digest, duplicate approval, and
-successful exact approval tests.
+successful exact approval tests, plus OutputReview artifact/exchange
+substitution and concurrent state change.
 
 Verification: core/state/CLI suites, full workspace tests, format, Clippy, and
 diff check.

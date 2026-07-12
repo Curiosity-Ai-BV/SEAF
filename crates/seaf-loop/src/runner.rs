@@ -180,6 +180,12 @@ pub struct PreparedLoopRun {
 }
 
 pub fn validate_rerun_eligibility(run: &LoopRun, step: LoopStepName) -> Result<(), RunnerError> {
+    if run.status == LoopStatus::AwaitingHumanReview {
+        return Err(RunnerError::Step(
+            "awaiting human review cannot be rerun without audited invalidation; start a new run or complete human approval"
+                .to_string(),
+        ));
+    }
     if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
         return Ok(());
     }
@@ -290,6 +296,7 @@ impl InitializedLoopRun {
                     .to_string(),
             ));
         }
+        validate_human_review_execution_barrier(&verified_run)?;
         let workspace = LoopWorkspace::open_minimal(runs_root, &verified_run.run_id)?;
         let persisted = state::load_run_before_provider_reconciliation(&workspace)?;
         if persisted != verified_run {
@@ -704,6 +711,15 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         run: LoopRun,
         step_runner: &'a mut R,
     ) -> Result<Self, RunnerError> {
+        if run.status == LoopStatus::AwaitingHumanReview {
+            return Ok(Self {
+                workspace,
+                run,
+                step_runner,
+                next_attempt: None,
+            });
+        }
+        validate_human_review_execution_barrier(&run)?;
         let filesystem_next_attempt = state::next_runnable_step(&run)
             .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
             .transpose()?;
@@ -773,10 +789,16 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     pub fn run_next_step(&mut self) -> Result<bool, RunnerError> {
         if matches!(
             self.run.status,
-            LoopStatus::Blocked | LoopStatus::Failed | LoopStatus::Passed | LoopStatus::Completed
+            LoopStatus::AwaitingHumanReview
+                | LoopStatus::Blocked
+                | LoopStatus::Failed
+                | LoopStatus::Passed
+                | LoopStatus::Completed
         ) {
             return Ok(false);
         }
+
+        validate_human_review_execution_barrier(&self.run)?;
 
         let Some(step) = state::next_runnable_step(&self.run) else {
             return Ok(false);
@@ -905,6 +927,22 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         .map_err(|error| RunnerError::Step(format!("failed to publish loop state: {error}")))?;
         Ok(())
     }
+}
+
+pub fn validate_human_review_execution_barrier(run: &LoopRun) -> Result<(), RunnerError> {
+    if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate
+        && matches!(run.status, LoopStatus::Pending | LoopStatus::Running)
+        && matches!(
+            state::next_runnable_step(run),
+            Some(LoopStepName::Testing | LoopStepName::EvalReport)
+        )
+    {
+        return Err(RunnerError::Step(
+            "isolated Testing and EvalReport require audited human approval; start a new run because this historical execution prefix has no approval barrier"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn append_policy_decisions(

@@ -19,11 +19,11 @@ use seaf_core::{
 };
 use seaf_loop::{
     build_loop_eval_report, cleanup_candidate_workspace_outcome, evaluate_zero_tolerance,
-    load_agent_bench_fixture, validate_rerun_eligibility, AgentBenchSummary, ArtifactContent,
-    AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits, ContextPackRequest,
-    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
-    PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
-    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    load_agent_bench_fixture, validate_human_review_execution_barrier, validate_rerun_eligibility,
+    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
+    ContextLimits, ContextPackRequest, GitCommandRunner, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
+    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -918,6 +918,7 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
     validate_run_id(&args.run_id)?;
     validate_provider_timeout(args.timeout_ms)?;
     let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    validate_human_review_execution_barrier(&existing).map_err(loop_runner_failure)?;
     let rerun_from = args
         .rerun_from
         .as_deref()
@@ -2070,13 +2071,23 @@ fn finish_loop_command(
         print_json(&report)?;
     } else {
         println!(
-            "loop {} {}: status {:?}, current step {:?}",
-            report.command, report.run_id, report.status, report.current_step
+            "loop {} {}: status {}, current step {:?}",
+            report.command,
+            report.run_id,
+            loop_status_label(report.status),
+            report.current_step
         );
         println!("next action: {}", report.next_action);
         println!("run file: {}", report.run_file);
     }
     Ok(())
+}
+
+fn loop_status_label(status: LoopStatus) -> String {
+    match status {
+        LoopStatus::AwaitingHumanReview => "awaiting_human_review".to_string(),
+        legacy => format!("{legacy:?}"),
+    }
 }
 
 fn loop_command_report(command: &str, runs_root: &Path, run: &LoopRun) -> LoopCommandReport {
@@ -2100,6 +2111,9 @@ fn next_loop_action(run: &LoopRun) -> String {
     match run.status {
         LoopStatus::Pending | LoopStatus::Running => {
             "resume the run to continue pending loop steps".to_string()
+        }
+        LoopStatus::AwaitingHumanReview => {
+            "human approval is required; Testing has not run".to_string()
         }
         LoopStatus::Blocked => {
             "inspect the blocked step artifact, resolve the blocker, then resume".to_string()

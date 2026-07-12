@@ -163,8 +163,13 @@ remove the real candidate. M1-05b4b now exposes only explicit, run-targeted
 cleanup, binds the caller repository and persisted run identity before
 repository-lock selection, returns one locked Cleaned outcome, and preserves
 the source checkout across success, refusal, retry, and timeout. M1-05 is
-complete and M1-06 human approval is active. The candidate is still not
-executable or promotable before the later human-approval and eval milestones.
+complete. M1-06a now atomically stops an isolated run after an authenticated
+OutputReview `ApproveForTests` outcome and records `awaiting_human_review`
+without running Testing or EvalReport. The barrier is closed against provider,
+rerun, reconciliation, cleanup, and public-writer bypasses; historical
+unapproved Testing/Eval prefixes fail before ticket or provider work. M1-06b,
+the exact human approval transaction, is active. The candidate is still not
+executable or promotable before approval and the later eval milestones.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable
