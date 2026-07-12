@@ -1366,3 +1366,37 @@ provider exchange 22, state 28, all remaining integration/doc tests, and SDK 8.
 Clippy with all targets/features and warnings denied, package lint, typecheck,
 SDK build, Rust/Prettier formatting, and diff checks pass. M1-05b3 is accepted;
 M1-05b4 explicit candidate cleanup is active.
+
+## 2026-07-12 implementation | M1-05b4a authoritative run-directory binding
+
+Reconnaissance split explicit cleanup into a safety prerequisite and the CLI
+surface. A same-run-ID copy of an authoritative run directory could otherwise
+target the original deterministic candidate and record only the copy as
+Cleaned. Candidate schema version 2 now binds authority to the SHA-256 digest
+of the canonical real absolute run-directory OS bytes. Runtime validation and
+the public JSON Schema admit only closed versions 1 and 2; version 1 is
+forensic-only and every operation directs users to a new run or manually
+verified worktree recovery.
+
+Provisioning/adoption, public creation, candidate patch application,
+verification, and cleanup now reject copied, moved, symlinked, tampered, or
+legacy authority before mutation. Public creation requires an already
+persisted matching plan and delegates to provisioning. Original crash-remnant
+adoption and Active/Cleaning/Cleaned recovery remain available only from the
+bound original directory.
+
+Both independent reviews found the same cleanup ordering flaw: after preflight,
+the locked body reloaded candidate state and selected the repository-lock
+namespace before revalidating the digest. A deterministic RED swapped both the
+digest and Git common directory after candidate-lock acquisition and created
+the malicious lock. The correction validates the reloaded authority before
+repository-lock selection; the GREEN regression proves no malicious lock, run
+publication, source change, or candidate change. Spec and quality re-review
+approved the frozen result.
+
+The controller's final gate passes the complete locked workspace: CLI 86, core
+33, seaf-loop library 99, candidate integration 39, provider candidate 11,
+provider exchange 22, state 28, all remaining integration/doc tests, and SDK 8.
+Clippy with all targets/features and warnings denied, package lint, typecheck,
+SDK build, Rust/Prettier formatting, and diff checks pass. M1-05b4a is accepted;
+M1-05b4b explicit cleanup CLI is active.

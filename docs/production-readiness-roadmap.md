@@ -156,9 +156,12 @@ M1-05b3 now durably publishes completed Development and policy evidence before
 applying it only to the isolated candidate. OutputReview is built from a
 locked, verified projection of the exact Applied tree and staged diff. Resume
 recovers None/Applying/Applied transaction cuts; only OutputReview may rerun
-after Applied, and forbidden reruns fail before mutation. Explicit CLI cleanup
-remains M1-05b4 and is active. The candidate is still not executable or
-promotable before the later human-approval and eval milestones.
+after Applied, and forbidden reruns fail before mutation. M1-05b4a binds every
+candidate operation to the canonical original run directory and makes legacy
+authority forensic-only, so copied or moved run state cannot operate on or
+remove the real candidate. Explicit CLI cleanup remains M1-05b4b and is active.
+The candidate is still not executable or promotable before the later
+human-approval and eval milestones.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

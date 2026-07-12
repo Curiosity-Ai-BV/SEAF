@@ -1715,6 +1715,7 @@ mod tests {
         authoritative.status = LoopStatus::Completed;
         authoritative.candidate_workspace = Some(CandidateWorkspaceState {
             schema_version: 1,
+            run_directory_digest: None,
             path: temp.path().join("candidate").display().to_string(),
             source_worktree_root: temp.path().join("source").display().to_string(),
             git_common_dir: temp.path().join("source/.git").display().to_string(),

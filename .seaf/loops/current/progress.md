@@ -22,7 +22,8 @@
 - [x] M1-05b1: Indexed candidate patch transaction.
 - [x] M1-05b2: Provider start/resume candidate authority.
 - [x] M1-05b3: Development/output-review candidate integration.
-- [ ] M1-05b4: Explicit candidate cleanup CLI (active).
+- [x] M1-05b4a: Authoritative run-directory binding.
+- [ ] M1-05b4b: Explicit candidate cleanup CLI (active).
 - [ ] M1-06: Human approval state.
 - [ ] M1-07: Integrated Testing and EvalReport.
 - [ ] M1-08: Promotion integrity.
@@ -52,9 +53,8 @@
 
 ## Current Gate
 
-M1-05b1 through M1-05b3 are complete; M1-05b4 is active. Milestone 1 remains
-active. Completed Development now becomes exact Applied candidate authority
-before OutputReview, which receives only the verified candidate tree/diff
-projection. Resume, staged/fresh review authentication, OutputReview-only
-rerun, forbidden-rerun no-mutation behavior, and source immutability are fully
-gated. Explicit safe candidate cleanup remains M1-05b4.
+M1-05b1 through M1-05b4a are complete; M1-05b4b is active. Milestone 1 remains
+active. Candidate schema v2 binds every operation to the canonical original
+run directory; copied, moved, symlinked, tampered, and forensic v1 authority
+fail before locks or Git/state mutation, including an under-lock cleanup race.
+Explicit safe candidate cleanup remains M1-05b4b.

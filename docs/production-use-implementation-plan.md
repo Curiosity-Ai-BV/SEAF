@@ -770,7 +770,8 @@ same-user directory-entry races remain M1-10/M1-11 hardening scope.
 ### M1-05b - Candidate Provider And CLI Integration
 
 Status: active. Dependencies: M1-05a (complete). Split into four reviewable
-boundaries: M1-05b1 through M1-05b3 are complete; M1-05b4 is active.
+boundaries: M1-05b1 through M1-05b3 and the M1-05b4a safety prerequisite are
+complete; M1-05b4b is active.
 
 Roadmap: U3. Dependencies: M1-04b.
 
@@ -913,9 +914,44 @@ formatting, and diff checks pass. Independent spec and quality re-reviews
 approved the final boundary after the forbidden-rerun, authoritative-model,
 locked-append, and public raw-append findings were closed.
 
-#### M1-05b4 - Explicit Candidate Cleanup CLI
+#### M1-05b4a - Authoritative Run-Directory Binding
 
-Status: active. Dependencies: M1-05b3 (complete).
+Status: complete on 2026-07-12. Dependencies: M1-05b3.
+
+Bind candidate authority to the canonical original run directory before
+exposing destructive cleanup through the CLI.
+
+- Candidate authority schema version 2 carries the lowercase SHA-256 digest of
+  the canonical real absolute run-directory OS bytes. The runtime model,
+  validation, and public JSON Schema admit only closed versions 1 and 2:
+  version 1 must omit the digest and is forensic-only, while version 2 requires
+  a non-null valid digest.
+- Every candidate operation rejects legacy, copied, moved, symlinked, or
+  tampered run-directory authority before candidate locks, Git operations,
+  artifacts, state publication, source mutation, or candidate mutation.
+  Operational recovery for version 1 requires a new run or manually verified
+  worktree recovery; no copied state can bless itself through migration.
+- Public candidate creation requires already-persisted matching authority and
+  delegates to provisioning. Provisioning/adoption, application, verification,
+  and Active/Cleaning/Cleaned cleanup revalidate authority under the candidate
+  lock before later mutation.
+- A cleanup race regression swaps both the digest and Git common-directory
+  authority after the candidate lock. The locked reload rejects it before
+  selecting or creating a repository-operation lock and leaves run, source,
+  and candidate state unchanged.
+
+Verification: 33 core tests, 39 candidate integration tests, the focused
+cleanup race regression, Clippy for core and loop with all targets/features and
+warnings denied, Rust formatting, and diff check. Independent spec and quality
+re-reviews approved the correction after the repository-lock ordering finding
+was closed.
+
+Commit boundary: candidate run-directory authority only; no CLI, approval,
+promotion, or eval behavior.
+
+#### M1-05b4b - Explicit Candidate Cleanup CLI
+
+Status: active. Dependencies: M1-05b4a (complete).
 
 Expose explicit cleanup through the existing authoritative
 Active-to-Cleaning-to-Cleaned primitive and close end-to-end source immutability

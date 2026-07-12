@@ -304,7 +304,11 @@
             "lifecycle"
           ],
           "properties": {
-            "schema_version": { "const": 1 },
+            "schema_version": { "enum": [1, 2] },
+            "run_directory_digest": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
             "path": { "type": "string", "pattern": "^/" },
             "source_worktree_root": { "type": "string", "pattern": "^/" },
             "git_common_dir": { "type": "string", "pattern": "^/" },
@@ -431,6 +435,20 @@
             }
           },
           "allOf": [
+            {
+              "if": {
+                "properties": { "schema_version": { "const": 1 } }
+              },
+              "then": {
+                "not": { "required": ["run_directory_digest"] }
+              }
+            },
+            {
+              "if": {
+                "properties": { "schema_version": { "const": 2 } }
+              },
+              "then": { "required": ["run_directory_digest"] }
+            },
             {
               "if": {
                 "required": ["lifecycle"],

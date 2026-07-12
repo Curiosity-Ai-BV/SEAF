@@ -41,4 +41,10 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-05b4 - Explicit candidate cleanup CLI.
+M1-05b4b - Explicit candidate cleanup CLI. Expose the existing authoritative
+Active-to-Cleaning-to-Cleaned transition through one explicit run-targeted CLI
+operation. It must open the named run from the selected runs root, use the
+current canonical repository as the caller witness, preserve idempotent Cleaned
+behavior, reject active/provisioning/legacy/copied authority before mutation,
+and report the exact cleaned candidate without adding implicit cleanup,
+approval, promotion, or eval behavior.

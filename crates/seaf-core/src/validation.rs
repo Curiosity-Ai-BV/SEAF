@@ -486,11 +486,30 @@ fn validate_candidate_workspace_state(
     errors: &mut Vec<FieldError>,
     candidate: &crate::CandidateWorkspaceState,
 ) {
-    if candidate.schema_version != 1 {
-        errors.push(FieldError::new(
+    match candidate.schema_version {
+        1 => {
+            if candidate.run_directory_digest.is_some() {
+                errors.push(FieldError::new(
+                    "candidate_workspace.run_directory_digest",
+                    "must be absent for candidate schema version 1",
+                ));
+            }
+        }
+        2 => match candidate.run_directory_digest.as_deref() {
+            Some(digest) => validate_lowercase_sha256_digest(
+                errors,
+                "candidate_workspace.run_directory_digest",
+                digest,
+            ),
+            None => errors.push(FieldError::new(
+                "candidate_workspace.run_directory_digest",
+                "is required for candidate schema version 2",
+            )),
+        },
+        _ => errors.push(FieldError::new(
             "candidate_workspace.schema_version",
-            "must be 1",
-        ));
+            "must be 1 or 2",
+        )),
     }
     for (field, value) in [
         ("path", &candidate.path),

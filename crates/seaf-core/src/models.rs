@@ -459,6 +459,12 @@ pub enum LoopExecutionMode {
 #[serde(deny_unknown_fields)]
 pub struct CandidateWorkspaceState {
     pub schema_version: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_string"
+    )]
+    pub run_directory_digest: Option<String>,
     pub path: String,
     pub source_worktree_root: String,
     pub git_common_dir: String,
@@ -475,6 +481,13 @@ pub struct CandidateWorkspaceState {
     pub cleanup_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleaned_at: Option<String>,
+}
+
+fn deserialize_present_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,10 +6,10 @@ use std::{
 
 use seaf_core::{canonical_json_bytes, validate_loop_run, LoopInputDigests, LoopStatus};
 use seaf_loop::{
-    apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
-    patch_digest, plan_candidate_workspace, provision_candidate_workspace,
-    validate_candidate_workspace, DeveloperResponse, DeveloperStatus, DevelopmentEvidence,
-    LoopWorkspace, PatchDecisionKind, PolicyDecision, Role,
+    apply_candidate_development_evidence, cleanup_candidate_workspace, patch_digest,
+    plan_candidate_workspace, provision_candidate_workspace, validate_candidate_workspace,
+    DeveloperResponse, DeveloperStatus, DevelopmentEvidence, LoopWorkspace, PatchDecisionKind,
+    PolicyDecision, Role,
 };
 use sha2::{Digest, Sha256};
 
@@ -53,6 +53,11 @@ fn candidate_plan_is_durable_authority_before_provisioning_creates_the_worktree(
 
     let planned = plan_candidate_workspace(workspace.run_directory(), &source, &digest)
         .expect("plan candidate");
+    assert_eq!(planned.schema_version, 2);
+    assert_eq!(
+        serde_json::to_value(&planned).unwrap()["run_directory_digest"],
+        serde_json::json!(sha256_path(workspace.run_directory()))
+    );
     assert_eq!(
         planned.lifecycle,
         seaf_core::CandidateWorkspaceLifecycle::Provisioning
@@ -94,6 +99,352 @@ fn candidate_plan_is_durable_authority_before_provisioning_creates_the_worktree(
     assert_eq!(persisted.candidate_workspace.as_ref(), Some(&active));
 
     remove_worktree(&source, Path::new(&active.path));
+}
+
+#[test]
+fn candidate_authority_versions_are_closed_and_match_the_public_schema() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let run_dir = temp.path().join("runs/run-version-contract");
+    fs::create_dir_all(&run_dir).unwrap();
+    let candidate = plan_candidate_workspace(&run_dir, &source, &identity_digest(&source)).unwrap();
+
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "run-version-contract".to_string(),
+        ticket_id: "T-1".to_string(),
+        goal_id: "goal".to_string(),
+        provider: "fake".to_string(),
+        model: "model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: identity_digest(&source),
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(candidate);
+
+    let v2 = serde_json::to_value(&run).unwrap();
+    assert!(validate_loop_run(&serde_json::from_value(v2.clone()).unwrap()).is_empty());
+
+    let mut v2_missing_digest = v2.clone();
+    v2_missing_digest["candidate_workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("run_directory_digest");
+    let parsed: seaf_core::LoopRun = serde_json::from_value(v2_missing_digest).unwrap();
+    assert!(validate_loop_run(&parsed)
+        .iter()
+        .any(|error| error.field == "candidate_workspace.run_directory_digest"));
+
+    let mut v2_bad_digest = v2.clone();
+    v2_bad_digest["candidate_workspace"]["run_directory_digest"] = serde_json::json!("BAD");
+    let parsed: seaf_core::LoopRun = serde_json::from_value(v2_bad_digest).unwrap();
+    assert!(validate_loop_run(&parsed)
+        .iter()
+        .any(|error| error.field == "candidate_workspace.run_directory_digest"));
+
+    let mut v1 = v2.clone();
+    v1["candidate_workspace"]["schema_version"] = serde_json::json!(1);
+    v1["candidate_workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("run_directory_digest");
+    assert!(validate_loop_run(&serde_json::from_value(v1.clone()).unwrap()).is_empty());
+
+    let mut v1_with_digest = v1;
+    v1_with_digest["candidate_workspace"]["run_directory_digest"] =
+        serde_json::json!(sha256_path(&run_dir));
+    let parsed: seaf_core::LoopRun = serde_json::from_value(v1_with_digest).unwrap();
+    assert!(validate_loop_run(&parsed)
+        .iter()
+        .any(|error| error.field == "candidate_workspace.run_directory_digest"));
+
+    let mut v1_null = serde_json::to_value(&run).unwrap();
+    v1_null["candidate_workspace"]["schema_version"] = serde_json::json!(1);
+    v1_null["candidate_workspace"]["run_directory_digest"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<seaf_core::LoopRun>(v1_null).is_err());
+
+    let mut v2_null = serde_json::to_value(&run).unwrap();
+    v2_null["candidate_workspace"]["run_directory_digest"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<seaf_core::LoopRun>(v2_null).is_err());
+
+    let mut unknown = serde_json::to_value(&run).unwrap();
+    unknown["candidate_workspace"]["schema_version"] = serde_json::json!(3);
+    let parsed: seaf_core::LoopRun = serde_json::from_value(unknown).unwrap();
+    assert!(validate_loop_run(&parsed)
+        .iter()
+        .any(|error| error.field == "candidate_workspace.schema_version"));
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../specs/loop-run.schema.json"
+    )))
+    .unwrap();
+    let contract = &schema["properties"]["candidate_workspace"]["anyOf"][0];
+    assert_eq!(
+        contract["properties"]["schema_version"]["enum"],
+        serde_json::json!([1, 2])
+    );
+    assert_eq!(
+        contract["properties"]["run_directory_digest"]["pattern"],
+        "^[a-f0-9]{64}$"
+    );
+    assert!(contract["allOf"].as_array().unwrap().iter().any(|branch| {
+        branch["if"]["properties"]["schema_version"]["const"] == 1
+            && branch["then"]["not"]["required"] == serde_json::json!(["run_directory_digest"])
+    }));
+    assert!(contract["allOf"].as_array().unwrap().iter().any(|branch| {
+        branch["if"]["properties"]["schema_version"]["const"] == 2
+            && branch["then"]["required"] == serde_json::json!(["run_directory_digest"])
+    }));
+}
+
+#[test]
+fn copied_or_moved_runs_cannot_operate_on_the_original_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let (workspace, candidate) =
+        persisted_candidate_workspace(temp.path(), &source, "bound-run", LoopStatus::Running);
+    let patch = "diff --git a/tracked.txt b/tracked.txt\nindex 1f7391f..39c5733 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-source\n+candidate\n";
+    persist_development_authority(
+        &workspace,
+        "bound-run",
+        patch,
+        vec!["tracked.txt".to_string()],
+        false,
+        PatchDecisionKind::Allowed,
+        false,
+    );
+    let applied = apply_candidate_development_evidence(&workspace, &source).unwrap();
+    let mut tampered_digest = applied.clone();
+    tampered_digest.run_directory_digest = Some("f".repeat(64));
+    assert!(
+        validate_candidate_workspace(workspace.run_directory(), &source, &tampered_digest).is_err()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let linked_run = temp.path().join("linked-run");
+        symlink(workspace.run_directory(), &linked_run).unwrap();
+        assert!(validate_candidate_workspace(&linked_run, &source, &applied).is_err());
+        fs::remove_file(linked_run).unwrap();
+    }
+
+    let copied_root = temp.path().join("copied-runs");
+    fs::create_dir(&copied_root).unwrap();
+    let copied_dir = copied_root.join("bound-run");
+    copy_directory(workspace.run_directory(), &copied_dir);
+    let copied_lock = copied_dir.join(".candidate-workspace.lock");
+    if copied_lock.exists() {
+        fs::remove_file(&copied_lock).unwrap();
+    }
+    let copied = LoopWorkspace::open(&copied_root, "bound-run").unwrap();
+    let copied_before = fs::read(copied.run_file()).unwrap();
+    let candidate_before = git(Path::new(&candidate.path), &["status", "--porcelain=v1"]);
+
+    assert!(validate_candidate_workspace(&copied_dir, &source, &applied).is_err());
+    assert!(apply_candidate_development_evidence(&copied, &source).is_err());
+    assert!(seaf_loop::verify_candidate_patch_evidence(&copied, &source).is_err());
+    let mut copied_run = seaf_loop::state::load_run(&copied).unwrap();
+    copied_run.status = LoopStatus::Completed;
+    seaf_loop::state::save_run(&copied, &copied_run).unwrap();
+    let cleanup_before = fs::read(copied.run_file()).unwrap();
+    assert!(cleanup_candidate_workspace(&copied, &source).is_err());
+    assert_eq!(fs::read(copied.run_file()).unwrap(), cleanup_before);
+    assert!(!copied_lock.exists());
+    assert_eq!(
+        git(Path::new(&candidate.path), &["status", "--porcelain=v1"]),
+        candidate_before
+    );
+    assert!(Path::new(&candidate.path).is_dir());
+    assert_ne!(
+        copied_before, cleanup_before,
+        "only the test's status transition may change the copy"
+    );
+
+    let moved_root = temp.path().join("moved-runs");
+    fs::create_dir(&moved_root).unwrap();
+    let moved_dir = moved_root.join("bound-run");
+    fs::rename(workspace.run_directory(), &moved_dir).unwrap();
+    assert!(validate_candidate_workspace(&moved_dir, &source, &applied).is_err());
+    remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn legacy_candidate_authority_is_read_only_and_rejected_before_lock_or_git_mutation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let workspace = LoopWorkspace::create(&temp.path().join("runs"), "legacy-run").unwrap();
+    let mut planned = plan_candidate_workspace(
+        workspace.run_directory(),
+        &source,
+        &identity_digest(&source),
+    )
+    .unwrap();
+    planned.schema_version = 1;
+    let mut planned_json = serde_json::to_value(&planned).unwrap();
+    planned_json
+        .as_object_mut()
+        .unwrap()
+        .remove("run_directory_digest");
+    let planned: seaf_core::CandidateWorkspaceState = serde_json::from_value(planned_json).unwrap();
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "legacy-run".to_string(),
+        ticket_id: "T-1".to_string(),
+        goal_id: "goal".to_string(),
+        provider: "fake".to_string(),
+        model: "model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: identity_digest(&source),
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(planned.clone());
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    let before = fs::read(workspace.run_file()).unwrap();
+    let lock = workspace.run_directory().join(".candidate-workspace.lock");
+
+    let error = provision_candidate_workspace(&workspace).expect_err("v1 is forensic-only");
+    assert!(error.to_string().contains("start a new run"), "{error}");
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+    assert!(!lock.exists());
+    assert!(!Path::new(&planned.path).exists());
+}
+
+#[test]
+fn legacy_active_cleaning_and_cleaned_authority_rejects_every_candidate_operation_pre_lock() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let (workspace, candidate) = persisted_candidate_workspace(
+        temp.path(),
+        &source,
+        "legacy-operations",
+        LoopStatus::Running,
+    );
+    let lock = workspace.run_directory().join(".candidate-workspace.lock");
+    if lock.exists() {
+        fs::remove_file(&lock).unwrap();
+    }
+    let candidate_before = git(Path::new(&candidate.path), &["status", "--porcelain=v1"]);
+    let mut run = seaf_loop::state::load_run(&workspace).unwrap();
+    let authority = run.candidate_workspace.as_mut().unwrap();
+    authority.schema_version = 1;
+    authority.run_directory_digest = None;
+    let legacy_active = authority.clone();
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+    let running_before = fs::read(workspace.run_file()).unwrap();
+
+    assert!(
+        validate_candidate_workspace(workspace.run_directory(), &source, &legacy_active).is_err()
+    );
+    assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+    assert!(seaf_loop::verify_candidate_patch_evidence(&workspace, &source).is_err());
+    assert_eq!(fs::read(workspace.run_file()).unwrap(), running_before);
+    assert!(!lock.exists());
+
+    for lifecycle in [
+        seaf_core::CandidateWorkspaceLifecycle::Active,
+        seaf_core::CandidateWorkspaceLifecycle::Cleaning,
+        seaf_core::CandidateWorkspaceLifecycle::Cleaned,
+    ] {
+        let mut terminal = seaf_loop::state::load_run(&workspace).unwrap();
+        terminal.status = LoopStatus::Completed;
+        let authority = terminal.candidate_workspace.as_mut().unwrap();
+        authority.lifecycle = lifecycle;
+        authority.cleanup_started_at = matches!(
+            lifecycle,
+            seaf_core::CandidateWorkspaceLifecycle::Cleaning
+                | seaf_core::CandidateWorkspaceLifecycle::Cleaned
+        )
+        .then(|| "started".to_string());
+        authority.cleaned_at = (lifecycle == seaf_core::CandidateWorkspaceLifecycle::Cleaned)
+            .then(|| "cleaned".to_string());
+        seaf_loop::state::save_run(&workspace, &terminal).unwrap();
+        let before = fs::read(workspace.run_file()).unwrap();
+        assert!(cleanup_candidate_workspace(&workspace, &source).is_err());
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+        assert!(!lock.exists());
+        assert!(Path::new(&candidate.path).is_dir());
+    }
+    assert_eq!(
+        git(Path::new(&candidate.path), &["status", "--porcelain=v1"]),
+        candidate_before
+    );
+    remove_worktree(&source, Path::new(&candidate.path));
+}
+
+#[test]
+fn copied_provisioning_authority_cannot_create_or_adopt_a_crash_remnant() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source = temp.path().join("source");
+    init_repo(&source);
+    let runs = temp.path().join("runs");
+    let workspace = LoopWorkspace::create(&runs, "provision-copy").unwrap();
+    let digest = identity_digest(&source);
+    let planned = plan_candidate_workspace(workspace.run_directory(), &source, &digest).unwrap();
+    let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "provision-copy".to_string(),
+        ticket_id: "T-1".to_string(),
+        goal_id: "goal".to_string(),
+        provider: "fake".to_string(),
+        model: "model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: "1".repeat(64),
+            policy: "2".repeat(64),
+            config: "3".repeat(64),
+            repository: digest.clone(),
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(planned.clone());
+    seaf_loop::state::save_run(&workspace, &run).unwrap();
+
+    let copied_root = temp.path().join("copied-runs");
+    fs::create_dir(&copied_root).unwrap();
+    copy_directory(
+        workspace.run_directory(),
+        &copied_root.join("provision-copy"),
+    );
+    let copied_lock = copied_root
+        .join("provision-copy")
+        .join(".candidate-workspace.lock");
+    if copied_lock.exists() {
+        fs::remove_file(&copied_lock).unwrap();
+    }
+    let copied = LoopWorkspace::open(&copied_root, "provision-copy").unwrap();
+    let copied_before = fs::read(copied.run_file()).unwrap();
+
+    assert!(
+        seaf_loop::create_candidate_workspace(copied.run_directory(), &source, &digest).is_err()
+    );
+    assert!(provision_candidate_workspace(&copied).is_err());
+    assert_eq!(fs::read(copied.run_file()).unwrap(), copied_before);
+    assert!(!copied_lock.exists());
+
+    let remnant = create_candidate_workspace(workspace.run_directory(), &source, &digest).unwrap();
+    let mut interrupted = seaf_loop::state::load_run(&workspace).unwrap();
+    interrupted.candidate_workspace = Some(planned.clone());
+    seaf_loop::state::save_run(&workspace, &interrupted).unwrap();
+    assert!(provision_candidate_workspace(&copied).is_err());
+    assert_eq!(fs::read(copied.run_file()).unwrap(), copied_before);
+    assert!(!copied_lock.exists());
+    assert!(Path::new(&remnant.path).is_dir());
+
+    let recovered = provision_candidate_workspace(&workspace).expect("original adopts remnant");
+    assert_eq!(
+        recovered.lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Active
+    );
+    remove_worktree(&source, Path::new(&recovered.path));
 }
 
 #[test]
@@ -273,7 +624,7 @@ fn candidate_creation_is_idempotent_and_disables_repository_checkout_hooks() {
     }
     let error = create_candidate_workspace(&run_dir, &source, &digest)
         .expect_err("wrong existing path must never be adopted");
-    assert!(error.to_string().contains("registered worktree"), "{error}");
+    assert!(error.to_string().contains("registered"), "{error}");
     fs::remove_dir(&cleaned.path).expect("remove substituted directory");
 }
 
@@ -559,6 +910,7 @@ fn concurrent_creators_serialize_and_adopt_without_deleting_the_winner() {
     let run_dir = temp.path().join("runs/run-concurrent");
     fs::create_dir_all(&run_dir).unwrap();
     let digest = identity_digest(&source);
+    prepare_candidate_workspace(&run_dir, &source, &digest);
     let barrier = Arc::new(Barrier::new(3));
     let mut handles = Vec::new();
     for _ in 0..2 {
@@ -1944,8 +2296,8 @@ fn persisted_candidate_workspace(
     let runs_root = root.join("runs");
     let workspace = LoopWorkspace::create(&runs_root, run_id).expect("loop workspace");
     let repository = identity_digest(source);
-    let candidate = create_candidate_workspace(workspace.run_directory(), source, &repository)
-        .expect("candidate");
+    let planned = plan_candidate_workspace(workspace.run_directory(), source, &repository)
+        .expect("candidate plan");
     let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
         run_id: run_id.to_string(),
         ticket_id: "T-1".to_string(),
@@ -1956,14 +2308,99 @@ fn persisted_candidate_workspace(
             ticket: identity_digest(Path::new("ticket")),
             policy: identity_digest(Path::new("policy")),
             config: identity_digest(Path::new("config")),
-            repository,
+            repository: repository.clone(),
         },
     });
-    run.status = status;
-    run.candidate_workspace = Some(candidate.clone());
+    run.candidate_workspace = Some(planned);
     run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-    seaf_loop::state::save_run(&workspace, &run).expect("persist candidate run");
+    seaf_loop::state::save_run(&workspace, &run).expect("persist candidate plan");
+    let candidate =
+        seaf_loop::create_candidate_workspace(workspace.run_directory(), source, &repository)
+            .expect("candidate");
+    let mut run = seaf_loop::state::load_run(&workspace).expect("active candidate run");
+    run.status = status;
+    seaf_loop::state::save_run(&workspace, &run).expect("persist candidate run status");
     (workspace, candidate)
+}
+
+fn sha256_path(path: &Path) -> String {
+    let canonical = path.canonicalize().expect("canonical path");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_os_str().as_encoded_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir(destination).expect("copy destination");
+    for entry in fs::read_dir(source).expect("copy source") {
+        let entry = entry.expect("copy entry");
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_directory(&source_path, &destination_path);
+        } else {
+            fs::copy(&source_path, &destination_path).expect("copy file");
+        }
+    }
+}
+
+fn prepare_candidate_workspace(
+    run_directory: &Path,
+    source: &Path,
+    repository: &str,
+) -> LoopWorkspace {
+    if !run_directory.join("run.json").exists() {
+        if run_directory.exists() {
+            assert!(
+                fs::read_dir(run_directory).unwrap().next().is_none(),
+                "candidate fixture run directory must be empty before scaffolding"
+            );
+            fs::remove_dir(run_directory).unwrap();
+        }
+        let runs_root = run_directory.parent().expect("runs root");
+        let run_id = run_directory
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("UTF-8 run ID");
+        let workspace = LoopWorkspace::create(runs_root, run_id).expect("fixture workspace");
+        let planned = plan_candidate_workspace(workspace.run_directory(), source, repository)
+            .expect("fixture plan");
+        let mut run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+            run_id: run_id.to_string(),
+            ticket_id: "T-fixture".to_string(),
+            goal_id: "fixture".to_string(),
+            provider: "fake".to_string(),
+            model: "model".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "1".repeat(64),
+                policy: "2".repeat(64),
+                config: "3".repeat(64),
+                repository: repository.to_string(),
+            },
+        });
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+        run.candidate_workspace = Some(planned);
+        seaf_loop::state::save_run(&workspace, &run).expect("fixture authority");
+        workspace
+    } else {
+        LoopWorkspace::open(
+            run_directory.parent().expect("runs root"),
+            run_directory
+                .file_name()
+                .and_then(|value| value.to_str())
+                .expect("UTF-8 run ID"),
+        )
+        .expect("existing fixture workspace")
+    }
+}
+
+fn create_candidate_workspace(
+    run_directory: &Path,
+    source: &Path,
+    repository: &str,
+) -> Result<seaf_core::CandidateWorkspaceState, seaf_loop::CandidateWorkspaceError> {
+    let workspace = prepare_candidate_workspace(run_directory, source, repository);
+    seaf_loop::create_candidate_workspace(workspace.run_directory(), source, repository)
 }
 
 fn persist_development_authority(
