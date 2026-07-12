@@ -100,7 +100,7 @@ where
 {
     plan.checks.iter().enumerate().map(move |(index, check)| {
         validate_authority(index).map_err(|error| {
-            EvalEngineError::message(format!(
+            EvalEngineError::authority(format!(
                 "eval check {} pre-spawn authority rejected: {error}",
                 check.name
             ))
@@ -113,6 +113,7 @@ where
 pub struct EvalEngineError {
     message: String,
     source: Option<io::Error>,
+    authority_rejection: bool,
 }
 
 impl EvalEngineError {
@@ -120,6 +121,15 @@ impl EvalEngineError {
         Self {
             message: message.into(),
             source: None,
+            authority_rejection: false,
+        }
+    }
+
+    pub(crate) fn authority(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+            authority_rejection: true,
         }
     }
 
@@ -127,7 +137,12 @@ impl EvalEngineError {
         Self {
             message: format!("{}: {source}", context.into()),
             source: Some(source),
+            authority_rejection: false,
         }
+    }
+
+    pub(crate) fn is_authority_rejection(&self) -> bool {
+        self.authority_rejection
     }
 }
 

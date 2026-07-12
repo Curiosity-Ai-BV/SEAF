@@ -36,8 +36,8 @@
 - [x] M1-09c1: Versioned evaluation attempt authority.
 - [x] M1-09c2a: Versioned evaluation recovery authority.
 - [x] M1-09c2b: Zero-command adoption transaction.
-- [ ] M1-09c3: Evaluation invalidation and rerun (active).
-- [ ] M1-10: Atomic state and run locking.
+- [x] M1-09c3: Evaluation invalidation and rerun.
+- [ ] M1-10: Atomic state and run locking (active).
 - [ ] M1-11: Minimum artifact protection.
 - [ ] M1-12: Interruption recovery acceptance.
 
@@ -125,5 +125,14 @@ adopts only an exact complete fixed-v1 or indexed-v2 prefix through an audited,
 zero-command transaction. It verifies all six authoritative input snapshots,
 candidate/source/provider authority, deterministic report bytes, crash orphans,
 and a dedicated recovery-advancing final CAS; exact retry is byte-inert and
-competing callers converge on one audit winner. M1-09c3 invalidation and fresh
-rerun is active.
+competing callers converge on one audit winner. M1-09c3 now adds dedicated v3
+invalidation authority for exact incomplete or active approval-bound Failed
+evaluation history. It preserves every prior byte, reconstructs the exact
+Approved predecessor, and resets only current final-evaluation pointers under
+candidate-to-provider CAS. Exact rerun owns one recovery-bound indexed attempt;
+partial attempts cannot replay and require another invalidation, while complete
+prefixes use zero-command adoption. Iterative mixed v1/v2/v3 lineage, all-six
+inputs, candidate/source/provider state, prior final references, crash cuts,
+tamper, competition, repeated attempts, pre-spawn drift abort, final failure,
+passing promotion, and frozen states are covered. M1-09 is complete and M1-10
+atomic state and run locking is active.

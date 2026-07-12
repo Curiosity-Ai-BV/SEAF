@@ -93,7 +93,7 @@ pub fn load_verified_final_evaluation_authority(
         run
     };
 
-    let inventory = EvaluationAttemptInventory::load(workspace)
+    let inventory = EvaluationAttemptInventory::load_for_invalidation(workspace)
         .map_err(FinalEvaluationAuthorityError::invalid)?;
     let testing_reference = step_artifact_reference(run, LoopStepName::Testing)?;
     let report_reference = step_artifact_reference(run, LoopStepName::EvalReport)?;
@@ -167,7 +167,14 @@ pub fn load_verified_final_evaluation_authority(
     }
     let eval_config = load_eval_config(workspace, run)?;
     execution_intent
-        .validate_against(&approved_run, &eval_config.evals.required)
+        .validate_against_with_recovery(
+            &approved_run,
+            &eval_config.evals.required,
+            testing_evidence
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.as_ref()),
+        )
         .map_err(FinalEvaluationAuthorityError::invalid)?;
     let eval_report = load_verified_eval_report(workspace, &report_reference)?;
     let loop_evidence = eval_report.loop_evidence.as_ref().ok_or_else(|| {
@@ -302,6 +309,7 @@ fn reconstruct_approved_authority(
             .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
     if let Some(source) = recovery_source {
         approved.latest_recovery = source.latest_recovery.clone();
+        approved.updated_at = source.updated_at.clone();
         if approved != source {
             return Err(FinalEvaluationAuthorityError::invalid(
                 "final LoopRun is not an allowed descendant of its evaluation recovery source",

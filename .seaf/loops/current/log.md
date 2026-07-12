@@ -1901,3 +1901,50 @@ and every remaining Rust integration and doc-test suite. Strict all-target/
 all-feature Clippy, Rust and Prettier formatting, package lint/typecheck, 8 SDK
 tests, SDK build, and diff checks also pass through pinned pnpm 11.7.0. M1-09c2
 is accepted and M1-09c3 evaluation invalidation and fresh rerun is active.
+
+## 2026-07-12 implementation | M1-09c3 evaluation invalidation and rerun
+
+Added dedicated schema-v3 evaluation invalidation authority without changing
+provider-v1 recovery or evaluation-v2 adoption. The create-only source snapshot
+and decision bind the exact observed incomplete or active approval-bound Failed
+run, reconstructed Approved predecessor, ordered prefix manifest, next indexed
+attempt, actor/reason/time, every input/candidate/source/provider binding, prior
+recovery and final references, and zero-digest reset projection. Invalidation is
+command- and provider-free, preserves every historical byte, resets only current
+Testing/EvalReport/final pointers, and advances one recovery ID through locked
+CAS. Exact invalidation retry is byte-inert.
+
+`loop rerun --recovery N` now distinguishes evaluation-v3 from provider-v1 and
+terminal adoption-v2 authority. It alone may publish the next intent, whose v2
+payload and Testing evidence bind the exact invalidation reference. Operational
+authority is reauthenticated before intent, before every command spawn, before
+Testing/report publication, and again inside the final locked CAS. Typed
+pre-spawn rejection aborts rather than manufacturing a failed check: the durable
+regression mutates policy after check one and proves only the factual intent and
+first log pair remain, with no second check, Testing, EvalReport, or final state.
+Partial attempts cannot replay and require another invalidation; complete
+pre-CAS prefixes use zero-command adoption; exact final retry is inert.
+
+Review found and closed attempt-1-only final reconstruction, under-authenticated
+v3 reload, substituted prior-final references, source and all-input TOCTOU,
+post-final cleanup acceptance, recursive mixed-chain validation, and synthetic
+failure publication after pre-spawn authority drift. The final reader validates
+mixed provider-v1, adoption-v2, and invalidation-v3 lineage iteratively and
+stack-safely using exact child-to-predecessor consumption. Historical direct and
+v2-adopted Failed authority remains bounded and verifiable after later attempts.
+Independent final review approves with no remaining P0/P1 findings.
+
+Coverage includes intent/log/Testing/report crash prefixes, trailing stdout,
+malformed/mixed/gapped inventory, all six input snapshots, candidate/source/
+provider drift, source/decision/prior-final tamper, direct and adopted Failed
+reset, old-recovery replay refusal, attempt-two adoption, reinvalidation through
+attempt three, competing invalidators, exact retry, passing promotion, and
+frozen EvalPassed/Promoted/promotion-intent states. Controller verification
+passes the full workspace: CLI 137, core 51, local runtime 5, loop unit 138,
+candidate 39, context expansion 22, eval engine 7, eval report 3, final authority
+2, patch 7, policy 13, provider-candidate 53, provider-exchange 22, isolation 1,
+staged authority 2, role response 13, state 32, Testing evidence 8, models 7,
+Ollama 8, and all doc tests. Strict all-target/all-feature Clippy, Rust and
+Prettier formatting, package lint/typecheck, 8 SDK tests, SDK build, and diff
+checks pass through pinned pnpm 11.7.0. M1-09 is accepted and M1-10 atomic state
+and run locking is active.

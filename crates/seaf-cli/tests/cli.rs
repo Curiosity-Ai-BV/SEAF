@@ -5770,7 +5770,7 @@ fn loop_revise_rejects_invalid_evaluation_recovery_grammar_before_workspace_look
     let runs_root = temp.path().join("runs");
     for args in [
         vec!["--from-step", "testing"],
-        vec!["--from-step", "testing", "--eval-recovery", "invalidate"],
+        vec!["--from-step", "testing", "--eval-recovery", "discard"],
         vec!["--from-step", "output-review", "--eval-recovery", "adopt"],
     ] {
         let mut command = seaf();
@@ -5872,6 +5872,100 @@ fn loop_revise_testing_adopt_finalizes_an_interrupted_complete_prefix_without_re
         .join("artifacts/recovery-001.source-run.json")
         .is_file());
     assert!(run_dir.join("artifacts/recovery-001.json").is_file());
+}
+
+#[test]
+fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: retry_probe\n      command: printf recovered\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure recovery probe");
+    let runs_root = temp.path().join("runs");
+    let run_id = "cli-evaluation-invalidation";
+    let ticket = write_provider_loop_ticket(temp.path(), true);
+    run_and_approve_provider_loop(&repo, &ticket, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let approved_bytes = fs::read(run_dir.join("run.json")).unwrap();
+
+    let evaluation = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(evaluation.status.success(), "{evaluation:?}");
+    fs::write(run_dir.join("run.json"), approved_bytes).unwrap();
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(run_dir.join(path)).unwrap();
+    }
+
+    let invalidated = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "testing",
+            "--eval-recovery",
+            "invalidate",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "invalidate trailing stdout crash cut",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(invalidated.status.success(), "{invalidated:?}");
+    let invalidated_output: serde_json::Value =
+        serde_json::from_slice(&invalidated.stdout).unwrap();
+    assert_eq!(invalidated_output["invalidated_attempt"], 1);
+    assert_eq!(invalidated_output["next_evaluation_attempt"], 2);
+
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(rerun.status.success(), "{rerun:?}");
+    let final_run = read_run_json(&run_dir);
+    assert_eq!(final_run["status"], "eval_passed");
+    assert_eq!(
+        final_run["steps"][6]["artifact_path"],
+        "artifacts/07-testing.attempt-002.json"
+    );
+    assert_eq!(
+        fs::read(run_dir.join("artifacts/07-testing.attempt-002.check-001.stdout.log")).unwrap(),
+        b"recovered"
+    );
 }
 
 #[test]

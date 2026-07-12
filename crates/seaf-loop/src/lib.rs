@@ -25,7 +25,9 @@ pub mod state;
 pub mod testing_evidence;
 pub mod workspace;
 
-pub use approved_eval::{execute_approved_evaluation, ApprovedEvaluationError};
+pub use approved_eval::{
+    execute_approved_evaluation, rerun_invalidated_evaluation, ApprovedEvaluationError,
+};
 pub use artifacts::ArtifactContent;
 pub use bench::{
     evaluate_zero_tolerance, load_agent_bench_fixture, summarize_agent_bench_results,
@@ -81,10 +83,13 @@ pub use provider_exchange::{
     PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 pub use recovery::{
-    adopt_approved_evaluation, ensure_no_pending_recovery, load_verified_latest_recovery,
-    revise_provider_step, validate_requested_recovery, EvaluationAdoptionOutcome, RecoveryAction,
-    RecoveryAttemptV1, RecoveryError, RecoveryRevisionOutcome, RecoverySourceRunV1,
-    RECOVERY_SCHEMA_VERSION,
+    adopt_approved_evaluation, ensure_no_pending_recovery, invalidate_approved_evaluation,
+    load_verified_latest_recovery, load_verified_recovery_authority_kind, revise_provider_step,
+    validate_requested_recovery, EvaluationAdoptionOutcome, EvaluationInvalidationAction,
+    EvaluationInvalidationAttemptV3, EvaluationInvalidationOutcome,
+    EvaluationInvalidationSourceRunV3, RecoveryAction, RecoveryAttemptV1, RecoveryAuthorityKind,
+    RecoveryError, RecoveryRevisionOutcome, RecoverySourceRunV1,
+    EVALUATION_INVALIDATION_SCHEMA_VERSION, RECOVERY_SCHEMA_VERSION,
 };
 pub use role_artifact::{RoleArtifactError, ValidatedRoleArtifact};
 pub use role_response::{

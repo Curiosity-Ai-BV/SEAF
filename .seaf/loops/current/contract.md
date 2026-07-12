@@ -44,31 +44,21 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09c3 - Evaluation invalidation and fresh rerun. Extend
-`loop revise --from-step testing --eval-recovery invalidate --actor <actor>
---reason <reason>` without changing provider recovery or adoption-v2 behavior.
-Eligible authority is either exact Approved/Testing with one factual latest
-incomplete evaluation prefix, or active approval-bound final Failed whose exact
-Approved predecessor and attempt evidence verify. EvalPassed, Promoted,
-promotion intent, legacy missing-evaluation authority, pending recovery,
-inactive candidate, malformed/mixed/gapped history, or any input, candidate,
-source, provider, artifact, and namespace drift fails closed before mutation.
+M1-10 - Atomic state and run locking. Generalize the narrow provider-ledger
+lock and atomic replacement guarantees to every remaining run-state mutation
+and recovery operation without weakening or replacing the existing
+ledger-specific guard.
 
-Invalidation executes zero commands and makes zero provider calls. Under the
-candidate-then-provider lock order, preflight and publish a dedicated
-create-only source snapshot and invalidation decision bound to every present
-prefix byte, exact prior/final authority, next contiguous evaluation attempt,
-actor/reason/time, and zero-digest reset projection. Preserve all prior
-intent/log/Testing/EvalReport bytes and provider history; reset only current
-Testing/EvalReport/final references to the reconstructed Approved authority and
-advance `latest_recovery` by one CAS. Exact revise retry is byte-inert.
+Every run-state writer must use durable same-directory temporary publication
+and atomic replacement. Exactly one cooperative SEAF process may mutate a run
+at a time; stale-lock behavior must be explicit, bounded, and safe. Concurrent
+writers must either serialize against the latest authenticated state or fail
+closed before mutation, never publish a hybrid of two intended states. Failed
+write, sync, or rename cuts must retain the last valid parseable `run.json` and
+leave a deterministic retry or cleanup path.
 
-Only `loop rerun --recovery <id>` may consume the pending invalidation and start
-its one authorized fresh indexed attempt. The new intent and Testing evidence
-must bind that recovery reference; ordinary resume/evaluation rejects before
-consumption. Once any artifact for that attempt exists, the same recovery may
-not replay commands within the attempt: another audited invalidation is needed
-to authorize the next contiguous attempt. Cover incomplete-prefix shapes,
-final-Failed reset, every publication cut, competing callers, repeated
-invalidate/rerun cycles, and frozen adoption/promotion regressions. Do not add
-general M1-10 locking, artifact protection, or distribution work.
+Start with an inventory of every state/workspace writer and the existing lock
+orders. Add focused fault-injection and competing-writer tests before changing
+production code. Preserve candidate, repository-operation, and provider lock
+ordering and all M1-09 recovery CAS semantics. Do not add M1-11 artifact
+permissions, retention, distribution, or release work.

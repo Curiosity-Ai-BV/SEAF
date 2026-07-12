@@ -508,6 +508,7 @@ where
         expected,
         intended,
         false,
+        false,
         validate_current,
     )
 }
@@ -526,6 +527,7 @@ where
         expected,
         intended,
         true,
+        false,
         validate_current,
     )
 }
@@ -544,6 +546,7 @@ where
         expected,
         intended,
         true,
+        false,
         |current| {
             if current.status != seaf_core::LoopStatus::Approved
                 || current.current_step != seaf_core::LoopStepName::Testing
@@ -585,11 +588,68 @@ where
     )
 }
 
+pub(crate) fn persist_evaluation_invalidation_with_validator<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+    validate_current: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
+    persist_run_with_full_compare_and_validator_mode(
+        workspace,
+        expected,
+        intended,
+        true,
+        true,
+        |current| {
+            if intended.status != seaf_core::LoopStatus::Approved
+                || intended.current_step != seaf_core::LoopStepName::Testing
+                || intended.eval_report_path.is_some()
+            {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation invalidation CAS requires exact Approved Testing reset".to_string(),
+                ));
+            }
+            let reference = intended.latest_recovery.as_ref().ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "evaluation invalidation reset lost recovery authority".to_string(),
+                )
+            })?;
+            let expected_id = current
+                .latest_recovery
+                .as_ref()
+                .map_or(Some(1), |previous| previous.recovery_id.checked_add(1));
+            if expected_id != Some(reference.recovery_id) {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation invalidation did not advance exactly one recovery ID".to_string(),
+                ));
+            }
+            let (_, source) =
+                crate::recovery::load_verified_evaluation_invalidation(workspace, reference)
+                    .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        ProviderExchangeError::Invalid(
+                            "evaluation invalidation CAS requires schema-v3 authority".to_string(),
+                        )
+                    })?;
+            if source.run != *current || source.approved_run.run_id != current.run_id {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation invalidation does not bind the exact locked source".to_string(),
+                ));
+            }
+            validate_current(current)
+        },
+    )
+}
+
 fn persist_run_with_full_compare_and_validator_mode<F>(
     workspace: &LoopWorkspace,
     expected: &LoopRun,
     intended: &LoopRun,
     allow_recovery_advance: bool,
+    allow_final_invalidation: bool,
     validate_current: F,
 ) -> Result<(), ProviderExchangeError>
 where
@@ -610,7 +670,9 @@ where
             ));
         }
         validate_current(&current)?;
-        validate_final_authority_cas_relation(workspace, &current, intended)?;
+        if !allow_final_invalidation {
+            validate_final_authority_cas_relation(workspace, &current, intended)?;
+        }
         validate_run_for_atomic_publication(workspace, intended)?;
         let mut bytes = serde_json::to_vec_pretty(intended)?;
         bytes.push(b'\n');

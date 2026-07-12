@@ -12,23 +12,662 @@ use seaf_core::{
     TicketStatus,
 };
 use seaf_loop::recovery::{
+    EvaluationInvalidationAttemptV3, EvaluationInvalidationSourceRunV3,
     EvaluationPrefixAuthorityV1, EvaluationPrefixSpellingV1, EvaluationRecoveryAction,
     EvaluationRecoveryAttemptV2, EvaluationRecoveryReportDisposition,
     EvaluationRecoverySourceRunV2, EVALUATION_RECOVERY_SCHEMA_VERSION,
 };
 use seaf_loop::{
     adopt_approved_evaluation, approve_candidate_for_testing, artifacts::write_step_request,
-    cleanup_candidate_workspace_outcome, load_verified_final_evaluation_authority,
-    persist_provider_exchange_record_reference, revise_provider_step,
-    stage_provider_exchange_record, verify_candidate_patch_evidence,
-    write_provider_exchange_request, AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits,
-    ContextPackRequest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
-    PatchCommand, PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
+    cleanup_candidate_workspace_outcome, invalidate_approved_evaluation,
+    load_verified_final_evaluation_authority, load_verified_recovery_authority_kind,
+    persist_provider_exchange_record_reference, promote_evaluated_candidate,
+    rerun_invalidated_evaluation, revise_provider_step, stage_provider_exchange_record,
+    verify_candidate_patch_evidence, write_provider_exchange_request,
+    AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits, ContextPackRequest,
+    InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchCommand,
+    PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
     ProviderPatchGateConfig, ProviderStepRunner, StepRunner, TestingEvidence,
     PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use seaf_models::{FakeProvider, ModelResponse};
 use sha2::{Digest, Sha256};
+
+#[test]
+fn evaluation_invalidation_preserves_an_intent_only_prefix_and_resets_exact_approved_authority() {
+    let (fixture, approved) = approved_fixture("evaluation-invalidate-intent-only");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let intent_path = "artifacts/07-testing.attempt-001.execution-intent.json";
+    let intent_before = fs::read(fixture.workspace.run_directory().join(intent_path)).unwrap();
+    let provider_before = approved.provider_exchange_records.clone();
+
+    let outcome = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "invalidate interrupted evaluation",
+    )
+    .expect("intent-only evaluation prefix must be invalidatable");
+
+    assert_eq!(outcome.run.status, seaf_core::LoopStatus::Approved);
+    assert_eq!(outcome.run.current_step, LoopStepName::Testing);
+    assert_eq!(outcome.run.provider_exchange_records, provider_before);
+    assert_eq!(outcome.recovery.invalidated_attempt, 1);
+    assert_eq!(outcome.recovery.next_evaluation_attempt, 2);
+    assert_eq!(outcome.run.latest_recovery, Some(outcome.reference));
+    assert_eq!(
+        fs::read(fixture.workspace.run_directory().join(intent_path)).unwrap(),
+        intent_before,
+        "invalidation must preserve the interrupted attempt bytes"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_invalidation_authorizes_exactly_one_fresh_indexed_attempt() {
+    let (fixture, approved) =
+        approved_fixture_with_eval_execution("evaluation-invalidation-rerun-once");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "authorize one fresh evaluation",
+    )
+    .unwrap();
+
+    let rerun = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .expect("exact invalidation must authorize its next indexed attempt");
+    assert_eq!(rerun.status, seaf_core::LoopStatus::EvalPassed);
+    let testing = rerun
+        .steps
+        .iter()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    assert_eq!(
+        testing.artifact_path.as_deref(),
+        Some("artifacts/07-testing.attempt-002.json")
+    );
+    let intent: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .workspace
+                .run_directory()
+                .join("artifacts/07-testing.attempt-002.execution-intent.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        intent["recovery"],
+        serde_json::to_value(&invalidated.reference).unwrap()
+    );
+
+    let tree_after = directory_snapshot(fixture.workspace.run_directory());
+    let retry = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .expect("exact post-final retry may return the already durable final authority");
+    assert_eq!(retry, rerun);
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        tree_after
+    );
+    let candidate = rerun.candidate_workspace.as_ref().unwrap();
+    let report_digest = rerun
+        .steps
+        .iter()
+        .find(|step| step.name == LoopStepName::EvalReport)
+        .and_then(|step| step.artifact_digest.as_deref())
+        .unwrap();
+    let canonical_source = fixture.source.canonicalize().unwrap();
+    let promoted = promote_evaluated_candidate(
+        &fixture.workspace,
+        &canonical_source,
+        "operator@example.invalid",
+        &candidate.candidate_diff_digest,
+        report_digest,
+        &git(&canonical_source, &["rev-parse", "HEAD"]),
+    )
+    .expect("passing V3 evaluation authority must remain promotable");
+    assert_eq!(promoted.run.status, seaf_core::LoopStatus::Promoted);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_invalidation_resets_active_final_failure_to_its_exact_approved_predecessor() {
+    let (fixture, approved) = approved_fixture("evaluation-invalidation-final-failed");
+    let failed = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, false);
+    write_raw_run(&fixture.workspace, &failed);
+
+    let outcome = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "retry the failed evaluation",
+    )
+    .expect("active approval-bound Failed evaluation must be invalidatable");
+
+    assert_eq!(outcome.run.status, seaf_core::LoopStatus::Approved);
+    assert_eq!(outcome.run.current_step, LoopStepName::Testing);
+    assert!(outcome.run.eval_report_path.is_none());
+    assert!(outcome
+        .recovery
+        .present_artifacts
+        .iter()
+        .any(|reference| { reference.path == "artifacts/08-eval-report.attempt-001.json" }));
+    assert_eq!(outcome.recovery.next_evaluation_attempt, 2);
+    fixture.cleanup();
+}
+
+#[test]
+fn complete_recovered_attempt_before_final_cas_uses_zero_command_adoption() {
+    let (fixture, approved) = approved_fixture_with_eval_execution("evaluation-recovered-adoption");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "authorize recovered evaluation",
+    )
+    .unwrap();
+    let completed = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .unwrap();
+    assert_eq!(completed.status, seaf_core::LoopStatus::EvalPassed);
+    write_raw_run(&fixture.workspace, &invalidated.run);
+    let bytes_before = approved_eval_log_bytes(&fixture.workspace);
+
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "adopt complete recovered attempt",
+    )
+    .expect("complete attempt two must adopt through its consumed V3 predecessor");
+
+    assert_eq!(adopted.recovery.evaluation_attempt, 2);
+    assert_eq!(
+        adopted.recovery.previous_recovery,
+        Some(invalidated.reference)
+    );
+    assert_eq!(approved_eval_log_bytes(&fixture.workspace), bytes_before);
+    load_verified_final_evaluation_authority(&fixture.workspace, &adopted.run).unwrap();
+    fixture.cleanup();
+}
+
+#[test]
+fn partial_recovered_attempt_requires_a_new_invalidation_before_attempt_three() {
+    let (fixture, approved) =
+        approved_fixture_with_eval_execution("evaluation-repeated-invalidation");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let first = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "authorize attempt two",
+    )
+    .unwrap();
+    rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        first.reference.recovery_id,
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &first.run);
+    for path in [
+        "artifacts/07-testing.attempt-002.json",
+        "artifacts/08-eval-report.attempt-002.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let partial_tree = directory_snapshot(fixture.workspace.run_directory());
+    rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        first.reference.recovery_id,
+    )
+    .expect_err("same recovery cannot replay after intent and log publication");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        partial_tree
+    );
+
+    let second = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "attempt two was interrupted",
+    )
+    .expect("partial consumed attempt two requires a new invalidation");
+    assert_eq!(second.recovery.invalidated_attempt, 2);
+    assert_eq!(second.recovery.next_evaluation_attempt, 3);
+    assert_eq!(second.recovery.previous_recovery, Some(first.reference));
+
+    let final_run = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        second.reference.recovery_id,
+    )
+    .expect("second invalidation must authorize exactly attempt three");
+    assert_eq!(
+        final_run
+            .steps
+            .iter()
+            .find(|step| step.name == LoopStepName::Testing)
+            .unwrap()
+            .artifact_path
+            .as_deref(),
+        Some("artifacts/07-testing.attempt-003.json")
+    );
+    load_verified_final_evaluation_authority(&fixture.workspace, &final_run).unwrap();
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_invalidation_recovers_create_only_publication_cuts_and_exact_retry() {
+    let (fixture, approved) = approved_fixture("evaluation-invalidation-crash-cuts");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let actor = "operator@example.invalid";
+    let reason = "recover invalidation publication cuts";
+    let first = invalidate_approved_evaluation(&fixture.workspace, actor, reason).unwrap();
+    let source_path = first.recovery.source_run.path.clone();
+    let recovery_path = first.reference.artifact.path.clone();
+    let source_bytes = fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap();
+    let recovery_bytes = fs::read(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
+
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(fixture.workspace.run_directory().join(&source_path)).unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
+    fs::write(
+        fixture.workspace.run_directory().join(&source_path),
+        &source_bytes,
+    )
+    .unwrap();
+    let after_source = invalidate_approved_evaluation(&fixture.workspace, actor, reason).unwrap();
+    assert_eq!(after_source, first);
+
+    write_raw_run(&fixture.workspace, &approved);
+    let after_decision = invalidate_approved_evaluation(&fixture.workspace, actor, reason).unwrap();
+    assert_eq!(after_decision, first);
+    assert_eq!(
+        fs::read(fixture.workspace.run_directory().join(&recovery_path)).unwrap(),
+        recovery_bytes
+    );
+
+    let tree = directory_snapshot(fixture.workspace.run_directory());
+    let after_cas = invalidate_approved_evaluation(&fixture.workspace, actor, reason).unwrap();
+    assert_eq!(after_cas, first);
+    assert_eq!(directory_snapshot(fixture.workspace.run_directory()), tree);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_rerun_rejects_authoritative_input_drift_before_attempt_publication() {
+    for (label, path) in [
+        ("ticket", "inputs/ticket.json"),
+        ("provider-ticket", "ticket.snapshot.json"),
+        ("policy", "inputs/policy.json"),
+        ("config", "inputs/config.json"),
+        ("repository", "inputs/repository.json"),
+        ("eval", "inputs/eval-config.json"),
+    ] {
+        let (fixture, approved) =
+            approved_fixture_with_eval_execution(&format!("evaluation-rerun-{label}-drift"));
+        publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+        for path in [
+            "artifacts/07-testing.attempt-001.check-001.stdout.log",
+            "artifacts/07-testing.attempt-001.check-001.stderr.log",
+            "artifacts/07-testing.attempt-001.json",
+            "artifacts/08-eval-report.attempt-001.json",
+        ] {
+            fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+        }
+        let invalidated = invalidate_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "authorize drift-checked rerun",
+        )
+        .unwrap();
+        fs::write(fixture.workspace.run_directory().join(path), b"substituted").unwrap();
+
+        rerun_invalidated_evaluation(
+            &fixture.workspace,
+            &fixture.source,
+            invalidated.reference.recovery_id,
+        )
+        .expect_err("every authoritative input drift must fail before attempt publication");
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/07-testing.attempt-002.execution-intent.json")
+            .exists());
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn pre_spawn_authority_rejection_preserves_only_the_factual_partial_attempt() {
+    let (fixture, approved) =
+        approved_fixture_with_drifting_eval("evaluation-pre-spawn-authority-rejection");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "authorize authority-checked rerun",
+    )
+    .unwrap();
+
+    let error = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .expect_err("second check pre-spawn must abort after first check changes authority");
+    assert!(
+        error.to_string().contains("pre-spawn authority rejected"),
+        "{error}"
+    );
+    let persisted = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    assert_eq!(persisted, invalidated.run);
+    for path in [
+        "artifacts/07-testing.attempt-002.execution-intent.json",
+        "artifacts/07-testing.attempt-002.check-001.stdout.log",
+        "artifacts/07-testing.attempt-002.check-001.stderr.log",
+    ] {
+        assert!(
+            fixture.workspace.run_directory().join(path).is_file(),
+            "{path}"
+        );
+    }
+    for path in [
+        "artifacts/07-testing.attempt-002.check-002.stdout.log",
+        "artifacts/07-testing.attempt-002.check-002.stderr.log",
+        "artifacts/07-testing.attempt-002.json",
+        "artifacts/08-eval-report.attempt-002.json",
+    ] {
+        assert!(
+            !fixture.workspace.run_directory().join(path).exists(),
+            "{path}"
+        );
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_invalidation_keeps_eval_passed_and_promotion_intent_frozen() {
+    let (complete_fixture, complete_approved) =
+        approved_fixture("evaluation-invalidation-complete-adoption-only");
+    publish_indexed_final_eval_artifacts(&complete_fixture.workspace, &complete_approved, true);
+    let before = directory_snapshot(complete_fixture.workspace.run_directory());
+    let error = invalidate_approved_evaluation(
+        &complete_fixture.workspace,
+        "operator@example.invalid",
+        "must adopt complete evidence",
+    )
+    .expect_err("complete Testing evidence is adoption-only");
+    assert!(error.to_string().contains("adoption"), "{error}");
+    assert_eq!(
+        directory_snapshot(complete_fixture.workspace.run_directory()),
+        before
+    );
+    complete_fixture.cleanup();
+
+    let (passed_fixture, passed_approved) =
+        approved_fixture("evaluation-invalidation-frozen-passed");
+    let passed =
+        publish_indexed_final_eval_artifacts(&passed_fixture.workspace, &passed_approved, true);
+    write_raw_run(&passed_fixture.workspace, &passed);
+    let before = directory_snapshot(passed_fixture.workspace.run_directory());
+    let error = invalidate_approved_evaluation(
+        &passed_fixture.workspace,
+        "operator@example.invalid",
+        "must not invalidate passing authority",
+    )
+    .expect_err("EvalPassed must remain frozen");
+    assert!(error.to_string().contains("immutable"), "{error}");
+    assert_eq!(
+        directory_snapshot(passed_fixture.workspace.run_directory()),
+        before
+    );
+    passed_fixture.cleanup();
+
+    let (intent_fixture, intent_approved) =
+        approved_fixture("evaluation-invalidation-promotion-intent");
+    publish_indexed_final_eval_artifacts(&intent_fixture.workspace, &intent_approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(intent_fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    fs::write(
+        intent_fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/09-promotion.intent.json"),
+        b"{}",
+    )
+    .unwrap();
+    let before = directory_snapshot(intent_fixture.workspace.run_directory());
+    let error = invalidate_approved_evaluation(
+        &intent_fixture.workspace,
+        "operator@example.invalid",
+        "must not cross promotion intent",
+    )
+    .expect_err("promotion intent freezes evaluation invalidation");
+    assert!(error.to_string().contains("promotion intent"), "{error}");
+    assert_eq!(
+        directory_snapshot(intent_fixture.workspace.run_directory()),
+        before
+    );
+    intent_fixture.cleanup();
+}
+
+#[test]
+fn failed_invalidation_source_remains_verifiable_after_the_fresh_attempt_exists() {
+    let (fixture, approved) =
+        approved_fixture_with_eval_execution("evaluation-failed-source-history");
+    let failed = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, false);
+    write_raw_run(&fixture.workspace, &failed);
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "retry exact failed authority",
+    )
+    .unwrap();
+
+    let rerun = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .expect("later attempt artifacts must not invalidate historical Failed source");
+    assert_eq!(rerun.status, seaf_core::LoopStatus::EvalPassed);
+    load_verified_final_evaluation_authority(&fixture.workspace, &rerun).unwrap();
+    fixture.cleanup();
+}
+
+#[test]
+fn adopted_failed_v2_can_be_invalidated_and_remains_verified_after_attempt_two() {
+    let (fixture, approved) =
+        approved_fixture_with_eval_execution("evaluation-adopted-failed-v2-to-v3");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, false);
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "adopt failed attempt one",
+    )
+    .unwrap();
+    assert_eq!(adopted.run.status, seaf_core::LoopStatus::Failed);
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "invalidate adopted failure",
+    )
+    .expect("exact adopted Failed V2 must be eligible for V3 invalidation");
+    assert_eq!(
+        invalidated.recovery.previous_recovery,
+        Some(adopted.reference)
+    );
+
+    let rerun = rerun_invalidated_evaluation(
+        &fixture.workspace,
+        &fixture.source,
+        invalidated.reference.recovery_id,
+    )
+    .expect("V2-to-V3 lineage must remain verifiable after attempt two exists");
+    load_verified_final_evaluation_authority(&fixture.workspace, &rerun).unwrap();
+    fixture.cleanup();
+}
+
+#[test]
+fn invalidation_v3_rejects_recomputed_prior_final_reference_substitution() {
+    let (fixture, approved) = approved_fixture("evaluation-v3-prior-final-tamper");
+    let failed = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, false);
+    write_raw_run(&fixture.workspace, &failed);
+    let outcome = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "publish tamper target",
+    )
+    .unwrap();
+    let mut source: EvaluationInvalidationSourceRunV3 = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .workspace
+                .run_directory()
+                .join(&outcome.recovery.source_run.path),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    source.prior_final.as_mut().unwrap().testing_evidence =
+        source.evaluation_prefix.present_artifacts[0].clone();
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    fs::write(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&outcome.recovery.source_run.path),
+        &source_bytes,
+    )
+    .unwrap();
+    let mut recovery: EvaluationInvalidationAttemptV3 = outcome.recovery.clone();
+    recovery.source_run.digest = format!("{:x}", Sha256::digest(&source_bytes));
+    let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
+    fs::write(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&outcome.reference.artifact.path),
+        &recovery_bytes,
+    )
+    .unwrap();
+    let mut tampered_run = outcome.run;
+    tampered_run
+        .latest_recovery
+        .as_mut()
+        .unwrap()
+        .artifact
+        .digest = format!("{:x}", Sha256::digest(&recovery_bytes));
+    write_raw_run(&fixture.workspace, &tampered_run);
+
+    let error = load_verified_recovery_authority_kind(
+        &fixture.workspace,
+        tampered_run.latest_recovery.as_ref().unwrap(),
+    )
+    .expect_err("recomputed V3 bytes cannot substitute prior_final Testing authority");
+    assert!(error.to_string().contains("final references"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn competing_evaluation_invalidators_choose_one_audited_winner() {
+    let (fixture, approved) = approved_fixture("evaluation-v3-competing-invalidators");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for reason in ["competing invalidation A", "competing invalidation B"] {
+        let workspace = fixture.workspace.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            invalidate_approved_evaluation(&workspace, "operator@example.invalid", reason)
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+    fixture.cleanup();
+}
 
 #[test]
 fn provider_rejects_context_and_patch_roots_that_are_not_the_candidate() {
@@ -1346,7 +1985,12 @@ fn evaluation_recovery_v2_rejects_pending_provider_v1_graft() {
     let error = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
         .expect_err("evaluation recovery cannot graft an unconsumed provider recovery");
 
-    assert!(error.to_string().contains("provider"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("predecessor is not demonstrably consumed"),
+        "{error}"
+    );
     fixture.cleanup();
 }
 
@@ -1382,7 +2026,7 @@ fn evaluation_recovery_v2_accepts_consumed_provider_v1_then_evaluation_v2_lineag
 }
 
 #[test]
-fn evaluation_adoption_rejects_prior_evaluation_v2_recovery() {
+fn evaluation_recovery_v2_rejects_grafted_prior_evaluation_authority() {
     let (fixture, approved) = approved_fixture("eval-recovery-prior-eval-v2");
     let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
     let first = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
@@ -1393,7 +2037,12 @@ fn evaluation_adoption_rejects_prior_evaluation_v2_recovery() {
     let error = load_verified_final_evaluation_authority(&fixture.workspace, &second)
         .expect_err("adoption cannot descend from prior evaluation-v2 recovery");
 
-    assert!(error.to_string().contains("evaluation-v2"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Testing evidence bindings do not match exact Approved authority"),
+        "{error}"
+    );
     fixture.cleanup();
 }
 
@@ -2603,6 +3252,27 @@ impl AwaitingApprovalFixture {
 }
 
 fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
+    awaiting_approval_fixture_with_eval_execution(run_id, false)
+}
+
+fn awaiting_approval_fixture_with_eval_execution(
+    run_id: &str,
+    allow_eval_execution: bool,
+) -> AwaitingApprovalFixture {
+    awaiting_approval_fixture_with_eval_mode(
+        run_id,
+        if allow_eval_execution {
+            FixtureEvalMode::Cargo
+        } else {
+            FixtureEvalMode::Disabled
+        },
+    )
+}
+
+fn awaiting_approval_fixture_with_eval_mode(
+    run_id: &str,
+    eval_mode: FixtureEvalMode,
+) -> AwaitingApprovalFixture {
     let Fixture {
         _temp,
         runs_root,
@@ -2611,7 +3281,7 @@ fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
         ticket,
         policy,
         prepared,
-    } = fixture(run_id);
+    } = fixture_with_eval_mode(run_id, eval_mode);
     let provider = FakeProvider::new(candidate_responses(true));
     let mut patch_runner = RecordingPatchRunner::default();
     let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
@@ -2649,6 +3319,43 @@ fn final_eval_fixture(run_id: &str, passed: bool) -> AwaitingApprovalFixture {
 
 fn approved_fixture(run_id: &str) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
     let fixture = awaiting_approval_fixture(run_id);
+    let awaiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let candidate = awaiting.candidate_workspace.as_ref().unwrap();
+    let approved = approve_candidate_for_testing(
+        &fixture.workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .unwrap()
+    .run;
+    (fixture, approved)
+}
+
+fn approved_fixture_with_eval_execution(
+    run_id: &str,
+) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
+    let fixture = awaiting_approval_fixture_with_eval_execution(run_id, true);
+    let awaiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let candidate = awaiting.candidate_workspace.as_ref().unwrap();
+    let approved = approve_candidate_for_testing(
+        &fixture.workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .unwrap()
+    .run;
+    (fixture, approved)
+}
+
+fn approved_fixture_with_drifting_eval(
+    run_id: &str,
+) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
+    let fixture =
+        awaiting_approval_fixture_with_eval_mode(run_id, FixtureEvalMode::DriftAfterFirstCheck);
     let awaiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
     let candidate = awaiting.candidate_workspace.as_ref().unwrap();
     let approved = approve_candidate_for_testing(
@@ -3293,7 +4000,19 @@ fn source_worktree_authority_digest(run: &seaf_core::LoopRun) -> String {
 }
 
 fn fixture(run_id: &str) -> Fixture {
+    fixture_with_eval_mode(run_id, FixtureEvalMode::Disabled)
+}
+
+#[derive(Clone, Copy)]
+enum FixtureEvalMode {
+    Disabled,
+    Cargo,
+    DriftAfterFirstCheck,
+}
+
+fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     git_ok(&source, &["init", "-q"]);
@@ -3301,21 +4020,50 @@ fn fixture(run_id: &str) -> Fixture {
     git_ok(&source, &["config", "user.name", "SEAF Test"]);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), "pub fn existing() {}\n").unwrap();
+    if matches!(eval_mode, FixtureEvalMode::DriftAfterFirstCheck) {
+        fs::write(
+            source.join("drift-authority.sh"),
+            "#!/bin/sh\nprintf substituted > \"$1\"\n",
+        )
+        .unwrap();
+    }
     git_ok(&source, &["add", "."]);
     git_ok(&source, &["commit", "-qm", "initial"]);
-    let ticket = ticket();
+    let mut ticket = ticket();
+    match eval_mode {
+        FixtureEvalMode::Disabled => {}
+        FixtureEvalMode::Cargo => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+        }
+        FixtureEvalMode::DriftAfterFirstCheck => {
+            ticket.autonomy.allow_shell_commands = vec!["sh".into(), "true".into()];
+        }
+    }
     let policy = policy();
     let config = serde_json::json!({"policy_path":"seaf.policy.json"});
     let repository = serde_json::json!({"source":source.canonicalize().unwrap()});
-    let eval_config = seaf_core::parse_eval_config(
-        "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n",
-    )
-    .unwrap();
+    let drift_command = format!(
+        "sh drift-authority.sh {}",
+        runs_root.join(run_id).join("inputs/policy.json").display()
+    );
+    let eval_yaml = match eval_mode {
+        FixtureEvalMode::Disabled => {
+            "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: cargo test\n"
+                .to_string()
+        }
+        FixtureEvalMode::Cargo => {
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n"
+                .to_string()
+        }
+        FixtureEvalMode::DriftAfterFirstCheck => format!(
+            "evals:\n  allow_commands: [sh, true]\n  required:\n    - name: mutate_authority\n      command: {drift_command}\n    - name: must_not_spawn\n      command: true\n"
+        ),
+    };
+    let eval_config = seaf_core::parse_eval_config(&eval_yaml).unwrap();
     let ticket_bytes = canonical_json_bytes(&ticket).unwrap();
     let policy_bytes = canonical_json_bytes(&policy).unwrap();
     let config_bytes = canonical_json_bytes(&config).unwrap();
     let repository_bytes = canonical_json_bytes(&repository).unwrap();
-    let runs_root = temp.path().join("runs");
     let initialized = InitializedLoopRun::create_isolated(
         LoopRunnerConfig::for_ticket(
             &runs_root,

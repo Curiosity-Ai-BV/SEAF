@@ -26,13 +26,15 @@ use seaf_core::{
 use seaf_loop::{
     adopt_approved_evaluation, approve_candidate_for_testing, build_loop_eval_report,
     cleanup_candidate_workspace_outcome, ensure_no_pending_recovery, evaluate_zero_tolerance,
-    execute_approved_evaluation, execute_eval_checks, inspect_loop_run, load_agent_bench_fixture,
-    plan_eval_checks, preflight_authoritative_run_inputs, promote_evaluated_candidate,
-    revise_provider_step, validate_human_review_execution_barrier, validate_requested_recovery,
-    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
-    ContextLimits, ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun,
-    LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision,
-    PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput,
+    execute_approved_evaluation, execute_eval_checks, inspect_loop_run,
+    invalidate_approved_evaluation, load_agent_bench_fixture,
+    load_verified_recovery_authority_kind, plan_eval_checks, preflight_authoritative_run_inputs,
+    promote_evaluated_candidate, rerun_invalidated_evaluation, revise_provider_step,
+    validate_human_review_execution_barrier, validate_requested_recovery, AgentBenchSummary,
+    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
+    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
+    ProviderPatchGateConfig, ProviderStepRunner, RecoveryAuthorityKind, RunnerError, StepOutput,
     StepRunner,
 };
 use seaf_models::{
@@ -360,7 +362,7 @@ struct LoopReviseArgs {
     runs_root: PathBuf,
     #[arg(long)]
     from_step: String,
-    /// Evaluation recovery action. Testing supports only `adopt`.
+    /// Evaluation recovery action. Testing supports `adopt` or `invalidate`.
     #[arg(long)]
     eval_recovery: Option<String>,
     #[arg(long)]
@@ -1136,16 +1138,18 @@ fn loop_inspect(args: LoopInspectArgs) -> Result<(), CliFailure> {
 }
 
 fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
-    let evaluation_adoption = match (args.from_step.as_str(), args.eval_recovery.as_deref()) {
-        ("testing", Some("adopt")) => true,
+    let evaluation_recovery = match (args.from_step.as_str(), args.eval_recovery.as_deref()) {
+        ("testing", Some("adopt")) => Some("adopt"),
+        ("testing", Some("invalidate")) => Some("invalidate"),
         ("testing", Some(_)) => {
             return Err(CliFailure::message(
-                "--eval-recovery supports only `adopt` for --from-step testing".to_string(),
+                "--eval-recovery supports `adopt` or `invalidate` for --from-step testing"
+                    .to_string(),
             ))
         }
         ("testing", None) => {
             return Err(CliFailure::message(
-                "--from-step testing requires --eval-recovery adopt".to_string(),
+                "--from-step testing requires --eval-recovery adopt|invalidate".to_string(),
             ))
         }
         (_, Some(_)) => {
@@ -1153,15 +1157,16 @@ fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
                 "--eval-recovery is valid only with --from-step testing".to_string(),
             ))
         }
-        _ => false,
+        _ => None,
     };
-    let provider_step = (!evaluation_adoption)
+    let provider_step = evaluation_recovery
+        .is_none()
         .then(|| parse_provider_rerun_step(&args.from_step))
         .transpose()?;
     validate_run_id(&args.run_id)?;
     let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
         .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
-    if evaluation_adoption {
+    if evaluation_recovery == Some("adopt") {
         let outcome = adopt_approved_evaluation(&workspace, &args.actor, &args.reason)
             .map_err(|error| CliFailure::message(error.to_string()))?;
         let report = serde_json::json!({
@@ -1184,6 +1189,36 @@ fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
             );
             println!("recovery artifact: {}", outcome.reference.artifact.path);
             println!("EvalReport artifact: {}", outcome.recovery.eval_report.path);
+            Ok(())
+        };
+    }
+    if evaluation_recovery == Some("invalidate") {
+        let outcome = invalidate_approved_evaluation(&workspace, &args.actor, &args.reason)
+            .map_err(|error| CliFailure::message(error.to_string()))?;
+        let report = serde_json::json!({
+            "command": "revise",
+            "run_id": outcome.run.run_id,
+            "status": outcome.run.status,
+            "current_step": outcome.run.current_step,
+            "recovery_id": outcome.reference.recovery_id,
+            "recovery": outcome.reference.artifact,
+            "invalidated_attempt": outcome.recovery.invalidated_attempt,
+            "next_evaluation_attempt": outcome.recovery.next_evaluation_attempt,
+        });
+        return if args.json {
+            print_json(&report)
+        } else {
+            println!(
+                "invalidated evaluation attempt {} for loop {} as recovery {}",
+                outcome.recovery.invalidated_attempt,
+                outcome.run.run_id,
+                outcome.reference.recovery_id
+            );
+            println!("recovery artifact: {}", outcome.reference.artifact.path);
+            println!(
+                "commands were not run; run `seaf loop rerun --recovery {}`",
+                outcome.reference.recovery_id
+            );
             Ok(())
         };
     }
@@ -1218,6 +1253,29 @@ fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
 
 fn rerun_loop(args: LoopRerunArgs) -> Result<(), CliFailure> {
     let recovery_id = args.recovery;
+    validate_run_id(&args.run_id)?;
+    let existing = load_persisted_loop_run(&args.runs_root, &args.run_id, args.json)?;
+    let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    if let Some(reference) = existing.latest_recovery.as_ref() {
+        match load_verified_recovery_authority_kind(&workspace, reference)
+            .map_err(|error| CliFailure::message(error.to_string()))?
+        {
+            RecoveryAuthorityKind::EvaluationInvalidationV3 => {
+                let repository_root = current_cleanup_repository_root()?;
+                let run = rerun_invalidated_evaluation(&workspace, &repository_root, recovery_id)
+                    .map_err(|error| CliFailure::message(error.to_string()))?;
+                return finish_loop_command("rerun", &args.runs_root, &run, args.json);
+            }
+            RecoveryAuthorityKind::EvaluationAdoptionV2 => {
+                return Err(CliFailure::message(
+                    "adopted evaluation recovery is terminal and cannot authorize rerun"
+                        .to_string(),
+                ));
+            }
+            RecoveryAuthorityKind::ProviderV1 => {}
+        }
+    }
     resume_loop_with_recovery(
         LoopResumeArgs {
             run_id: args.run_id,

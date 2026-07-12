@@ -224,8 +224,14 @@ authenticated, complete fixed-v1 or indexed-v2 prefixes can be adopted with an
 exact existing or deterministically created EvalReport, and adopted finals
 reconstruct their Approved source without weakening cleanup, promotion, or
 frozen passing authority. M1-09c3 evaluation invalidation and fresh rerun is
-active. Authoritative input changes still require a new run; EvalPassed/Promoted
-and M1-08 promotion intent remain frozen.
+also complete: dedicated v3 invalidation authority preserves incomplete or
+failed evaluation history, reconstructs the exact Approved predecessor, and
+authorizes one recovery-bound indexed attempt without replaying a partial
+attempt. Repeated invalidation, zero-command adoption of complete recovered
+prefixes, exact retry, promotion, drift, tamper, crash, and concurrent-winner
+paths fail closed or converge as specified. M1-10 atomic state and run locking
+is active. Authoritative input changes still require a new run;
+EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

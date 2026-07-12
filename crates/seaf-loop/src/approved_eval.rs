@@ -9,7 +9,8 @@ use std::{
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, validate_eval_config, validate_ticket_spec,
     ArtifactReference, CheckStatus, EvalCheck, EvalConfig, EvalDecision, EvalLoopEvidence,
-    EvalReport, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, RiskLevel, TicketSpec,
+    EvalReport, LoopRun, LoopStatus, LoopStepName, LoopStepStatus, RecoveryReference, RiskLevel,
+    TicketSpec,
 };
 use sha2::{Digest, Sha256};
 
@@ -33,7 +34,69 @@ pub fn execute_approved_evaluation(
 ) -> Result<LoopRun, ApprovedEvaluationError> {
     let candidate_lock =
         acquire_candidate_lock(workspace).map_err(ApprovedEvaluationError::wrapped)?;
-    let result = execute_approved_evaluation_locked(workspace, source_worktree_root);
+    let result = execute_approved_evaluation_locked(workspace, source_worktree_root, None);
+    let unlock = candidate_lock.unlock();
+    match (result, unlock) {
+        (Ok(run), Ok(())) => Ok(run),
+        (Ok(_), Err(error)) => Err(ApprovedEvaluationError::wrapped(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+pub fn rerun_invalidated_evaluation(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+    recovery_id: u32,
+) -> Result<LoopRun, ApprovedEvaluationError> {
+    let candidate_lock =
+        acquire_candidate_lock(workspace).map_err(ApprovedEvaluationError::wrapped)?;
+    let result = (|| {
+        let run = state::load_run(workspace).map_err(ApprovedEvaluationError::wrapped)?;
+        if matches!(run.status, LoopStatus::EvalPassed)
+            || (run.status == LoopStatus::Failed && run.human_approval.is_some())
+        {
+            let exact_reference = crate::recovery::validate_final_evaluation_invalidation_retry(
+                workspace,
+                &run,
+                recovery_id,
+            )
+            .map_err(ApprovedEvaluationError::wrapped)?;
+            let authority = crate::load_verified_final_evaluation_authority(workspace, &run)
+                .map_err(ApprovedEvaluationError::wrapped)?;
+            let recovery = authority.execution_intent().recovery().ok_or_else(|| {
+                ApprovedEvaluationError::invalid(
+                    "final evaluation did not consume invalidation recovery",
+                )
+            })?;
+            let latest = run.latest_recovery.as_ref();
+            let candidate_active = run.candidate_workspace.as_ref().is_some_and(|candidate| {
+                candidate.lifecycle == seaf_core::CandidateWorkspaceLifecycle::Active
+                    && candidate.cleanup_started_at.is_none()
+                    && candidate.cleaned_at.is_none()
+            });
+            if recovery.recovery_id != recovery_id
+                || latest != Some(recovery)
+                || &exact_reference != recovery
+                || !candidate_active
+            {
+                return Err(ApprovedEvaluationError::invalid(
+                    "final evaluation is not the exact active descendant of requested invalidation recovery",
+                ));
+            }
+            return Ok(run);
+        }
+        let (reference, attempt) = crate::recovery::validate_requested_evaluation_invalidation(
+            workspace,
+            &run,
+            recovery_id,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+        execute_approved_evaluation_locked(
+            workspace,
+            source_worktree_root,
+            Some((reference, attempt)),
+        )
+    })();
     let unlock = candidate_lock.unlock();
     match (result, unlock) {
         (Ok(run), Ok(())) => Ok(run),
@@ -45,6 +108,7 @@ pub fn execute_approved_evaluation(
 fn execute_approved_evaluation_locked(
     workspace: &LoopWorkspace,
     source_worktree_root: &Path,
+    recovery_authorization: Option<(RecoveryReference, u32)>,
 ) -> Result<LoopRun, ApprovedEvaluationError> {
     let approved = state::load_run(workspace).map_err(ApprovedEvaluationError::wrapped)?;
     if matches!(approved.status, LoopStatus::EvalPassed)
@@ -78,7 +142,9 @@ fn execute_approved_evaluation_locked(
     }
     let (ticket, ticket_bytes) = load_ticket_snapshot(workspace, &approved)?;
     let (eval_config, eval_config_bytes) = load_eval_snapshot(workspace, &approved)?;
-    refuse_incomplete_attempt(workspace)?;
+    if recovery_authorization.is_none() {
+        refuse_incomplete_attempt(workspace)?;
+    }
 
     let candidate = approved.candidate_workspace.as_ref().ok_or_else(|| {
         ApprovedEvaluationError::invalid("Approved authority has no candidate workspace")
@@ -107,7 +173,20 @@ fn execute_approved_evaluation_locked(
     let source_authority =
         capture_source_worktree_authority(source_worktree_root, Some(workspace.run_directory()))
             .map_err(ApprovedEvaluationError::wrapped)?;
-    let attempt = 1;
+    let source_authority_digest =
+        canonical_sha256_digest(&source_authority).map_err(ApprovedEvaluationError::wrapped)?;
+    if let Some((reference, _)) = recovery_authorization.as_ref() {
+        crate::recovery::reauthenticate_evaluation_invalidation_execution(
+            workspace,
+            &approved,
+            reference,
+            &source_authority_digest,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    }
+    let attempt = recovery_authorization
+        .as_ref()
+        .map_or(1, |(_, attempt)| *attempt);
     let paths =
         EvaluationAttemptPaths::indexed(attempt).map_err(ApprovedEvaluationError::invalid)?;
     let intent = ApprovedEvaluationIntentV2 {
@@ -129,9 +208,10 @@ fn execute_approved_evaluation_locked(
         candidate_state_digest: canonical_sha256_digest(candidate)
             .map_err(ApprovedEvaluationError::wrapped)?,
         candidate_diff: approval.candidate_diff.clone(),
-        source_worktree_state_digest: canonical_sha256_digest(&source_authority)
-            .map_err(ApprovedEvaluationError::wrapped)?,
-        recovery: None,
+        source_worktree_state_digest: source_authority_digest.clone(),
+        recovery: recovery_authorization
+            .as_ref()
+            .map(|(reference, _)| reference.clone()),
         planned_checks: eval_config.evals.required.clone(),
     };
     let intent_bytes = canonical_json_bytes(&intent).map_err(ApprovedEvaluationError::wrapped)?;
@@ -166,6 +246,15 @@ fn execute_approved_evaluation_locked(
                 &source_authority,
             )
             .map_err(ApprovedEvaluationError::wrapped)?;
+            if let Some((reference, _)) = recovery_authorization.as_ref() {
+                crate::recovery::reauthenticate_evaluation_invalidation_execution(
+                    workspace,
+                    &current,
+                    reference,
+                    &source_authority_digest,
+                )
+                .map_err(ApprovedEvaluationError::wrapped)?;
+            }
             verify_snapshot_bytes(
                 workspace,
                 "inputs/ticket.json",
@@ -194,17 +283,7 @@ fn execute_approved_evaluation_locked(
     });
     for (index, result) in executions.enumerate() {
         let configured = &eval_config.evals.required[index];
-        let execution = match result {
-            Ok(execution) => execution,
-            Err(error) => crate::EvalCheckExecution {
-                name: configured.name.clone(),
-                status: CheckStatus::Failed,
-                duration_ms: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                summary: format!("controlled command execution failed: {error}"),
-            },
-        };
+        let execution = evaluation_execution_or_abort(configured, result)?;
         let number = index + 1;
         let stdout_path = paths.stdout(number);
         let stderr_path = paths.stderr(number);
@@ -250,6 +329,15 @@ fn execute_approved_evaluation_locked(
         &source_authority,
     )
     .map_err(ApprovedEvaluationError::wrapped)?;
+    if let Some((reference, _)) = recovery_authorization.as_ref() {
+        crate::recovery::reauthenticate_evaluation_invalidation_execution(
+            workspace,
+            &current,
+            reference,
+            &source_authority_digest,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    }
     verify_snapshot_bytes(
         workspace,
         "inputs/ticket.json",
@@ -281,7 +369,9 @@ fn execute_approved_evaluation_locked(
     let testing = TestingEvidence::create_v2(
         &approved,
         attempt,
-        None,
+        recovery_authorization
+            .as_ref()
+            .map(|(reference, _)| reference.clone()),
         intent_reference,
         started_at,
         completed_at.clone(),
@@ -339,6 +429,15 @@ fn execute_approved_evaluation_locked(
         &source_authority,
     )
     .map_err(ApprovedEvaluationError::wrapped)?;
+    if let Some((reference, _)) = recovery_authorization.as_ref() {
+        crate::recovery::reauthenticate_evaluation_invalidation_execution(
+            workspace,
+            &approved,
+            reference,
+            &source_authority_digest,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    }
 
     let mut final_run = approved.clone();
     final_run.status = if passed {
@@ -388,6 +487,17 @@ fn execute_approved_evaluation_locked(
             .map_err(|error| {
                 crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
             })?;
+            if let Some((reference, _)) = recovery_authorization.as_ref() {
+                crate::recovery::reauthenticate_evaluation_invalidation_execution(
+                    workspace,
+                    locked,
+                    reference,
+                    &source_authority_digest,
+                )
+                .map_err(|error| {
+                    crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
+                })?;
+            }
             if reverified != verified {
                 return Err(crate::provider_exchange::ProviderExchangeError::Invalid(
                     "candidate authority changed before final publication".to_string(),
@@ -440,6 +550,26 @@ fn execute_approved_evaluation_locked(
     )
     .map_err(ApprovedEvaluationError::wrapped)?;
     Ok(final_run)
+}
+
+fn evaluation_execution_or_abort(
+    configured: &seaf_core::EvalCommandConfig,
+    result: Result<crate::EvalCheckExecution, crate::eval_engine::EvalEngineError>,
+) -> Result<crate::EvalCheckExecution, ApprovedEvaluationError> {
+    match result {
+        Ok(execution) => Ok(execution),
+        Err(error) if error.is_authority_rejection() => {
+            Err(ApprovedEvaluationError::invalid(error.to_string()))
+        }
+        Err(error) => Ok(crate::EvalCheckExecution {
+            name: configured.name.clone(),
+            status: CheckStatus::Failed,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            summary: format!("controlled command execution failed: {error}"),
+        }),
+    }
 }
 
 pub(crate) fn build_integrated_eval_report(
@@ -645,3 +775,30 @@ impl fmt::Display for ApprovedEvaluationError {
 }
 
 impl Error for ApprovedEvaluationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn pre_spawn_authority_rejection_aborts_instead_of_minting_failed_check_evidence() {
+        let configured = seaf_core::EvalCommandConfig {
+            name: "authority-checked".into(),
+            command: "true".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            max_output_bytes: None,
+        };
+        let error = evaluation_execution_or_abort(
+            &configured,
+            Err(crate::eval_engine::EvalEngineError::authority(
+                "pre-spawn input drift",
+            )),
+        )
+        .expect_err("authority rejection must abort the evaluator");
+
+        assert!(error.to_string().contains("pre-spawn input drift"));
+    }
+}

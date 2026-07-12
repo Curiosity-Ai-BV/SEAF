@@ -202,12 +202,16 @@ impl TestingEvidence {
                             .to_string(),
                     );
                 }
-                if self
-                    .recovery
-                    .as_ref()
-                    .is_some_and(|recovery| recovery.is_some())
-                {
-                    errors.push("evaluation recovery is not supported before M1-09c3".to_string());
+                if let Some(Some(recovery)) = self.recovery.as_ref() {
+                    validate_reference(&mut errors, "recovery", &recovery.artifact);
+                    if recovery.recovery_id == 0
+                        || recovery.artifact.path
+                            != format!("artifacts/recovery-{:03}.json", recovery.recovery_id)
+                    {
+                        errors.push(
+                            "Testing v2 recovery path does not match its positive ID".to_string(),
+                        );
+                    }
                 }
                 if let (Some(attempt), Some(intent)) =
                     (self.evaluation_attempt, self.execution_intent.as_ref())

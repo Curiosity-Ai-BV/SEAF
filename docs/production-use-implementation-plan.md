@@ -1279,8 +1279,8 @@ Commit boundary: promotion only.
 
 Roadmap: U5. Dependencies: M1-08.
 
-Status: active. M1-09a attempt-safe history/inspect and M1-09b provider
-revise/rerun are complete; M1-09c Approved-evaluation recovery is active.
+Status: complete. M1-09a attempt-safe history/inspect, M1-09b provider
+revise/rerun, and M1-09c Approved-evaluation recovery are complete.
 Dependencies: M1-08 (complete).
 
 Objective: inspect, revise, and rerun blocked/failed attempts without replacing
@@ -1386,8 +1386,8 @@ Commit boundary: provider revise/rerun only. No eval or promotion recovery.
 
 ### M1-09c - Approved-Evaluation Recovery
 
-Status: active. Split into M1-09c1 versioned evaluation authority, M1-09c2
-zero-command adoption, and M1-09c3 invalidation/rerun. Dependencies: M1-09b
+Status: complete. M1-09c1 versioned evaluation authority, M1-09c2 zero-command
+adoption, and M1-09c3 invalidation/rerun are complete. Dependencies: M1-09b
 (complete).
 
 Objective: adopt complete verified interrupted evaluation evidence with zero
@@ -1529,7 +1529,7 @@ Commit boundary: adoption writer and CLI only; no invalidation or rerun.
 
 ### M1-09c3 - Evaluation Invalidation And Rerun
 
-Status: active. Dependencies: M1-09c2 (complete).
+Status: complete. Dependencies: M1-09c2 (complete).
 
 Objective: preserve and invalidate one incomplete or failed evaluation attempt,
 then authorize exactly one fresh indexed attempt.
@@ -1542,16 +1542,34 @@ heads, and reset projection. Invalidation preserves all history, executes zero
 commands/provider calls, and advances only audited recovery/reset authority.
 Only exact `loop rerun --recovery N` may consume it; new intent and Testing bind
 the recovery reference. Once any artifact for the authorized attempt exists,
-commands may not replay within that attempt. A later audited invalidation is
-required for the next contiguous attempt. Cover repeated cycles, every crash
-cut and race, malformed/mixed/gapped inventory, drift, final-Failed reset, and
-frozen EvalPassed/Promoted/promotion-intent regressions.
+commands may not replay within that attempt. A partial prefix requires a later
+audited invalidation; a complete pre-CAS prefix uses zero-command adoption. An
+exact post-final-CAS rerun may return byte-inert success only when the final
+authority binds that recovery. Cover repeated cycles, every crash cut and race,
+malformed/mixed/gapped inventory, drift, final-Failed reset, and frozen
+EvalPassed/Promoted/promotion-intent regressions.
+
+Delivered: a dedicated evaluation-invalidation v3 source and decision contract
+binds the exact incomplete or active approval-bound Failed authority, every
+present prefix byte, reconstructed Approved predecessor, next attempt, input,
+candidate, source, provider and prior-recovery authority, audit fields, and
+zero-digest reset projection. `loop revise ... invalidate` is command- and
+provider-free; only exact `loop rerun --recovery N` publishes the recovery-bound
+indexed intent and Testing evidence. A typed pre-spawn rejection aborts on
+authority drift without manufacturing final failure evidence. Mixed v1/v2/v3
+lineage validation is iterative and exact; partial attempts require a new
+invalidation, complete prefixes use zero-command adoption, and exact final
+retries are inert. Repeated cycles, V2-adopted failure, tamper, crash, all-input
+drift, replay, concurrency, final failure, passing promotion, and frozen-state
+coverage pass.
 
 Commit boundary: evaluation invalidation and fresh rerun only.
 
 ### M1-10 - Atomic State And Run Locking
 
 Roadmap: U5. Dependencies: M1-09.
+
+Status: active. Dependencies: M1-09 (complete).
 
 Objective: prevent corrupt or concurrently mutated run state.
 

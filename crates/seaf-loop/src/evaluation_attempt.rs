@@ -80,8 +80,30 @@ pub(crate) struct EvaluationRecoveryPrefixPaths {
     pub report_present: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluationInvalidationPrefixPaths {
+    pub attempt: u32,
+    pub spelling: Spelling,
+    pub paths: Vec<String>,
+    pub testing_present: bool,
+    pub report_present: bool,
+    pub complete_log_pairs: u32,
+    pub trailing_stdout: bool,
+}
+
 impl EvaluationAttemptInventory {
     pub fn load(workspace: &LoopWorkspace) -> Result<Self, String> {
+        Self::load_with_mode(workspace, false)
+    }
+
+    pub(crate) fn load_for_invalidation(workspace: &LoopWorkspace) -> Result<Self, String> {
+        Self::load_with_mode(workspace, true)
+    }
+
+    fn load_with_mode(
+        workspace: &LoopWorkspace,
+        allow_recovered_attempts_and_crash_prefixes: bool,
+    ) -> Result<Self, String> {
         let mut attempts: BTreeMap<u32, AttemptInventory> = BTreeMap::new();
         for entry in fs::read_dir(workspace.run_directory().join("artifacts"))
             .map_err(|error| error.to_string())?
@@ -100,7 +122,7 @@ impl EvaluationAttemptInventory {
             let (attempt, spelling, kind) = parse_name(&name).ok_or_else(|| {
                 format!("evaluation artifact filename is malformed or noncanonical: {name}")
             })?;
-            if attempt != 1 {
+            if attempt != 1 && !allow_recovered_attempts_and_crash_prefixes {
                 return Err(
                     "evaluation attempt is unauthorized before M1-09c3 recovery".to_string()
                 );
@@ -142,9 +164,23 @@ impl EvaluationAttemptInventory {
             {
                 return Err("evaluation attempt contains artifacts without intent".into());
             }
+            if inventory.report.is_some() && inventory.testing.is_none() {
+                return Err(
+                    "evaluation attempt contains EvalReport without Testing evidence".into(),
+                );
+            }
             let mut expected_check = 1_u32;
             for (check, (stdout, stderr)) in &inventory.logs {
-                if *check != expected_check || stdout.is_none() || stderr.is_none() {
+                let trailing_stdout = allow_recovered_attempts_and_crash_prefixes
+                    && *check == inventory.logs.keys().next_back().copied().unwrap_or(0)
+                    && stdout.is_some()
+                    && stderr.is_none()
+                    && inventory.testing.is_none()
+                    && inventory.report.is_none();
+                if *check != expected_check
+                    || stdout.is_none()
+                    || (stderr.is_none() && !trailing_stdout)
+                {
                     return Err(
                         "evaluation logs are unpaired or have noncontiguous check numbering".into(),
                     );
@@ -194,12 +230,8 @@ impl EvaluationAttemptInventory {
         let (&attempt, selected) = self
             .attempts
             .iter()
-            .next()
-            .filter(|_| self.attempts.len() == 1)
-            .ok_or_else(|| "adoption requires one exact evaluation attempt".to_string())?;
-        if attempt != 1 {
-            return Err("evaluation attempt is unauthorized before M1-09c3 recovery".into());
-        }
+            .next_back()
+            .ok_or_else(|| "adoption requires an exact evaluation attempt".to_string())?;
         let spelling = selected
             .spelling
             .ok_or_else(|| "adoption evaluation attempt lost path spelling".to_string())?;
@@ -225,6 +257,65 @@ impl EvaluationAttemptInventory {
             testing,
             report,
             report_present: selected.report.is_some(),
+        })
+    }
+
+    pub(crate) fn invalidation_prefix_paths(
+        &self,
+    ) -> Result<EvaluationInvalidationPrefixPaths, String> {
+        let attempt = self
+            .attempts
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or_else(|| "invalidation requires a factual evaluation prefix".to_string())?;
+        self.invalidation_prefix_paths_for(attempt)
+    }
+
+    pub(crate) fn invalidation_prefix_paths_for(
+        &self,
+        attempt: u32,
+    ) -> Result<EvaluationInvalidationPrefixPaths, String> {
+        let selected = self
+            .attempts
+            .get(&attempt)
+            .ok_or_else(|| "invalidation evaluation attempt is absent".to_string())?;
+        let spelling = selected
+            .spelling
+            .ok_or_else(|| "invalidation evaluation attempt lost path spelling".to_string())?;
+        let intent = selected
+            .intent
+            .clone()
+            .ok_or_else(|| "invalidation evaluation prefix lost execution intent".to_string())?;
+        let mut paths = vec![intent];
+        let mut complete_log_pairs = 0_u32;
+        let mut trailing_stdout = false;
+        for (check, (stdout, stderr)) in &selected.logs {
+            let stdout = stdout
+                .clone()
+                .ok_or_else(|| "invalidation evaluation prefix lost stdout log".to_string())?;
+            paths.push(stdout);
+            if let Some(stderr) = stderr.clone() {
+                paths.push(stderr);
+                complete_log_pairs = *check;
+            } else {
+                trailing_stdout = true;
+            }
+        }
+        if let Some(testing) = selected.testing.clone() {
+            paths.push(testing);
+        }
+        if let Some(report) = selected.report.clone() {
+            paths.push(report);
+        }
+        Ok(EvaluationInvalidationPrefixPaths {
+            attempt,
+            spelling,
+            paths,
+            testing_present: selected.testing.is_some(),
+            report_present: selected.report.is_some(),
+            complete_log_pairs,
+            trailing_stdout,
         })
     }
 
@@ -265,8 +356,7 @@ impl EvaluationAttemptInventory {
             .get(&attempt)
             .ok_or_else(|| "recovery evaluation attempt is absent".to_string())?;
         let report_present = selected.report.as_deref() == Some(report);
-        if self.attempts.keys().next_back().copied() != Some(attempt)
-            || selected.intent.as_deref() != Some(intent)
+        if selected.intent.as_deref() != Some(intent)
             || selected.testing.as_deref() != Some(testing)
             || (!report_present && (!allow_missing_report || selected.report.is_some()))
         {
@@ -362,10 +452,11 @@ impl ApprovedEvaluationIntent {
         }
     }
 
-    pub fn validate_against(
+    pub fn validate_against_with_recovery(
         &self,
         approved: &LoopRun,
         planned_checks: &[EvalCommandConfig],
+        expected_recovery: Option<&RecoveryReference>,
     ) -> Result<(), String> {
         let approved_digest =
             canonical_sha256_digest(approved).map_err(|error| error.to_string())?;
@@ -391,6 +482,7 @@ impl ApprovedEvaluationIntent {
         match self {
             Self::V1(intent)
                 if intent.schema_version == 1
+                    && expected_recovery.is_none()
                     && common_valid(
                         &intent.run_id,
                         &intent.approved_run_digest,
@@ -406,7 +498,7 @@ impl ApprovedEvaluationIntent {
                 if intent.schema_version == 2
                     && intent.evaluation_attempt > 0
                     && intent.input_digests == approved.input_digests
-                    && intent.recovery.is_none()
+                    && intent.recovery.as_ref() == expected_recovery
                     && approved
                         .candidate_workspace
                         .as_ref()
@@ -665,6 +757,43 @@ mod tests {
             );
             assert_eq!(snapshot(&workspace), before, "{name}");
         }
+    }
+
+    #[test]
+    fn invalidation_inventory_accepts_only_the_factual_trailing_stdout_crash_cut() {
+        let (_temp, workspace) = workspace("invalidation-trailing-stdout");
+        let intent = canonical_json_bytes(&v2_intent(1)).unwrap();
+        write(
+            &workspace,
+            "07-testing.attempt-001.execution-intent.json",
+            &intent,
+        );
+        write(
+            &workspace,
+            "07-testing.attempt-001.check-001.stdout.log",
+            b"partial stdout",
+        );
+
+        assert!(EvaluationAttemptInventory::load(&workspace).is_err());
+        let inventory = EvaluationAttemptInventory::load_for_invalidation(&workspace)
+            .expect("stdout is published before stderr and is a factual crash cut");
+        let prefix = inventory.invalidation_prefix_paths().unwrap();
+        assert_eq!(prefix.attempt, 1);
+        assert!(prefix.trailing_stdout);
+        assert_eq!(prefix.complete_log_pairs, 0);
+
+        fs::remove_file(
+            workspace
+                .run_directory()
+                .join("artifacts/07-testing.attempt-001.check-001.stdout.log"),
+        )
+        .unwrap();
+        write(
+            &workspace,
+            "07-testing.attempt-001.check-001.stderr.log",
+            b"impossible stderr",
+        );
+        assert!(EvaluationAttemptInventory::load_for_invalidation(&workspace).is_err());
     }
 
     #[test]
