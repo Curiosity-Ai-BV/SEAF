@@ -70,6 +70,16 @@ pub(crate) struct EvaluationAttemptInventory {
     attempts: BTreeMap<u32, AttemptInventory>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluationRecoveryPrefixPaths {
+    pub attempt: u32,
+    pub spelling: Spelling,
+    pub intent: String,
+    pub testing: String,
+    pub report: String,
+    pub report_present: bool,
+}
+
 impl EvaluationAttemptInventory {
     pub fn load(workspace: &LoopWorkspace) -> Result<Self, String> {
         let mut attempts: BTreeMap<u32, AttemptInventory> = BTreeMap::new();
@@ -178,6 +188,44 @@ impl EvaluationAttemptInventory {
 
     pub fn intent_path(&self, attempt: u32) -> Option<&str> {
         self.attempts.get(&attempt)?.intent.as_deref()
+    }
+
+    pub(crate) fn recovery_prefix_paths(&self) -> Result<EvaluationRecoveryPrefixPaths, String> {
+        let (&attempt, selected) = self
+            .attempts
+            .iter()
+            .next()
+            .filter(|_| self.attempts.len() == 1)
+            .ok_or_else(|| "adoption requires one exact evaluation attempt".to_string())?;
+        if attempt != 1 {
+            return Err("evaluation attempt is unauthorized before M1-09c3 recovery".into());
+        }
+        let spelling = selected
+            .spelling
+            .ok_or_else(|| "adoption evaluation attempt lost path spelling".to_string())?;
+        let intent = selected
+            .intent
+            .clone()
+            .ok_or_else(|| "adoption evaluation prefix lost execution intent".to_string())?;
+        let testing = selected
+            .testing
+            .clone()
+            .ok_or_else(|| "adoption evaluation prefix lost Testing evidence".to_string())?;
+        let report = match spelling {
+            Spelling::Fixed => "artifacts/08-eval-report.json".to_string(),
+            Spelling::Indexed => EvaluationAttemptPaths::indexed(attempt)?.report,
+        };
+        if selected.report.as_ref().is_some_and(|path| path != &report) {
+            return Err("adoption evaluation prefix selects a noncanonical EvalReport".into());
+        }
+        Ok(EvaluationRecoveryPrefixPaths {
+            attempt,
+            spelling,
+            intent,
+            testing,
+            report,
+            report_present: selected.report.is_some(),
+        })
     }
 
     pub fn validate_selected_logs(&self, attempt: u32, checks: &[EvalCheck]) -> Result<(), String> {

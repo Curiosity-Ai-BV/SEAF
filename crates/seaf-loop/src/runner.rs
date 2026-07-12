@@ -529,6 +529,30 @@ pub fn preflight_authoritative_run_inputs(
     preflight_authoritative_snapshot_prefix(&workspace, &persisted, snapshots)
 }
 
+pub(crate) fn load_verified_authoritative_run_inputs(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<AuthoritativeRunInputSnapshots, RunnerError> {
+    let read = |path: &str| {
+        crate::immutable_artifact::read_verified_regular_file(
+            workspace.run_directory(),
+            path,
+            "authoritative run input",
+        )
+        .map_err(|error| RunnerError::Step(error.to_string()))
+    };
+    let snapshots = AuthoritativeRunInputSnapshots {
+        ticket: read("inputs/ticket.json")?,
+        policy: read("inputs/policy.json")?,
+        config: read("inputs/config.json")?,
+        repository: read("inputs/repository.json")?,
+        eval_config: read("inputs/eval-config.json")?,
+        provider_ticket: read("ticket.snapshot.json")?,
+    };
+    validate_authoritative_run_input_payloads(run, &snapshots)?;
+    Ok(snapshots)
+}
+
 type AuthoritativeRunInputEntry<'a> = (&'static str, &'a Vec<u8>, &'a String);
 
 fn authoritative_run_input_entries<'a>(

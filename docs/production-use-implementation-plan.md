@@ -1463,7 +1463,7 @@ change into the preview release notes.
 
 ### M1-09c2 - Zero-Command Evaluation Adoption
 
-Status: active. Split into M1-09c2a recovery authority and M1-09c2b adoption
+Status: complete. Split into M1-09c2a recovery authority and M1-09c2b adoption
 transaction. Dependencies: M1-09c1 (complete).
 
 Objective: publish audited recovery and finalize one complete interrupted v1 or
@@ -1508,7 +1508,7 @@ Commit boundary: typed evaluation recovery reader and final reconstruction only.
 
 ### M1-09c2b - Zero-Command Adoption Transaction
 
-Status: active. Dependencies: M1-09c2a (complete).
+Status: complete. Dependencies: M1-09c2a (complete).
 
 Objective: expose exact complete-prefix adoption with no command or provider
 execution.
@@ -1518,18 +1518,34 @@ deterministic report verification/creation, candidate-to-provider adoption CAS,
 all crash cuts, and inert exact post-CAS retry for the same action, actor, and
 reason. Arbitrary fresh terminal adoption remains forbidden.
 
+Delivered: the CLI and public adoption API accept only exact Approved/Testing
+authority with a complete fixed-v1 or indexed-v2 attempt-1 prefix. All six
+authoritative input snapshots, physical candidate/source state, provider
+ledger, report bytes, recovery namespace, and crash orphans are authenticated
+under candidate-to-provider lock order. Fixed/indexed, present/missing report,
+pass/fail, crash, retry, drift, and concurrent-winner matrices are covered.
+
 Commit boundary: adoption writer and CLI only; no invalidation or rerun.
 
 ### M1-09c3 - Evaluation Invalidation And Rerun
 
-Status: pending. Dependencies: M1-09c2.
+Status: active. Dependencies: M1-09c2 (complete).
 
 Objective: preserve and invalidate one incomplete or failed evaluation attempt,
 then authorize exactly one fresh indexed attempt.
 
-Acceptance criteria: M1-09c invalidation/rerun criteria above, including exact
-prefix binding, final-Failed reset, rerun-only consumption, no within-attempt
-replay, and every interruption/race/frozen-final regression.
+Acceptance criteria: M1-09c invalidation/rerun criteria above. A dedicated
+create-only invalidation authority binds every present byte of the latest
+incomplete prefix or exact active approval-bound final Failed, the reconstructed
+Approved source, next contiguous attempt, audit fields, prior recovery/provider
+heads, and reset projection. Invalidation preserves all history, executes zero
+commands/provider calls, and advances only audited recovery/reset authority.
+Only exact `loop rerun --recovery N` may consume it; new intent and Testing bind
+the recovery reference. Once any artifact for the authorized attempt exists,
+commands may not replay within that attempt. A later audited invalidation is
+required for the next contiguous attempt. Cover repeated cycles, every crash
+cut and race, malformed/mixed/gapped inventory, drift, final-Failed reset, and
+frozen EvalPassed/Promoted/promotion-intent regressions.
 
 Commit boundary: evaluation invalidation and fresh rerun only.
 

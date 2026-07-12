@@ -17,7 +17,7 @@ use seaf_loop::recovery::{
     EvaluationRecoverySourceRunV2, EVALUATION_RECOVERY_SCHEMA_VERSION,
 };
 use seaf_loop::{
-    approve_candidate_for_testing, artifacts::write_step_request,
+    adopt_approved_evaluation, approve_candidate_for_testing, artifacts::write_step_request,
     cleanup_candidate_workspace_outcome, load_verified_final_evaluation_authority,
     persist_provider_exchange_record_reference, revise_provider_step,
     stage_provider_exchange_record, verify_candidate_patch_evidence,
@@ -710,6 +710,591 @@ fn evaluation_recovery_v2_reconstructs_exact_approved_for_pass_and_failure() {
         assert_eq!(authority.approved_run(), &approved);
         fixture.cleanup();
     }
+}
+
+#[test]
+fn evaluation_adoption_finalizes_complete_prefix_without_command_execution_and_retries_inertly() {
+    for (indexed, report_present, passed) in [
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+    ] {
+        let run_id = format!(
+            "evaluation-adoption-{}-{}-{}",
+            if indexed { "indexed" } else { "fixed" },
+            if report_present {
+                "existing"
+            } else {
+                "missing"
+            },
+            if passed { "pass" } else { "fail" },
+        );
+        let (fixture, approved) = approved_fixture(&run_id);
+        let final_shape = if indexed {
+            publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, passed)
+        } else {
+            publish_final_eval_artifacts(&fixture.workspace, &approved, passed)
+        };
+        let report_path = final_shape.eval_report_path.unwrap();
+        if !report_present {
+            fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+        }
+        let run_before = fs::read(fixture.workspace.run_file()).unwrap();
+        let provider_before = approved
+            .provider_exchange_records
+            .iter()
+            .map(|reference| {
+                fs::read(fixture.workspace.run_directory().join(&reference.path)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let logs_before = approved_eval_log_bytes(&fixture.workspace);
+        let candidate_before = source_evidence(&fixture.candidate);
+
+        let adopted = adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "adopt complete interrupted evaluation",
+        )
+        .expect("a complete exact evaluation prefix must be adoptable");
+
+        assert_eq!(
+            adopted.run.status == seaf_core::LoopStatus::EvalPassed,
+            passed
+        );
+        assert_eq!(adopted.run.updated_at, adopted.recovery.created_at);
+        assert_eq!(adopted.run.latest_recovery, Some(adopted.reference.clone()));
+        assert_eq!(
+            adopted.recovery.report_disposition,
+            if report_present {
+                EvaluationRecoveryReportDisposition::VerifyExisting
+            } else {
+                EvaluationRecoveryReportDisposition::CreateMissing
+            }
+        );
+        assert_eq!(
+            fs::read(fixture.workspace.run_directory().join(&report_path)).unwrap(),
+            canonical_json_bytes(
+                load_verified_final_evaluation_authority(&fixture.workspace, &adopted.run)
+                    .unwrap()
+                    .eval_report()
+            )
+            .unwrap()
+        );
+        load_verified_final_evaluation_authority(&fixture.workspace, &adopted.run)
+            .expect("adopted final authority must verify");
+        assert_eq!(
+            approved
+                .provider_exchange_records
+                .iter()
+                .map(|reference| {
+                    fs::read(fixture.workspace.run_directory().join(&reference.path)).unwrap()
+                })
+                .collect::<Vec<_>>(),
+            provider_before,
+            "adoption must not call the provider or change its ledger"
+        );
+        assert_eq!(approved_eval_log_bytes(&fixture.workspace), logs_before);
+        assert_eq!(source_evidence(&fixture.candidate), candidate_before);
+        assert_ne!(fs::read(fixture.workspace.run_file()).unwrap(), run_before);
+        let tree_after = directory_snapshot(fixture.workspace.run_directory());
+
+        let retry = adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "adopt complete interrupted evaluation",
+        )
+        .expect("an exact post-CAS retry must be inert");
+        assert_eq!(retry, adopted);
+        assert_eq!(
+            directory_snapshot(fixture.workspace.run_directory()),
+            tree_after
+        );
+        for (actor, reason) in [
+            (
+                "another@example.invalid",
+                "adopt complete interrupted evaluation",
+            ),
+            ("operator@example.invalid", "different adoption reason"),
+        ] {
+            let rejected = adopt_approved_evaluation(&fixture.workspace, actor, reason)
+                .expect_err("retry audit substitution must fail");
+            assert!(rejected.to_string().contains("retry"), "{rejected}");
+            assert_eq!(
+                directory_snapshot(fixture.workspace.run_directory()),
+                tree_after
+            );
+        }
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_adoption_rejects_input_and_report_drift_before_recovery_publication() {
+    for target in ["input", "report", "attempt2"] {
+        let (fixture, approved) = approved_fixture(&format!("adoption-preflight-{target}"));
+        let final_shape = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+        let path = match target {
+            "input" => "inputs/ticket.json".to_string(),
+            "report" => final_shape.eval_report_path.unwrap(),
+            "attempt2" => "artifacts/07-testing.attempt-002.execution-intent.json".to_string(),
+            _ => unreachable!(),
+        };
+        fs::write(
+            fixture.workspace.run_directory().join(&path),
+            b"substituted",
+        )
+        .unwrap();
+        let before = directory_snapshot(fixture.workspace.run_directory());
+
+        let error = adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "drift must fail before publication",
+        )
+        .expect_err("bound input or report drift must reject adoption");
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            directory_snapshot(fixture.workspace.run_directory()),
+            before
+        );
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/recovery-001.source-run.json")
+            .exists());
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/recovery-001.json")
+            .exists());
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_adoption_rejects_impossible_or_conflicting_recovery_orphans_without_writes() {
+    let (fixture, approved) = approved_fixture("adoption-source-collision");
+    let final_shape = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let report_path = final_shape.eval_report_path.unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let source_path = fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.source-run.json");
+    fs::write(&source_path, b"not an adoption source").unwrap();
+    let before = directory_snapshot(fixture.workspace.run_directory());
+
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "collision must reject",
+    )
+    .expect_err("source collision must reject before recovery or report creation");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.json")
+        .exists());
+    assert!(!fixture.workspace.run_directory().join(report_path).exists());
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture("adoption-recovery-without-source");
+    let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+    let source = recovered
+        .latest_recovery
+        .as_ref()
+        .map(|reference| {
+            let recovery: EvaluationRecoveryAttemptV2 = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .workspace
+                        .run_directory()
+                        .join(&reference.artifact.path),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            recovery.source_run.path
+        })
+        .unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(source)).unwrap();
+    let before = directory_snapshot(fixture.workspace.run_directory());
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "reviewer@example.invalid",
+        "adopt complete interrupted evaluation",
+    )
+    .expect_err("recovery without its source snapshot is impossible");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_adoption_rejects_noncanonical_source_orphan_timestamp_before_later_writes() {
+    let (fixture, approved) = approved_fixture("adoption-invalid-orphan-time");
+    let final_shape = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let report_path = final_shape.eval_report_path.unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "invalid source orphan timestamp",
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&adopted.reference.artifact.path),
+    )
+    .unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let source_path = adopted.recovery.source_run.path;
+    let mut source: EvaluationRecoverySourceRunV2 = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap(),
+    )
+    .unwrap();
+    source.created_at = "01".to_string();
+    fs::write(
+        fixture.workspace.run_directory().join(&source_path),
+        canonical_json_bytes(&source).unwrap(),
+    )
+    .unwrap();
+    let before = directory_snapshot(fixture.workspace.run_directory());
+
+    let error = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "invalid source orphan timestamp",
+    )
+    .expect_err("noncanonical orphan timestamp must fail during preflight");
+
+    assert!(error.to_string().contains("source orphan"), "{error}");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.json")
+        .exists());
+    assert!(!fixture.workspace.run_directory().join(report_path).exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
+    let (fixture, approved) = approved_fixture("adoption-crash-cuts");
+    let final_shape = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let report_path = final_shape.eval_report_path.unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let first = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "resume every adoption crash cut",
+    )
+    .unwrap();
+    assert_eq!(
+        first.recovery.report_disposition,
+        EvaluationRecoveryReportDisposition::CreateMissing
+    );
+    let source_path = first.recovery.source_run.path.clone();
+    let recovery_path = first.reference.artifact.path.clone();
+    let source_bytes = fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap();
+    let recovery_bytes = fs::read(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
+    let report_bytes = fs::read(fixture.workspace.run_directory().join(&report_path)).unwrap();
+
+    // Source published, then interrupted.
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let after_source = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "resume every adoption crash cut",
+    )
+    .unwrap();
+    assert_eq!(after_source.recovery.created_at, first.recovery.created_at);
+    assert_eq!(
+        after_source.recovery.report_disposition,
+        first.recovery.report_disposition
+    );
+    assert_eq!(
+        fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap(),
+        source_bytes
+    );
+    assert_eq!(
+        fs::read(fixture.workspace.run_directory().join(&recovery_path)).unwrap(),
+        recovery_bytes
+    );
+    assert_eq!(
+        fs::read(fixture.workspace.run_directory().join(&report_path)).unwrap(),
+        report_bytes
+    );
+
+    // Recovery published, then interrupted before missing report.
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let after_recovery = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "resume every adoption crash cut",
+    )
+    .unwrap();
+    assert_eq!(after_recovery, first);
+
+    // Report published, then interrupted before CAS.
+    write_raw_run(&fixture.workspace, &approved);
+    let after_report = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "resume every adoption crash cut",
+    )
+    .unwrap();
+    assert_eq!(after_report, first);
+
+    // Successful CAS, then caller interruption.
+    let after_cas = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "resume every adoption crash cut",
+    )
+    .unwrap();
+    assert_eq!(after_cas, first);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_adoption_rejects_unrelated_terminal_promotion_and_retry_drift() {
+    let (fixture, approved) = approved_fixture("adoption-terminal-rejections");
+    let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    write_raw_run(&fixture.workspace, &direct);
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "unrelated final",
+    )
+    .expect_err("ordinary terminal evaluation cannot be relabelled adopted");
+    write_raw_run(&fixture.workspace, &approved);
+    fs::write(
+        fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/09-promotion.intent.json"),
+        b"promotion intent",
+    )
+    .unwrap();
+    let before = directory_snapshot(fixture.workspace.run_directory());
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "promotion intent must freeze adoption",
+    )
+    .expect_err("promotion intent must reject fresh adoption");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_adoption_exact_retry_rejects_post_cas_input_promotion_and_attempt_drift() {
+    for drift in ["input", "promotion", "future-attempt"] {
+        let (fixture, approved) = approved_fixture(&format!("adoption-retry-{drift}"));
+        publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+        let adopted = adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "exact retry drift test",
+        )
+        .unwrap();
+        match drift {
+            "input" => fs::write(
+                fixture.workspace.run_directory().join("inputs/ticket.json"),
+                b"substituted ticket",
+            )
+            .unwrap(),
+            "promotion" => fs::write(
+                fixture
+                    .workspace
+                    .run_directory()
+                    .join("artifacts/09-promotion.intent.json"),
+                b"promotion intent",
+            )
+            .unwrap(),
+            "future-attempt" => fs::write(
+                fixture
+                    .workspace
+                    .run_directory()
+                    .join("artifacts/07-testing.attempt-002.execution-intent.json"),
+                b"future attempt",
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        let before = directory_snapshot(fixture.workspace.run_directory());
+        adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "exact retry drift test",
+        )
+        .expect_err("post-CAS drift must reject exact retry");
+        assert_eq!(
+            directory_snapshot(fixture.workspace.run_directory()),
+            before
+        );
+        let mut expected_run = serde_json::to_vec_pretty(&adopted.run).unwrap();
+        expected_run.push(b'\n');
+        assert_eq!(
+            fs::read(fixture.workspace.run_file()).unwrap(),
+            expected_run
+        );
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_adoption_rejects_pending_provider_and_active_evaluation_recovery_lineage() {
+    let (fixture, approved) = approved_fixture("adoption-pending-provider");
+    let pending = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::OutputReview,
+        "operator@example.invalid",
+        "pending provider recovery",
+    )
+    .unwrap();
+    publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let mut grafted = approved.clone();
+    grafted.latest_recovery = Some(pending.reference);
+    write_raw_run(&fixture.workspace, &grafted);
+    let before = directory_snapshot(fixture.workspace.run_directory());
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "pending lineage must reject",
+    )
+    .expect_err("unconsumed provider recovery must reject adoption");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture("adoption-active-evaluation");
+    let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+    let mut grafted = approved;
+    grafted.latest_recovery = recovered.latest_recovery;
+    write_raw_run(&fixture.workspace, &grafted);
+    let before = directory_snapshot(fixture.workspace.run_directory());
+    adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "active evaluation recovery must reject",
+    )
+    .expect_err("evaluation-v2 cannot be adopted again from Approved");
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn competing_evaluation_adoptions_converge_for_exact_retry_and_choose_one_audit_winner() {
+    let run_competition = |run_id: &str, reasons: [&'static str; 2]| {
+        let (fixture, approved) = approved_fixture(run_id);
+        publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for reason in reasons {
+            let workspace = fixture.workspace.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                adopt_approved_evaluation(&workspace, "operator@example.invalid", reason)
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        (fixture, outcomes)
+    };
+
+    let (fixture, exact) = run_competition(
+        "adoption-concurrent-exact",
+        ["same adoption audit", "same adoption audit"],
+    );
+    let first = exact[0].as_ref().expect("one exact caller");
+    let second = exact[1].as_ref().expect("other exact caller");
+    assert_eq!(
+        first, second,
+        "same-request callers must converge byte-exactly"
+    );
+    fixture.cleanup();
+
+    let (fixture, competing) = run_competition(
+        "adoption-concurrent-different",
+        ["competing adoption A", "competing adoption B"],
+    );
+    assert_eq!(
+        competing.iter().filter(|outcome| outcome.is_ok()).count(),
+        1
+    );
+    assert_eq!(
+        competing.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+    let winner = competing
+        .iter()
+        .find_map(|outcome| outcome.as_ref().ok())
+        .unwrap();
+    assert!(matches!(
+        winner.recovery.reason.as_str(),
+        "competing adoption A" | "competing adoption B"
+    ));
+    let persisted = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    assert_eq!(persisted, winner.run);
+    assert!(fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.source-run.json")
+        .is_file());
+    assert!(fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.json")
+        .is_file());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-002.source-run.json")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-002.json")
+        .exists());
+    fixture.cleanup();
 }
 
 #[test]
@@ -2218,9 +2803,9 @@ fn publish_final_eval_artifacts(
         goal_id: approved.goal_id.clone(),
         passed,
         summary: if passed {
-            "Integrated evaluation passed.".to_string()
+            "Approved candidate passed all required local checks.".to_string()
         } else {
-            "Integrated evaluation failed.".to_string()
+            "Approved candidate failed one or more required local checks.".to_string()
         },
         checks: vec![check],
         score_delta_estimate: None,
@@ -2494,7 +3079,7 @@ fn publish_indexed_final_eval_artifacts(
         },
         "candidate_state_digest": canonical_sha256_digest(candidate).unwrap(),
         "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
-        "source_worktree_state_digest": "a".repeat(64),
+        "source_worktree_state_digest": source_worktree_authority_digest(approved),
         "recovery": null,
         "planned_checks": eval_config["evals"]["required"],
     });
@@ -2635,6 +3220,76 @@ fn write_raw_run(workspace: &LoopWorkspace, run: &seaf_core::LoopRun) {
     let mut bytes = serde_json::to_vec_pretty(run).unwrap();
     bytes.push(b'\n');
     fs::write(workspace.run_file(), bytes).unwrap();
+}
+
+fn directory_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn approved_eval_log_bytes(workspace: &LoopWorkspace) -> Vec<(String, Vec<u8>)> {
+    let mut logs = fs::read_dir(workspace.run_directory().join("artifacts"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            (name.starts_with("07-testing") && name.ends_with(".log"))
+                .then(|| (name, fs::read(entry.path()).unwrap()))
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by(|left, right| left.0.cmp(&right.0));
+    logs
+}
+
+fn source_worktree_authority_digest(run: &seaf_core::LoopRun) -> String {
+    let root = PathBuf::from(
+        &run.candidate_workspace
+            .as_ref()
+            .unwrap()
+            .source_worktree_root,
+    );
+    let git_bytes = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let authority = serde_json::json!({
+        "canonical_root": fs::canonicalize(&root).unwrap(),
+        "head": git(&root, &["rev-parse", "HEAD"]),
+        "staged_diff_digest": hex::encode(Sha256::digest(git_bytes(&[
+            "diff", "--cached", "--binary", "--full-index", "--no-ext-diff",
+            "--no-textconv", "HEAD", "--",
+        ]))),
+        "tracked_worktree_diff_digest": hex::encode(Sha256::digest(git_bytes(&[
+            "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--",
+        ]))),
+        "untracked": [],
+    });
+    canonical_sha256_digest(&authority).unwrap()
 }
 
 fn fixture(run_id: &str) -> Fixture {

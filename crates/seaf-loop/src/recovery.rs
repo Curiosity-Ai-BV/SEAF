@@ -8,7 +8,7 @@ use std::{
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CandidatePatchPhase,
     CandidateWorkspaceLifecycle, CandidateWorkspaceState, LoopExecutionMode, LoopInputDigests,
-    LoopRun, LoopStatus, LoopStepName, ProviderExchangeKind, ProviderExchangePhase,
+    LoopRun, LoopStatus, LoopStepName, LoopStepStatus, ProviderExchangeKind, ProviderExchangePhase,
     ProviderExchangeRecordReference, RecoveryReference,
 };
 use serde::{Deserialize, Serialize};
@@ -17,21 +17,24 @@ use crate::{
     artifacts::latest_step_attempt,
     candidate_workspace::{
         acquire_candidate_lock, capture_source_worktree_authority, validate_candidate_workspace,
-        validate_source_worktree_authority, verify_candidate_patch_evidence_locked,
+        validate_source_worktree_authority, verify_candidate_patch_evidence_for_evaluation_locked,
+        verify_candidate_patch_evidence_locked, SourceWorktreeAuthority,
         CANDIDATE_WORKSPACE_SCHEMA_VERSION,
     },
     evaluation_attempt::{
-        load_intent, selected_attempt, ApprovedEvaluationIntent, EvaluationAttemptInventory,
+        fixed_spelling, load_intent, reference_for_path, selected_attempt,
+        ApprovedEvaluationIntent, EvaluationAttemptInventory,
     },
     immutable_artifact::{publish_create_only, read_verified_regular_file},
     inspect::{inspect_loop_run, InspectionIntegrity},
     provider_exchange::{
-        load_provider_exchange_record, persist_recovery_reset_with_full_compare_and_validator,
+        load_provider_exchange_record, persist_evaluation_adoption_with_validator,
+        persist_recovery_reset_with_full_compare_and_validator,
         preflight_provider_exchange_reconciliation,
         validate_authoritative_provider_exchange_records,
     },
     state::{self, step_index},
-    LoopWorkspace, TestingEvidence,
+    LoopWorkspace, TestingEvidence, VerifiedCandidatePatchEvidence,
 };
 
 pub const RECOVERY_SCHEMA_VERSION: u32 = 1;
@@ -153,6 +156,704 @@ pub struct RecoveryRevisionOutcome {
     pub run: LoopRun,
     pub recovery: RecoveryAttemptV1,
     pub reference: RecoveryReference,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluationAdoptionOutcome {
+    pub run: LoopRun,
+    pub recovery: EvaluationRecoveryAttemptV2,
+    pub reference: RecoveryReference,
+}
+
+pub fn adopt_approved_evaluation(
+    workspace: &LoopWorkspace,
+    actor: &str,
+    reason: &str,
+) -> Result<EvaluationAdoptionOutcome, RecoveryError> {
+    validate_note("actor", actor, 256)?;
+    validate_note("reason", reason, 1024)?;
+    let candidate_lock = acquire_candidate_lock(workspace).map_err(RecoveryError::wrapped)?;
+    let result = adopt_approved_evaluation_locked(workspace, actor, reason);
+    let unlock = candidate_lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(RecoveryError::wrapped(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn adopt_approved_evaluation_locked(
+    workspace: &LoopWorkspace,
+    actor: &str,
+    reason: &str,
+) -> Result<EvaluationAdoptionOutcome, RecoveryError> {
+    let approved = state::load_run(workspace).map_err(RecoveryError::wrapped)?;
+    if is_final_evaluation_status(&approved) {
+        return exact_evaluation_adoption_retry(workspace, approved, actor, reason);
+    }
+    validate_evaluation_adoption_source(workspace, &approved)?;
+
+    let candidate = approved
+        .candidate_workspace
+        .as_ref()
+        .expect("adoption source validation checked candidate");
+    let source_root = Path::new(&candidate.source_worktree_root);
+    let verified = verify_candidate_patch_evidence_for_evaluation_locked(workspace, source_root)
+        .map_err(RecoveryError::wrapped)?;
+    let approval = approved
+        .human_approval
+        .as_ref()
+        .expect("adoption source validation checked approval");
+    if verified.applied_diff != approval.candidate_diff
+        || verified.policy_decision_digest != approval.policy_decision_digest
+        || verified.candidate_authority.starting_head != approval.starting_head
+    {
+        return Err(RecoveryError::invalid(
+            "physical candidate authority does not match exact human approval",
+        ));
+    }
+    let source_authority =
+        capture_source_worktree_authority(source_root, Some(workspace.run_directory()))
+            .map_err(RecoveryError::wrapped)?;
+    let source_authority_digest =
+        canonical_sha256_digest(&source_authority).map_err(RecoveryError::wrapped)?;
+
+    let inventory = EvaluationAttemptInventory::load(workspace).map_err(RecoveryError::invalid)?;
+    let prefix = inventory
+        .recovery_prefix_paths()
+        .map_err(RecoveryError::invalid)?;
+    let intent_reference =
+        reference_for_path(workspace, &prefix.intent).map_err(RecoveryError::invalid)?;
+    let testing_reference =
+        reference_for_path(workspace, &prefix.testing).map_err(RecoveryError::invalid)?;
+    let testing = TestingEvidence::load_for_approved_run(workspace, &testing_reference, &approved)
+        .map_err(RecoveryError::wrapped)?;
+    let intent = load_intent(workspace, &intent_reference).map_err(RecoveryError::invalid)?;
+    let eval_config = load_recovery_eval_config(workspace, &approved)?;
+    intent
+        .validate_against(&approved, &eval_config.evals.required)
+        .map_err(RecoveryError::invalid)?;
+    if intent.attempt() != prefix.attempt
+        || testing.evaluation_attempt.unwrap_or(1) != prefix.attempt
+        || (testing.schema_version == 1) != fixed_spelling(prefix.spelling)
+        || intent.recovery().is_some()
+        || testing
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.as_ref())
+            .is_some()
+    {
+        return Err(RecoveryError::invalid(
+            "adoption prefix schema, attempt, or recovery authority is invalid",
+        ));
+    }
+    match (&intent, testing.schema_version) {
+        (ApprovedEvaluationIntent::V1(_), 1)
+            if testing.evaluation_attempt.is_none()
+                && testing.execution_intent.is_none()
+                && testing.recovery.is_none() => {}
+        (ApprovedEvaluationIntent::V2(_), 2)
+            if testing.evaluation_attempt == Some(prefix.attempt)
+                && testing.execution_intent.as_ref() == Some(&intent_reference)
+                && testing.recovery == Some(None) => {}
+        _ => {
+            return Err(RecoveryError::invalid(
+                "adoption prefix spelling and evidence schema disagree",
+            ))
+        }
+    }
+    if let ApprovedEvaluationIntent::V2(intent) = &intent {
+        if intent.source_worktree_state_digest != source_authority_digest {
+            return Err(RecoveryError::invalid(
+                "adoption source worktree authority changed after command execution",
+            ));
+        }
+    }
+    inventory
+        .validate_selected_logs(prefix.attempt, &testing.checks)
+        .map_err(RecoveryError::invalid)?;
+    verify_evaluation_prefix_references(
+        workspace,
+        &testing,
+        &intent_reference,
+        &testing_reference,
+    )?;
+
+    let report = crate::approved_eval::build_integrated_eval_report(
+        &approved,
+        &testing,
+        testing_reference.clone(),
+    )
+    .map_err(RecoveryError::wrapped)?;
+    let report_bytes = canonical_json_bytes(&report).map_err(RecoveryError::wrapped)?;
+    let report_reference = ArtifactReference {
+        path: prefix.report.clone(),
+        digest: digest_bytes(&report_bytes),
+    };
+    if prefix.report_present {
+        preflight_exact_artifact(workspace, &prefix.report, &report_bytes, false)?;
+    }
+
+    let recovery_id = next_evaluation_recovery_id(workspace, &approved)?;
+    let source_path = recovery_source_path(recovery_id);
+    let recovery_path = recovery_path(recovery_id);
+    validate_recovery_namespace(
+        workspace,
+        approved
+            .latest_recovery
+            .as_ref()
+            .map_or(0, |reference| reference.recovery_id),
+        recovery_id,
+    )?;
+    let orphan = load_evaluation_adoption_orphan(
+        workspace,
+        recovery_id,
+        &source_path,
+        &recovery_path,
+        actor,
+        reason,
+    )?;
+    let created_at = orphan
+        .as_ref()
+        .map(|orphan| orphan.created_at.clone())
+        .unwrap_or_else(now_timestamp);
+    let report_disposition = orphan
+        .as_ref()
+        .map(|orphan| orphan.report_disposition)
+        .unwrap_or(if prefix.report_present {
+            EvaluationRecoveryReportDisposition::VerifyExisting
+        } else {
+            EvaluationRecoveryReportDisposition::CreateMissing
+        });
+    if report_disposition == EvaluationRecoveryReportDisposition::VerifyExisting
+        && !prefix.report_present
+    {
+        return Err(RecoveryError::invalid(
+            "VerifyExisting adoption recovery lost its exact EvalReport",
+        ));
+    }
+
+    let source_snapshot = EvaluationRecoverySourceRunV2 {
+        schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
+        recovery_id,
+        actor: actor.to_string(),
+        reason: reason.to_string(),
+        created_at: created_at.clone(),
+        run: approved.clone(),
+        evaluation_prefix: EvaluationPrefixAuthorityV1 {
+            evaluation_attempt: prefix.attempt,
+            spelling: if fixed_spelling(prefix.spelling) {
+                EvaluationPrefixSpellingV1::FixedV1
+            } else {
+                EvaluationPrefixSpellingV1::IndexedV2
+            },
+            execution_intent: intent_reference.clone(),
+            testing_evidence: testing_reference.clone(),
+            eval_report: (report_disposition
+                == EvaluationRecoveryReportDisposition::VerifyExisting)
+                .then(|| report_reference.clone()),
+        },
+    };
+    let source_bytes = canonical_json_bytes(&source_snapshot).map_err(RecoveryError::wrapped)?;
+    let source_reference = ArtifactReference {
+        path: source_path.clone(),
+        digest: digest_bytes(&source_bytes),
+    };
+    let zero_reference = RecoveryReference {
+        recovery_id,
+        artifact: ArtifactReference {
+            path: recovery_path.clone(),
+            digest: "0".repeat(64),
+        },
+    };
+    let mut zero_projection = build_adopted_final(
+        &approved,
+        &testing,
+        &testing_reference,
+        &report_reference,
+        &created_at,
+    )?;
+    zero_projection.latest_recovery = Some(zero_reference);
+    let recovery = EvaluationRecoveryAttemptV2 {
+        schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
+        recovery_id,
+        run_id: approved.run_id.clone(),
+        action: EvaluationRecoveryAction::AdoptApprovedEvaluation,
+        step: LoopStepName::Testing,
+        actor: actor.to_string(),
+        reason: reason.to_string(),
+        created_at: created_at.clone(),
+        source_run: source_reference,
+        source_run_digest: canonical_sha256_digest(&approved).map_err(RecoveryError::wrapped)?,
+        input_digests: approved.input_digests.clone(),
+        candidate_state_digest: canonical_sha256_digest(candidate)
+            .map_err(RecoveryError::wrapped)?,
+        candidate_head: candidate.candidate_head.clone(),
+        candidate_tree: candidate.candidate_tree.clone(),
+        candidate_diff_digest: candidate.candidate_diff_digest.clone(),
+        source_worktree_state_digest: source_authority_digest,
+        evaluation_attempt: prefix.attempt,
+        execution_intent: intent_reference,
+        testing_evidence: testing_reference.clone(),
+        eval_report: report_reference.clone(),
+        report_disposition,
+        previous_recovery: approved.latest_recovery.clone(),
+        previous_provider_head: approved.provider_exchange_records.last().cloned(),
+        expected_final_projection_digest: canonical_sha256_digest(&zero_projection)
+            .map_err(RecoveryError::wrapped)?,
+    };
+    let recovery_bytes = canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)?;
+    let reference = RecoveryReference {
+        recovery_id,
+        artifact: ArtifactReference {
+            path: recovery_path.clone(),
+            digest: digest_bytes(&recovery_bytes),
+        },
+    };
+
+    // Every possible collision is inspected before the first create-only publication.
+    preflight_exact_artifact(workspace, &source_path, &source_bytes, true)?;
+    preflight_exact_artifact(workspace, &recovery_path, &recovery_bytes, true)?;
+    preflight_exact_artifact(
+        workspace,
+        &prefix.report,
+        &report_bytes,
+        report_disposition == EvaluationRecoveryReportDisposition::CreateMissing,
+    )?;
+
+    publish_create_only(workspace.run_directory(), &source_path, &source_bytes)
+        .map_err(RecoveryError::wrapped)?;
+    publish_create_only(workspace.run_directory(), &recovery_path, &recovery_bytes)
+        .map_err(RecoveryError::wrapped)?;
+    if report_disposition == EvaluationRecoveryReportDisposition::CreateMissing {
+        publish_create_only(workspace.run_directory(), &prefix.report, &report_bytes)
+            .map_err(RecoveryError::wrapped)?;
+    }
+
+    let mut final_run = zero_projection;
+    final_run.latest_recovery = Some(reference.clone());
+    reauthenticate_evaluation_adoption(
+        workspace,
+        &approved,
+        &final_run,
+        &reference,
+        source_root,
+        &source_authority,
+        &verified,
+    )?;
+    persist_evaluation_adoption_with_validator(workspace, &approved, &final_run, |locked| {
+        reauthenticate_evaluation_adoption(
+            workspace,
+            locked,
+            &final_run,
+            &reference,
+            source_root,
+            &source_authority,
+            &verified,
+        )
+        .map_err(|error| {
+            crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
+        })
+    })
+    .map_err(RecoveryError::wrapped)?;
+    Ok(EvaluationAdoptionOutcome {
+        run: final_run,
+        recovery,
+        reference,
+    })
+}
+
+#[derive(Debug)]
+struct EvaluationAdoptionOrphan {
+    created_at: String,
+    report_disposition: EvaluationRecoveryReportDisposition,
+}
+
+fn is_final_evaluation_status(run: &LoopRun) -> bool {
+    run.status == LoopStatus::EvalPassed
+        || (run.status == LoopStatus::Failed && run.human_approval.is_some())
+}
+
+fn exact_evaluation_adoption_retry(
+    workspace: &LoopWorkspace,
+    run: LoopRun,
+    actor: &str,
+    reason: &str,
+) -> Result<EvaluationAdoptionOutcome, RecoveryError> {
+    ensure_no_promotion_intent(workspace)?;
+    let reference = run
+        .latest_recovery
+        .clone()
+        .ok_or_else(|| RecoveryError::invalid("fresh terminal evaluation adoption is forbidden"))?;
+    let (recovery, source) = load_verified_evaluation_recovery(workspace, &reference)?
+        .ok_or_else(|| RecoveryError::invalid("terminal evaluation was not adopted"))?;
+    if recovery.actor != actor
+        || recovery.reason != reason
+        || recovery.action != EvaluationRecoveryAction::AdoptApprovedEvaluation
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption retry does not match its exact action, actor, and reason",
+        ));
+    }
+    let authority = crate::load_verified_final_evaluation_authority(workspace, &run)
+        .map_err(RecoveryError::wrapped)?;
+    if authority.approved_run() != &source.run {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption retry changed adopted final authority",
+        ));
+    }
+    let mut expected = build_adopted_final(
+        &source.run,
+        authority.testing_evidence(),
+        &recovery.testing_evidence,
+        &recovery.eval_report,
+        &recovery.created_at,
+    )?;
+    expected.latest_recovery = Some(reference.clone());
+    if run != expected {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption retry is not the exact adopted final authority",
+        ));
+    }
+    validate_authoritative_provider_exchange_records(workspace, &run)
+        .map_err(RecoveryError::wrapped)?;
+    crate::runner::load_verified_authoritative_run_inputs(workspace, &source.run)
+        .map_err(RecoveryError::wrapped)?;
+    let reconciled = preflight_provider_exchange_reconciliation(workspace, &run)
+        .map_err(RecoveryError::wrapped)?;
+    if reconciled != run {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption retry has an unpublished provider exchange winner",
+        ));
+    }
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        RecoveryError::invalid("adopted final authority lost its active candidate")
+    })?;
+    if candidate.lifecycle != CandidateWorkspaceLifecycle::Active {
+        return Err(RecoveryError::invalid(
+            "exact evaluation adoption retry requires the original active final authority",
+        ));
+    }
+    verify_candidate_patch_evidence_for_evaluation_locked(
+        workspace,
+        Path::new(&candidate.source_worktree_root),
+    )
+    .map_err(RecoveryError::wrapped)?;
+    let source_authority = capture_source_worktree_authority(
+        Path::new(&candidate.source_worktree_root),
+        Some(workspace.run_directory()),
+    )
+    .map_err(RecoveryError::wrapped)?;
+    if canonical_sha256_digest(&source_authority).map_err(RecoveryError::wrapped)?
+        != recovery.source_worktree_state_digest
+    {
+        return Err(RecoveryError::invalid(
+            "source worktree authority changed after evaluation adoption",
+        ));
+    }
+    Ok(EvaluationAdoptionOutcome {
+        run,
+        recovery,
+        reference,
+    })
+}
+
+fn validate_evaluation_adoption_source(
+    workspace: &LoopWorkspace,
+    source: &LoopRun,
+) -> Result<(), RecoveryError> {
+    if source.status != LoopStatus::Approved
+        || source.current_step != LoopStepName::Testing
+        || source.execution_mode != LoopExecutionMode::IsolatedCandidate
+        || source.human_approval.is_none()
+        || source.promotion.is_some()
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption requires exact Approved Testing authority",
+        ));
+    }
+    ensure_no_promotion_intent(workspace)?;
+    let candidate = source.candidate_workspace.as_ref().ok_or_else(|| {
+        RecoveryError::invalid("evaluation adoption source lost candidate authority")
+    })?;
+    if candidate.schema_version != CANDIDATE_WORKSPACE_SCHEMA_VERSION
+        || candidate.lifecycle != CandidateWorkspaceLifecycle::Active
+        || candidate.cleanup_started_at.is_some()
+        || candidate.cleaned_at.is_some()
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption requires active candidate authority",
+        ));
+    }
+    crate::provider_exchange::validate_run_for_atomic_publication(workspace, source)
+        .map_err(RecoveryError::wrapped)?;
+    crate::runner::load_verified_authoritative_run_inputs(workspace, source)
+        .map_err(RecoveryError::wrapped)?;
+    let reconciled = preflight_provider_exchange_reconciliation(workspace, source)
+        .map_err(RecoveryError::wrapped)?;
+    if &reconciled != source {
+        return Err(RecoveryError::invalid(
+            "evaluation adoption source has an unpublished provider exchange winner",
+        ));
+    }
+    validate_evaluation_source_prior_consumption(workspace, source)
+}
+
+fn ensure_no_promotion_intent(workspace: &LoopWorkspace) -> Result<(), RecoveryError> {
+    match fs::symlink_metadata(
+        workspace
+            .run_directory()
+            .join("artifacts/09-promotion.intent.json"),
+    ) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(RecoveryError::invalid(
+            "evaluation adoption is forbidden after promotion intent publication",
+        )),
+        Err(error) => Err(RecoveryError::wrapped(error)),
+    }
+}
+
+fn next_evaluation_recovery_id(
+    workspace: &LoopWorkspace,
+    source: &LoopRun,
+) -> Result<u32, RecoveryError> {
+    source.latest_recovery.as_ref().map_or(Ok(1), |reference| {
+        if !recovery_is_consumed(workspace, source, reference)? {
+            return Err(RecoveryError::invalid(
+                "evaluation adoption source carries an unconsumed prior recovery",
+            ));
+        }
+        reference
+            .recovery_id
+            .checked_add(1)
+            .ok_or_else(|| RecoveryError::invalid("recovery ID sequence is exhausted"))
+    })
+}
+
+fn verify_evaluation_prefix_references(
+    workspace: &LoopWorkspace,
+    testing: &TestingEvidence,
+    intent: &ArtifactReference,
+    testing_reference: &ArtifactReference,
+) -> Result<(), RecoveryError> {
+    let mut references = vec![intent.clone(), testing_reference.clone()];
+    for check in &testing.checks {
+        for (path, digest) in [
+            (check.stdout_path.as_ref(), check.stdout_digest.as_ref()),
+            (check.stderr_path.as_ref(), check.stderr_digest.as_ref()),
+        ] {
+            references.push(ArtifactReference {
+                path: path
+                    .cloned()
+                    .ok_or_else(|| RecoveryError::invalid("adoption prefix lost check log path"))?,
+                digest: digest.cloned().ok_or_else(|| {
+                    RecoveryError::invalid("adoption prefix lost check log digest")
+                })?,
+            });
+        }
+    }
+    for reference in references {
+        let bytes = read_verified_regular_file(
+            workspace.run_directory(),
+            &reference.path,
+            "evaluation adoption prefix artifact",
+        )
+        .map_err(RecoveryError::wrapped)?;
+        if digest_bytes(&bytes) != reference.digest {
+            return Err(RecoveryError::invalid(
+                "evaluation adoption prefix artifact digest mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_adopted_final(
+    approved: &LoopRun,
+    testing: &TestingEvidence,
+    testing_reference: &ArtifactReference,
+    report_reference: &ArtifactReference,
+    created_at: &str,
+) -> Result<LoopRun, RecoveryError> {
+    let passed = testing.passed;
+    let mut run = approved.clone();
+    run.status = if passed {
+        LoopStatus::EvalPassed
+    } else {
+        LoopStatus::Failed
+    };
+    run.current_step = LoopStepName::EvalReport;
+    run.updated_at = created_at.to_string();
+    for (name, reference) in [
+        (LoopStepName::Testing, testing_reference),
+        (LoopStepName::EvalReport, report_reference),
+    ] {
+        let step = run
+            .steps
+            .iter_mut()
+            .find(|step| step.name == name)
+            .ok_or_else(|| RecoveryError::invalid("evaluation step chain is incomplete"))?;
+        step.status = if passed {
+            LoopStepStatus::Passed
+        } else {
+            LoopStepStatus::Failed
+        };
+        step.artifact_path = Some(reference.path.clone());
+        step.artifact_digest = Some(reference.digest.clone());
+    }
+    run.eval_report_path = Some(report_reference.path.clone());
+    Ok(run)
+}
+
+fn load_evaluation_adoption_orphan(
+    workspace: &LoopWorkspace,
+    recovery_id: u32,
+    source_path: &str,
+    recovery_path: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<Option<EvaluationAdoptionOrphan>, RecoveryError> {
+    let existing_source = read_optional_verified(workspace, source_path, "adoption source orphan")?
+        .map(|bytes| {
+            let source: EvaluationRecoverySourceRunV2 =
+                serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
+            if canonical_json_bytes(&source).map_err(RecoveryError::wrapped)? != bytes
+                || source.schema_version != EVALUATION_RECOVERY_SCHEMA_VERSION
+                || source.recovery_id != recovery_id
+                || parse_canonical_timestamp(&source.created_at).is_none()
+            {
+                return Err(RecoveryError::invalid(
+                    "evaluation adoption source orphan is invalid",
+                ));
+            }
+            Ok(source)
+        })
+        .transpose()?;
+    let existing_recovery =
+        read_optional_verified(workspace, recovery_path, "adoption recovery orphan")?
+            .map(|bytes| {
+                let recovery: EvaluationRecoveryAttemptV2 =
+                    serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
+                if canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)? != bytes
+                    || recovery.schema_version != EVALUATION_RECOVERY_SCHEMA_VERSION
+                    || recovery.recovery_id != recovery_id
+                    || parse_canonical_timestamp(&recovery.created_at).is_none()
+                {
+                    return Err(RecoveryError::invalid(
+                        "evaluation adoption recovery orphan is invalid",
+                    ));
+                }
+                Ok(recovery)
+            })
+            .transpose()?;
+    match (existing_source, existing_recovery) {
+        (None, None) => Ok(None),
+        (Some(source), None) => {
+            if source.actor != actor || source.reason != reason {
+                return Err(RecoveryError::invalid(
+                    "evaluation adoption source orphan actor or reason disagrees",
+                ));
+            }
+            Ok(Some(EvaluationAdoptionOrphan {
+                created_at: source.created_at,
+                report_disposition: if source.evaluation_prefix.eval_report.is_some() {
+                    EvaluationRecoveryReportDisposition::VerifyExisting
+                } else {
+                    EvaluationRecoveryReportDisposition::CreateMissing
+                },
+            }))
+        }
+        (None, Some(_)) => Err(RecoveryError::invalid(
+            "evaluation adoption recovery orphan exists without its source snapshot",
+        )),
+        (Some(source), Some(recovery)) => {
+            if source.created_at != recovery.created_at
+                || source.actor != actor
+                || source.reason != reason
+                || recovery.actor != actor
+                || recovery.reason != reason
+            {
+                return Err(RecoveryError::invalid(
+                    "evaluation adoption orphan audit fields disagree",
+                ));
+            }
+            Ok(Some(EvaluationAdoptionOrphan {
+                created_at: recovery.created_at,
+                report_disposition: recovery.report_disposition,
+            }))
+        }
+    }
+}
+
+fn read_optional_verified(
+    workspace: &LoopWorkspace,
+    path: &str,
+    label: &str,
+) -> Result<Option<Vec<u8>>, RecoveryError> {
+    match fs::symlink_metadata(workspace.run_directory().join(path)) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            RecoveryError::invalid(format!("{label} is not a real regular file")),
+        ),
+        Ok(_) => read_verified_regular_file(workspace.run_directory(), path, label)
+            .map(Some)
+            .map_err(RecoveryError::wrapped),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RecoveryError::wrapped(error)),
+    }
+}
+
+fn preflight_exact_artifact(
+    workspace: &LoopWorkspace,
+    path: &str,
+    expected: &[u8],
+    allow_absent: bool,
+) -> Result<(), RecoveryError> {
+    match read_optional_verified(workspace, path, "evaluation adoption artifact")? {
+        Some(bytes) if bytes == expected => Ok(()),
+        Some(_) => Err(RecoveryError::invalid(format!(
+            "evaluation adoption artifact collision at {path}"
+        ))),
+        None if allow_absent => Ok(()),
+        None => Err(RecoveryError::invalid(format!(
+            "evaluation adoption requires existing exact artifact at {path}"
+        ))),
+    }
+}
+
+fn reauthenticate_evaluation_adoption(
+    workspace: &LoopWorkspace,
+    approved: &LoopRun,
+    final_run: &LoopRun,
+    reference: &RecoveryReference,
+    source_root: &Path,
+    source_authority: &SourceWorktreeAuthority,
+    verified: &VerifiedCandidatePatchEvidence,
+) -> Result<(), RecoveryError> {
+    if state::load_run(workspace).map_err(RecoveryError::wrapped)? != *approved {
+        return Err(RecoveryError::invalid(
+            "Approved authority changed before evaluation adoption CAS",
+        ));
+    }
+    validate_evaluation_adoption_source(workspace, approved)?;
+    let current_verified =
+        verify_candidate_patch_evidence_for_evaluation_locked(workspace, source_root)
+            .map_err(RecoveryError::wrapped)?;
+    if &current_verified != verified {
+        return Err(RecoveryError::invalid(
+            "candidate authority changed during evaluation adoption",
+        ));
+    }
+    validate_source_worktree_authority(
+        source_root,
+        Some(workspace.run_directory()),
+        source_authority,
+    )
+    .map_err(RecoveryError::wrapped)?;
+    load_verified_evaluation_recovery(workspace, reference)?
+        .ok_or_else(|| RecoveryError::invalid("evaluation adoption recovery lost v2 authority"))?;
+    crate::load_verified_final_evaluation_authority(workspace, final_run)
+        .map_err(RecoveryError::wrapped)?;
+    Ok(())
 }
 
 pub fn revise_provider_step(

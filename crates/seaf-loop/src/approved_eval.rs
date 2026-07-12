@@ -301,42 +301,7 @@ fn execute_approved_evaluation_locked(
         .map_err(ApprovedEvaluationError::wrapped)?;
 
     let passed = testing.passed;
-    let report = EvalReport {
-        eval_report_id: format!("eval_{}", approved.run_id),
-        patch_id: approved.run_id.clone(),
-        goal_id: approved.goal_id.clone(),
-        passed,
-        summary: if passed {
-            "Approved candidate passed all required local checks.".to_string()
-        } else {
-            "Approved candidate failed one or more required local checks.".to_string()
-        },
-        checks,
-        score_delta_estimate: None,
-        risk_level: if passed {
-            RiskLevel::Low
-        } else {
-            RiskLevel::High
-        },
-        decision: if passed {
-            EvalDecision::ApproveForHumanReview
-        } else {
-            EvalDecision::Reject
-        },
-        loop_evidence: Some(EvalLoopEvidence {
-            schema_version: 1,
-            run_id: approved.run_id.clone(),
-            ticket_id: approved.ticket_id.clone(),
-            ticket_digest: approved.input_digests.ticket.clone(),
-            eval_config: intent.eval_config,
-            candidate_diff: approval.candidate_diff.clone(),
-            starting_head: approval.starting_head.clone(),
-            human_approval_digest: canonical_sha256_digest(approval)
-                .map_err(ApprovedEvaluationError::wrapped)?,
-            policy_decision_digest: approval.policy_decision_digest.clone(),
-            testing_evidence: testing_reference.clone(),
-        }),
-    };
+    let report = build_integrated_eval_report(&approved, &testing, testing_reference.clone())?;
     let report_bytes = canonical_json_bytes(&report).map_err(ApprovedEvaluationError::wrapped)?;
     let report_reference = ArtifactReference {
         path: paths.report.clone(),
@@ -475,6 +440,59 @@ fn execute_approved_evaluation_locked(
     )
     .map_err(ApprovedEvaluationError::wrapped)?;
     Ok(final_run)
+}
+
+pub(crate) fn build_integrated_eval_report(
+    approved: &LoopRun,
+    testing: &TestingEvidence,
+    testing_reference: ArtifactReference,
+) -> Result<EvalReport, ApprovedEvaluationError> {
+    let approval = approved.human_approval.as_ref().ok_or_else(|| {
+        ApprovedEvaluationError::invalid("Approved authority has no human approval")
+    })?;
+    let eval_config_digest = approved.input_digests.eval_config.as_ref().ok_or_else(|| {
+        ApprovedEvaluationError::invalid("Approved authority has no eval config digest")
+    })?;
+    let passed = testing.passed;
+    Ok(EvalReport {
+        eval_report_id: format!("eval_{}", approved.run_id),
+        patch_id: approved.run_id.clone(),
+        goal_id: approved.goal_id.clone(),
+        passed,
+        summary: if passed {
+            "Approved candidate passed all required local checks.".to_string()
+        } else {
+            "Approved candidate failed one or more required local checks.".to_string()
+        },
+        checks: testing.checks.clone(),
+        score_delta_estimate: None,
+        risk_level: if passed {
+            RiskLevel::Low
+        } else {
+            RiskLevel::High
+        },
+        decision: if passed {
+            EvalDecision::ApproveForHumanReview
+        } else {
+            EvalDecision::Reject
+        },
+        loop_evidence: Some(EvalLoopEvidence {
+            schema_version: 1,
+            run_id: approved.run_id.clone(),
+            ticket_id: approved.ticket_id.clone(),
+            ticket_digest: approved.input_digests.ticket.clone(),
+            eval_config: ArtifactReference {
+                path: "inputs/eval-config.json".to_string(),
+                digest: eval_config_digest.clone(),
+            },
+            candidate_diff: approval.candidate_diff.clone(),
+            starting_head: approval.starting_head.clone(),
+            human_approval_digest: canonical_sha256_digest(approval)
+                .map_err(ApprovedEvaluationError::wrapped)?,
+            policy_decision_digest: approval.policy_decision_digest.clone(),
+            testing_evidence: testing_reference.clone(),
+        }),
+    })
 }
 
 fn load_ticket_snapshot(

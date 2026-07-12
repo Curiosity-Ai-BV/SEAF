@@ -530,6 +530,61 @@ where
     )
 }
 
+pub(crate) fn persist_evaluation_adoption_with_validator<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    intended: &LoopRun,
+    validate_current: F,
+) -> Result<(), ProviderExchangeError>
+where
+    F: FnOnce(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
+    persist_run_with_full_compare_and_validator_mode(
+        workspace,
+        expected,
+        intended,
+        true,
+        |current| {
+            if current.status != seaf_core::LoopStatus::Approved
+                || current.current_step != seaf_core::LoopStepName::Testing
+            {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation adoption CAS requires exact Approved Testing authority".to_string(),
+                ));
+            }
+            let reference = intended.latest_recovery.as_ref().ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "evaluation adoption final lost recovery authority".to_string(),
+                )
+            })?;
+            let expected_id = current
+                .latest_recovery
+                .as_ref()
+                .map_or(Some(1), |previous| previous.recovery_id.checked_add(1));
+            if expected_id != Some(reference.recovery_id) {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation adoption did not advance exactly one recovery ID".to_string(),
+                ));
+            }
+            let (_, source) =
+                crate::recovery::load_verified_evaluation_recovery(workspace, reference)
+                    .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        ProviderExchangeError::Invalid(
+                            "evaluation adoption CAS requires evaluation-v2 recovery".to_string(),
+                        )
+                    })?;
+            if source.run != *current {
+                return Err(ProviderExchangeError::Invalid(
+                    "evaluation adoption recovery does not bind the exact locked Approved source"
+                        .to_string(),
+                ));
+            }
+            validate_current(current)
+        },
+    )
+}
+
 fn persist_run_with_full_compare_and_validator_mode<F>(
     workspace: &LoopWorkspace,
     expected: &LoopRun,

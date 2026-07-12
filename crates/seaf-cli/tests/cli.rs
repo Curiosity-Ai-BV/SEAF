@@ -5743,7 +5743,10 @@ fn loop_resume_rerun_from_returns_migration_guidance_before_run_lookup_or_mutati
 #[test]
 fn loop_revise_and_rerun_publish_the_audited_recovery_cli_contract() {
     for (command, required) in [
-        ("revise", ["--from-step", "--actor", "--reason"].as_slice()),
+        (
+            "revise",
+            ["--from-step", "--eval-recovery", "--actor", "--reason"].as_slice(),
+        ),
         ("rerun", ["--recovery"].as_slice()),
     ] {
         let output = seaf()
@@ -5759,6 +5762,116 @@ fn loop_revise_and_rerun_publish_the_audited_recovery_cli_contract() {
             );
         }
     }
+}
+
+#[test]
+fn loop_revise_rejects_invalid_evaluation_recovery_grammar_before_workspace_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let runs_root = temp.path().join("runs");
+    for args in [
+        vec!["--from-step", "testing"],
+        vec!["--from-step", "testing", "--eval-recovery", "invalidate"],
+        vec!["--from-step", "output-review", "--eval-recovery", "adopt"],
+    ] {
+        let mut command = seaf();
+        command.args([
+            "loop",
+            "revise",
+            "--run-id",
+            "missing-run",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+        ]);
+        command.args(args);
+        command.args([
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "must reject before mutation",
+        ]);
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("eval-recovery"), "{stderr}");
+        assert!(!runs_root.exists(), "grammar rejection must precede lookup");
+    }
+}
+
+#[test]
+fn loop_revise_testing_adopt_finalizes_an_interrupted_complete_prefix_without_rerunning() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: adoption_probe\n      command: printf adoption-prefix\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure adoption probe");
+    let runs_root = temp.path().join("runs");
+    let run_id = "cli-evaluation-adoption";
+    let ticket = write_provider_loop_ticket(temp.path(), true);
+    let approved = run_and_approve_provider_loop(&repo, &ticket, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let approved_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    let provider_records = approved["provider_exchange_records"].clone();
+
+    let evaluation = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(evaluation.status.success(), "{evaluation:?}");
+    let log_path = run_dir.join("artifacts/07-testing.attempt-001.check-001.stdout.log");
+    let log_before = fs::read(&log_path).unwrap();
+    assert_eq!(log_before, b"adoption-prefix");
+
+    // Simulate interruption after complete prefix publication but before final LoopRun CAS.
+    fs::write(run_dir.join("run.json"), approved_bytes).unwrap();
+    let adopted = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "testing",
+            "--eval-recovery",
+            "adopt",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "adopt complete CLI evaluation prefix",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(adopted.status.success(), "{adopted:?}");
+    let output: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
+    assert_eq!(output["command"], "revise");
+    assert_eq!(output["status"], "eval_passed");
+    assert_eq!(output["current_step"], "eval_report");
+    assert_eq!(output["evaluation_attempt"], 1);
+    assert_eq!(output["report_disposition"], "verify_existing");
+    let final_run = read_run_json(&run_dir);
+    assert_eq!(final_run["status"], "eval_passed");
+    assert_eq!(final_run["latest_recovery"]["recovery_id"], 1);
+    assert_eq!(final_run["provider_exchange_records"], provider_records);
+    assert_eq!(fs::read(log_path).unwrap(), log_before);
+    assert!(run_dir
+        .join("artifacts/recovery-001.source-run.json")
+        .is_file());
+    assert!(run_dir.join("artifacts/recovery-001.json").is_file());
 }
 
 #[test]

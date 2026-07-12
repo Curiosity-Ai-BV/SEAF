@@ -35,8 +35,8 @@
 - [x] M1-09b: Audited provider revise and rerun.
 - [x] M1-09c1: Versioned evaluation attempt authority.
 - [x] M1-09c2a: Versioned evaluation recovery authority.
-- [ ] M1-09c2b: Zero-command adoption transaction (active).
-- [ ] M1-09c3: Evaluation invalidation and rerun.
+- [x] M1-09c2b: Zero-command adoption transaction.
+- [ ] M1-09c3: Evaluation invalidation and rerun (active).
 - [ ] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
 - [ ] M1-12: Interruption recovery acceptance.
@@ -120,5 +120,10 @@ source-compatibility note into M1-12 and preview release notes. M1-09c2a now
 adds evaluation-v2 recovery/source/prefix contracts, a stack-safe mixed-v1/v2
 reader, and source-snapshot Approved reconstruction for pass/fail, frozen
 EvalPassed/Promoted, and approval-bound Failed cleanup. Pending provider
-recovery grafts and prior evaluation-v2 recovery fail closed. M1-09c2b is active
-for the zero-command adoption transaction.
+recovery grafts and prior evaluation-v2 recovery fail closed. M1-09c2b now
+adopts only an exact complete fixed-v1 or indexed-v2 prefix through an audited,
+zero-command transaction. It verifies all six authoritative input snapshots,
+candidate/source/provider authority, deterministic report bytes, crash orphans,
+and a dedicated recovery-advancing final CAS; exact retry is byte-inert and
+competing callers converge on one audit winner. M1-09c3 invalidation and fresh
+rerun is active.

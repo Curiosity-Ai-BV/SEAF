@@ -218,12 +218,14 @@ M1-09c1 versioned evaluation authority is complete. New evaluations publish
 strict attempt-001 v2 intent, logs, Testing, and EvalReport; fixed v1 final
 evidence stays readable, while mixed, malformed, future, gapped, surplus, or
 cross-attempt authority fails closed. Final validation and promotion select the
-exact Testing-bound intent. M1-09c2a typed evaluation recovery authority is also
-complete: mixed provider-v1/evaluation-v2 lineage is authenticated and adopted
-finals reconstruct their exact Approved source without weakening cleanup,
-promotion, or frozen passing authority. M1-09c2b zero-command adoption is active
-before evaluation invalidation/rerun. Authoritative input changes still require
-a new run; EvalPassed/Promoted and M1-08 promotion intent remain frozen.
+exact Testing-bound intent. M1-09c2 typed evaluation recovery and zero-command
+adoption are also complete: mixed provider-v1/evaluation-v2 lineage is
+authenticated, complete fixed-v1 or indexed-v2 prefixes can be adopted with an
+exact existing or deterministically created EvalReport, and adopted finals
+reconstruct their Approved source without weakening cleanup, promotion, or
+frozen passing authority. M1-09c3 evaluation invalidation and fresh rerun is
+active. Authoritative input changes still require a new run; EvalPassed/Promoted
+and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
 validates command configuration and detects repository drift, but it does not
 contain approved code from malicious same-user filesystem access.

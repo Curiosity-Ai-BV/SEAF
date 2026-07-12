@@ -24,15 +24,16 @@ use seaf_core::{
     TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
-    approve_candidate_for_testing, build_loop_eval_report, cleanup_candidate_workspace_outcome,
-    ensure_no_pending_recovery, evaluate_zero_tolerance, execute_approved_evaluation,
-    execute_eval_checks, inspect_loop_run, load_agent_bench_fixture, plan_eval_checks,
-    preflight_authoritative_run_inputs, promote_evaluated_candidate, revise_provider_step,
-    validate_human_review_execution_barrier, validate_requested_recovery, AgentBenchSummary,
-    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
-    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
-    ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput, StepRunner,
+    adopt_approved_evaluation, approve_candidate_for_testing, build_loop_eval_report,
+    cleanup_candidate_workspace_outcome, ensure_no_pending_recovery, evaluate_zero_tolerance,
+    execute_approved_evaluation, execute_eval_checks, inspect_loop_run, load_agent_bench_fixture,
+    plan_eval_checks, preflight_authoritative_run_inputs, promote_evaluated_candidate,
+    revise_provider_step, validate_human_review_execution_barrier, validate_requested_recovery,
+    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
+    ContextLimits, ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun,
+    LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision,
+    PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RunnerError, StepOutput,
+    StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -359,6 +360,9 @@ struct LoopReviseArgs {
     runs_root: PathBuf,
     #[arg(long)]
     from_step: String,
+    /// Evaluation recovery action. Testing supports only `adopt`.
+    #[arg(long)]
+    eval_recovery: Option<String>,
     #[arg(long)]
     actor: String,
     #[arg(long)]
@@ -1132,10 +1136,58 @@ fn loop_inspect(args: LoopInspectArgs) -> Result<(), CliFailure> {
 }
 
 fn revise_loop(args: LoopReviseArgs) -> Result<(), CliFailure> {
+    let evaluation_adoption = match (args.from_step.as_str(), args.eval_recovery.as_deref()) {
+        ("testing", Some("adopt")) => true,
+        ("testing", Some(_)) => {
+            return Err(CliFailure::message(
+                "--eval-recovery supports only `adopt` for --from-step testing".to_string(),
+            ))
+        }
+        ("testing", None) => {
+            return Err(CliFailure::message(
+                "--from-step testing requires --eval-recovery adopt".to_string(),
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(CliFailure::message(
+                "--eval-recovery is valid only with --from-step testing".to_string(),
+            ))
+        }
+        _ => false,
+    };
+    let provider_step = (!evaluation_adoption)
+        .then(|| parse_provider_rerun_step(&args.from_step))
+        .transpose()?;
     validate_run_id(&args.run_id)?;
-    let step = parse_provider_rerun_step(&args.from_step)?;
     let workspace = LoopWorkspace::open(&args.runs_root, &args.run_id)
         .map_err(|error| CliFailure::message(format!("could not open loop run: {error}")))?;
+    if evaluation_adoption {
+        let outcome = adopt_approved_evaluation(&workspace, &args.actor, &args.reason)
+            .map_err(|error| CliFailure::message(error.to_string()))?;
+        let report = serde_json::json!({
+            "command": "revise",
+            "run_id": outcome.run.run_id,
+            "status": outcome.run.status,
+            "current_step": outcome.run.current_step,
+            "recovery_id": outcome.reference.recovery_id,
+            "recovery": outcome.reference.artifact,
+            "evaluation_attempt": outcome.recovery.evaluation_attempt,
+            "report_disposition": outcome.recovery.report_disposition,
+            "eval_report": outcome.recovery.eval_report,
+        });
+        return if args.json {
+            print_json(&report)
+        } else {
+            println!(
+                "adopted complete evaluation prefix for loop {} as recovery {}",
+                outcome.run.run_id, outcome.reference.recovery_id
+            );
+            println!("recovery artifact: {}", outcome.reference.artifact.path);
+            println!("EvalReport artifact: {}", outcome.recovery.eval_report.path);
+            Ok(())
+        };
+    }
+    let step = provider_step.expect("non-evaluation revise parsed provider step");
     let outcome = revise_provider_step(&workspace, step, &args.actor, &args.reason)
         .map_err(|error| CliFailure::message(error.to_string()))?;
     let report = serde_json::json!({

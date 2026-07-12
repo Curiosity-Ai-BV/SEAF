@@ -44,23 +44,31 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09c2b - Zero-command adoption transaction. Add
-`loop revise --from-step testing --eval-recovery adopt --actor <actor> --reason
-<reason>` and no other evaluation action. Provider steps must reject the option;
-Testing without it must reject before mutation. Fresh adoption accepts only an
-exact Approved/Testing source with an active candidate, consumed prior provider
-recovery, and one complete verified fixed-v1 or indexed-v2
-intent/log/Testing prefix. EvalReport may be absent or exact. Partial, mixed,
-future, substituted, pending-recovery, terminal, promotion-intent, input,
-candidate, source, provider, or namespace drift fails closed.
+M1-09c3 - Evaluation invalidation and fresh rerun. Extend
+`loop revise --from-step testing --eval-recovery invalidate --actor <actor>
+--reason <reason>` without changing provider recovery or adoption-v2 behavior.
+Eligible authority is either exact Approved/Testing with one factual latest
+incomplete evaluation prefix, or active approval-bound final Failed whose exact
+Approved predecessor and attempt evidence verify. EvalPassed, Promoted,
+promotion intent, legacy missing-evaluation authority, pending recovery,
+inactive candidate, malformed/mixed/gapped history, or any input, candidate,
+source, provider, artifact, and namespace drift fails closed before mutation.
 
-Under the candidate lock, preflight every source/recovery/report collision
-before the first write. Publish the exact prefix-bearing source snapshot,
-evaluation-v2 recovery, and only a missing deterministic EvalReport; execute
-zero evaluation commands and make zero provider calls. Reauthenticate all
-authority, then use one dedicated provider-lock Approved-to-final CAS that
-advances `latest_recovery` without weakening ordinary final relations. Cover
-every crash cut and concurrent winner. An exact post-CAS retry is byte-inert
-only when action, actor, reason, and adopted final authority all match; arbitrary
-fresh Failed/EvalPassed/Promoted adoption remains forbidden. Do not add
-invalidation, rerun, attempt 2, general M1-10 locking, or artifact protection.
+Invalidation executes zero commands and makes zero provider calls. Under the
+candidate-then-provider lock order, preflight and publish a dedicated
+create-only source snapshot and invalidation decision bound to every present
+prefix byte, exact prior/final authority, next contiguous evaluation attempt,
+actor/reason/time, and zero-digest reset projection. Preserve all prior
+intent/log/Testing/EvalReport bytes and provider history; reset only current
+Testing/EvalReport/final references to the reconstructed Approved authority and
+advance `latest_recovery` by one CAS. Exact revise retry is byte-inert.
+
+Only `loop rerun --recovery <id>` may consume the pending invalidation and start
+its one authorized fresh indexed attempt. The new intent and Testing evidence
+must bind that recovery reference; ordinary resume/evaluation rejects before
+consumption. Once any artifact for that attempt exists, the same recovery may
+not replay commands within the attempt: another audited invalidation is needed
+to authorize the next contiguous attempt. Cover incomplete-prefix shapes,
+final-Failed reset, every publication cut, competing callers, repeated
+invalidate/rerun cycles, and frozen adoption/promotion regressions. Do not add
+general M1-10 locking, artifact protection, or distribution work.

@@ -81,9 +81,10 @@ pub use provider_exchange::{
     PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 pub use recovery::{
-    ensure_no_pending_recovery, load_verified_latest_recovery, revise_provider_step,
-    validate_requested_recovery, RecoveryAction, RecoveryAttemptV1, RecoveryError,
-    RecoveryRevisionOutcome, RecoverySourceRunV1, RECOVERY_SCHEMA_VERSION,
+    adopt_approved_evaluation, ensure_no_pending_recovery, load_verified_latest_recovery,
+    revise_provider_step, validate_requested_recovery, EvaluationAdoptionOutcome, RecoveryAction,
+    RecoveryAttemptV1, RecoveryError, RecoveryRevisionOutcome, RecoverySourceRunV1,
+    RECOVERY_SCHEMA_VERSION,
 };
 pub use role_artifact::{RoleArtifactError, ValidatedRoleArtifact};
 pub use role_response::{

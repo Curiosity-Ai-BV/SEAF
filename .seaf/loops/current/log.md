@@ -1849,3 +1849,55 @@ Controller verification passes the full workspace: CLI 134, core 51, loop unit
 provider-exchange 22, state 32, and every remaining Rust integration and doc-test
 suite. Strict all-target/all-feature Clippy, Rust formatting, and diff checks
 pass. M1-09c2a is accepted and M1-09c2b zero-command adoption is active.
+
+## 2026-07-12 implementation | M1-09c2b zero-command adoption transaction
+
+Added `loop revise --from-step testing --eval-recovery adopt --actor <actor>
+--reason <reason>` and the public `adopt_approved_evaluation` operation. CLI
+grammar rejects Testing without adoption, every other evaluation action, and
+provider-step use of the evaluation flag before workspace lookup. Adoption
+holds the candidate lock, accepts one complete exact fixed-v1 or indexed-v2
+attempt-1 prefix, and executes no evaluation command or provider call.
+
+The transaction verifies all six authoritative input snapshots, physical
+candidate and source-worktree authority, the provider ledger, intent, Testing,
+every paired log, and deterministic EvalReport bytes. A shared integrated
+report builder keeps ordinary execution and adoption byte-identical. Complete
+preflight covers source, recovery, and report targets before the first write;
+publication is source snapshot, evaluation-v2 recovery, optional missing
+report, full reauthentication, then one dedicated Approved-to-final provider
+CAS that advances exactly one recovery ID. Existing reports are byte-verified;
+missing reports alone are created. The final timestamp is the recovery audit
+timestamp.
+
+Crash recovery inherits both timestamp and CreateMissing/VerifyExisting
+disposition from exact source/recovery orphans. Source-only, recovery, report,
+pre-CAS, and post-CAS states converge to the same bytes. Exact post-CAS retry is
+inert for adopted pass or failure only when action, actor, reason, and the full
+final authority match. Fresh terminal authority, Failed cleanup descendants,
+promotion intent, future attempts, pending provider recovery, prior evaluation
+recovery, or any drift remains forbidden. Same concurrent requests converge;
+different requests produce one audit winner and no recovery-002 orphan.
+
+Independent review found that the first implementation authenticated only the
+eval configuration, not every durable input, and that retry initially omitted
+input, staged-provider, and promotion-intent rechecks. A shared crate-private
+input loader now verifies ticket, policy, config, repository, eval config, and
+provider ticket canonical bytes/digests on fresh adoption and retry. Controller
+review then found that a noncanonical orphan timestamp could survive preflight
+until after a later publication; source and recovery orphan timestamps now fail
+before deriving any write. Both fixes have byte-inert adversarial regressions,
+and final independent re-review approves with no remaining P0/P1 findings.
+
+RED began with the missing adoption API. Coverage now includes the full
+fixed/indexed by report-present/missing by pass/fail matrix, zero ledger/log/
+candidate mutation, CLI success and fail-fast grammar, input/report/attempt-2
+preflight drift, impossible and conflicting orphans, all durable crash states,
+audit substitution, active and terminal lineage, promotion and retry drift,
+noncanonical orphan time, and concurrent same/different callers. The controller
+full workspace passes: CLI 136, core 51, loop unit 136, provider-candidate 40,
+candidate 39, context expansion 22, policy 13, provider-exchange 22, state 32,
+and every remaining Rust integration and doc-test suite. Strict all-target/
+all-feature Clippy, Rust and Prettier formatting, package lint/typecheck, 8 SDK
+tests, SDK build, and diff checks also pass through pinned pnpm 11.7.0. M1-09c2
+is accepted and M1-09c3 evaluation invalidation and fresh rerun is active.
