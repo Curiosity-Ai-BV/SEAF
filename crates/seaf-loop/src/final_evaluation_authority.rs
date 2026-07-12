@@ -113,7 +113,7 @@ pub fn load_verified_final_evaluation_authority(
         ));
     }
 
-    let approved_run = reconstruct_approved_authority(run)?;
+    let approved_run = reconstruct_approved_authority(workspace, run)?;
     let testing_evidence =
         TestingEvidence::load_for_approved_run(workspace, &testing_reference, &approved_run)
             .map_err(|error| {
@@ -265,6 +265,7 @@ fn load_eval_config(
 }
 
 fn reconstruct_approved_authority(
+    workspace: &LoopWorkspace,
     final_run: &LoopRun,
 ) -> Result<LoopRun, FinalEvaluationAuthorityError> {
     let approval = final_run.human_approval.as_ref().ok_or_else(|| {
@@ -295,6 +296,18 @@ fn reconstruct_approved_authority(
         candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Active;
         candidate.cleanup_started_at = None;
         candidate.cleaned_at = None;
+    }
+    let recovery_source =
+        crate::recovery::load_evaluation_recovery_source_for_final(workspace, final_run)
+            .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    if let Some(source) = recovery_source {
+        approved.latest_recovery = source.latest_recovery.clone();
+        if approved != source {
+            return Err(FinalEvaluationAuthorityError::invalid(
+                "final LoopRun is not an allowed descendant of its evaluation recovery source",
+            ));
+        }
+        approved = source;
     }
     let errors = validate_loop_run(&approved);
     if !errors.is_empty() {

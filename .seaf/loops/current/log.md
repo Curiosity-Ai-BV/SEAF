@@ -1804,3 +1804,48 @@ suite. Strict all-target/all-feature Clippy, Rust and Prettier formatting,
 package lint/typecheck, 8 SDK tests, SDK build, and diff checks pass through
 pinned pnpm 11.7.0. M1-09c1 is accepted and M1-09c2 zero-command evaluation
 adoption is active.
+
+## 2026-07-12 implementation | M1-09c2a versioned evaluation recovery authority
+
+Added evaluation-specific durable recovery contracts without changing provider
+recovery v1. `EvaluationRecoverySourceRunV2` binds the exact Approved run,
+actor/reason/time, and a typed fixed-v1 or indexed-v2 prefix manifest.
+`EvaluationRecoveryAttemptV2` binds the source, full input/candidate/source and
+provider lineage, intent, Testing, expected EvalReport, VerifyExisting or
+CreateMissing disposition, prior recovery, and a zero-digest final projection.
+A crate-private, iterative discriminated reader authenticates provider v1 and
+evaluation v2 in one contiguous chain while the public provider-v1 structs,
+writer, loader, bytes, and rerun behavior remain unchanged.
+
+Final evaluation authority now detects an evaluation-v2 `latest_recovery` and
+reconstructs the byte-exact Approved predecessor from its verified source
+snapshot. Direct c1 and provider-v1 finals keep the existing path. Passing and
+reported-failure finals bind the recovery timestamp and exact Testing/EvalReport
+references. Promoted authority normalizes to its frozen EvalPassed predecessor;
+only approval-bound Failed may normalize monotonic Cleaning/Cleaned candidate
+descendants. Every Testing log is reread and digest checked. CreateMissing
+authority accepts an absent report before publication or only the exact expected
+report afterward.
+
+Review found and closed two lineage/state gaps. A valid but unconsumed provider
+recovery could initially be grafted onto an Approved source; the reader now
+accepts only no predecessor or a demonstrably consumed provider-v1 recovery and
+rejects prior evaluation v2. The positive fixture performs a real OutputReview
+attempt-2 request/response and reapproval. Cleanup normalization also initially
+accepted EvalPassed Cleaning/Cleaned shapes; it is now restricted to
+approval-bound Failed. Independent re-review approves the corrected foundation
+with no remaining actionable findings.
+
+RED began with missing evaluation-v2 types. Coverage now includes fixed-v1
+pass/fail, indexed-v2, exact CreateMissing before/after report publication,
+consumed and pending provider-v1 lineage, source/prefix/disposition/projection/
+reference/log/provider/descendant tamper, malformed expected report digest,
+Failed cleanup, and frozen EvalPassed cleanup rejection. No recovery writer,
+CLI, report creation, adoption CAS, invalidation, rerun, or attempt-2 evaluation
+behavior is present.
+
+Controller verification passes the full workspace: CLI 134, core 51, loop unit
+136, candidate 39, context expansion 22, policy 13, provider-candidate 31,
+provider-exchange 22, state 32, and every remaining Rust integration and doc-test
+suite. Strict all-target/all-feature Clippy, Rust formatting, and diff checks
+pass. M1-09c2a is accepted and M1-09c2b zero-command adoption is active.

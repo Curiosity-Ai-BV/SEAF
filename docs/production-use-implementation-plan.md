@@ -1463,7 +1463,8 @@ change into the preview release notes.
 
 ### M1-09c2 - Zero-Command Evaluation Adoption
 
-Status: active. Dependencies: M1-09c1 (complete).
+Status: active. Split into M1-09c2a recovery authority and M1-09c2b adoption
+transaction. Dependencies: M1-09c1 (complete).
 
 Objective: publish audited recovery and finalize one complete interrupted v1 or
 v2 evaluation prefix without executing commands.
@@ -1474,6 +1475,50 @@ Approved reconstruction, deterministic missing EvalReport creation, and
 Approved-to-final recovery CAS without weakening ordinary final relations.
 
 Commit boundary: adoption only; no invalidation or command execution.
+
+### M1-09c2a - Versioned Evaluation Recovery Authority
+
+Status: complete. Dependencies: M1-09c1 (complete).
+
+Objective: add typed evaluation recovery lineage and recovery-aware final
+reconstruction before exposing an adoption operation.
+
+Acceptance criteria:
+
+- Provider recovery v1 remains byte-, API-, and behavior-compatible. A private
+  discriminated loader authenticates provider v1 or evaluation v2 in the same
+  contiguous recovery chain.
+- Evaluation v2 uses a prefix-bearing source snapshot and binds exact Approved,
+  input, candidate, source, provider, intent, Testing, expected EvalReport,
+  report disposition, prior recovery, and zero-digest final projection
+  authority.
+- Final evaluation authority reconstructs the exact Approved predecessor from
+  the v2 source snapshot and validates pass/fail, Failed-cleanup, and Promoted
+  descendants without weakening direct c1 or provider-v1 final relations.
+- No writer, CLI option, report creation, adoption CAS, invalidation, rerun, or
+  attempt-2 behavior is added.
+
+RED: v1 compatibility; v2 pass/fail reconstruction; mixed lineage; source,
+prefix, disposition, projection, reference, and descendant substitution.
+
+Verification: recovery/final/provider/promotion suites, full workspace, format,
+Clippy, and diff check.
+
+Commit boundary: typed evaluation recovery reader and final reconstruction only.
+
+### M1-09c2b - Zero-Command Adoption Transaction
+
+Status: active. Dependencies: M1-09c2a (complete).
+
+Objective: expose exact complete-prefix adoption with no command or provider
+execution.
+
+Acceptance criteria: M1-09c2 criteria above, including preflight-before-write,
+deterministic report verification/creation, candidate-to-provider adoption CAS,
+all crash cuts, and inert exact post-CAS retry for the same action, actor, and
+reason. Arbitrary fresh terminal adoption remains forbidden.
+
+Commit boundary: adoption writer and CLI only; no invalidation or rerun.
 
 ### M1-09c3 - Evaluation Invalidation And Rerun
 

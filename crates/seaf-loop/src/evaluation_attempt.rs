@@ -202,6 +202,31 @@ impl EvaluationAttemptInventory {
         }
         Ok(())
     }
+
+    pub(crate) fn require_recovery_prefix(
+        &self,
+        attempt: u32,
+        intent: &str,
+        testing: &str,
+        report: &str,
+        allow_missing_report: bool,
+        checks: &[EvalCheck],
+    ) -> Result<bool, String> {
+        let selected = self
+            .attempts
+            .get(&attempt)
+            .ok_or_else(|| "recovery evaluation attempt is absent".to_string())?;
+        let report_present = selected.report.as_deref() == Some(report);
+        if self.attempts.keys().next_back().copied() != Some(attempt)
+            || selected.intent.as_deref() != Some(intent)
+            || selected.testing.as_deref() != Some(testing)
+            || (!report_present && (!allow_missing_report || selected.report.is_some()))
+        {
+            return Err("recovery prefix does not select one exact latest attempt".into());
+        }
+        self.validate_selected_logs(attempt, checks)?;
+        Ok(report_present)
+    }
 }
 
 pub(crate) fn selected_attempt(
@@ -620,6 +645,63 @@ mod tests {
             summary: None,
         }];
         assert!(inventory.validate_selected_logs(1, &checks).is_err());
+    }
+
+    #[test]
+    fn recovery_prefix_allows_create_missing_before_and_after_exact_report_publication() {
+        let (_temp, workspace) = workspace("create-missing-prefix");
+        for name in [
+            "07-testing.attempt-001.execution-intent.json",
+            "07-testing.attempt-001.check-001.stdout.log",
+            "07-testing.attempt-001.check-001.stderr.log",
+            "07-testing.attempt-001.json",
+        ] {
+            write(&workspace, name, b"x");
+        }
+        let checks = vec![EvalCheck {
+            name: "one".into(),
+            status: CheckStatus::Passed,
+            duration_ms: Some(1),
+            stdout_path: Some("artifacts/07-testing.attempt-001.check-001.stdout.log".into()),
+            stdout_digest: Some("a".repeat(64)),
+            stderr_path: Some("artifacts/07-testing.attempt-001.check-001.stderr.log".into()),
+            stderr_digest: Some("b".repeat(64)),
+            summary: None,
+        }];
+        let inventory = EvaluationAttemptInventory::load(&workspace).unwrap();
+        assert!(!inventory
+            .require_recovery_prefix(
+                1,
+                "artifacts/07-testing.attempt-001.execution-intent.json",
+                "artifacts/07-testing.attempt-001.json",
+                "artifacts/08-eval-report.attempt-001.json",
+                true,
+                &checks,
+            )
+            .unwrap());
+        assert!(inventory
+            .require_recovery_prefix(
+                1,
+                "artifacts/07-testing.attempt-001.execution-intent.json",
+                "artifacts/07-testing.attempt-001.json",
+                "artifacts/08-eval-report.attempt-001.json",
+                false,
+                &checks,
+            )
+            .is_err());
+
+        write(&workspace, "08-eval-report.attempt-001.json", b"report");
+        let inventory = EvaluationAttemptInventory::load(&workspace).unwrap();
+        assert!(inventory
+            .require_recovery_prefix(
+                1,
+                "artifacts/07-testing.attempt-001.execution-intent.json",
+                "artifacts/07-testing.attempt-001.json",
+                "artifacts/08-eval-report.attempt-001.json",
+                true,
+                &checks,
+            )
+            .unwrap());
     }
 
     #[test]

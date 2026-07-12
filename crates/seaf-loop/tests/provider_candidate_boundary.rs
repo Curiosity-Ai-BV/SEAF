@@ -7,17 +7,23 @@ use std::{
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, CheckStatus, EvalCheck,
     EvalDecision, EvalLoopEvidence, EvalReport, LoopInputDigests, LoopStepName, Policy,
-    ProviderExchangeKind, ProviderExchangePhase, ProviderExchangeRecord, ProviderRole, RiskLevel,
-    TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
+    ProviderExchangeKind, ProviderExchangePhase, ProviderExchangeRecord, ProviderRole,
+    RecoveryReference, RiskLevel, TicketAutonomy, TicketContext, TicketPriority, TicketSpec,
+    TicketStatus,
+};
+use seaf_loop::recovery::{
+    EvaluationPrefixAuthorityV1, EvaluationPrefixSpellingV1, EvaluationRecoveryAction,
+    EvaluationRecoveryAttemptV2, EvaluationRecoveryReportDisposition,
+    EvaluationRecoverySourceRunV2, EVALUATION_RECOVERY_SCHEMA_VERSION,
 };
 use seaf_loop::{
     approve_candidate_for_testing, artifacts::write_step_request,
     cleanup_candidate_workspace_outcome, load_verified_final_evaluation_authority,
-    persist_provider_exchange_record_reference, stage_provider_exchange_record,
-    verify_candidate_patch_evidence, write_provider_exchange_request,
-    AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits, ContextPackRequest,
-    InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchCommand,
-    PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
+    persist_provider_exchange_record_reference, revise_provider_step,
+    stage_provider_exchange_record, verify_candidate_patch_evidence,
+    write_provider_exchange_request, AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits,
+    ContextPackRequest, InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace,
+    PatchCommand, PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
     ProviderPatchGateConfig, ProviderStepRunner, StepRunner, TestingEvidence,
     PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
@@ -682,6 +688,268 @@ fn public_writers_cannot_mint_final_evaluation_authority_from_approved() {
         assert!(save_error.to_string().contains("final evaluation"));
         assert!(write_error.to_string().contains("final evaluation"));
         assert_eq!(fs::read(fixture.workspace.run_file()).unwrap(), before);
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_recovery_v2_reconstructs_exact_approved_for_pass_and_failure() {
+    for passed in [true, false] {
+        let run_id = if passed {
+            "eval-recovery-v2-pass"
+        } else {
+            "eval-recovery-v2-fail"
+        };
+        let (fixture, approved) = approved_fixture(run_id);
+        let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, passed);
+        let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+
+        let authority = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+            .expect("evaluation-v2 final must reconstruct its exact Approved source");
+
+        assert_eq!(authority.approved_run(), &approved);
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_recovery_v2_authenticates_indexed_v2_prefix() {
+    let (fixture, approved) = approved_fixture("eval-recovery-indexed-v2");
+    let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+
+    let authority = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+        .expect("indexed-v2 adoption authority must verify");
+
+    assert_eq!(authority.approved_run(), &approved);
+    assert_eq!(authority.testing_evidence().schema_version, 2);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_recovery_create_missing_accepts_the_exact_created_report() {
+    let (fixture, approved) = approved_fixture("eval-recovery-create-missing");
+    let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let mut recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+    rewrite_evaluation_recovery_source(&fixture.workspace, &mut recovered, |source| {
+        source.evaluation_prefix.eval_report = None;
+    });
+    rewrite_evaluation_recovery(&fixture.workspace, &mut recovered, |recovery| {
+        recovery.report_disposition = EvaluationRecoveryReportDisposition::CreateMissing;
+    });
+
+    load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+        .expect("CreateMissing must accept only its exact deterministic report after publication");
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_recovery_v2_rejects_pending_provider_v1_graft() {
+    let (fixture, approved) = approved_fixture("eval-recovery-mixed-lineage");
+    let provider_recovery = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::OutputReview,
+        "reviewer@example.invalid",
+        "revise output review before evaluation",
+    )
+    .expect("publish valid provider-v1 recovery authority");
+    let mut mixed_approved = approved;
+    mixed_approved.latest_recovery = Some(provider_recovery.reference);
+    let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &mixed_approved, true);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &mixed_approved, direct);
+
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+        .expect_err("evaluation recovery cannot graft an unconsumed provider recovery");
+
+    assert!(error.to_string().contains("provider"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_recovery_v2_accepts_consumed_provider_v1_then_evaluation_v2_lineage() {
+    let (fixture, approved) = approved_fixture("eval-recovery-consumed-lineage");
+    let provider_recovery = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::OutputReview,
+        "reviewer@example.invalid",
+        "revise output review before evaluation",
+    )
+    .expect("publish valid provider-v1 recovery authority");
+    let mixed_approved = consume_output_review_recovery_and_reapprove(
+        &fixture,
+        provider_recovery.recovery.next_step_attempt,
+    );
+    assert_eq!(
+        mixed_approved.latest_recovery,
+        Some(provider_recovery.reference)
+    );
+    assert!(
+        mixed_approved.provider_exchange_records.len() > approved.provider_exchange_records.len()
+    );
+    let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &mixed_approved, true);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &mixed_approved, direct);
+
+    let authority = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+        .expect("consumed provider-v1 may precede evaluation-v2 recovery");
+
+    assert_eq!(authority.approved_run(), &mixed_approved);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_adoption_rejects_prior_evaluation_v2_recovery() {
+    let (fixture, approved) = approved_fixture("eval-recovery-prior-eval-v2");
+    let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let first = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+    let mut grafted_approved = approved;
+    grafted_approved.latest_recovery = first.latest_recovery.clone();
+    let second = publish_evaluation_recovery_v2(&fixture.workspace, &grafted_approved, first);
+
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &second)
+        .expect_err("adoption cannot descend from prior evaluation-v2 recovery");
+
+    assert!(error.to_string().contains("evaluation-v2"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_recovery_v2_rejects_source_prefix_disposition_projection_and_descendant_tamper() {
+    for mutation in [
+        "source",
+        "prefix",
+        "disposition",
+        "projection",
+        "reference",
+        "log",
+        "provider",
+        "descendant",
+    ] {
+        let run_id = format!("eval-recovery-tamper-{mutation}");
+        let (fixture, approved) = approved_fixture(&run_id);
+        let direct = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+        let mut recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+        match mutation {
+            "source" => {
+                rewrite_evaluation_recovery_source(&fixture.workspace, &mut recovered, |source| {
+                    source
+                        .run
+                        .candidate_workspace
+                        .as_mut()
+                        .unwrap()
+                        .candidate_head = "b".repeat(40);
+                })
+            }
+            "prefix" => {
+                rewrite_evaluation_recovery_source(&fixture.workspace, &mut recovered, |source| {
+                    source.evaluation_prefix.spelling = EvaluationPrefixSpellingV1::FixedV1;
+                })
+            }
+            "disposition" => {
+                rewrite_evaluation_recovery(&fixture.workspace, &mut recovered, |recovery| {
+                    recovery.report_disposition =
+                        EvaluationRecoveryReportDisposition::CreateMissing;
+                })
+            }
+            "projection" => {
+                rewrite_evaluation_recovery(&fixture.workspace, &mut recovered, |recovery| {
+                    recovery.expected_final_projection_digest = "b".repeat(64);
+                })
+            }
+            "reference" => {
+                rewrite_evaluation_recovery(&fixture.workspace, &mut recovered, |recovery| {
+                    recovery.testing_evidence.digest = "b".repeat(64);
+                })
+            }
+            "log" => {
+                fs::write(
+                    fixture
+                        .workspace
+                        .run_directory()
+                        .join("artifacts/07-testing.attempt-001.check-001.stdout.log"),
+                    b"substituted log\n",
+                )
+                .unwrap();
+            }
+            "provider" => {
+                let path = &approved.provider_exchange_records.last().unwrap().path;
+                fs::write(fixture.workspace.run_directory().join(path), b"substituted").unwrap();
+            }
+            "descendant" => recovered.updated_at = "99".to_string(),
+            _ => unreachable!(),
+        }
+
+        let error = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+            .expect_err("evaluation recovery tamper must fail closed");
+        assert!(!error.to_string().is_empty(), "{mutation}");
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_recovery_v2_accepts_only_monotonic_failed_cleanup_descendants() {
+    let (fixture, approved) = approved_fixture("eval-recovery-v2-cleanup");
+    let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, false);
+    let recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+    let base_time = recovered.updated_at.parse::<u64>().unwrap();
+    let started_at = base_time.checked_add(1).unwrap().to_string();
+    let cleaned_at = base_time.checked_add(2).unwrap().to_string();
+
+    let mut cleaning = recovered.clone();
+    let candidate = cleaning.candidate_workspace.as_mut().unwrap();
+    candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaning;
+    candidate.cleanup_started_at = Some(started_at.clone());
+    cleaning.updated_at = started_at;
+    load_verified_final_evaluation_authority(&fixture.workspace, &cleaning)
+        .expect("monotonic Cleaning descendant remains verifiable");
+
+    let mut cleaned = cleaning;
+    let candidate = cleaned.candidate_workspace.as_mut().unwrap();
+    candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Cleaned;
+    candidate.cleaned_at = Some(cleaned_at.clone());
+    cleaned.updated_at = cleaned_at;
+    load_verified_final_evaluation_authority(&fixture.workspace, &cleaned)
+        .expect("monotonic Cleaned descendant remains verifiable");
+
+    let mut arbitrary = recovered;
+    arbitrary.updated_at = "99".to_string();
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &arbitrary)
+        .expect_err("an arbitrary Failed timestamp is not cleanup authority");
+    assert!(error.to_string().contains("cleanup"), "{error}");
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_recovery_v2_rejects_eval_passed_cleanup_descendants() {
+    for lifecycle in [
+        seaf_core::CandidateWorkspaceLifecycle::Cleaning,
+        seaf_core::CandidateWorkspaceLifecycle::Cleaned,
+    ] {
+        let suffix = match lifecycle {
+            seaf_core::CandidateWorkspaceLifecycle::Cleaning => "cleaning",
+            seaf_core::CandidateWorkspaceLifecycle::Cleaned => "cleaned",
+            _ => unreachable!(),
+        };
+        let (fixture, approved) = approved_fixture(&format!("eval-passed-{suffix}"));
+        let direct = publish_final_eval_artifacts(&fixture.workspace, &approved, true);
+        let mut recovered = publish_evaluation_recovery_v2(&fixture.workspace, &approved, direct);
+        let base_time = recovered.updated_at.parse::<u64>().unwrap();
+        let started_at = base_time.checked_add(1).unwrap().to_string();
+        let cleaned_at = base_time.checked_add(2).unwrap().to_string();
+        let candidate = recovered.candidate_workspace.as_mut().unwrap();
+        candidate.lifecycle = lifecycle;
+        candidate.cleanup_started_at = Some(started_at.clone());
+        recovered.updated_at = started_at;
+        if lifecycle == seaf_core::CandidateWorkspaceLifecycle::Cleaned {
+            candidate.cleaned_at = Some(cleaned_at.clone());
+            recovered.updated_at = cleaned_at;
+        }
+
+        let error = load_verified_final_evaluation_authority(&fixture.workspace, &recovered)
+            .expect_err("EvalPassed recovery authority must remain frozen and non-cleanable");
+        assert!(
+            error.to_string().contains("cleanup") || error.to_string().contains("active"),
+            "{error}"
+        );
         fixture.cleanup();
     }
 }
@@ -1738,6 +2006,8 @@ struct AwaitingApprovalFixture {
     _temp: tempfile::TempDir,
     source: PathBuf,
     candidate: PathBuf,
+    ticket: TicketSpec,
+    policy: Policy,
     workspace: LoopWorkspace,
 }
 
@@ -1763,7 +2033,7 @@ fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
         .with_ticket(ticket.clone())
         .with_context_pack_request(context_request(&candidate, &ticket))
         .with_patch_gate(
-            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy.clone(), true),
             &mut patch_runner,
         );
     let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).expect("start");
@@ -1777,6 +2047,8 @@ fn awaiting_approval_fixture(run_id: &str) -> AwaitingApprovalFixture {
         _temp,
         source,
         candidate,
+        ticket,
+        policy,
         workspace,
     }
 }
@@ -1804,6 +2076,64 @@ fn approved_fixture(run_id: &str) -> (AwaitingApprovalFixture, seaf_core::LoopRu
     .unwrap()
     .run;
     (fixture, approved)
+}
+
+fn consume_output_review_recovery_and_reapprove(
+    fixture: &AwaitingApprovalFixture,
+    attempt: u32,
+) -> seaf_core::LoopRun {
+    let reset = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let runs_root = fixture.workspace.run_directory().parent().unwrap();
+    let initialized =
+        InitializedLoopRun::resume_isolated_for_rerun(runs_root, reset, LoopStepName::OutputReview)
+            .unwrap();
+    let run_directory = fixture.workspace.run_directory();
+    let read = |path: &str| fs::read(run_directory.join(path)).unwrap();
+    let prepared = initialized
+        .scaffold()
+        .unwrap()
+        .publish_authoritative_inputs(AuthoritativeRunInputSnapshots {
+            ticket: read("inputs/ticket.json"),
+            provider_ticket: read("ticket.snapshot.json"),
+            policy: read("inputs/policy.json"),
+            config: read("inputs/config.json"),
+            repository: read("inputs/repository.json"),
+            eval_config: read("inputs/eval-config.json"),
+        })
+        .unwrap();
+    let provider = FakeProvider::new(vec![response(
+        r#"{"role":"output_reviewer","decision":"approve_for_tests","summary":"The revised candidate still matches the approved spec.","blocking_issues":[],"non_blocking_issues":[]}"#,
+    )]);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        )
+        .with_recovery_attempt(LoopStepName::OutputReview, attempt);
+    let mut runner = LoopRunner::resume_initialized(prepared, &mut step_runner).unwrap();
+    runner.run_to_completion().unwrap();
+    let awaiting = runner.run().clone();
+    drop(runner);
+    drop(step_runner);
+    assert_eq!(awaiting.status, seaf_core::LoopStatus::AwaitingHumanReview);
+    let candidate = awaiting.candidate_workspace.as_ref().unwrap();
+    approve_candidate_for_testing(
+        &fixture.workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .unwrap()
+    .run
 }
 
 fn publish_final_eval_artifacts(
@@ -1966,6 +2296,306 @@ fn publish_final_eval_artifacts(
         .approved_at
         .clone();
     run
+}
+
+fn publish_evaluation_recovery_v2(
+    workspace: &LoopWorkspace,
+    approved: &seaf_core::LoopRun,
+    mut final_run: seaf_core::LoopRun,
+) -> seaf_core::LoopRun {
+    let recovery_id = approved
+        .latest_recovery
+        .as_ref()
+        .map_or(1, |reference| reference.recovery_id + 1);
+    let actor = "reviewer@example.invalid".to_string();
+    let reason = "adopt complete interrupted evaluation".to_string();
+    let created_at = approved
+        .human_approval
+        .as_ref()
+        .unwrap()
+        .approved_at
+        .clone();
+    let testing = final_run
+        .steps
+        .iter()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    let testing_reference = ArtifactReference {
+        path: testing.artifact_path.clone().unwrap(),
+        digest: testing.artifact_digest.clone().unwrap(),
+    };
+    let testing_evidence: TestingEvidence = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join(&testing_reference.path)).unwrap(),
+    )
+    .unwrap();
+    let intent_path = testing_evidence
+        .execution_intent
+        .as_ref()
+        .map_or("artifacts/07-testing.execution-intent.json", |value| {
+            value.path.as_str()
+        });
+    let intent_reference = ArtifactReference {
+        path: intent_path.to_string(),
+        digest: format!(
+            "{:x}",
+            Sha256::digest(fs::read(workspace.run_directory().join(intent_path)).unwrap())
+        ),
+    };
+    let intent_value: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.run_directory().join(intent_path)).unwrap())
+            .unwrap();
+    let source_worktree_state_digest = intent_value
+        .get("source_worktree_state_digest")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| "a".repeat(64), str::to_string);
+    let report = final_run
+        .steps
+        .iter()
+        .find(|step| step.name == LoopStepName::EvalReport)
+        .unwrap();
+    let report_reference = ArtifactReference {
+        path: report.artifact_path.clone().unwrap(),
+        digest: report.artifact_digest.clone().unwrap(),
+    };
+    let source = EvaluationRecoverySourceRunV2 {
+        schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
+        recovery_id,
+        actor: actor.clone(),
+        reason: reason.clone(),
+        created_at: created_at.clone(),
+        run: approved.clone(),
+        evaluation_prefix: EvaluationPrefixAuthorityV1 {
+            evaluation_attempt: 1,
+            spelling: if testing_evidence.schema_version == 1 {
+                EvaluationPrefixSpellingV1::FixedV1
+            } else {
+                EvaluationPrefixSpellingV1::IndexedV2
+            },
+            execution_intent: intent_reference.clone(),
+            testing_evidence: testing_reference.clone(),
+            eval_report: Some(report_reference.clone()),
+        },
+    };
+    let source_path = format!("artifacts/recovery-{recovery_id:03}.source-run.json");
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    let source_reference = ArtifactReference {
+        path: source_path.clone(),
+        digest: format!("{:x}", Sha256::digest(&source_bytes)),
+    };
+    fs::write(workspace.run_directory().join(source_path), source_bytes).unwrap();
+    let recovery_path = format!("artifacts/recovery-{recovery_id:03}.json");
+    let zero_reference = RecoveryReference {
+        recovery_id,
+        artifact: ArtifactReference {
+            path: recovery_path.clone(),
+            digest: "0".repeat(64),
+        },
+    };
+    final_run.latest_recovery = Some(zero_reference);
+    let projection_digest = canonical_sha256_digest(&final_run).unwrap();
+    let candidate = approved.candidate_workspace.as_ref().unwrap();
+    let recovery = EvaluationRecoveryAttemptV2 {
+        schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
+        recovery_id,
+        run_id: approved.run_id.clone(),
+        action: EvaluationRecoveryAction::AdoptApprovedEvaluation,
+        step: LoopStepName::Testing,
+        actor,
+        reason,
+        created_at,
+        source_run: source_reference,
+        source_run_digest: canonical_sha256_digest(approved).unwrap(),
+        input_digests: approved.input_digests.clone(),
+        candidate_state_digest: canonical_sha256_digest(candidate).unwrap(),
+        candidate_head: candidate.candidate_head.clone(),
+        candidate_tree: candidate.candidate_tree.clone(),
+        candidate_diff_digest: candidate.candidate_diff_digest.clone(),
+        source_worktree_state_digest,
+        evaluation_attempt: 1,
+        execution_intent: intent_reference,
+        testing_evidence: testing_reference,
+        eval_report: report_reference,
+        report_disposition: EvaluationRecoveryReportDisposition::VerifyExisting,
+        previous_recovery: approved.latest_recovery.clone(),
+        previous_provider_head: approved.provider_exchange_records.last().cloned(),
+        expected_final_projection_digest: projection_digest,
+    };
+    let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
+    let recovery_reference = RecoveryReference {
+        recovery_id,
+        artifact: ArtifactReference {
+            path: recovery_path.clone(),
+            digest: format!("{:x}", Sha256::digest(&recovery_bytes)),
+        },
+    };
+    fs::write(
+        workspace.run_directory().join(recovery_path),
+        recovery_bytes,
+    )
+    .unwrap();
+    final_run.latest_recovery = Some(recovery_reference);
+    final_run
+}
+
+fn publish_indexed_final_eval_artifacts(
+    workspace: &LoopWorkspace,
+    approved: &seaf_core::LoopRun,
+    passed: bool,
+) -> seaf_core::LoopRun {
+    let fixed = publish_final_eval_artifacts(workspace, approved, passed);
+    let fixed_testing_path = "artifacts/07-testing.json";
+    let fixed_report_path = "artifacts/08-eval-report.json";
+    let mut testing: TestingEvidence = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join(fixed_testing_path)).unwrap(),
+    )
+    .unwrap();
+    let mut report: EvalReport = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join(fixed_report_path)).unwrap(),
+    )
+    .unwrap();
+    let stdout_path = "artifacts/07-testing.attempt-001.check-001.stdout.log";
+    let stderr_path = "artifacts/07-testing.attempt-001.check-001.stderr.log";
+    fs::rename(
+        workspace
+            .run_directory()
+            .join("artifacts/07-testing.check-001.stdout.log"),
+        workspace.run_directory().join(stdout_path),
+    )
+    .unwrap();
+    fs::rename(
+        workspace
+            .run_directory()
+            .join("artifacts/07-testing.check-001.stderr.log"),
+        workspace.run_directory().join(stderr_path),
+    )
+    .unwrap();
+    for check in [&mut testing.checks[0], &mut report.checks[0]] {
+        check.stdout_path = Some(stdout_path.to_string());
+        check.stderr_path = Some(stderr_path.to_string());
+    }
+    let candidate = approved.candidate_workspace.as_ref().unwrap();
+    let eval_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap(),
+    )
+    .unwrap();
+    let intent = serde_json::json!({
+        "schema_version": 2,
+        "evaluation_attempt": 1,
+        "run_id": approved.run_id,
+        "approved_run_digest": canonical_sha256_digest(approved).unwrap(),
+        "input_digests": approved.input_digests,
+        "ticket": {
+            "path": "inputs/ticket.json",
+            "digest": approved.input_digests.ticket,
+        },
+        "eval_config": {
+            "path": "inputs/eval-config.json",
+            "digest": approved.input_digests.eval_config,
+        },
+        "candidate_state_digest": canonical_sha256_digest(candidate).unwrap(),
+        "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
+        "source_worktree_state_digest": "a".repeat(64),
+        "recovery": null,
+        "planned_checks": eval_config["evals"]["required"],
+    });
+    let intent_path = "artifacts/07-testing.attempt-001.execution-intent.json";
+    let intent_bytes = canonical_json_bytes(&intent).unwrap();
+    fs::write(workspace.run_directory().join(intent_path), &intent_bytes).unwrap();
+    let intent_reference = ArtifactReference {
+        path: intent_path.to_string(),
+        digest: format!("{:x}", Sha256::digest(&intent_bytes)),
+    };
+    testing.schema_version = 2;
+    testing.evaluation_attempt = Some(1);
+    testing.recovery = Some(None);
+    testing.execution_intent = Some(intent_reference);
+    let testing_path = "artifacts/07-testing.attempt-001.json";
+    let testing_bytes = canonical_json_bytes(&testing).unwrap();
+    fs::write(workspace.run_directory().join(testing_path), &testing_bytes).unwrap();
+    let testing_reference = ArtifactReference {
+        path: testing_path.to_string(),
+        digest: format!("{:x}", Sha256::digest(&testing_bytes)),
+    };
+    report.loop_evidence.as_mut().unwrap().testing_evidence = testing_reference.clone();
+    let report_path = "artifacts/08-eval-report.attempt-001.json";
+    let report_bytes = canonical_json_bytes(&report).unwrap();
+    fs::write(workspace.run_directory().join(report_path), &report_bytes).unwrap();
+    let report_reference = ArtifactReference {
+        path: report_path.to_string(),
+        digest: format!("{:x}", Sha256::digest(&report_bytes)),
+    };
+    for path in [
+        "artifacts/07-testing.execution-intent.json",
+        fixed_testing_path,
+        fixed_report_path,
+    ] {
+        fs::remove_file(workspace.run_directory().join(path)).unwrap();
+    }
+    let mut run = fixed;
+    let testing_step = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    testing_step.artifact_path = Some(testing_reference.path);
+    testing_step.artifact_digest = Some(testing_reference.digest);
+    let report_step = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::EvalReport)
+        .unwrap();
+    report_step.artifact_path = Some(report_reference.path.clone());
+    report_step.artifact_digest = Some(report_reference.digest);
+    run.eval_report_path = Some(report_reference.path);
+    run
+}
+
+fn rewrite_evaluation_recovery(
+    workspace: &LoopWorkspace,
+    run: &mut seaf_core::LoopRun,
+    mutate: impl FnOnce(&mut EvaluationRecoveryAttemptV2),
+) {
+    let reference = run.latest_recovery.as_ref().unwrap();
+    let path = reference.artifact.path.clone();
+    let mut recovery: EvaluationRecoveryAttemptV2 =
+        serde_json::from_slice(&fs::read(workspace.run_directory().join(&path)).unwrap()).unwrap();
+    mutate(&mut recovery);
+    let bytes = canonical_json_bytes(&recovery).unwrap();
+    fs::write(workspace.run_directory().join(&path), &bytes).unwrap();
+    run.latest_recovery.as_mut().unwrap().artifact.digest = format!("{:x}", Sha256::digest(&bytes));
+}
+
+fn rewrite_evaluation_recovery_source(
+    workspace: &LoopWorkspace,
+    run: &mut seaf_core::LoopRun,
+    mutate: impl FnOnce(&mut EvaluationRecoverySourceRunV2),
+) {
+    let recovery_reference = run.latest_recovery.as_ref().unwrap();
+    let recovery_path = recovery_reference.artifact.path.clone();
+    let mut recovery: EvaluationRecoveryAttemptV2 =
+        serde_json::from_slice(&fs::read(workspace.run_directory().join(&recovery_path)).unwrap())
+            .unwrap();
+    let mut source: EvaluationRecoverySourceRunV2 = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join(&recovery.source_run.path)).unwrap(),
+    )
+    .unwrap();
+    mutate(&mut source);
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    fs::write(
+        workspace.run_directory().join(&recovery.source_run.path),
+        &source_bytes,
+    )
+    .unwrap();
+    recovery.source_run.digest = format!("{:x}", Sha256::digest(&source_bytes));
+    recovery.source_run_digest = canonical_sha256_digest(&source.run).unwrap();
+    let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
+    fs::write(
+        workspace.run_directory().join(recovery_path),
+        &recovery_bytes,
+    )
+    .unwrap();
+    run.latest_recovery.as_mut().unwrap().artifact.digest =
+        format!("{:x}", Sha256::digest(&recovery_bytes));
 }
 
 fn publish_report_variant(

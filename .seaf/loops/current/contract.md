@@ -44,19 +44,23 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-09c2 - Zero-command evaluation adoption. Add a schema-v2 evaluation recovery
-variant to the existing sequential recovery chain without changing provider
-RecoveryAttemptV1. `loop revise --from-step testing --eval-recovery adopt` must
-accept only one exact complete v1 or v2 intent/check-log/Testing prefix for the
-active Approved authority. EvalReport may be absent. Gaps, substitutions,
-partial Testing, mixed attempts, physical drift, final Failed, EvalPassed,
-Promoted, or an active recovery fail closed.
+M1-09c2b - Zero-command adoption transaction. Add
+`loop revise --from-step testing --eval-recovery adopt --actor <actor> --reason
+<reason>` and no other evaluation action. Provider steps must reject the option;
+Testing without it must reject before mutation. Fresh adoption accepts only an
+exact Approved/Testing source with an active candidate, consumed prior provider
+recovery, and one complete verified fixed-v1 or indexed-v2
+intent/log/Testing prefix. EvalReport may be absent or exact. Partial, mixed,
+future, substituted, pending-recovery, terminal, promotion-intent, input,
+candidate, source, provider, or namespace drift fails closed.
 
-Adoption publishes a create-only source-run snapshot and recovery artifact,
-executes zero commands and makes zero provider calls, reconstructs the exact
-execution-time Approved predecessor, and deterministically creates only a
-missing EvalReport before one candidate-to-provider final CAS advances recovery
-authority. Existing complete report bytes must verify exactly. Preserve every
-prior byte and the M1-08 promotion/final-state relations. Do not add evaluation
-invalidation, command rerun, attempt 2 execution, general M1-10 locking, or
-artifact protection in this checkpoint.
+Under the candidate lock, preflight every source/recovery/report collision
+before the first write. Publish the exact prefix-bearing source snapshot,
+evaluation-v2 recovery, and only a missing deterministic EvalReport; execute
+zero evaluation commands and make zero provider calls. Reauthenticate all
+authority, then use one dedicated provider-lock Approved-to-final CAS that
+advances `latest_recovery` without weakening ordinary final relations. Cover
+every crash cut and concurrent winner. An exact post-CAS retry is byte-inert
+only when action, actor, reason, and adopted final authority all match; arbitrary
+fresh Failed/EvalPassed/Promoted adoption remains forbidden. Do not add
+invalidation, rerun, attempt 2, general M1-10 locking, or artifact protection.

@@ -20,6 +20,9 @@ use crate::{
         validate_source_worktree_authority, verify_candidate_patch_evidence_locked,
         CANDIDATE_WORKSPACE_SCHEMA_VERSION,
     },
+    evaluation_attempt::{
+        load_intent, selected_attempt, ApprovedEvaluationIntent, EvaluationAttemptInventory,
+    },
     immutable_artifact::{publish_create_only, read_verified_regular_file},
     inspect::{inspect_loop_run, InspectionIntegrity},
     provider_exchange::{
@@ -28,10 +31,11 @@ use crate::{
         validate_authoritative_provider_exchange_records,
     },
     state::{self, step_index},
-    LoopWorkspace,
+    LoopWorkspace, TestingEvidence,
 };
 
 pub const RECOVERY_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATION_RECOVERY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +75,77 @@ pub struct RecoveryAttemptV1 {
     pub previous_recovery: Option<RecoveryReference>,
     pub previous_provider_head: Option<ProviderExchangeRecordReference>,
     pub expected_reset_projection_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationRecoveryAction {
+    AdoptApprovedEvaluation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationRecoveryReportDisposition {
+    VerifyExisting,
+    CreateMissing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationPrefixSpellingV1 {
+    FixedV1,
+    IndexedV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationPrefixAuthorityV1 {
+    pub evaluation_attempt: u32,
+    pub spelling: EvaluationPrefixSpellingV1,
+    pub execution_intent: ArtifactReference,
+    pub testing_evidence: ArtifactReference,
+    pub eval_report: Option<ArtifactReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRecoverySourceRunV2 {
+    pub schema_version: u32,
+    pub recovery_id: u32,
+    pub actor: String,
+    pub reason: String,
+    pub created_at: String,
+    pub run: LoopRun,
+    pub evaluation_prefix: EvaluationPrefixAuthorityV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRecoveryAttemptV2 {
+    pub schema_version: u32,
+    pub recovery_id: u32,
+    pub run_id: String,
+    pub action: EvaluationRecoveryAction,
+    pub step: LoopStepName,
+    pub actor: String,
+    pub reason: String,
+    pub created_at: String,
+    pub source_run: ArtifactReference,
+    pub source_run_digest: String,
+    pub input_digests: LoopInputDigests,
+    pub candidate_state_digest: String,
+    pub candidate_head: String,
+    pub candidate_tree: String,
+    pub candidate_diff_digest: String,
+    pub source_worktree_state_digest: String,
+    pub evaluation_attempt: u32,
+    pub execution_intent: ArtifactReference,
+    pub testing_evidence: ArtifactReference,
+    pub eval_report: ArtifactReference,
+    pub report_disposition: EvaluationRecoveryReportDisposition,
+    pub previous_recovery: Option<RecoveryReference>,
+    pub previous_provider_head: Option<ProviderExchangeRecordReference>,
+    pub expected_final_projection_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,6 +613,15 @@ fn load_verified_recovery_lineage(
     workspace: &LoopWorkspace,
     reference: &RecoveryReference,
 ) -> Result<(RecoveryAttemptV1, LoopRun, LoopRun), RecoveryError> {
+    let result = load_verified_provider_recovery_entry(workspace, reference)?;
+    validate_prior_recovery_chain(workspace, result.0.previous_recovery.clone())?;
+    Ok(result)
+}
+
+fn load_verified_provider_recovery_entry(
+    workspace: &LoopWorkspace,
+    reference: &RecoveryReference,
+) -> Result<(RecoveryAttemptV1, LoopRun, LoopRun), RecoveryError> {
     let bytes = read_verified_regular_file(
         workspace.run_directory(),
         &reference.artifact.path,
@@ -593,7 +677,6 @@ fn load_verified_recovery_lineage(
         )));
     }
     validate_source_bindings(&snapshot.run, &recovery)?;
-    validate_prior_recovery_chain(workspace, recovery.previous_recovery.clone())?;
     let projection = reset_run(
         &snapshot.run,
         recovery.step,
@@ -609,79 +692,547 @@ fn load_verified_recovery_lineage(
     Ok((recovery, snapshot.run, projection))
 }
 
+#[derive(Debug)]
+enum VerifiedRecoveryLineage {
+    Provider {
+        recovery: RecoveryAttemptV1,
+    },
+    Evaluation {
+        recovery: EvaluationRecoveryAttemptV2,
+        source: Box<EvaluationRecoverySourceRunV2>,
+    },
+}
+
+pub(crate) fn load_evaluation_recovery_source_for_final(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<Option<LoopRun>, RecoveryError> {
+    let Some(reference) = run.latest_recovery.as_ref() else {
+        return Ok(None);
+    };
+    let Some((recovery, source)) = load_verified_evaluation_recovery(workspace, reference)? else {
+        return Ok(None);
+    };
+    let testing_reference = final_step_reference(run, LoopStepName::Testing)?;
+    let report_reference = final_step_reference(run, LoopStepName::EvalReport)?;
+    if testing_reference != recovery.testing_evidence
+        || report_reference != recovery.eval_report
+        || run.eval_report_path.as_deref() != Some(recovery.eval_report.path.as_str())
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation final descendant substituted recovery evidence or timestamp",
+        ));
+    }
+    let mut zero_digest_projection = run.clone();
+    normalize_evaluation_final_cleanup(&mut zero_digest_projection, &recovery.created_at)?;
+    let latest = zero_digest_projection
+        .latest_recovery
+        .as_mut()
+        .ok_or_else(|| RecoveryError::invalid("evaluation final projection lost recovery"))?;
+    latest.artifact.digest = "0".repeat(64);
+    if canonical_sha256_digest(&zero_digest_projection).map_err(RecoveryError::wrapped)?
+        != recovery.expected_final_projection_digest
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation final projection digest mismatch",
+        ));
+    }
+    Ok(Some(source.run))
+}
+
+pub(crate) fn load_verified_evaluation_recovery(
+    workspace: &LoopWorkspace,
+    reference: &RecoveryReference,
+) -> Result<Option<(EvaluationRecoveryAttemptV2, EvaluationRecoverySourceRunV2)>, RecoveryError> {
+    match load_verified_any_recovery_lineage(workspace, reference)? {
+        VerifiedRecoveryLineage::Evaluation { recovery, source } => Ok(Some((recovery, *source))),
+        VerifiedRecoveryLineage::Provider { .. } => Ok(None),
+    }
+}
+
+fn normalize_evaluation_final_cleanup(
+    run: &mut LoopRun,
+    recovery_created_at: &str,
+) -> Result<(), RecoveryError> {
+    let recovery_time = parse_canonical_timestamp(recovery_created_at)
+        .ok_or_else(|| RecoveryError::invalid("evaluation recovery created_at is not canonical"))?;
+    let cleanup_allowed = run.status == LoopStatus::Failed && run.human_approval.is_some();
+    let candidate = run.candidate_workspace.as_mut().ok_or_else(|| {
+        RecoveryError::invalid("evaluation final descendant lost candidate authority")
+    })?;
+    match candidate.lifecycle {
+        CandidateWorkspaceLifecycle::Active
+            if candidate.cleanup_started_at.is_none()
+                && candidate.cleaned_at.is_none()
+                && run.updated_at == recovery_created_at => {}
+        CandidateWorkspaceLifecycle::Cleaning => {
+            if !cleanup_allowed {
+                return Err(RecoveryError::invalid(
+                    "only approval-bound Failed evaluation may enter Cleaning",
+                ));
+            }
+            let started = candidate
+                .cleanup_started_at
+                .as_deref()
+                .and_then(parse_canonical_timestamp)
+                .ok_or_else(|| {
+                    RecoveryError::invalid("evaluation cleanup start timestamp is invalid")
+                })?;
+            if candidate.cleaned_at.is_some()
+                || started < recovery_time
+                || run.updated_at.as_str() != candidate.cleanup_started_at.as_deref().unwrap()
+            {
+                return Err(RecoveryError::invalid(
+                    "evaluation Cleaning descendant timestamp relation is invalid",
+                ));
+            }
+        }
+        CandidateWorkspaceLifecycle::Cleaned => {
+            if !cleanup_allowed {
+                return Err(RecoveryError::invalid(
+                    "only approval-bound Failed evaluation may become Cleaned",
+                ));
+            }
+            let started = candidate
+                .cleanup_started_at
+                .as_deref()
+                .and_then(parse_canonical_timestamp)
+                .ok_or_else(|| {
+                    RecoveryError::invalid("evaluation cleanup start timestamp is invalid")
+                })?;
+            let cleaned = candidate
+                .cleaned_at
+                .as_deref()
+                .and_then(parse_canonical_timestamp)
+                .ok_or_else(|| RecoveryError::invalid("evaluation cleaned timestamp is invalid"))?;
+            if started < recovery_time
+                || cleaned < started
+                || run.updated_at.as_str() != candidate.cleaned_at.as_deref().unwrap()
+            {
+                return Err(RecoveryError::invalid(
+                    "evaluation Cleaned descendant timestamp relation is invalid",
+                ));
+            }
+        }
+        _ => {
+            return Err(RecoveryError::invalid(
+                "evaluation final candidate cleanup relation is invalid",
+            ))
+        }
+    }
+    candidate.lifecycle = CandidateWorkspaceLifecycle::Active;
+    candidate.cleanup_started_at = None;
+    candidate.cleaned_at = None;
+    run.updated_at = recovery_created_at.to_string();
+    Ok(())
+}
+
+fn parse_canonical_timestamp(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn final_step_reference(
+    run: &LoopRun,
+    name: LoopStepName,
+) -> Result<ArtifactReference, RecoveryError> {
+    let step = run
+        .steps
+        .iter()
+        .find(|step| step.name == name)
+        .ok_or_else(|| RecoveryError::invalid("evaluation final lost its exact step chain"))?;
+    Ok(ArtifactReference {
+        path: step
+            .artifact_path
+            .clone()
+            .ok_or_else(|| RecoveryError::invalid("evaluation final step lost artifact path"))?,
+        digest: step
+            .artifact_digest
+            .clone()
+            .ok_or_else(|| RecoveryError::invalid("evaluation final step lost artifact digest"))?,
+    })
+}
+
+fn load_verified_any_recovery_lineage(
+    workspace: &LoopWorkspace,
+    reference: &RecoveryReference,
+) -> Result<VerifiedRecoveryLineage, RecoveryError> {
+    let lineage = load_verified_any_recovery_entry(workspace, reference)?;
+    let previous = match &lineage {
+        VerifiedRecoveryLineage::Provider { recovery } => recovery.previous_recovery.clone(),
+        VerifiedRecoveryLineage::Evaluation { recovery, .. } => recovery.previous_recovery.clone(),
+    };
+    validate_prior_recovery_chain(workspace, previous)?;
+    Ok(lineage)
+}
+
+fn load_verified_any_recovery_entry(
+    workspace: &LoopWorkspace,
+    reference: &RecoveryReference,
+) -> Result<VerifiedRecoveryLineage, RecoveryError> {
+    let bytes = read_verified_regular_file(
+        workspace.run_directory(),
+        &reference.artifact.path,
+        "recovery attempt",
+    )
+    .map_err(RecoveryError::wrapped)?;
+    if digest_bytes(&bytes) != reference.artifact.digest {
+        return Err(RecoveryError::invalid("recovery attempt digest mismatch"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
+    match value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(1) => {
+            let (recovery, _, _) = load_verified_provider_recovery_entry(workspace, reference)?;
+            Ok(VerifiedRecoveryLineage::Provider { recovery })
+        }
+        Some(2) => {
+            let (recovery, source) =
+                load_verified_evaluation_recovery_lineage(workspace, reference, &bytes)?;
+            Ok(VerifiedRecoveryLineage::Evaluation {
+                recovery,
+                source: Box::new(source),
+            })
+        }
+        _ => Err(RecoveryError::invalid(
+            "unsupported recovery schema version",
+        )),
+    }
+}
+
+fn load_verified_evaluation_recovery_lineage(
+    workspace: &LoopWorkspace,
+    reference: &RecoveryReference,
+    bytes: &[u8],
+) -> Result<(EvaluationRecoveryAttemptV2, EvaluationRecoverySourceRunV2), RecoveryError> {
+    let recovery: EvaluationRecoveryAttemptV2 =
+        serde_json::from_slice(bytes).map_err(RecoveryError::wrapped)?;
+    if canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)? != bytes {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery attempt is not canonical JSON",
+        ));
+    }
+    validate_evaluation_recovery_contract(&recovery, reference)?;
+    let source_bytes = read_verified_regular_file(
+        workspace.run_directory(),
+        &recovery.source_run.path,
+        "evaluation recovery source run",
+    )
+    .map_err(RecoveryError::wrapped)?;
+    if digest_bytes(&source_bytes) != recovery.source_run.digest {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery source snapshot digest mismatch",
+        ));
+    }
+    let source: EvaluationRecoverySourceRunV2 =
+        serde_json::from_slice(&source_bytes).map_err(RecoveryError::wrapped)?;
+    if canonical_json_bytes(&source).map_err(RecoveryError::wrapped)? != source_bytes
+        || source.schema_version != EVALUATION_RECOVERY_SCHEMA_VERSION
+        || source.recovery_id != recovery.recovery_id
+        || source.actor != recovery.actor
+        || source.reason != recovery.reason
+        || source.created_at != recovery.created_at
+        || canonical_sha256_digest(&source.run).map_err(RecoveryError::wrapped)?
+            != recovery.source_run_digest
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery source snapshot binding mismatch",
+        ));
+    }
+    let errors = seaf_core::validate_loop_run(&source.run);
+    if !errors.is_empty()
+        || source.run.status != LoopStatus::Approved
+        || source.run.current_step != LoopStepName::Testing
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery source is not exact Approved Testing authority",
+        ));
+    }
+    validate_authoritative_provider_exchange_records(workspace, &source.run)
+        .map_err(RecoveryError::wrapped)?;
+    validate_evaluation_source_bindings(&source, &recovery)?;
+    validate_evaluation_source_prior_consumption(workspace, &source.run)?;
+    validate_evaluation_prefix(workspace, &source, &recovery)?;
+    Ok((recovery, source))
+}
+
+fn validate_evaluation_source_prior_consumption(
+    workspace: &LoopWorkspace,
+    source: &LoopRun,
+) -> Result<(), RecoveryError> {
+    let Some(reference) = source.latest_recovery.as_ref() else {
+        return Ok(());
+    };
+    match load_verified_any_recovery_entry(workspace, reference)? {
+        VerifiedRecoveryLineage::Provider { .. } => {
+            if !recovery_is_consumed(workspace, source, reference)? {
+                return Err(RecoveryError::invalid(
+                    "evaluation recovery source carries an unconsumed provider-v1 recovery",
+                ));
+            }
+        }
+        VerifiedRecoveryLineage::Evaluation { .. } => {
+            return Err(RecoveryError::invalid(
+                "evaluation adoption cannot descend from evaluation-v2 recovery authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_evaluation_recovery_contract(
+    recovery: &EvaluationRecoveryAttemptV2,
+    reference: &RecoveryReference,
+) -> Result<(), RecoveryError> {
+    validate_note("actor", &recovery.actor, 256)?;
+    validate_note("reason", &recovery.reason, 1024)?;
+    let canonical_timestamp = recovery
+        .created_at
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|value| value.to_string() == recovery.created_at);
+    let previous_recovery_valid = match (&recovery.previous_recovery, recovery.recovery_id) {
+        (None, 1) => true,
+        (Some(previous), id) if id > 1 => {
+            previous.recovery_id.checked_add(1) == Some(id)
+                && previous.artifact.path == recovery_path(previous.recovery_id)
+                && is_lower_hex_digest(&previous.artifact.digest)
+        }
+        _ => false,
+    };
+    if recovery.schema_version != EVALUATION_RECOVERY_SCHEMA_VERSION
+        || recovery.recovery_id == 0
+        || recovery.action != EvaluationRecoveryAction::AdoptApprovedEvaluation
+        || recovery.step != LoopStepName::Testing
+        || !canonical_timestamp
+        || !previous_recovery_valid
+        || recovery.evaluation_attempt == 0
+        || recovery.source_run.path != recovery_source_path(recovery.recovery_id)
+        || recovery.recovery_id != reference.recovery_id
+        || reference.artifact.path != recovery_path(recovery.recovery_id)
+        || !is_lower_hex_digest(&reference.artifact.digest)
+        || !is_lower_hex_digest(&recovery.source_run.digest)
+        || !is_lower_hex_digest(&recovery.source_run_digest)
+        || !is_lower_hex_digest(&recovery.execution_intent.digest)
+        || !is_lower_hex_digest(&recovery.testing_evidence.digest)
+        || !is_lower_hex_digest(&recovery.eval_report.digest)
+        || !is_lower_hex_digest(&recovery.candidate_state_digest)
+        || !is_lower_hex_digest(&recovery.candidate_diff_digest)
+        || !is_lower_hex_digest(&recovery.source_worktree_state_digest)
+        || !is_git_object_id(&recovery.candidate_head)
+        || !is_git_object_id(&recovery.candidate_tree)
+        || !is_lower_hex_digest(&recovery.expected_final_projection_digest)
+        || !is_lower_hex_digest(&recovery.input_digests.ticket)
+        || !is_lower_hex_digest(&recovery.input_digests.policy)
+        || !is_lower_hex_digest(&recovery.input_digests.config)
+        || !is_lower_hex_digest(&recovery.input_digests.repository)
+        || recovery
+            .input_digests
+            .eval_config
+            .as_ref()
+            .is_none_or(|digest| !is_lower_hex_digest(digest))
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery contract fields are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evaluation_source_bindings(
+    source: &EvaluationRecoverySourceRunV2,
+    recovery: &EvaluationRecoveryAttemptV2,
+) -> Result<(), RecoveryError> {
+    let run = &source.run;
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        RecoveryError::invalid("evaluation recovery source lost candidate authority")
+    })?;
+    if recovery.run_id != run.run_id
+        || recovery.input_digests != run.input_digests
+        || recovery.previous_recovery != run.latest_recovery
+        || recovery.previous_provider_head != run.provider_exchange_records.last().cloned()
+        || recovery.candidate_state_digest
+            != canonical_sha256_digest(candidate).map_err(RecoveryError::wrapped)?
+        || recovery.candidate_head != candidate.candidate_head
+        || recovery.candidate_tree != candidate.candidate_tree
+        || recovery.candidate_diff_digest != candidate.candidate_diff_digest
+        || recovery.execution_intent != source.evaluation_prefix.execution_intent
+        || recovery.testing_evidence != source.evaluation_prefix.testing_evidence
+        || recovery.evaluation_attempt != source.evaluation_prefix.evaluation_attempt
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery fields do not bind the exact source authority",
+        ));
+    }
+    match recovery.report_disposition {
+        EvaluationRecoveryReportDisposition::VerifyExisting
+            if source.evaluation_prefix.eval_report.as_ref() == Some(&recovery.eval_report) => {}
+        EvaluationRecoveryReportDisposition::CreateMissing
+            if source.evaluation_prefix.eval_report.is_none() => {}
+        _ => {
+            return Err(RecoveryError::invalid(
+                "evaluation recovery report disposition does not match its source prefix",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_evaluation_prefix(
+    workspace: &LoopWorkspace,
+    source: &EvaluationRecoverySourceRunV2,
+    recovery: &EvaluationRecoveryAttemptV2,
+) -> Result<(), RecoveryError> {
+    let (attempt, spelling) =
+        selected_attempt(&recovery.testing_evidence.path, &recovery.eval_report.path)
+            .map_err(RecoveryError::invalid)?;
+    let expected_spelling = if crate::evaluation_attempt::fixed_spelling(spelling) {
+        EvaluationPrefixSpellingV1::FixedV1
+    } else {
+        EvaluationPrefixSpellingV1::IndexedV2
+    };
+    if attempt != recovery.evaluation_attempt
+        || source.evaluation_prefix.spelling != expected_spelling
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery prefix attempt or spelling mismatch",
+        ));
+    }
+    let testing =
+        TestingEvidence::load_for_approved_run(workspace, &recovery.testing_evidence, &source.run)
+            .map_err(RecoveryError::wrapped)?;
+    if testing.evaluation_attempt.unwrap_or(1) != attempt
+        || testing
+            .execution_intent
+            .as_ref()
+            .is_some_and(|reference| reference != &recovery.execution_intent)
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery Testing reference substituted attempt authority",
+        ));
+    }
+    let intent =
+        load_intent(workspace, &recovery.execution_intent).map_err(RecoveryError::invalid)?;
+    let eval_config = load_recovery_eval_config(workspace, &source.run)?;
+    intent
+        .validate_against(&source.run, &eval_config.evals.required)
+        .map_err(RecoveryError::invalid)?;
+    if intent.attempt() != attempt {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery intent selects another attempt",
+        ));
+    }
+    match (expected_spelling, &intent) {
+        (EvaluationPrefixSpellingV1::FixedV1, ApprovedEvaluationIntent::V1(_))
+            if testing.schema_version == 1
+                && testing.evaluation_attempt.is_none()
+                && testing.recovery.is_none()
+                && testing.execution_intent.is_none() => {}
+        (EvaluationPrefixSpellingV1::IndexedV2, ApprovedEvaluationIntent::V2(intent))
+            if testing.schema_version == 2
+                && testing.evaluation_attempt == Some(attempt)
+                && testing.recovery == Some(None)
+                && testing.execution_intent.as_ref() == Some(&recovery.execution_intent)
+                && intent.recovery.is_none() => {}
+        _ => {
+            return Err(RecoveryError::invalid(
+                "evaluation recovery prefix spelling and schema authority disagree",
+            ))
+        }
+    }
+    if let ApprovedEvaluationIntent::V2(intent) = &intent {
+        if intent.source_worktree_state_digest != recovery.source_worktree_state_digest {
+            return Err(RecoveryError::invalid(
+                "evaluation recovery source worktree authority mismatch",
+            ));
+        }
+    }
+    let inventory = EvaluationAttemptInventory::load(workspace).map_err(RecoveryError::invalid)?;
+    let report_present = inventory
+        .require_recovery_prefix(
+            attempt,
+            &recovery.execution_intent.path,
+            &recovery.testing_evidence.path,
+            &recovery.eval_report.path,
+            recovery.report_disposition == EvaluationRecoveryReportDisposition::CreateMissing,
+            &testing.checks,
+        )
+        .map_err(RecoveryError::invalid)?;
+    let mut references = vec![
+        recovery.execution_intent.clone(),
+        recovery.testing_evidence.clone(),
+    ];
+    if report_present {
+        references.push(recovery.eval_report.clone());
+    }
+    for check in &testing.checks {
+        for (path, digest) in [
+            (check.stdout_path.as_ref(), check.stdout_digest.as_ref()),
+            (check.stderr_path.as_ref(), check.stderr_digest.as_ref()),
+        ] {
+            references.push(ArtifactReference {
+                path: path
+                    .cloned()
+                    .ok_or_else(|| RecoveryError::invalid("evaluation recovery lost log path"))?,
+                digest: digest
+                    .cloned()
+                    .ok_or_else(|| RecoveryError::invalid("evaluation recovery lost log digest"))?,
+            });
+        }
+    }
+    for reference in &references {
+        let bytes = read_verified_regular_file(
+            workspace.run_directory(),
+            &reference.path,
+            "evaluation recovery prefix artifact",
+        )
+        .map_err(RecoveryError::wrapped)?;
+        if digest_bytes(&bytes) != reference.digest {
+            return Err(RecoveryError::invalid(
+                "evaluation recovery prefix artifact digest mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_recovery_eval_config(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<seaf_core::EvalConfig, RecoveryError> {
+    let expected = run.input_digests.eval_config.as_ref().ok_or_else(|| {
+        RecoveryError::invalid("evaluation recovery source lost eval config digest")
+    })?;
+    let bytes = read_verified_regular_file(
+        workspace.run_directory(),
+        "inputs/eval-config.json",
+        "evaluation recovery eval config",
+    )
+    .map_err(RecoveryError::wrapped)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
+    if canonical_json_bytes(&value).map_err(RecoveryError::wrapped)? != bytes
+        || canonical_sha256_digest(&value).map_err(RecoveryError::wrapped)? != *expected
+    {
+        return Err(RecoveryError::invalid(
+            "evaluation recovery eval config bytes or digest mismatch",
+        ));
+    }
+    serde_json::from_value(value).map_err(RecoveryError::wrapped)
+}
+
 fn validate_prior_recovery_chain(
     workspace: &LoopWorkspace,
     mut reference: Option<RecoveryReference>,
 ) -> Result<(), RecoveryError> {
     while let Some(current) = reference {
-        if current.artifact.path != recovery_path(current.recovery_id)
-            || !is_lower_hex_digest(&current.artifact.digest)
-        {
-            return Err(RecoveryError::invalid(
-                "prior recovery chain contains a noncanonical reference",
-            ));
-        }
-        let bytes = read_verified_regular_file(
-            workspace.run_directory(),
-            &current.artifact.path,
-            "prior recovery attempt",
-        )
-        .map_err(RecoveryError::wrapped)?;
-        if digest_bytes(&bytes) != current.artifact.digest {
-            return Err(RecoveryError::invalid(
-                "prior recovery chain digest mismatch",
-            ));
-        }
-        let recovery: RecoveryAttemptV1 =
-            serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
-        if canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)? != bytes
-            || recovery.recovery_id != current.recovery_id
-        {
-            return Err(RecoveryError::invalid(
-                "prior recovery chain artifact is not exact canonical authority",
-            ));
-        }
-        validate_recovery_contract(&recovery)?;
-        let source_bytes = read_verified_regular_file(
-            workspace.run_directory(),
-            &recovery.source_run.path,
-            "prior recovery source run",
-        )
-        .map_err(RecoveryError::wrapped)?;
-        if digest_bytes(&source_bytes) != recovery.source_run.digest {
-            return Err(RecoveryError::invalid(
-                "prior recovery source snapshot digest mismatch",
-            ));
-        }
-        let source: RecoverySourceRunV1 =
-            serde_json::from_slice(&source_bytes).map_err(RecoveryError::wrapped)?;
-        if canonical_json_bytes(&source).map_err(RecoveryError::wrapped)? != source_bytes
-            || source.schema_version != RECOVERY_SCHEMA_VERSION
-            || source.recovery_id != recovery.recovery_id
-            || canonical_sha256_digest(&source.run).map_err(RecoveryError::wrapped)?
-                != recovery.source_run_digest
-            || !seaf_core::validate_loop_run(&source.run).is_empty()
-        {
-            return Err(RecoveryError::invalid(
-                "prior recovery source snapshot binding mismatch",
-            ));
-        }
-        validate_source_bindings(&source.run, &recovery)?;
-        let projection = reset_run(
-            &source.run,
-            recovery.step,
-            recovery.recovery_id,
-            &current.artifact.path,
-            &recovery.created_at,
-        )?;
-        if canonical_sha256_digest(&projection).map_err(RecoveryError::wrapped)?
-            != recovery.expected_reset_projection_digest
-        {
-            return Err(RecoveryError::invalid(
-                "prior recovery reset projection binding mismatch",
-            ));
-        }
-        reference = recovery.previous_recovery;
+        reference = match load_verified_any_recovery_entry(workspace, &current)? {
+            VerifiedRecoveryLineage::Provider { recovery } => recovery.previous_recovery,
+            VerifiedRecoveryLineage::Evaluation { recovery, .. } => recovery.previous_recovery,
+        };
     }
     Ok(())
 }
@@ -1410,6 +1961,66 @@ mod tests {
 
         let bounded = [u32::MAX].into_iter().collect();
         assert!(validate_contiguous_history(&bounded, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn create_missing_recovery_rejects_malformed_expected_report_digest_before_publication() {
+        let recovery_path = recovery_path(1);
+        let reference = RecoveryReference {
+            recovery_id: 1,
+            artifact: ArtifactReference {
+                path: recovery_path,
+                digest: "a".repeat(64),
+            },
+        };
+        let mut recovery = EvaluationRecoveryAttemptV2 {
+            schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
+            recovery_id: 1,
+            run_id: "missing-report".into(),
+            action: EvaluationRecoveryAction::AdoptApprovedEvaluation,
+            step: LoopStepName::Testing,
+            actor: "reviewer@example.invalid".into(),
+            reason: "adopt complete prefix".into(),
+            created_at: "1".into(),
+            source_run: ArtifactReference {
+                path: recovery_source_path(1),
+                digest: "b".repeat(64),
+            },
+            source_run_digest: "c".repeat(64),
+            input_digests: LoopInputDigests {
+                ticket: "d".repeat(64),
+                policy: "e".repeat(64),
+                config: "f".repeat(64),
+                repository: "1".repeat(64),
+                eval_config: Some("2".repeat(64)),
+            },
+            candidate_state_digest: "3".repeat(64),
+            candidate_head: "4".repeat(40),
+            candidate_tree: "5".repeat(40),
+            candidate_diff_digest: "6".repeat(64),
+            source_worktree_state_digest: "7".repeat(64),
+            evaluation_attempt: 1,
+            execution_intent: ArtifactReference {
+                path: "artifacts/07-testing.attempt-001.execution-intent.json".into(),
+                digest: "8".repeat(64),
+            },
+            testing_evidence: ArtifactReference {
+                path: "artifacts/07-testing.attempt-001.json".into(),
+                digest: "9".repeat(64),
+            },
+            eval_report: ArtifactReference {
+                path: "artifacts/08-eval-report.attempt-001.json".into(),
+                digest: "a".repeat(64),
+            },
+            report_disposition: EvaluationRecoveryReportDisposition::CreateMissing,
+            previous_recovery: None,
+            previous_provider_head: None,
+            expected_final_projection_digest: "b".repeat(64),
+        };
+        validate_evaluation_recovery_contract(&recovery, &reference).unwrap();
+
+        recovery.eval_report.digest = "not-a-digest".into();
+        assert!(validate_evaluation_recovery_contract(&recovery, &reference).is_err());
     }
 
     #[test]
