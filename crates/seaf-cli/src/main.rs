@@ -18,11 +18,11 @@ use seaf_core::{
     TicketPriority, TicketSpec, TicketStatus, ValidationReport,
 };
 use seaf_loop::{
-    build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture, AgentBenchSummary,
-    ArtifactContent, AuthoritativeRunInputSnapshots, ContextLimits, ContextPackRequest,
-    GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig, PatchDecisionKind,
-    PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RunnerError,
-    StepOutput, StepRunner,
+    build_loop_eval_report, evaluate_zero_tolerance, load_agent_bench_fixture,
+    validate_rerun_eligibility, AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots,
+    ContextLimits, ContextPackRequest, GitCommandRunner, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
+    ProviderStepRunner, RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -859,6 +859,9 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
         .as_deref()
         .map(parse_provider_rerun_step)
         .transpose()?;
+    if let Some(step) = rerun_from {
+        validate_rerun_eligibility(&existing, step).map_err(loop_runner_failure)?;
+    }
     let run = if loop_run_needs_provider_resume(&existing) || rerun_from.is_some() {
         let Some(ticket_path) = args.ticket.as_ref() else {
             return Err(CliFailure::message(
@@ -883,8 +886,13 @@ fn resume_loop(args: LoopResumeArgs) -> Result<(), CliFailure> {
             &effective_inputs.config,
             &repository_identity,
         )?;
-        let initialized = InitializedLoopRun::resume_isolated(&args.runs_root, existing)
-            .map_err(loop_runner_failure)?;
+        let initialized = match rerun_from {
+            Some(step) => {
+                InitializedLoopRun::resume_isolated_for_rerun(&args.runs_root, existing, step)
+            }
+            None => InitializedLoopRun::resume_isolated(&args.runs_root, existing),
+        }
+        .map_err(loop_runner_failure)?;
         let scaffolded = initialized.scaffold().map_err(loop_runner_failure)?;
         let prepared = scaffolded
             .publish_authoritative_inputs(authoritative_input_snapshots(

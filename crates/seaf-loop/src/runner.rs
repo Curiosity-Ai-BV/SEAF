@@ -179,6 +179,30 @@ pub struct PreparedLoopRun {
     run: LoopRun,
 }
 
+pub fn validate_rerun_eligibility(run: &LoopRun, step: LoopStepName) -> Result<(), RunnerError> {
+    if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
+        return Ok(());
+    }
+    let candidate = run
+        .candidate_workspace
+        .as_ref()
+        .ok_or_else(|| RunnerError::Step("isolated rerun lost candidate authority".to_string()))?;
+    match candidate
+        .patch_transaction
+        .as_ref()
+        .map(|transaction| transaction.phase)
+    {
+        Some(seaf_core::CandidatePatchPhase::Applied) if step == LoopStepName::OutputReview => {
+            Ok(())
+        }
+        None if step != LoopStepName::OutputReview => Ok(()),
+        _ => Err(RunnerError::Step(
+            "an isolated candidate permits only OutputReview rerun from exact Applied evidence; start a new run"
+                .to_string(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeRunInputSnapshots {
     pub ticket: Vec<u8>,
@@ -276,41 +300,24 @@ impl InitializedLoopRun {
         let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
             RunnerError::Step("isolated run has no candidate authority".to_string())
         })?;
-        if candidate
-            .patch_transaction
-            .as_ref()
-            .is_some_and(|transaction| {
-                transaction.phase == seaf_core::CandidatePatchPhase::Applying
-            })
-        {
-            return Err(RunnerError::Step(
-                "candidate patch transaction is still applying and cannot resume before recovery"
-                    .to_string(),
-            ));
-        }
-        let run = match candidate.lifecycle {
+        let recovered = match candidate.lifecycle {
             seaf_core::CandidateWorkspaceLifecycle::Provisioning => {
                 crate::candidate_workspace::provision_candidate_workspace(&workspace)
                     .map_err(|error| RunnerError::Step(error.to_string()))?;
                 state::load_run(&workspace)?
             }
             seaf_core::CandidateWorkspaceLifecycle::Active => {
-                crate::candidate_workspace::validate_candidate_workspace(
-                    workspace.run_directory(),
-                    Path::new(&candidate.source_worktree_root),
-                    candidate,
-                )
-                .map_err(|error| RunnerError::Step(error.to_string()))?;
-                if candidate
+                if !candidate
                     .patch_transaction
                     .as_ref()
                     .is_some_and(|transaction| {
-                        transaction.phase == seaf_core::CandidatePatchPhase::Applied
+                        transaction.phase == seaf_core::CandidatePatchPhase::Applying
                     })
                 {
-                    crate::candidate_workspace::apply_candidate_development_evidence(
-                        &workspace,
+                    crate::candidate_workspace::validate_candidate_workspace(
+                        workspace.run_directory(),
                         Path::new(&candidate.source_worktree_root),
+                        candidate,
                     )
                     .map_err(|error| RunnerError::Step(error.to_string()))?;
                 }
@@ -322,7 +329,17 @@ impl InitializedLoopRun {
                 ));
             }
         };
+        let run = normalize_completed_development_candidate(&workspace, recovered)?;
         Ok(Self { workspace, run })
+    }
+
+    pub fn resume_isolated_for_rerun(
+        runs_root: &Path,
+        verified_run: LoopRun,
+        step: LoopStepName,
+    ) -> Result<Self, RunnerError> {
+        validate_rerun_eligibility(&verified_run, step)?;
+        Self::resume_isolated(runs_root, verified_run)
     }
 
     pub fn workspace(&self) -> &LoopWorkspace {
@@ -345,6 +362,86 @@ impl InitializedLoopRun {
             run: self.run,
         })
     }
+}
+
+fn normalize_completed_development_candidate(
+    workspace: &LoopWorkspace,
+    run: LoopRun,
+) -> Result<LoopRun, RunnerError> {
+    let development_completed = run.steps.iter().any(|record| {
+        record.name == LoopStepName::Development && record.status == LoopStepStatus::Completed
+    });
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        RunnerError::Step("isolated run lost candidate authority during recovery".to_string())
+    })?;
+    let phase = candidate
+        .patch_transaction
+        .as_ref()
+        .map(|transaction| transaction.phase);
+    if !development_completed {
+        if phase.is_some() {
+            return Err(RunnerError::Step(
+                "candidate patch transaction exists without completed Development".to_string(),
+            ));
+        }
+        return Ok(run);
+    }
+
+    let prospective =
+        crate::provider_exchange::preflight_provider_exchange_reconciliation(workspace, &run)
+            .map_err(|error| {
+                RunnerError::Step(format!(
+            "provider exchange recovery preflight failed before candidate normalization: {error}"
+        ))
+            })?;
+    let has_output_review_history = prospective
+        .provider_exchange_records
+        .iter()
+        .any(|record| record.step == LoopStepName::OutputReview);
+    let output_review_pending = run.steps.iter().any(|record| {
+        record.name == LoopStepName::OutputReview && record.status == LoopStepStatus::Pending
+    });
+
+    match phase {
+        None if !output_review_pending || has_output_review_history => {
+            return Err(RunnerError::Step(
+                "pre-B3 completed Development can migrate only while OutputReview is pending with no provider history; start a new run"
+                    .to_string(),
+            ));
+        }
+        Some(seaf_core::CandidatePatchPhase::Applying) if has_output_review_history => {
+            return Err(RunnerError::Step(
+                "Applying candidate cannot have OutputReview provider history; start a new run"
+                    .to_string(),
+            ));
+        }
+        None | Some(seaf_core::CandidatePatchPhase::Applying) => {
+            if run.status != LoopStatus::Running {
+                return Err(RunnerError::Step(
+                    "incomplete candidate application can resume only on a running loop"
+                        .to_string(),
+                ));
+            }
+            crate::candidate_workspace::apply_candidate_development_evidence(
+                workspace,
+                Path::new(&candidate.source_worktree_root),
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+        }
+        Some(seaf_core::CandidatePatchPhase::Applied) => {}
+    }
+
+    let normalized = state::load_run(workspace)?;
+    let normalized_candidate = normalized
+        .candidate_workspace
+        .as_ref()
+        .ok_or_else(|| RunnerError::Step("normalized run lost candidate authority".to_string()))?;
+    crate::candidate_workspace::verify_candidate_patch_evidence(
+        workspace,
+        Path::new(&normalized_candidate.source_worktree_root),
+    )
+    .map_err(|error| RunnerError::Step(error.to_string()))?;
+    Ok(normalized)
 }
 
 impl ScaffoldedLoopRun {
@@ -637,16 +734,15 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     }
 
     pub fn rerun_from(mut self, step: LoopStepName) -> Result<Self, RunnerError> {
-        if self
-            .run
-            .candidate_workspace
-            .as_ref()
-            .and_then(|candidate| candidate.patch_transaction.as_ref())
-            .is_some()
-        {
-            return Err(RunnerError::Step(
-                "candidate patch transaction must be resolved before rerun reset".to_string(),
-            ));
+        validate_rerun_eligibility(&self.run, step)?;
+        if let Some(candidate) = self.run.candidate_workspace.as_ref() {
+            if candidate.patch_transaction.is_some() {
+                crate::candidate_workspace::verify_candidate_patch_evidence(
+                    &self.workspace,
+                    Path::new(&candidate.source_worktree_root),
+                )
+                .map_err(|error| RunnerError::Step(error.to_string()))?;
+            }
         }
         let attempt = next_step_attempt(&self.workspace, step)?;
         let previous = self.run.clone();
@@ -731,6 +827,40 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             artifact_digest,
         )?;
         self.persist_run_state()?;
+        if self.run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate
+            && step == LoopStepName::Development
+            && output.status == LoopStepStatus::Completed
+        {
+            let source = self
+                .run
+                .candidate_workspace
+                .as_ref()
+                .ok_or_else(|| {
+                    RunnerError::Step(
+                        "completed isolated Development lost candidate authority".to_string(),
+                    )
+                })?
+                .source_worktree_root
+                .clone();
+            crate::candidate_workspace::apply_candidate_development_evidence(
+                &self.workspace,
+                Path::new(&source),
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+            let applied = state::load_run(&self.workspace)?;
+            let phase = applied
+                .candidate_workspace
+                .as_ref()
+                .and_then(|candidate| candidate.patch_transaction.as_ref())
+                .map(|transaction| transaction.phase);
+            if phase != Some(seaf_core::CandidatePatchPhase::Applied) {
+                return Err(RunnerError::Step(
+                    "completed isolated Development did not publish exact Applied candidate evidence"
+                        .to_string(),
+                ));
+            }
+            self.run = applied;
+        }
         self.workspace
             .append_log(&format!("finished step {step:?} as {:?}", output.status))?;
 

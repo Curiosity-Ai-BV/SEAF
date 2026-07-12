@@ -1195,7 +1195,7 @@ fn loop_run_ollama_completes_against_fake_server_with_provider_artifacts() {
 }
 
 #[test]
-fn loop_resume_provider_rerun_requires_ticket_and_continues_with_audited_attempts() {
+fn loop_resume_rejects_completed_analysis_rerun_before_ticket_or_mutation() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -1224,12 +1224,12 @@ fn loop_resume_provider_rerun_requires_ticket_and_continues_with_audited_attempt
         .expect("run loop");
     assert!(run.status.success(), "{run:?}");
 
-    let run_path = runs_root.join(run_id).join("run.json");
+    let run_dir = runs_root.join(run_id);
     assert!(
-        runs_root.join(run_id).join("ticket.snapshot.json").exists(),
+        run_dir.join("ticket.snapshot.json").exists(),
         "provider-backed runs must persist the original ticket content used for resume checks"
     );
-    mark_loop_run_pending_from_analysis(&run_path);
+    let before = read_tree_bytes(&run_dir);
 
     let missing_ticket = seaf_in(&repo)
         .args([
@@ -1248,9 +1248,10 @@ fn loop_resume_provider_rerun_requires_ticket_and_continues_with_audited_attempt
     assert!(!missing_ticket.status.success());
     let stderr = String::from_utf8(missing_ticket.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("--ticket is required"),
-        "provider-backed incomplete resumes must rebuild context and patch-gate config, got {stderr}"
+        stderr.contains("start a new run"),
+        "forbidden rerun must reject before ticket handling, got {stderr}"
     );
+    assert_eq!(read_tree_bytes(&run_dir), before);
 
     let resume = seaf_in(&repo)
         .args([
@@ -1268,33 +1269,14 @@ fn loop_resume_provider_rerun_requires_ticket_and_continues_with_audited_attempt
         ])
         .output()
         .expect("resume loop with ticket");
-    assert!(resume.status.success(), "{resume:?}");
-    let stdout = String::from_utf8(resume.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("\"status\": \"completed\""));
-    assert!(
-        runs_root
-            .join(run_id)
-            .join("prompts/02-analysis.attempt-002.prompt.md")
-            .exists(),
-        "resume should persist a fresh provider request for the interrupted step"
-    );
-    assert!(
-        runs_root
-            .join(run_id)
-            .join("responses/02-analysis.attempt-002.raw.txt")
-            .exists(),
-        "resume should persist a fresh provider response for the interrupted step"
-    );
-
-    let resumed_run: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&run_path).expect("resumed run json"))
-            .expect("resumed run json");
-    assert_eq!(resumed_run["status"], "completed");
-    assert_eq!(resumed_run["policy_decisions"][0]["patch_id"], run_id);
+    assert!(!resume.status.success(), "{resume:?}");
+    let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
 }
 
 #[test]
-fn loop_resume_rerun_from_starts_a_new_audited_attempt_without_overwriting_exchange_history() {
+fn loop_resume_rejects_completed_research_rerun_before_any_mutation() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -1305,10 +1287,14 @@ fn loop_resume_rerun_from_starts_a_new_audited_attempt_without_overwriting_excha
     run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
     let run_dir = runs_root.join(run_id);
     let before = read_run_json(&run_dir);
-    let attempt_one = fs::read(
-        run_dir.join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json"),
-    )
-    .expect("attempt one record");
+    let before_tree = read_tree_bytes(&run_dir);
+    let source_before = git_evidence(&repo);
+    let candidate = PathBuf::from(
+        before["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let candidate_before = git_evidence(&candidate);
 
     let rerun = resume_provider_run(
         &repo,
@@ -1318,30 +1304,12 @@ fn loop_resume_rerun_from_starts_a_new_audited_attempt_without_overwriting_excha
         &["--rerun-from", "research", "--json"],
     );
 
-    assert!(rerun.status.success(), "{rerun:?}");
-    let after = read_run_json(&run_dir);
-    assert_eq!(after["status"], "completed");
-    assert!(
-        after["provider_exchange_records"]
-            .as_array()
-            .expect("exchange records")
-            .len()
-            > before["provider_exchange_records"]
-                .as_array()
-                .expect("prior exchange records")
-                .len()
-    );
-    assert!(run_dir
-        .join("prompts/01-research.attempt-002.exchange-001.initial.request.md")
-        .is_file());
-    assert_eq!(
-        fs::read(
-            run_dir
-                .join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json")
-        )
-        .expect("attempt one remains"),
-        attempt_one
-    );
+    assert!(!rerun.status.success(), "{rerun:?}");
+    let stderr = String::from_utf8(rerun.stderr).expect("stderr");
+    assert!(stderr.contains("start a new run"), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), before_tree);
+    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(git_evidence(&candidate), candidate_before);
 }
 
 #[test]
@@ -1357,12 +1325,19 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
     let runs_root = repo.join("runs");
     let run_id = "cli-context-cap-rerun";
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
-    let mut initial_responses = vec![
+    let initial_responses = vec![
         provider_needs_context_response("researcher", "one.txt"),
         provider_needs_context_response("researcher", "two.txt"),
-        agent_response("researcher", "Research complete.", "Continue."),
+        serde_json::json!({
+            "role": "researcher",
+            "status": "blocked",
+            "summary": "Research cannot continue with the available context.",
+            "findings": [],
+            "risks": [],
+            "next_step_recommendation": "Resolve the missing evidence."
+        })
+        .to_string(),
     ];
-    initial_responses.extend(provider_loop_model_responses().into_iter().skip(1));
     let initial_url = start_fake_ollama_server_sequence(initial_responses);
     let initial = seaf_in(&repo)
         .args([
@@ -1387,6 +1362,9 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
     assert!(initial.status.success(), "{initial:?}");
     let run_dir = runs_root.join(run_id);
     let before = read_run_json(&run_dir);
+    assert_eq!(before["status"], "blocked");
+    assert_eq!(before["current_step"], "research");
+    assert!(before["candidate_workspace"]["patch_transaction"].is_null());
     let before_records = before["provider_exchange_records"]
         .as_array()
         .expect("records")
@@ -1427,6 +1405,59 @@ fn loop_cli_rerun_preserves_context_cap_across_attempts() {
     );
     assert!(!run_dir
         .join("artifacts/01-research.attempt-002.context-round-001.json")
+        .exists());
+}
+
+#[test]
+fn loop_resume_reruns_only_output_review_as_attempt_two_without_overwriting_attempt_one() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    let runs_root = repo.join("runs");
+    let run_id = "cli-output-review-rerun";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), false);
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let run_dir = runs_root.join(run_id);
+    let before = read_run_json(&run_dir);
+    let attempt_one = before["provider_exchange_records"]
+        .as_array()
+        .expect("provider records")
+        .iter()
+        .filter(|record| record["step"] == "output_review")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(attempt_one.len(), 2);
+    assert!(attempt_one.iter().all(|record| record["step_attempt"] == 1));
+
+    let rerun = resume_provider_run(
+        &repo,
+        &ticket_path,
+        &runs_root,
+        run_id,
+        &["--rerun-from", "output-review", "--json"],
+    );
+
+    assert!(rerun.status.success(), "{rerun:?}");
+    let after = read_run_json(&run_dir);
+    assert_eq!(after["status"], "completed");
+    let output_review_records = after["provider_exchange_records"]
+        .as_array()
+        .expect("provider records")
+        .iter()
+        .filter(|record| record["step"] == "output_review")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(&output_review_records[..attempt_one.len()], attempt_one);
+    assert_eq!(output_review_records.len(), 4);
+    assert!(output_review_records[attempt_one.len()..]
+        .iter()
+        .all(|record| record["step_attempt"] == 2));
+    assert!(run_dir
+        .join("prompts/06-output-review.attempt-001.exchange-001.initial.request.md")
+        .exists());
+    assert!(run_dir
+        .join("prompts/06-output-review.attempt-002.exchange-001.initial.request.md")
         .exists());
 }
 
@@ -1635,6 +1666,7 @@ fn loop_cli_resume_reconstructs_context_retry_from_old_bytes_after_repository_ch
         .expect("initial run");
     assert!(initial.status.success(), "{initial:?}");
     let run_dir = runs_root.join(run_id);
+    mark_loop_run_pending_from_step(&run_dir.join("run.json"), "analysis");
     let retry_path = "prompts/01-research.attempt-001.exchange-002.context-retry.request.md";
     let retry: serde_json::Value =
         serde_json::from_slice(&fs::read(run_dir.join(retry_path)).expect("retry request"))
@@ -1867,15 +1899,7 @@ fn loop_resume_repairs_missing_exact_provider_ticket_snapshot_before_provider_re
         ])
         .output()
         .expect("resume loop without ticket snapshot");
-    assert!(
-        !resume.status.success(),
-        "synthetic provider history remains inconsistent"
-    );
-    let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
-    assert!(
-        !stderr.contains("snapshot"),
-        "missing exact snapshot must be repaired before downstream recovery, got {stderr}"
-    );
+    assert!(resume.status.success(), "{resume:?}");
     assert_eq!(fs::read(snapshot_path).unwrap(), expected_snapshot);
     assert_eq!(
         git_status_porcelain(&repo),
@@ -2039,21 +2063,15 @@ fn loop_resume_repairs_missing_input_but_rejects_noncanonical_collision() {
 
         let resume = resume_provider_run(&repo, &ticket_path, &runs_root, case, &[]);
 
-        assert!(
-            !resume.status.success(),
-            "synthetic provider history remains inconsistent"
-        );
-        let stderr = String::from_utf8(resume.stderr).expect("stderr");
         if let Some(expected) = removed {
-            assert!(
-                !stderr.contains("snapshot"),
-                "missing exact prefix should repair: {stderr}"
-            );
+            assert!(resume.status.success(), "{resume:?}");
             assert_eq!(
                 fs::read(run_dir.join("inputs/policy.json")).unwrap(),
                 expected
             );
         } else {
+            assert!(!resume.status.success(), "{resume:?}");
+            let stderr = String::from_utf8(resume.stderr).expect("stderr");
             assert!(
                 stderr.contains("collision"),
                 "noncanonical snapshot must collide: {stderr}"
@@ -4657,6 +4675,28 @@ fn read_tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     files
 }
 
+fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let run = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git evidence");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    (
+        run(&["rev-parse", "HEAD"]),
+        run(&["status", "--porcelain=v1", "--untracked-files=all"]),
+        run(&["diff", "--binary"]),
+        run(&["diff", "--cached", "--binary"]),
+    )
+}
+
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create destination directory");
     for entry in fs::read_dir(source).expect("read source directory") {
@@ -4911,26 +4951,89 @@ fn mark_loop_run_pending_from_analysis(run_path: &Path) {
 fn mark_loop_run_pending_from_step(run_path: &Path, pending_from: &str) {
     let mut run: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_path).expect("run json")).expect("run json");
+    let step_index = |name: &str| match name {
+        "research" => 1,
+        "analysis" => 2,
+        "spec_creation" => 3,
+        "spec_review" => 4,
+        "development" => 5,
+        "output_review" => 6,
+        "testing" => 7,
+        "eval_report" => 8,
+        _ => panic!("unknown loop step {name}"),
+    };
+    let pending_index = step_index(pending_from);
+    let run_dir = run_path.parent().expect("run directory");
+    let candidate = PathBuf::from(
+        run["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    for args in [["reset", "--hard", "HEAD"], ["clean", "-fd", "--"]] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&candidate)
+            .output()
+            .expect("reset candidate fixture");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let candidate_state = run["candidate_workspace"]
+        .as_object_mut()
+        .expect("candidate state");
+    let starting_tree = candidate_state["starting_tree"].clone();
+    candidate_state.insert("candidate_tree".to_string(), starting_tree);
+    candidate_state.insert(
+        "candidate_diff_digest".to_string(),
+        serde_json::json!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+    );
+    candidate_state.remove("patch_transaction");
+
+    run["provider_exchange_records"]
+        .as_array_mut()
+        .expect("provider records")
+        .retain(|record| {
+            record["step"]
+                .as_str()
+                .is_some_and(|step| step_index(step) < pending_index)
+        });
     run["status"] = serde_json::json!("running");
     run["current_step"] = serde_json::json!(pending_from);
     run["policy_decisions"] = serde_json::json!([]);
+    run.as_object_mut()
+        .expect("run object")
+        .remove("eval_report_path");
 
-    let mut should_reset = false;
     let steps = run["steps"].as_array_mut().expect("steps");
     for step in steps {
         let name = step["name"].as_str().expect("step name");
-        if name == pending_from {
-            should_reset = true;
-        }
-
-        if should_reset {
+        if step_index(name) >= pending_index {
             step["status"] = serde_json::json!("pending");
             if let Some(object) = step.as_object_mut() {
                 object.remove("artifact_path");
                 object.remove("artifact_digest");
             }
-        } else {
-            step["status"] = serde_json::json!("completed");
+        }
+    }
+
+    for directory in ["prompts", "responses", "artifacts"] {
+        for entry in fs::read_dir(run_dir.join(directory)).expect("runtime directory") {
+            let entry = entry.expect("runtime entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let numbered_step = name
+                .get(0..2)
+                .and_then(|prefix| prefix.parse::<usize>().ok());
+            let candidate_patch = name.starts_with("candidate-patch.");
+            let policy_decision = name.ends_with(".policy-decision.json");
+            if numbered_step.is_some_and(|index| index >= pending_index)
+                || candidate_patch
+                || policy_decision
+            {
+                fs::remove_file(entry.path()).expect("remove later runtime artifact");
+            }
         }
     }
 

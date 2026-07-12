@@ -25,7 +25,8 @@ pub use bench::{
 pub use candidate_workspace::{
     apply_candidate_development_evidence, cleanup_candidate_workspace, create_candidate_workspace,
     plan_candidate_workspace, provision_candidate_workspace, validate_candidate_workspace,
-    CandidateWorkspaceError, CANDIDATE_WORKSPACE_SCHEMA_VERSION,
+    verify_candidate_patch_evidence, CandidateWorkspaceError, VerifiedCandidatePatchEvidence,
+    CANDIDATE_WORKSPACE_SCHEMA_VERSION,
 };
 pub use context::{
     pack_context, pack_context_for_ticket, pack_live_context, CandidateContextAuthority,
@@ -62,8 +63,8 @@ pub use role_response::{
     MAX_CONTEXT_REQUEST_REASON_CHARS,
 };
 pub use runner::{
-    AuthoritativeRunInputSnapshots, InitializedLoopRun, LoopRunner, LoopRunnerConfig,
-    PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
+    validate_rerun_eligibility, AuthoritativeRunInputSnapshots, InitializedLoopRun, LoopRunner,
+    LoopRunnerConfig, PreparedLoopRun, RunnerError, ScaffoldedLoopRun, StepOutput, StepRunner,
 };
 pub use seaf_core::ArtifactReference;
 pub use workspace::{LoopWorkspace, WorkspaceError};

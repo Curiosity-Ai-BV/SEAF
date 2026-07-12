@@ -781,20 +781,13 @@ fn only_malformed_json_is_eligible_for_json_repair() {
 }
 
 #[test]
-fn wrong_reviewer_decisions_are_audited_as_terminal_invalid_responses() {
+fn wrong_spec_reviewer_decision_is_audited_as_a_terminal_invalid_response() {
     assert_wrong_reviewer_decision_is_terminal(
         "wrong-spec-decision",
         LoopStepName::SpecReview,
         ProviderRole::SpecReviewer,
         "spec_reviewer",
         "approve_for_tests",
-    );
-    assert_wrong_reviewer_decision_is_terminal(
-        "wrong-output-decision",
-        LoopStepName::OutputReview,
-        ProviderRole::OutputReviewer,
-        "output_reviewer",
-        "approve_spec",
     );
 }
 

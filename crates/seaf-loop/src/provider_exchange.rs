@@ -372,6 +372,27 @@ pub fn persist_provider_exchange_record_reference(
     workspace: &LoopWorkspace,
     reference: ProviderExchangeRecordReference,
 ) -> Result<LoopRun, ProviderExchangeError> {
+    if reference.step == LoopStepName::OutputReview
+        && reference.role == ProviderRole::OutputReviewer
+        && reference.kind == ProviderExchangeKind::Initial
+        && reference.phase == ProviderExchangePhase::Request
+    {
+        return Err(ProviderExchangeError::Invalid(
+            "OutputReview initial requests require the authenticated ProviderStepRunner path"
+                .to_string(),
+        ));
+    }
+    persist_provider_exchange_record_reference_with_validator(workspace, reference, |_| Ok(()))
+}
+
+pub(crate) fn persist_provider_exchange_record_reference_with_validator<F>(
+    workspace: &LoopWorkspace,
+    reference: ProviderExchangeRecordReference,
+    validate_prospective: F,
+) -> Result<LoopRun, ProviderExchangeError>
+where
+    F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let mut run = state::load_run(workspace)?;
@@ -382,6 +403,7 @@ pub fn persist_provider_exchange_record_reference(
         }
         validate_provider_exchange_record_append(workspace, &run, &reference)?;
         run.provider_exchange_records.push(reference);
+        validate_prospective(&run)?;
         validate_run_for_atomic_publication(workspace, &run)?;
         let mut bytes = serde_json::to_vec_pretty(&run)?;
         bytes.push(b'\n');
@@ -470,10 +492,14 @@ pub(crate) fn persist_run_with_full_compare(
     }
 }
 
-pub(crate) fn reconcile_provider_exchange_state(
+pub(crate) fn reconcile_provider_exchange_state_with_validator<F>(
     workspace: &LoopWorkspace,
     authoritative: &LoopRun,
-) -> Result<LoopRun, ProviderExchangeError> {
+    validate_prospective: F,
+) -> Result<LoopRun, ProviderExchangeError>
+where
+    F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
     let lock = acquire_provider_exchange_lock(workspace)?;
     let result = (|| {
         let persisted = state::load_run(workspace)?;
@@ -483,6 +509,7 @@ pub(crate) fn reconcile_provider_exchange_state(
             ));
         }
         let prospective = preflight_provider_exchange_reconciliation(workspace, authoritative)?;
+        validate_prospective(&prospective)?;
         if prospective.provider_exchange_records == authoritative.provider_exchange_records {
             return Ok(authoritative.clone());
         }
@@ -1524,6 +1551,150 @@ mod tests {
     };
 
     #[test]
+    fn locked_append_validator_rejection_leaves_staged_record_unadopted() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "locked-validator").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "locked-validator".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        state::save_run(&workspace, &run).expect("initial run");
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request =
+            write_provider_exchange_request(workspace.run_directory(), &coordinates, b"research")
+                .expect("request audit");
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference =
+            stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage");
+        let before = fs::read(workspace.run_file()).expect("run bytes");
+
+        let error = persist_provider_exchange_record_reference_with_validator(
+            &workspace,
+            reference.clone(),
+            |_| {
+                Err(ProviderExchangeError::Invalid(
+                    "prospective subject rejected".to_string(),
+                ))
+            },
+        )
+        .expect_err("validator must reject before publication");
+
+        assert!(error.to_string().contains("prospective subject rejected"));
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+        let current = state::load_run(&workspace).expect("current run");
+        assert!(current.provider_exchange_records.is_empty());
+        assert_eq!(
+            classify_provider_exchange_record(&workspace, &current, &reference).unwrap(),
+            ProviderExchangeRecordState::Staged
+        );
+    }
+
+    #[test]
+    fn public_append_rejects_output_review_initial_request_before_adoption() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "typed-output-review").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "typed-output-review".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+            },
+        });
+        state::save_run(&workspace, &run).expect("initial run");
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::OutputReview,
+            role: ProviderRole::OutputReviewer,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = write_provider_exchange_request(
+            workspace.run_directory(),
+            &coordinates,
+            b"unauthenticated output review",
+        )
+        .expect("request audit");
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference =
+            stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage");
+        let before = fs::read(workspace.run_file()).expect("run bytes");
+
+        let error = persist_provider_exchange_record_reference(&workspace, reference.clone())
+            .expect_err("public append must require authenticated OutputReview path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated ProviderStepRunner path"),
+            "{error}"
+        );
+        assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
+        let current = state::load_run(&workspace).expect("current run");
+        assert!(current.provider_exchange_records.is_empty());
+        assert_eq!(
+            classify_provider_exchange_record(&workspace, &current, &reference).unwrap(),
+            ProviderExchangeRecordState::Staged
+        );
+    }
+
+    #[test]
     fn reconciliation_rejects_stale_candidate_authority_before_adopting_a_staged_suffix() {
         let temp = tempfile::tempdir().expect("temp");
         let workspace = LoopWorkspace::create(&temp.path().join("runs"), "reconcile-candidate-cas")
@@ -1600,8 +1771,12 @@ mod tests {
         state::save_run(&workspace, &persisted).expect("persisted Cleaning state");
         let before = std::fs::read(workspace.run_file()).expect("before bytes");
 
-        let error = reconcile_provider_exchange_state(&workspace, &authoritative)
-            .expect_err("stale Active authority must not replace Cleaning");
+        let error = reconcile_provider_exchange_state_with_validator(
+            &workspace,
+            &authoritative,
+            |_| Ok(()),
+        )
+        .expect_err("stale Active authority must not replace Cleaning");
 
         assert!(
             error.to_string().contains("persisted LoopRun differs"),

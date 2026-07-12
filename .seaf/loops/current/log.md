@@ -1324,3 +1324,45 @@ controller gate repeated the complete Rust workspace, Clippy, package lint,
 typecheck, 8 SDK tests, SDK build, Rust/Prettier formatting, and diff check with
 no failures. M1-05b2 is accepted, and M1-05b3 is active in the roadmap and
 current-loop trackers.
+
+## 2026-07-12 implementation | M1-05b3 Development and OutputReview integration
+
+Completed isolated Development now publishes its response exchange, canonical
+Development evidence, unique policy decision, and completed step state before
+the B1 transaction may mutate the candidate. Candidate application must reload
+as exact Applied before the semantic Development finish log or OutputReview.
+Rejected, blocked, provider-failed, and candidate-application-failed paths leave
+no review call; the application-fault case retains the already durable evidence
+without falsely claiming the step finished.
+
+A candidate-locked read-only verifier rechecks the full Development, policy,
+intent, applied-evidence, candidate-tree, and staged-diff chain and returns a
+closed review projection. OutputReview receives only that projection, the run
+and input digests, and approved SpecCreation/SpecReview identities. It never
+receives repository context, ticket text, proposal body, or an unverified live
+diff. Resume safely migrates only the no-review-history pre-B3 state, recovers
+real pristine/materialized Applying cuts, and verifies Applied read-only.
+
+Every staged, durable, and fresh OutputReview Initial request is authenticated
+as an exact full subject and envelope. Recovery and fresh publication validate
+the prospective ledger inside the provider lock and bind the persisted run
+model. The exported raw append refuses this record identity, leaving only the
+crate-private authenticated path. Applied runs permit OutputReview-only rerun;
+earlier reruns fail before ticket handling, scaffold, snapshot repair, provider
+reconciliation, or logs. CLI coverage proves OutputReview attempt two preserves
+attempt one and that a naturally blocked pre-Development Research rerun retains
+the context cap.
+
+The first independent review found forbidden-rerun mutation ordering and an
+authoritative-model/locked-append gap. Re-review then found the public raw
+append bypass. All findings returned to the implementer, received focused
+regressions, and were independently approved after correction. A final
+test-only compatibility adjustment preserved the historical in-crate legacy
+harness without compiling a production bypass.
+
+The controller's final gate passes the complete locked workspace: CLI 86, core
+33, seaf-loop library 98, candidate integration 34, provider candidate 11,
+provider exchange 22, state 28, all remaining integration/doc tests, and SDK 8.
+Clippy with all targets/features and warnings denied, package lint, typecheck,
+SDK build, Rust/Prettier formatting, and diff checks pass. M1-05b3 is accepted;
+M1-05b4 explicit candidate cleanup is active.

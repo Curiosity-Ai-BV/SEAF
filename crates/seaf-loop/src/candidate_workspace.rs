@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    context::{CandidateContextAuthority, CandidateContextAuthorityKind},
     immutable_artifact::{publish_create_only, read_verified_regular_file},
     workspace::{LoopWorkspace, ARTIFACTS_DIR},
     DevelopmentEvidence, PatchDecisionKind, PolicyDecision,
@@ -37,6 +38,21 @@ const PATCH_EXPECTED_DIFF_PATH: &str = "artifacts/candidate-patch.expected.diff"
 const PATCH_APPLIED_DIFF_PATH: &str = "artifacts/candidate-patch.applied.diff";
 const PATCH_APPLIED_EVIDENCE_PATH: &str = "artifacts/candidate-patch.applied.json";
 static PATCH_PLAN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedCandidatePatchEvidence {
+    pub development_evidence: ArtifactReference,
+    pub policy_decision: PolicyDecision,
+    pub policy_decision_digest: String,
+    pub candidate_authority: CandidateContextAuthority,
+    pub intent: ArtifactReference,
+    pub applied_evidence: ArtifactReference,
+    pub candidate_tree: String,
+    pub applied_diff: ArtifactReference,
+    pub applied_diff_digest: String,
+    pub applied_diff_content: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +96,123 @@ pub fn apply_candidate_development_evidence(
     source_worktree_root: &Path,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
     apply_candidate_development_evidence_with_hook(workspace, source_worktree_root, |_| Ok(()))
+}
+
+pub fn verify_candidate_patch_evidence(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
+    let lock = acquire_candidate_lock(workspace)?;
+    let result = verify_candidate_patch_evidence_locked(workspace, source_worktree_root);
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(CandidateWorkspaceError::Io(error)),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn verify_candidate_patch_evidence_locked(
+    workspace: &LoopWorkspace,
+    source_worktree_root: &Path,
+) -> Result<VerifiedCandidatePatchEvidence, CandidateWorkspaceError> {
+    let run = crate::state::load_run(workspace)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    if run.execution_mode != LoopExecutionMode::IsolatedCandidate {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate patch verification requires isolated_candidate execution".to_string(),
+        ));
+    }
+    let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "isolated candidate run has no candidate workspace authority".to_string(),
+        )
+    })?;
+    if candidate.lifecycle != CandidateWorkspaceLifecycle::Active {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "candidate patch verification requires an active candidate".to_string(),
+        ));
+    }
+    validate_candidate_physical(
+        workspace.run_directory(),
+        source_worktree_root,
+        candidate,
+        true,
+    )?;
+    let development_evidence = development_evidence_reference(&run)?;
+    let evidence = DevelopmentEvidence::load(
+        workspace,
+        &development_evidence.path,
+        &development_evidence.digest,
+        &run.run_id,
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    let policy_decision = authoritative_policy_decision(&run, &evidence)?;
+    if policy_decision.applied
+        || !matches!(
+            policy_decision.decision,
+            PatchDecisionKind::Allowed | PatchDecisionKind::RequiresHumanReview
+        )
+    {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "verified candidate patch requires an unapplied Allowed or RequiresHumanReview policy decision"
+                .to_string(),
+        ));
+    }
+    let transaction = candidate.patch_transaction.as_ref().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "verified candidate patch requires an Applied transaction".to_string(),
+        )
+    })?;
+    if transaction.phase != CandidatePatchPhase::Applied {
+        return Err(CandidateWorkspaceError::Mismatch(
+            "verified candidate patch transaction is not Applied".to_string(),
+        ));
+    }
+    let intent: CandidatePatchIntent = load_canonical_artifact(workspace, &transaction.intent)?;
+    validate_patch_intent(
+        workspace,
+        &run,
+        candidate,
+        &development_evidence,
+        &evidence,
+        &policy_decision,
+        &intent,
+    )?;
+    validate_applied_patch_evidence(workspace, &run, candidate, transaction, &intent)?;
+    let applied_evidence = transaction.applied_evidence.clone().ok_or_else(|| {
+        CandidateWorkspaceError::Mismatch(
+            "Applied candidate transaction has no applied evidence".to_string(),
+        )
+    })?;
+    let applied: CandidatePatchAppliedEvidence =
+        load_canonical_artifact(workspace, &applied_evidence)?;
+    let applied_diff_bytes = load_artifact_bytes(workspace, &applied.observed_candidate_diff)?;
+    let applied_diff_content = String::from_utf8(applied_diff_bytes).map_err(|error| {
+        CandidateWorkspaceError::Mismatch(format!(
+            "verified candidate applied diff is not UTF-8: {error}"
+        ))
+    })?;
+    let policy_decision_digest = canonical_sha256_digest(&policy_decision)
+        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
+    Ok(VerifiedCandidatePatchEvidence {
+        development_evidence,
+        policy_decision,
+        policy_decision_digest,
+        candidate_authority: CandidateContextAuthority {
+            kind: CandidateContextAuthorityKind::IsolatedCandidate,
+            repository_identity_digest: candidate.repository_identity_digest.clone(),
+            candidate_path_digest: sha256_bytes(candidate.path.as_bytes()),
+            starting_head: candidate.starting_head.clone(),
+            starting_tree: candidate.starting_tree.clone(),
+        },
+        intent: transaction.intent.clone(),
+        applied_evidence,
+        candidate_tree: candidate.candidate_tree.clone(),
+        applied_diff_digest: applied.observed_candidate_diff.digest.clone(),
+        applied_diff: applied.observed_candidate_diff,
+        applied_diff_content,
+    })
 }
 
 fn apply_candidate_development_evidence_with_hook<F>(
@@ -3045,6 +3178,89 @@ mod tests {
         apply_candidate_development_evidence(&after_applied.workspace, &after_applied.source)
             .expect("replay exact Applied publication");
         after_applied.cleanup();
+    }
+
+    #[test]
+    fn isolated_resume_normalizes_completed_development_none_applying_and_applied_before_scaffold()
+    {
+        let none = application_fixture("resume-development-none");
+        let none_run = crate::state::load_run(&none.workspace).expect("pre-B3 run");
+        let none_initialized = crate::runner::InitializedLoopRun::resume_isolated(
+            none.workspace.run_directory().parent().unwrap(),
+            none_run,
+        )
+        .expect("pending no-history pre-B3 Development migrates");
+        assert_eq!(
+            none_initialized
+                .run()
+                .candidate_workspace
+                .as_ref()
+                .unwrap()
+                .patch_transaction
+                .as_ref()
+                .unwrap()
+                .phase,
+            CandidatePatchPhase::Applied
+        );
+        none.cleanup();
+
+        for (run_id, cut) in [
+            (
+                "resume-development-applying-pristine",
+                CandidatePatchApplicationPhase::ApplyingPersisted,
+            ),
+            (
+                "resume-development-applying-materialized",
+                CandidatePatchApplicationPhase::Materialized,
+            ),
+        ] {
+            let fixture = application_fixture(run_id);
+            apply_candidate_development_evidence_with_hook(
+                &fixture.workspace,
+                &fixture.source,
+                |phase| {
+                    if phase == cut {
+                        Err(CandidateWorkspaceError::State(
+                            "injected resume cut".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("leave Applying authority");
+            let applying = crate::state::load_run(&fixture.workspace).expect("Applying run");
+            let initialized = crate::runner::InitializedLoopRun::resume_isolated(
+                fixture.workspace.run_directory().parent().unwrap(),
+                applying,
+            )
+            .expect("resume converges Applying transaction");
+            assert_eq!(
+                initialized
+                    .run()
+                    .candidate_workspace
+                    .as_ref()
+                    .unwrap()
+                    .patch_transaction
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                CandidatePatchPhase::Applied
+            );
+            fixture.cleanup();
+        }
+
+        let applied = application_fixture("resume-development-applied");
+        apply_candidate_development_evidence(&applied.workspace, &applied.source)
+            .expect("Applied setup");
+        let applied_run = crate::state::load_run(&applied.workspace).expect("Applied run");
+        let initialized = crate::runner::InitializedLoopRun::resume_isolated(
+            applied.workspace.run_directory().parent().unwrap(),
+            applied_run.clone(),
+        )
+        .expect("Applied resume is read-only verified");
+        assert_eq!(initialized.run(), &applied_run);
+        applied.cleanup();
     }
 
     struct ApplicationFixture {

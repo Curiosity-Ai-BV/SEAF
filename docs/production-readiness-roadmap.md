@@ -150,9 +150,15 @@ prefixes only after candidate validation. Initial and additive context bind the
 candidate identity, patch gating runs check-only in the candidate, and the
 source checkout remains unchanged even when apply intent is true or source
 bytes are dirty. Legacy provider execution and rerun fail closed while the
-deterministic non-provider runner remains compatible. M1-05b3 is active for
-Development/OutputReview integration; explicit cleanup remains M1-05b4. The
-production loop remains proposal-only until those boundaries are accepted.
+deterministic non-provider runner remains compatible.
+
+M1-05b3 now durably publishes completed Development and policy evidence before
+applying it only to the isolated candidate. OutputReview is built from a
+locked, verified projection of the exact Applied tree and staged diff. Resume
+recovers None/Applying/Applied transaction cuts; only OutputReview may rerun
+after Applied, and forbidden reruns fail before mutation. Explicit CLI cleanup
+remains M1-05b4 and is active. The candidate is still not executable or
+promotable before the later human-approval and eval milestones.
 
 The B1 boundary also preserves pre-B1 candidate runs through a narrow
 missing-mode migration, atomically publishes and directory-syncs immutable

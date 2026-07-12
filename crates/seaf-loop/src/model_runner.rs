@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use seaf_core::{
-    canonical_json_bytes, canonical_sha256_digest, ArtifactReference, LoopRun, LoopStepName,
-    LoopStepStatus, Policy, ProviderExchangeKind, ProviderExchangeOutcome, ProviderExchangePhase,
-    ProviderExchangeRecord, ProviderRole, TicketSpec,
+    canonical_json_bytes, canonical_sha256_digest, ArtifactReference, LoopInputDigests, LoopRun,
+    LoopStepName, LoopStepStatus, Policy, ProviderExchangeKind, ProviderExchangeOutcome,
+    ProviderExchangePhase, ProviderExchangeRecord, ProviderRole, TicketSpec,
 };
 use seaf_models::{ModelMessage, ModelMessageRole, ModelProvider, ModelRequest};
 use sha2::{Digest, Sha256};
@@ -13,8 +13,9 @@ use crate::provider_exchange::authorize_provider_exchange_rerun;
 use crate::provider_exchange::{
     classify_provider_exchange_response, load_provider_exchange_record,
     load_provider_exchange_request, load_provider_exchange_response_audit,
-    persist_provider_exchange_record_reference, persist_provider_rerun_reset,
-    preflight_provider_exchange_reconciliation, reconcile_provider_exchange_state,
+    persist_provider_exchange_record_reference,
+    persist_provider_exchange_record_reference_with_validator, persist_provider_rerun_reset,
+    preflight_provider_exchange_reconciliation, reconcile_provider_exchange_state_with_validator,
     stage_provider_exchange_record, stage_provider_exchange_response_record,
     validate_recovered_conventional_attempt, write_provider_exchange_request,
     write_provider_exchange_response, ProviderExchangeCoordinates, ProviderExchangeResponseAudit,
@@ -73,6 +74,34 @@ struct AuditedRepositoryContextFile {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputReviewArtifactIdentity {
+    run_id: String,
+    step: LoopStepName,
+    role: Role,
+    response_digest: String,
+    artifact_path: String,
+    artifact_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputReviewApprovedSpecIdentity {
+    spec_creation: OutputReviewArtifactIdentity,
+    spec_review: OutputReviewArtifactIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputReviewInitialSubject {
+    instructions: String,
+    run_id: String,
+    input_digests: LoopInputDigests,
+    approved_spec_identity: OutputReviewApprovedSpecIdentity,
+    verified_candidate_patch: crate::VerifiedCandidatePatchEvidence,
+}
+
 pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     provider: &'a P,
     model: String,
@@ -82,7 +111,9 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     ticket: Option<TicketSpec>,
     run: Option<LoopRun>,
     early_artifacts: Vec<PersistedRoleArtifact>,
-    development_evidence: Option<PersistedDevelopmentEvidence>,
+    verified_candidate_patch: Option<crate::VerifiedCandidatePatchEvidence>,
+    #[cfg(test)]
+    legacy_development_evidence: Option<PersistedDevelopmentEvidence>,
     run_directory: Option<PathBuf>,
     run_id: Option<String>,
     patch_gate: Option<ProviderPatchGate<'a>>,
@@ -134,6 +165,7 @@ struct PersistedRoleArtifact {
     artifact: ValidatedRoleArtifact,
 }
 
+#[cfg(test)]
 struct PersistedDevelopmentEvidence {
     artifact_path: String,
     artifact_digest: String,
@@ -156,7 +188,9 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             ticket: None,
             run: None,
             early_artifacts: Vec::new(),
-            development_evidence: None,
+            verified_candidate_patch: None,
+            #[cfg(test)]
+            legacy_development_evidence: None,
             run_directory: None,
             run_id: None,
             patch_gate: None,
@@ -290,6 +324,11 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     }
 
     fn prepare_run(&mut self, workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), RunnerError> {
+        if self.model != run.model {
+            return Err(RunnerError::Step(
+                "configured provider model does not match authoritative run model".to_string(),
+            ));
+        }
         self.fresh_exchange_run = false;
         self.recovered_step_attempt = None;
         self.exchange_workspace = Some(workspace.clone());
@@ -300,6 +339,7 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             )
         })?;
         validate_prepared_ticket(ticket, run)?;
+        let mut expected_output_review = None;
         if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
             self.validate_isolated_candidate_authority(workspace, run)?;
             let prospective = preflight_provider_exchange_reconciliation(workspace, run)
@@ -314,6 +354,23 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 })?;
                 load_audited_initial_context_bundle(workspace, &prospective, request)?;
             }
+            if run.steps.iter().any(|record| {
+                record.name == LoopStepName::Development
+                    && record.status == LoopStepStatus::Completed
+            }) {
+                let source = run
+                    .candidate_workspace
+                    .as_ref()
+                    .expect("isolated candidate validated above")
+                    .source_worktree_root
+                    .clone();
+                let verified =
+                    crate::verify_candidate_patch_evidence(workspace, Path::new(&source))
+                        .map_err(|error| RunnerError::Step(error.to_string()))?;
+                expected_output_review = Some(load_expected_output_review_subject(
+                    workspace, run, verified,
+                )?);
+            }
         } else if !self.legacy_unit_test_harness_enabled() {
             return Err(RunnerError::Step(
                 "legacy provider run cannot execute or resume; start a new isolated run"
@@ -321,7 +378,19 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             ));
         }
         let reconciled = if workspace.run_file().exists() {
-            reconcile_provider_exchange_state(workspace, run).map_err(|error| {
+            reconcile_provider_exchange_state_with_validator(workspace, run, |prospective| {
+                if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
+                    return Ok(());
+                }
+                validate_all_output_review_initial_subjects(
+                    workspace,
+                    prospective,
+                    expected_output_review.as_ref(),
+                    &run.model,
+                )
+                .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))
+            })
+            .map_err(|error| {
                 RunnerError::Step(format!(
                     "provider exchange recovery preflight failed: {error}"
                 ))
@@ -400,7 +469,39 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             self.require_approved_spec_review()?;
         }
         if step == LoopStepName::OutputReview {
-            self.development_evidence = Some(load_verified_development_evidence(workspace, run)?);
+            if let Some(candidate) = run.candidate_workspace.as_ref() {
+                self.verified_candidate_patch = Some(
+                    crate::verify_candidate_patch_evidence(
+                        workspace,
+                        Path::new(&candidate.source_worktree_root),
+                    )
+                    .map_err(|error| RunnerError::Step(error.to_string()))?,
+                );
+            } else {
+                #[cfg(test)]
+                if self.legacy_unit_test_harness_enabled() {
+                    let evidence = load_verified_development_evidence(workspace, run)?;
+                    let record = run
+                        .steps
+                        .iter()
+                        .find(|record| record.name == LoopStepName::Development)
+                        .expect("legacy Development step");
+                    let (path, digest) = required_artifact_pair(record)?;
+                    self.legacy_development_evidence = Some(PersistedDevelopmentEvidence {
+                        artifact_path: path.to_string(),
+                        artifact_digest: digest.to_string(),
+                        evidence,
+                    });
+                } else {
+                    return Err(RunnerError::Step(
+                        "OutputReview requires isolated candidate authority".to_string(),
+                    ));
+                }
+                #[cfg(not(test))]
+                return Err(RunnerError::Step(
+                    "OutputReview requires isolated candidate authority".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -436,6 +537,35 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 "legacy provider run cannot be rerun; start a new isolated run".to_string(),
             ));
         }
+        if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
+            let candidate = run.candidate_workspace.as_ref().ok_or_else(|| {
+                RunnerError::Step("isolated rerun lost candidate authority".to_string())
+            })?;
+            if candidate.patch_transaction.is_some()
+                && (step != LoopStepName::OutputReview
+                    || candidate
+                        .patch_transaction
+                        .as_ref()
+                        .is_none_or(|transaction| {
+                            transaction.phase != seaf_core::CandidatePatchPhase::Applied
+                        }))
+            {
+                return Err(RunnerError::Step(
+                    "isolated candidate rerun is limited to OutputReview over exact Applied evidence; start a new run"
+                        .to_string(),
+                ));
+            }
+            if step == LoopStepName::OutputReview {
+                self.verified_candidate_patch = Some(
+                    crate::verify_candidate_patch_evidence(
+                        workspace,
+                        Path::new(&candidate.source_worktree_root),
+                    )
+                    .map_err(|error| RunnerError::Step(error.to_string()))?,
+                );
+            }
+        }
+        self.run = Some(run.clone());
         self.fresh_exchange_run = true;
         self.recovered_step_attempt = None;
         self.step_attempt = Some(attempt);
@@ -1051,6 +1181,29 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         bytes: &[u8],
         expansion: Option<ArtifactReference>,
     ) -> Result<ArtifactReference, RunnerError> {
+        if coordinates.step == LoopStepName::OutputReview
+            && coordinates.role == ProviderRole::OutputReviewer
+            && coordinates.kind == ProviderExchangeKind::Initial
+            && !self.legacy_unit_test_harness_enabled()
+        {
+            let expected = self.output_review_subject(Role::OutputReviewer)?;
+            let authoritative_model = self
+                .run
+                .as_ref()
+                .ok_or_else(|| {
+                    RunnerError::Step(
+                        "OutputReview request lost authoritative run model".to_string(),
+                    )
+                })?
+                .model
+                .clone();
+            validate_output_review_initial_request_bytes(
+                bytes,
+                &expected,
+                &authoritative_model,
+                Some(self.timeout_ms),
+            )?;
+        }
         let workspace = self.exchange_workspace.clone().ok_or_else(|| {
             RunnerError::Step("audited provider exchange is missing its workspace".to_string())
         })?;
@@ -1135,10 +1288,51 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         workspace: &LoopWorkspace,
         record: &ProviderExchangeRecord,
     ) -> Result<(), RunnerError> {
+        let is_output_review_initial = record.step == LoopStepName::OutputReview
+            && record.role == ProviderRole::OutputReviewer
+            && record.phase == ProviderExchangePhase::Request
+            && record.kind == ProviderExchangeKind::Initial;
+        let expected_output_review =
+            if is_output_review_initial && !self.legacy_unit_test_harness_enabled() {
+                Some(self.output_review_subject(Role::OutputReviewer)?)
+            } else {
+                None
+            };
         let reference = stage_provider_exchange_record(workspace.run_directory(), record)
             .map_err(exchange_write_error)?;
-        let run = persist_provider_exchange_record_reference(workspace, reference)
-            .map_err(exchange_write_error)?;
+        let run = if let Some(expected) = expected_output_review.as_ref() {
+            persist_provider_exchange_record_reference_with_validator(
+                workspace,
+                reference,
+                |prospective| {
+                    validate_all_output_review_initial_subjects(
+                        workspace,
+                        prospective,
+                        Some(expected),
+                        &prospective.model,
+                    )
+                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))
+                },
+            )
+        } else {
+            #[cfg(test)]
+            {
+                if is_output_review_initial && self.legacy_unit_test_harness_enabled() {
+                    persist_provider_exchange_record_reference_with_validator(
+                        workspace,
+                        reference,
+                        |_| Ok(()),
+                    )
+                } else {
+                    persist_provider_exchange_record_reference(workspace, reference)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                persist_provider_exchange_record_reference(workspace, reference)
+            }
+        }
+        .map_err(exchange_write_error)?;
         self.run = Some(run.clone());
         self.durable_provider_exchange_records = Some(run.provider_exchange_records);
         Ok(())
@@ -1325,13 +1519,21 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     .map_err(|error| {
                         RunnerError::Step(format!("failed to build Development evidence: {error}"))
                     })?;
-                    let artifact_path = format!(
-                        "{ARTIFACTS_DIR}/{}.json",
-                        step_file_stem(LoopStepName::Development)
-                    );
-                    let artifact_digest = evidence.artifact_digest().map_err(|error| {
-                        RunnerError::Step(format!("failed to digest Development evidence: {error}"))
-                    })?;
+                    #[cfg(test)]
+                    if self.legacy_unit_test_harness_enabled() {
+                        self.legacy_development_evidence = Some(PersistedDevelopmentEvidence {
+                            artifact_path: format!(
+                                "{ARTIFACTS_DIR}/{}.json",
+                                step_file_stem(LoopStepName::Development)
+                            ),
+                            artifact_digest: evidence.artifact_digest().map_err(|error| {
+                                RunnerError::Step(format!(
+                                    "failed to digest Development evidence: {error}"
+                                ))
+                            })?,
+                            evidence: evidence.clone(),
+                        });
+                    }
                     let content = crate::ArtifactContent::new(
                         "json",
                         evidence.canonical_bytes().map_err(|error| {
@@ -1340,11 +1542,6 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                             ))
                         })?,
                     );
-                    self.development_evidence = Some(PersistedDevelopmentEvidence {
-                        artifact_path,
-                        artifact_digest,
-                        evidence,
-                    });
                     Some(content)
                 }
                 (RoleResponse::Developer(_), None) => {
@@ -1557,39 +1754,74 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
     }
 
     fn output_review_prompt(&self, role: Role) -> Result<String, RunnerError> {
+        #[cfg(test)]
+        if self.legacy_unit_test_harness_enabled() && self.verified_candidate_patch.is_none() {
+            let run = self.run.as_ref().ok_or_else(|| {
+                RunnerError::Step(
+                    "legacy OutputReview request requires authoritative loop state".to_string(),
+                )
+            })?;
+            let development = self.legacy_development_evidence.as_ref().ok_or_else(|| {
+                RunnerError::Step(
+                    "legacy OutputReview request requires verified Development evidence"
+                        .to_string(),
+                )
+            })?;
+            let spec_creation = self
+                .required_persisted_early_artifact(LoopStepName::SpecCreation, Role::SpecWriter)?;
+            let spec_review = self.require_approved_spec_review()?;
+            return serde_json::to_string(&serde_json::json!({
+                "instructions": format!(
+                    "Run the OutputReview loop step as the {}. Review only the persisted policy-gated Development evidence and return only JSON matching the response schema.",
+                    role.as_str()
+                ),
+                "run_id": run.run_id,
+                "input_digests": run.input_digests,
+                "approved_spec_identity": {
+                    "spec_creation": persisted_artifact_identity(spec_creation),
+                    "spec_review": persisted_artifact_identity(spec_review),
+                },
+                "development_evidence": {
+                    "artifact_path": development.artifact_path,
+                    "artifact_digest": development.artifact_digest,
+                    "artifact": development.evidence,
+                },
+            }))
+            .map_err(|error| {
+                RunnerError::Step(format!(
+                    "failed to serialize legacy OutputReview role input: {error}"
+                ))
+            });
+        }
+        let subject = self.output_review_subject(role)?;
+        serde_json::to_string(&subject).map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to serialize OutputReview role input: {error}"
+            ))
+        })
+    }
+
+    fn output_review_subject(&self, role: Role) -> Result<OutputReviewInitialSubject, RunnerError> {
         let run = self.run.as_ref().ok_or_else(|| {
             RunnerError::Step("OutputReview request requires authoritative loop state".to_string())
         })?;
-        let development = self.development_evidence.as_ref().ok_or_else(|| {
+        let verified_candidate_patch = self.verified_candidate_patch.as_ref().ok_or_else(|| {
             RunnerError::Step(
-                "OutputReview request requires verified Development evidence".to_string(),
+                "OutputReview request requires verified Applied candidate evidence".to_string(),
             )
         })?;
         let spec_creation =
             self.required_persisted_early_artifact(LoopStepName::SpecCreation, Role::SpecWriter)?;
         let spec_review = self.require_approved_spec_review()?;
-        let prompt = serde_json::json!({
-            "instructions": format!(
-                "Run the OutputReview loop step as the {}. Review only the persisted policy-gated candidate evidence and return only JSON matching the response schema.",
-                role.as_str()
-            ),
-            "run_id": run.run_id,
-            "input_digests": run.input_digests,
-            "approved_spec_identity": {
-                "spec_creation": persisted_artifact_identity(spec_creation),
-                "spec_review": persisted_artifact_identity(spec_review),
+        Ok(OutputReviewInitialSubject {
+            instructions: output_review_instructions(role),
+            run_id: run.run_id.clone(),
+            input_digests: run.input_digests.clone(),
+            approved_spec_identity: OutputReviewApprovedSpecIdentity {
+                spec_creation: persisted_artifact_identity(spec_creation),
+                spec_review: persisted_artifact_identity(spec_review),
             },
-            "development_evidence": {
-                "artifact_path": development.artifact_path,
-                "artifact_digest": development.artifact_digest,
-                "artifact": development.evidence,
-            },
-            "candidate_authority": candidate_context_authority(run),
-        });
-        serde_json::to_string(&prompt).map_err(|error| {
-            RunnerError::Step(format!(
-                "failed to serialize OutputReview role input: {error}"
-            ))
+            verified_candidate_patch: verified_candidate_patch.clone(),
         })
     }
 
@@ -1657,7 +1889,11 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
     ) -> Result<(), RunnerError> {
         self.context_bundle = None;
         self.early_artifacts.clear();
-        self.development_evidence = None;
+        self.verified_candidate_patch = None;
+        #[cfg(test)]
+        {
+            self.legacy_development_evidence = None;
+        }
         self.run_directory = Some(workspace.run_directory().to_path_buf());
         self.run_id = run_id.map(str::to_string);
         if self.ticket.is_some() {
@@ -1737,8 +1973,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             let (path, digest) = required_artifact_pair(record)?;
             match record.status {
                 LoopStepStatus::Completed | LoopStepStatus::Failed => {
-                    self.development_evidence =
-                        Some(load_verified_development_evidence(workspace, run)?);
+                    load_verified_development_evidence(workspace, run)?;
                 }
                 LoopStepStatus::Blocked => {
                     ValidatedRoleArtifact::load(
@@ -1777,6 +2012,125 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         }
         Ok(())
     }
+}
+
+fn output_review_instructions(role: Role) -> String {
+    format!(
+        "Run the OutputReview loop step as the {}. Review only the persisted policy-gated candidate evidence and return only JSON matching the response schema.",
+        role.as_str()
+    )
+}
+
+fn load_expected_output_review_subject(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    verified_candidate_patch: crate::VerifiedCandidatePatchEvidence,
+) -> Result<OutputReviewInitialSubject, RunnerError> {
+    let load = |step: LoopStepName, role: Role| -> Result<PersistedRoleArtifact, RunnerError> {
+        let record = run
+            .steps
+            .iter()
+            .find(|record| record.name == step)
+            .ok_or_else(|| RunnerError::Step(format!("loop state is missing {step:?}")))?;
+        let (path, digest) = required_artifact_pair(record)?;
+        let artifact =
+            ValidatedRoleArtifact::load(workspace, path, digest, &run.run_id, step, role).map_err(
+                |error| {
+                    RunnerError::Step(format!("failed to verify {step:?} role artifact: {error}"))
+                },
+            )?;
+        Ok(PersistedRoleArtifact {
+            artifact_path: path.to_string(),
+            artifact_digest: digest.to_string(),
+            artifact,
+        })
+    };
+    let spec_creation = load(LoopStepName::SpecCreation, Role::SpecWriter)?;
+    let spec_review = load(LoopStepName::SpecReview, Role::SpecReviewer)?;
+    if !matches!(
+        &spec_review.artifact.response,
+        RoleResponse::Reviewer(response) if response.decision == ReviewDecision::ApproveSpec
+    ) {
+        return Err(RunnerError::Step(
+            "OutputReview requires an approving SpecReview artifact".to_string(),
+        ));
+    }
+    Ok(OutputReviewInitialSubject {
+        instructions: output_review_instructions(Role::OutputReviewer),
+        run_id: run.run_id.clone(),
+        input_digests: run.input_digests.clone(),
+        approved_spec_identity: OutputReviewApprovedSpecIdentity {
+            spec_creation: persisted_artifact_identity(&spec_creation),
+            spec_review: persisted_artifact_identity(&spec_review),
+        },
+        verified_candidate_patch,
+    })
+}
+
+fn validate_all_output_review_initial_subjects(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    expected: Option<&OutputReviewInitialSubject>,
+    model: &str,
+) -> Result<(), RunnerError> {
+    for reference in run.provider_exchange_records.iter().filter(|reference| {
+        reference.step == LoopStepName::OutputReview
+            && reference.role == ProviderRole::OutputReviewer
+            && reference.phase == ProviderExchangePhase::Request
+            && reference.kind == ProviderExchangeKind::Initial
+    }) {
+        let expected = expected.ok_or_else(|| {
+            RunnerError::Step(
+                "OutputReview provider history has no verified Applied candidate subject"
+                    .to_string(),
+            )
+        })?;
+        let record = load_provider_exchange_record(workspace.run_directory(), reference)
+            .map_err(exchange_recovery_error)?;
+        let bytes = load_provider_exchange_request(workspace.run_directory(), &record.request)
+            .map_err(exchange_recovery_error)?;
+        validate_output_review_initial_request_bytes(&bytes, expected, model, None)?;
+    }
+    Ok(())
+}
+
+fn validate_output_review_initial_request_bytes(
+    bytes: &[u8],
+    expected: &OutputReviewInitialSubject,
+    model: &str,
+    expected_timeout_ms: Option<u64>,
+) -> Result<(), RunnerError> {
+    let request: ModelRequest = serde_json::from_slice(bytes).map_err(|error| {
+        RunnerError::Step(format!(
+            "failed to parse OutputReview initial provider request: {error}"
+        ))
+    })?;
+    if request.model != model
+        || request.system != Role::OutputReviewer.system_prompt()
+        || request.response_schema != Some(Role::OutputReviewer.response_schema())
+        || request.temperature != 0.0
+        || request.timeout_ms == 0
+        || expected_timeout_ms.is_some_and(|timeout| request.timeout_ms != timeout)
+        || request.messages.len() != 1
+        || request.messages[0].role != ModelMessageRole::User
+    {
+        return Err(RunnerError::Step(
+            "OutputReview initial provider request envelope is not exact".to_string(),
+        ));
+    }
+    let actual: OutputReviewInitialSubject = serde_json::from_str(&request.messages[0].content)
+        .map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to parse OutputReview initial provider subject: {error}"
+            ))
+        })?;
+    if actual != *expected {
+        return Err(RunnerError::Step(
+            "OutputReview initial provider request does not match exact verified candidate patch subject"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_all_audited_initial_candidate_authorities(
@@ -1822,13 +2176,19 @@ fn validate_all_audited_initial_candidate_authorities(
         let context_bound = role_input
             .get("repository_context_authority")
             .and_then(|authority| authority.get("candidate_authority"));
-        if dedicated.is_none() && context_bound.is_none() {
+        let verified_patch_bound = role_input
+            .get("verified_candidate_patch")
+            .and_then(|evidence| evidence.get("candidate_authority"));
+        if dedicated.is_none() && context_bound.is_none() && verified_patch_bound.is_none() {
             return Err(RunnerError::Step(
                 "audited provider history has no candidate-root context authority; start a new run"
                     .to_string(),
             ));
         }
-        for actual in [dedicated, context_bound].into_iter().flatten() {
+        for actual in [dedicated, context_bound, verified_patch_bound]
+            .into_iter()
+            .flatten()
+        {
             let actual: CandidateContextAuthority = serde_json::from_value(actual.clone())
                 .map_err(|error| {
                     RunnerError::Step(format!(
@@ -2085,15 +2445,15 @@ fn persisted_artifact_prompt(
         })
 }
 
-fn persisted_artifact_identity(persisted: &PersistedRoleArtifact) -> serde_json::Value {
-    serde_json::json!({
-        "run_id": persisted.artifact.run_id,
-        "step": persisted.artifact.step,
-        "role": persisted.artifact.role,
-        "response_digest": persisted.artifact.response_digest,
-        "artifact_path": persisted.artifact_path,
-        "artifact_digest": persisted.artifact_digest,
-    })
+fn persisted_artifact_identity(persisted: &PersistedRoleArtifact) -> OutputReviewArtifactIdentity {
+    OutputReviewArtifactIdentity {
+        run_id: persisted.artifact.run_id.clone(),
+        step: persisted.artifact.step,
+        role: persisted.artifact.role,
+        response_digest: persisted.artifact.response_digest.clone(),
+        artifact_path: persisted.artifact_path.clone(),
+        artifact_digest: persisted.artifact_digest.clone(),
+    }
 }
 
 fn validated_role_artifact_content(
@@ -2151,7 +2511,7 @@ fn required_artifact_pair(record: &seaf_core::LoopStepRecord) -> Result<(&str, &
 fn load_verified_development_evidence(
     workspace: &LoopWorkspace,
     run: &LoopRun,
-) -> Result<PersistedDevelopmentEvidence, RunnerError> {
+) -> Result<DevelopmentEvidence, RunnerError> {
     let record = run
         .steps
         .iter()
@@ -2191,11 +2551,7 @@ fn load_verified_development_evidence(
             "Development evidence policy decision does not exactly match run state".to_string(),
         ));
     }
-    Ok(PersistedDevelopmentEvidence {
-        artifact_path: path.to_string(),
-        artifact_digest: digest.to_string(),
-        evidence,
-    })
+    Ok(evidence)
 }
 
 fn early_step_roles() -> [(LoopStepName, Role); 4] {
@@ -2491,8 +2847,12 @@ mod live_context_cap_tests {
         };
         let reference =
             stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage");
-        let run =
-            persist_provider_exchange_record_reference(&workspace, reference).expect("persist");
+        let run = persist_provider_exchange_record_reference_with_validator(
+            &workspace,
+            reference,
+            |_| Ok(()),
+        )
+        .expect("persist test fixture");
         let ticket = TicketSpec {
             ticket_id: "T-1".to_string(),
             goal_id: "G-1".to_string(),

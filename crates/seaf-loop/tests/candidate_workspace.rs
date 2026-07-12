@@ -1437,9 +1437,13 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     let before_rerun = fs::read(workspace.run_file()).unwrap();
     let error = runner
         .rerun_from(seaf_core::LoopStepName::Development)
-        .expect_err("Applied transaction must block reset until B3");
-    assert!(error.to_string().contains("before rerun reset"), "{error}");
+        .expect_err("Applied transaction permits only OutputReview rerun");
+    assert!(error.to_string().contains("start a new run"), "{error}");
     assert_eq!(fs::read(workspace.run_file()).unwrap(), before_rerun);
+    let verified = seaf_loop::verify_candidate_patch_evidence(&workspace, &source)
+        .expect("exact Applied review projection");
+    assert_eq!(verified.candidate_tree, applied.candidate_tree);
+    assert_eq!(verified.applied_diff_digest, applied.candidate_diff_digest);
     let replayed = apply_candidate_development_evidence(&workspace, &source)
         .expect("exact Applied replay is idempotent");
     assert_eq!(replayed, applied);
@@ -1454,6 +1458,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     )
     .expect("tamper applied evidence");
     assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+    assert!(seaf_loop::verify_candidate_patch_evidence(&workspace, &source).is_err());
     fs::write(&applied_evidence_path, &applied_evidence_bytes).expect("restore applied evidence");
 
     let applied_evidence: serde_json::Value =
@@ -1470,6 +1475,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     )
     .expect("tamper applied diff");
     assert!(apply_candidate_development_evidence(&workspace, &source).is_err());
+    assert!(seaf_loop::verify_candidate_patch_evidence(&workspace, &source).is_err());
     fs::write(&applied_diff_path, applied_diff_bytes).expect("restore applied diff");
     assert_eq!(
         apply_candidate_development_evidence(&workspace, &source).expect("restored Applied replay"),

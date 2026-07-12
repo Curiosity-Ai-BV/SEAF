@@ -770,7 +770,7 @@ same-user directory-entry races remain M1-10/M1-11 hardening scope.
 ### M1-05b - Candidate Provider And CLI Integration
 
 Status: active. Dependencies: M1-05a (complete). Split into four reviewable
-boundaries: M1-05b1 and M1-05b2 are complete; M1-05b3 is active.
+boundaries: M1-05b1 through M1-05b3 are complete; M1-05b4 is active.
 
 Roadmap: U3. Dependencies: M1-04b.
 
@@ -871,14 +871,51 @@ Rust/Prettier formatting, and diff checks pass.
 
 #### M1-05b3 - Development And Output-Review Integration
 
-Status: active. Dependencies: M1-05b2.
+Status: complete on 2026-07-12. Dependencies: M1-05b2.
 
 Wire policy-gated Development evidence into the candidate transaction and make
 OutputReview consume the verified candidate tree/diff evidence.
 
+- A completed isolated Development response, canonical Development artifact,
+  unique policy decision, and completed step state are durable before candidate
+  application begins. The runner requires exact Applied authority before the
+  semantic finish log or OutputReview; rejected, blocked, provider-failed, or
+  application-failed Development never reaches OutputReview.
+- A read-only, candidate-locked verifier rechecks the Development reference,
+  exact policy and digest, B2 candidate authority, immutable intent and applied
+  evidence, candidate tree, and exact staged-diff reference, digest, and bytes.
+  OutputReview receives only that closed projection, approved-spec identities,
+  run identity, and input digests.
+- Resume normalizes only the narrow pre-B3 no-transaction state with pending
+  OutputReview and no review history, recovers pristine or materialized
+  Applying cuts through the B1 transaction, and verifies Applied read-only.
+  Proposal-only review history and inconsistent transaction/step combinations
+  fail with start-new-run guidance.
+- Every staged, durable, and fresh OutputReview Initial request is checked as a
+  complete subject and provider envelope. Recovery and fresh publication
+  validate the prospective ledger while the provider lock is held and bind the
+  authoritative run model. The exported raw append rejects this authenticated
+  record identity.
+- Applied candidates permit only OutputReview reruns. Earlier reruns fail before
+  ticket handling, scaffold, snapshot repair, provider reconciliation, or log
+  mutation. OutputReview attempt two preserves candidate, Development/policy
+  authority, and attempt-one audit history.
+- The source checkout remains unchanged across pass, block, provider failure,
+  application failure, resume, and rerun. Historical provider harness behavior
+  is retained only in structurally `cfg(test)` code.
+
+Verification: the final locked workspace passes with 86 CLI tests, 33 core
+tests, 98 seaf-loop library tests, 34 candidate integration tests, 11 provider
+candidate boundary tests, 22 provider-exchange integration tests, 28 state
+tests, all remaining integration and doc tests, and 8 SDK tests. Clippy with all
+targets/features and warnings denied, SDK lint/typecheck/build, Rust/Prettier
+formatting, and diff checks pass. Independent spec and quality re-reviews
+approved the final boundary after the forbidden-rerun, authoritative-model,
+locked-append, and public raw-append findings were closed.
+
 #### M1-05b4 - Explicit Candidate Cleanup CLI
 
-Status: pending. Dependencies: M1-05b3.
+Status: active. Dependencies: M1-05b3 (complete).
 
 Expose explicit cleanup through the existing authoritative
 Active-to-Cleaning-to-Cleaned primitive and close end-to-end source immutability

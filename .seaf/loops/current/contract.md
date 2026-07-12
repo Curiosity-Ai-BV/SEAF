@@ -41,4 +41,4 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-05b3 - Development and output-review candidate integration.
+M1-05b4 - Explicit candidate cleanup CLI.
