@@ -136,10 +136,25 @@ pub fn pack_context_for_ticket(
 
 pub fn pack_live_context(request: &ContextPackRequest) -> Result<ContextBundle, ContextError> {
     validate_live_context_paths(request)?;
-    pack_context(request)
+    pack_context_impl(request, None)
 }
 
 pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, ContextError> {
+    pack_context_impl(request, None)
+}
+
+pub(crate) fn pack_live_context_with_redactor(
+    request: &ContextPackRequest,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<ContextBundle, ContextError> {
+    validate_live_context_paths(request)?;
+    pack_context_impl(request, Some(redactor))
+}
+
+fn pack_context_impl(
+    request: &ContextPackRequest,
+    redactor: Option<&crate::secret_redaction::SecretRedactor>,
+) -> Result<ContextBundle, ContextError> {
     let repository_root = request.repository_root.canonicalize()?;
     let default_excludes = effective_default_exclude_globs(&request.default_exclude_globs);
     let mut files = Vec::new();
@@ -210,6 +225,14 @@ pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, Conte
                 continue;
             }
         };
+        if redactor
+            .is_some_and(|redactor| redactor.contains_prohibited_bytes(&source).unwrap_or(true))
+        {
+            warnings.push(format!(
+                "excluded {repo_path} because it contains prohibited credential material"
+            ));
+            continue;
+        }
         let sha256 = sha256_digest(&source);
         let source_bytes = source.len();
 
@@ -287,6 +310,15 @@ pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, Conte
     };
     let mut manifest_json = serde_json::to_vec_pretty(&manifest)?;
     manifest_json.push(b'\n');
+    if redactor.is_some_and(|redactor| {
+        redactor
+            .contains_prohibited_bytes(&manifest_json)
+            .unwrap_or(true)
+    }) {
+        return Err(ContextError::Safety(
+            "context manifest contains prohibited credential material".to_string(),
+        ));
+    }
     let manifest_path = write_artifact(
         &request.run_directory,
         CONTEXT_MANIFEST_FILE,
@@ -300,6 +332,32 @@ pub fn pack_context(request: &ContextPackRequest) -> Result<ContextBundle, Conte
         warnings,
         manifest_path,
     })
+}
+
+pub(crate) fn load_context_manifest_with_redactor(
+    run_directory: &Path,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<ContextManifest, ContextError> {
+    let bytes = crate::immutable_artifact::read_verified_regular_file(
+        run_directory,
+        CONTEXT_MANIFEST_FILE,
+        "context manifest",
+    )
+    .map_err(|error| ContextError::Safety(error.to_string()))?;
+    if redactor.contains_prohibited_bytes(&bytes).unwrap_or(true) {
+        return Err(ContextError::Safety(
+            "context manifest contains prohibited credential material".to_string(),
+        ));
+    }
+    let manifest: ContextManifest = serde_json::from_slice(&bytes)?;
+    let mut canonical = serde_json::to_vec_pretty(&manifest)?;
+    canonical.push(b'\n');
+    if canonical != bytes || manifest.untrusted_context_marker != UNTRUSTED_CONTEXT_MARKER {
+        return Err(ContextError::Safety(
+            "context manifest is not exact canonical context authority".to_string(),
+        ));
+    }
+    Ok(manifest)
 }
 
 #[derive(Debug)]
@@ -409,11 +467,14 @@ fn utf8_prefix_len(bytes: &[u8], max_bytes: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use seaf_core::{TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus};
     use sha2::{Digest, Sha256};
 
     use super::{
-        pack_context, pack_context_for_ticket, ContextLimits, ContextManifest, ContextPackRequest,
+        load_context_manifest_with_redactor, pack_context, pack_context_for_ticket,
+        pack_context_impl, ContextLimits, ContextManifest, ContextPackRequest,
         CONTEXT_MANIFEST_FILE, UNTRUSTED_CONTEXT_MARKER,
     };
 
@@ -620,6 +681,59 @@ mod tests {
             .default_exclude_globs
             .iter()
             .any(|pattern| pattern == "docs/private.md"));
+    }
+
+    #[test]
+    fn context_pack_screens_exact_canonical_manifest_bytes_before_publication() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        let run_dir = temp_dir.path().join("run");
+        std::fs::create_dir(&repo).expect("repo dir");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
+        let request = ContextPackRequest {
+            repository_root: repo,
+            run_directory: run_dir.clone(),
+            relevant_files: Vec::new(),
+            ticket_forbidden_files: Vec::new(),
+            policy_forbidden_paths: Vec::new(),
+            default_exclude_globs: Vec::new(),
+            limits: ContextLimits {
+                max_bytes_per_file: 7,
+                max_total_bytes: 11,
+            },
+        };
+        let secret = "\"max_bytes_per_file\": 7,\n  \"max_total_bytes\": 11";
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+
+        let error = pack_context_impl(&request, Some(&redactor))
+            .expect_err("canonical manifest material must fail before publication");
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!run_dir.join(CONTEXT_MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn context_manifest_reauthentication_screens_exact_bytes_before_decode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let run_dir = temp_dir.path().join("run");
+        crate::artifact_safety::create_private_directory(&run_dir).expect("run dir");
+        let secret = "manifest-history-secret-value";
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+        crate::artifact_safety::write_private_fixture(
+            run_dir.join(CONTEXT_MANIFEST_FILE),
+            format!("not-json:{secret}").into_bytes(),
+        )
+        .expect("persisted manifest fixture");
+
+        let error = load_context_manifest_with_redactor(&run_dir, &redactor)
+            .expect_err("raw persisted manifest must be screened before JSON decode");
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains("JSON"), "{error}");
     }
 
     fn ticket_with_relevant_files(relevant_files: Vec<&str>) -> TicketSpec {

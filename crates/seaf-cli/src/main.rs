@@ -1483,8 +1483,9 @@ fn resume_loop_with_recovery(
         )?;
         preflight_authoritative_run_inputs(&args.runs_root, &existing, &snapshots)
             .map_err(loop_runner_failure)?;
-        let initialized = InitializedLoopRun::resume_isolated(&args.runs_root, existing)
-            .map_err(loop_runner_failure)?;
+        let initialized =
+            InitializedLoopRun::resume_isolated_with_inputs(&args.runs_root, existing, &snapshots)
+                .map_err(loop_runner_failure)?;
         let scaffolded = initialized.scaffold().map_err(loop_runner_failure)?;
         let prepared = scaffolded
             .publish_authoritative_inputs(snapshots)
@@ -1780,8 +1781,16 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
         config.model.to_string(),
         input_digests,
     );
-    let initialized = InitializedLoopRun::create_isolated(runner_config, config.repository_root)
-        .map_err(loop_runner_failure)?;
+    let snapshots = authoritative_input_snapshots(
+        config.ticket,
+        policy,
+        project_config,
+        config.repository_identity,
+        config.eval_config,
+    )?;
+    let initialized =
+        InitializedLoopRun::create_isolated(runner_config, config.repository_root, &snapshots)
+            .map_err(loop_runner_failure)?;
     let candidate_root = PathBuf::from(
         &initialized
             .run()
@@ -1792,13 +1801,7 @@ fn start_provider_loop_to_completion<P: ModelProvider + ?Sized>(
     );
     let scaffolded = initialized.scaffold().map_err(loop_runner_failure)?;
     let prepared = scaffolded
-        .publish_authoritative_inputs(authoritative_input_snapshots(
-            config.ticket,
-            policy,
-            project_config,
-            config.repository_identity,
-            config.eval_config,
-        )?)
+        .publish_authoritative_inputs(snapshots)
         .map_err(loop_runner_failure)?;
     let context_request = provider_context_request(&candidate_root, config.ticket, policy);
     let patch_gate_config =
@@ -3109,7 +3112,10 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
             "could not parse {}: {error}",
             args.config.display()
         )),
-        EvalConfigError::MissingRequiredChecks => CliFailure::message(error.to_string()),
+        EvalConfigError::MissingRequiredChecks
+        | EvalConfigError::TooManySensitiveEnvOccurrences
+        | EvalConfigError::SensitiveEnvValueTooLarge
+        | EvalConfigError::SensitiveEnvAggregateTooLarge => CliFailure::message(error.to_string()),
     })?;
 
     if args.loop_run.is_some() != args.ticket.is_some() {
@@ -3183,9 +3189,19 @@ fn run_eval(args: EvalRunArgs) -> Result<(), CliFailure> {
         )));
     }
 
-    write_json_file(&output_path, &report)?;
+    let mut report_bytes = serde_json::to_vec_pretty(&report)
+        .map_err(|error| CliFailure::message(format!("could not serialize JSON: {error}")))?;
+    report_bytes.push(b'\n');
+    plan.validate_exact_derived_bytes(&report_bytes)
+        .map_err(|error| CliFailure::message(error.to_string()))?;
+    fs::write(&output_path, &report_bytes).map_err(|error| {
+        CliFailure::message(format!(
+            "could not write {}: {error}",
+            output_path.display()
+        ))
+    })?;
     if args.json {
-        print_json(&report)?;
+        print!("{}", String::from_utf8_lossy(&report_bytes));
     } else {
         println!("wrote eval report {}", output_path.display());
         println!("{}", report.summary);

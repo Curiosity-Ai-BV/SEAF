@@ -38,15 +38,15 @@
 - [x] M1-09c2b: Zero-command adoption transaction.
 - [x] M1-09c3: Evaluation invalidation and rerun.
 - [x] M1-10: Atomic state and run locking.
-- [ ] M1-11: Minimum artifact protection.
+- [x] M1-11: Minimum artifact protection.
   - [x] M1-11a: Private run artifacts.
   - [x] M1-11b: Bounded artifact storage.
     - [x] M1-11b1: Serialized artifact limits.
     - [x] M1-11b2: Pre-side-effect storage commitments.
       - [x] M1-11b2a: Provider commitments.
       - [x] M1-11b2b: Evaluation commitments.
-  - [ ] M1-11c: Bounded secret redaction (active).
-- [ ] M1-12: Interruption recovery acceptance.
+  - [x] M1-11c: Bounded secret redaction.
+- [ ] M1-12: Interruption recovery acceptance (active).
 
 ## Milestone 2 - Consumable Loop
 
@@ -69,7 +69,7 @@
 
 ## Current Gate
 
-M1-06 through M1-10 and M1-11a are complete; M1-11b is active. Public run/status output supplies
+M1-06 through M1-11 are complete; M1-12 is active. Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -180,4 +180,15 @@ isolated in pinned external operation directories, and promotion crash tests now
 synchronize through the repository-to-provider lock order. Provider-side
 M1-11b2a and M1-11b2b are accepted after independent specification, quality,
 and evidence review. M1-11b2 and M1-11b are complete. M1-11c bounded secret
-redaction is active.
+redaction is accepted after independent specification/security and quality
+re-reviews. The exact provider, evaluation, operator, recovery, context,
+scaffold, log, and run-state envelopes are screened before side effects and at
+authority-changing compare-and-swap boundaries. V3 intent omits configured
+values; clean v1/v2 history remains readable and unsafe legacy history fails
+closed. Fresh isolated provisioning requires authoritative input snapshots and
+screens its exact state/scaffold before the run leaf, candidate, or lock exists.
+The full workspace passes, including CLI 142/142, provider/candidate boundary
+75/75, state 44/44, and provider exchange 22/22; strict Clippy, workspace check,
+Rust/Prettier formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK tests,
+and diff hygiene pass. M1-11 is complete. M1-12 now owns the integrated
+fault-injection acceptance harness and both pre-preview Rust compatibility notes.

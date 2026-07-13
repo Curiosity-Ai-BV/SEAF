@@ -44,23 +44,25 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-11c - Bounded secret redaction. M1-11b, including provider and evaluation
-pre-side-effect commitments, is accepted. M1-11c is the only remaining M1-11
-slice.
+M1-12 - Interruption recovery acceptance. M1-11 minimum artifact protection,
+including bounded secret propagation across exact provider, evaluation,
+operator, recovery, context, scaffold, log, and run-state envelopes, is accepted.
 
-Configured evaluation environment values may remain only in the exact private
-`inputs/eval-config.json`. Provider prompts, requests, responses, evaluation
-logs, Testing evidence, EvalReport, and other derived artifacts must redact both
-configured secret values and obvious credential forms before persistence.
+Add one focused Milestone 1 acceptance harness that interrupts patch, review,
+testing, report, and promotion boundaries and proves restart without duplicate
+effects or source mutation. The suite must also exercise authoritative input
+snapshots, validated role dataflow, candidate isolation, exact human approval,
+controlled evaluation, bound reports, promotion integrity, and recovery through
+the verified source-workspace path.
 
-Accept at most 64 configured secret values, each at most 4 KiB and at most
-64 KiB in aggregate. Oversized redaction input or output fails closed. Preserve
-clean provider results and M1-11b2 typed oversize failures exactly. A
-secret-bearing provider response becomes a small safe non-retryable audited
-failure without raw bytes or a raw digest, while request-only recovery semantics
-remain unchanged.
+Carry two pre-preview Rust compatibility notes into the handoff: M1-09c1 added
+public v2 `TestingEvidence` fields, and M1-11c made
+`InitializedLoopRun::create_isolated` require `AuthoritativeRunInputSnapshots`.
+Persisted clean v1 Testing JSON remains readable. Do not claim packaged or
+external-project acceptance in this slice; those belong to Milestone 2.
 
-Mandatory RED/GREEN covers configured values, obvious patterns, overlaps,
-input/output caps, provider responses, request-only crash recovery, and
-no-raw-leak assertions. Do not add retention/purge, format migration, packaging,
-release, or M1-12 interruption-acceptance behavior in this slice.
+Mandatory RED/GREEN covers every lifecycle interruption boundary, exact resume
+or adoption, absence of duplicate publication/process effects, and byte-exact
+source-checkout preservation. Commit only the integration/fault harness, any
+minimal boundary wiring it proves necessary, the focused CI gate, and matching
+Milestone 1 evidence/docs.

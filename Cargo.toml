@@ -14,6 +14,7 @@ license = "MIT"
 repository = "https://github.com/Curiosity-Ai-BV/SEAF"
 
 [workspace.dependencies]
+aho-corasick = "1.1.4"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 libc = "0.2"

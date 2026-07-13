@@ -98,8 +98,7 @@ pub fn save_run(workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), StateErr
 
 pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
     validate_run_integrity(run)?;
-    let mut json = serde_json::to_vec_pretty(run)?;
-    json.push(b'\n');
+    let json = run_file_bytes(run)?;
     let run_directory = path
         .parent()
         .ok_or_else(|| StateError::InvalidRun("run file has no parent directory".to_string()))?;
@@ -122,10 +121,46 @@ pub fn write_run_file(path: &Path, run: &LoopRun) -> Result<(), StateError> {
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
+                return Err(StateError::InvalidRun(
+                    "public state writer cannot provision a new isolated candidate run".to_string(),
+                ));
+            }
             guard_frozen_authority_direct_write(None, run)?;
             run_persistence::publish_create_only(&lock, path, &json)?;
             Ok(())
         }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn publish_prevalidated_isolated_run(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    expected_bytes: &[u8],
+) -> Result<(), StateError> {
+    validate_run_integrity(run)?;
+    if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate
+        || run.candidate_workspace.as_ref().is_none_or(|candidate| {
+            candidate.lifecycle != seaf_core::CandidateWorkspaceLifecycle::Provisioning
+        })
+        || run_file_bytes(run)? != expected_bytes
+    {
+        return Err(StateError::InvalidRun(
+            "isolated provisioning requires exact prevalidated run bytes".to_string(),
+        ));
+    }
+    let path = workspace.run_file();
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            guard_frozen_authority_direct_write(None, run)?;
+            run_persistence::publish_create_only(&lock, &path, expected_bytes)?;
+            Ok(())
+        }
+        Ok(_) => Err(StateError::InvalidRun(
+            "isolated provisioning run already exists".to_string(),
+        )),
         Err(error) => Err(error.into()),
     }
 }
@@ -146,8 +181,7 @@ pub(crate) fn resync_exact_run(
     expected: &LoopRun,
 ) -> Result<(), StateError> {
     validate_run_integrity(expected)?;
-    let mut expected_bytes = serde_json::to_vec_pretty(expected)?;
-    expected_bytes.push(b'\n');
+    let expected_bytes = run_file_bytes(expected)?;
     let lock = RunMutationGuard::acquire(workspace.run_directory())?;
     let current = load_run(workspace)?;
     let current_bytes = run_persistence::read_regular_file(&workspace.run_file())?;
@@ -166,10 +200,15 @@ pub(crate) fn write_raw_canonical_run_fixture(
     run: &LoopRun,
 ) -> Result<(), StateError> {
     validate_run_integrity(run)?;
+    let bytes = run_file_bytes(run)?;
+    crate::artifact_safety::write_private_fixture(path, bytes)?;
+    Ok(())
+}
+
+pub(crate) fn run_file_bytes(run: &LoopRun) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = serde_json::to_vec_pretty(run)?;
     bytes.push(b'\n');
-    fs::write(path, bytes)?;
-    Ok(())
+    Ok(bytes)
 }
 
 fn guard_frozen_authority_direct_write(
@@ -492,7 +531,7 @@ mod recovery_authority_tests {
         crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let path = temp.path().join("run.json");
         let run = run_with_candidate();
-        write_run_file(&path, &run).unwrap();
+        write_raw_canonical_run_fixture(&path, &run).unwrap();
 
         let mut minted = run.clone();
         minted.latest_recovery = Some(recovery(1, '6'));
@@ -516,14 +555,14 @@ mod recovery_authority_tests {
     }
 
     #[test]
-    fn new_run_file_cannot_begin_with_recovery_authority() {
+    fn new_isolated_run_file_cannot_bypass_provisioning_with_recovery_authority() {
         let temp = tempfile::tempdir().unwrap();
         crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let path = temp.path().join("run.json");
         let mut run = run_with_candidate();
         run.latest_recovery = Some(recovery(1, '6'));
         let error = write_run_file(&path, &run).unwrap_err();
-        assert!(error.to_string().contains("cannot begin"), "{error}");
+        assert!(error.to_string().contains("cannot provision"), "{error}");
         assert!(!path.exists());
     }
 
@@ -533,7 +572,7 @@ mod recovery_authority_tests {
         crate::artifact_safety::make_private_directory_fixture(temp.path()).unwrap();
         let path = temp.path().join("run.json");
         let run = run_with_candidate();
-        write_run_file(&path, &run).unwrap();
+        write_raw_canonical_run_fixture(&path, &run).unwrap();
         fs::File::options()
             .write(true)
             .open(&path)
@@ -558,7 +597,7 @@ mod recovery_authority_tests {
             run_id: "direct-writer-cas".to_string(),
             ..run
         };
-        save_run(&workspace, &run).unwrap();
+        write_raw_canonical_run_fixture(&workspace.run_file(), &run).unwrap();
         let original = fs::read(workspace.run_file()).unwrap();
 
         save_run(&workspace, &run).expect("an exact retry is idempotent");
@@ -590,7 +629,7 @@ mod recovery_authority_tests {
         let workspace = LoopWorkspace::create(&runs_root, "ordinary-cas-race").unwrap();
         let mut expected = run_with_candidate();
         expected.run_id = "ordinary-cas-race".to_string();
-        save_run(&workspace, &expected).unwrap();
+        write_raw_canonical_run_fixture(&workspace.run_file(), &expected).unwrap();
         let mut left_intended = expected.clone();
         left_intended.updated_at = "left-transition".to_string();
         let mut right_intended = expected.clone();
@@ -631,7 +670,7 @@ mod recovery_authority_tests {
         let workspace = LoopWorkspace::create(&temp.path().join("runs"), "resync-bytes").unwrap();
         let mut run = run_with_candidate();
         run.run_id = "resync-bytes".to_string();
-        save_run(&workspace, &run).unwrap();
+        write_raw_canonical_run_fixture(&workspace.run_file(), &run).unwrap();
         resync_exact_run(&workspace, &run).expect("canonical authority resyncs");
         fs::write(workspace.run_file(), serde_json::to_vec(&run).unwrap()).unwrap();
         let error = resync_exact_run(&workspace, &run).unwrap_err();

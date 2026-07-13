@@ -13,6 +13,8 @@ use std::{
 use seaf_core::{validate_eval_config, CheckStatus, EvalCommandConfig, EvalConfig};
 use sha2::{Digest, Sha256};
 
+use crate::secret_redaction::{SecretRedactor, MAX_REDACTION_BYTES};
+
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -21,12 +23,7 @@ const MAX_EVAL_TIMEOUT_MS: u64 = 3_600_000;
 const DEFAULT_EVAL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_EVAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const EVAL_OUTPUT_DRAIN_GRACE_MS: u64 = 250;
-const MIN_OBVIOUS_SECRET_SUFFIX_BYTES: usize = 16;
-const MAX_OBVIOUS_SECRET_PREFIX_BYTES: usize = 11;
-// A token beginning at the final persisted byte needs 26 more ASCII bytes to
-// reach the longest recognized prefix plus the minimum classified suffix.
-const EVAL_REDACTION_LOOKAHEAD_BYTES: usize =
-    MAX_OBVIOUS_SECRET_PREFIX_BYTES + MIN_OBVIOUS_SECRET_SUFFIX_BYTES - 1;
+const EVAL_REDACTION_LOOKAHEAD_BYTES: usize = 4095;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalCheckExecution {
@@ -41,6 +38,18 @@ pub struct EvalCheckExecution {
 #[derive(Debug)]
 pub struct EvalPlan {
     checks: Vec<EvalCheckPlan>,
+    redactor: Arc<SecretRedactor>,
+}
+
+impl EvalPlan {
+    pub fn validate_exact_derived_bytes(&self, bytes: &[u8]) -> Result<(), EvalEngineError> {
+        match self.redactor.contains_prohibited_bytes(bytes) {
+            Ok(false) => Ok(()),
+            Ok(true) | Err(_) => Err(EvalEngineError::message(
+                "derived evaluation artifact contains prohibited credential material",
+            )),
+        }
+    }
 }
 
 pub fn run_eval_checks(
@@ -58,6 +67,12 @@ pub fn plan_eval_checks(
     execution_root: &Path,
 ) -> Result<EvalPlan, EvalEngineError> {
     validate_eval_config(config).map_err(|error| EvalEngineError::message(error.to_string()))?;
+    let redactor = Arc::new(
+        SecretRedactor::from_eval_config(config)
+            .map_err(|error| EvalEngineError::message(error.to_string()))?,
+    );
+    crate::evaluation_attempt::project_eval_checks_v3(&config.evals.required)
+        .map_err(EvalEngineError::message)?;
     let execution_root = execution_root.canonicalize().map_err(|error| {
         EvalEngineError::io(
             format!(
@@ -78,11 +93,12 @@ pub fn plan_eval_checks(
                 &config.evals.allow_commands,
                 ticket_allow_commands,
                 &execution_root,
+                &redactor,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(EvalPlan { checks })
+    Ok(EvalPlan { checks, redactor })
 }
 
 pub fn execute_eval_checks(
@@ -201,6 +217,7 @@ struct EvalCheckPlan {
     env: BTreeMap<String, String>,
     timeout_ms: u64,
     max_output_bytes: usize,
+    redactor: Arc<SecretRedactor>,
     cwd_identity: PlannedDirectoryIdentity,
     executable_identity: PlannedExecutableIdentity,
 }
@@ -229,6 +246,7 @@ fn plan_eval_check(
     eval_allow_commands: &[String],
     ticket_allow_commands: Option<&[String]>,
     execution_root: &Path,
+    redactor: &Arc<SecretRedactor>,
 ) -> Result<EvalCheckPlan, EvalEngineError> {
     if check.name.trim().is_empty() {
         return Err(EvalEngineError::message(
@@ -285,6 +303,7 @@ fn plan_eval_check(
         env: check.env.clone(),
         timeout_ms,
         max_output_bytes,
+        redactor: redactor.clone(),
         cwd_identity,
         executable_identity,
     })
@@ -317,8 +336,8 @@ fn run_eval_check(plan: &EvalCheckPlan) -> Result<EvalCheckExecution, EvalEngine
         EvalEngineError::io(format!("could not run eval check {}", plan.name), error)
     })?;
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let stdout = sanitize_eval_log(&output.stdout, &plan.env, plan.max_output_bytes);
-    let stderr = sanitize_eval_log(&output.stderr, &plan.env, plan.max_output_bytes);
+    let stdout = sanitize_eval_log(&output.stdout, &plan.redactor, plan.max_output_bytes)?;
+    let stderr = sanitize_eval_log(&output.stderr, &plan.redactor, plan.max_output_bytes)?;
     let summary = if output.timed_out {
         format!("command timed out after {}ms", plan.timeout_ms)
     } else {
@@ -1005,159 +1024,102 @@ fn output_drain_snapshot(state: &Arc<Mutex<OutputDrainState>>) -> io::Result<Out
 
 fn sanitize_eval_log(
     output: &[u8],
-    env: &BTreeMap<String, String>,
+    redactor: &SecretRedactor,
     max_output_bytes: usize,
-) -> String {
-    let mut text = String::from_utf8_lossy(output).into_owned();
-    for (name, value) in env {
-        if is_sensitive_name(name) && !value.is_empty() {
-            text = text.replace(value, "[REDACTED]");
-        }
-    }
-    text = redact_configured_secret_prefixes(&text, env);
-    text = redact_sensitive_assignments(&text);
-    text = redact_obvious_standalone_secrets(&text);
-    truncate_to_bytes(&text, max_output_bytes)
+) -> Result<String, EvalEngineError> {
+    let redacted = redactor
+        .redact_bytes(output, MAX_REDACTION_BYTES)
+        .map_err(|error| {
+            EvalEngineError::message(format!("eval output redaction failed: {error}"))
+        })?;
+    let text = String::from_utf8_lossy(&redacted);
+    Ok(truncate_redacted_to_bytes(&text, max_output_bytes))
 }
 
-fn redact_configured_secret_prefixes(text: &str, env: &BTreeMap<String, String>) -> String {
-    redact_tokens(text, |token| {
-        if is_configured_secret_prefix(token, env) {
-            "[REDACTED]".to_string()
-        } else {
-            token.to_string()
-        }
-    })
-}
-
-fn is_configured_secret_prefix(token: &str, env: &BTreeMap<String, String>) -> bool {
-    let candidate = trim_secret_token(token);
-    if candidate.is_empty() {
-        return false;
-    }
-    env.iter().any(|(name, value)| {
-        is_sensitive_name(name)
-            && ((value.len() > candidate.len() && value.starts_with(candidate))
-                || is_labeled_configured_secret_prefix(candidate, name, value))
-    })
-}
-
-fn is_labeled_configured_secret_prefix(candidate: &str, name: &str, value: &str) -> bool {
-    for separator in [':', '='] {
-        let Some((label, prefix)) = candidate.split_once(separator) else {
-            continue;
-        };
-        if !prefix.is_empty()
-            && (label == name || is_sensitive_name(label))
-            && value.len() > prefix.len()
-            && value.starts_with(prefix)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn redact_sensitive_assignments(text: &str) -> String {
-    redact_tokens(text, |token| {
-        let Some((name, _value)) = token.split_once('=') else {
-            return token.to_string();
-        };
-        if is_sensitive_name(name) {
-            format!("{name}=[REDACTED]")
-        } else {
-            token.to_string()
-        }
-    })
-}
-
-fn is_sensitive_name(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD"]
-        .iter()
-        .any(|needle| name.contains(needle))
-}
-
-fn redact_obvious_standalone_secrets(text: &str) -> String {
-    redact_tokens(text, |token| {
-        if is_obvious_standalone_secret(token) {
-            "[REDACTED]".to_string()
-        } else if let Some((label, value)) = token.split_once(':') {
-            if !label.is_empty() && is_obvious_standalone_secret(value) {
-                format!("{label}:[REDACTED]")
-            } else {
-                token.to_string()
-            }
-        } else {
-            token.to_string()
-        }
-    })
-}
-
-fn redact_tokens(text: &str, redact: impl Fn(&str) -> String) -> String {
-    let mut redacted = String::new();
-    let mut token = String::new();
-    for character in text.chars() {
-        if character.is_whitespace() {
-            redacted.push_str(&redact(&token));
-            token.clear();
-            redacted.push(character);
-        } else {
-            token.push(character);
-        }
-    }
-    redacted.push_str(&redact(&token));
-    redacted
-}
-
-fn trim_secret_token(token: &str) -> &str {
-    token.trim_matches(|character: char| {
-        matches!(
-            character,
-            '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-        )
-    })
-}
-
-fn is_obvious_standalone_secret(token: &str) -> bool {
-    let candidate = trim_secret_token(token);
-    for prefix in [
-        "sk-proj-",
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "xoxa-",
-    ] {
-        let Some(rest) = candidate.strip_prefix(prefix) else {
-            continue;
-        };
-        if rest.len() >= MIN_OBVIOUS_SECRET_SUFFIX_BYTES
-            && rest.chars().all(|character| {
-                character == '_' || character == '-' || character.is_ascii_alphanumeric()
-            })
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+fn truncate_redacted_to_bytes(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
+    let marker = crate::secret_redaction::REDACTION_MARKER;
     let mut end = max_bytes;
     while !text.is_char_boundary(end) {
         end -= 1;
+    }
+    for (start, _) in text.match_indices(marker) {
+        let marker_end = start + marker.len();
+        if start < end && end < marker_end {
+            end = start;
+            break;
+        }
     }
     text[..end].to_string()
 }
 
 #[cfg(test)]
 mod storage_commitment_tests {
-    use super::normalize_eval_output_limit;
+    use std::collections::BTreeMap;
+
+    use seaf_core::{EvalCommandConfig, EvalConfig, EvalGroup};
+
+    use super::{normalize_eval_output_limit, plan_eval_checks};
+
+    #[test]
+    fn eval_plan_rejects_exact_derived_bytes_that_collide_with_configured_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = EvalConfig {
+            evals: EvalGroup {
+                allow_commands: vec!["true".into()],
+                required: vec![EvalCommandConfig {
+                    name: "envelope".into(),
+                    command: "true".into(),
+                    cwd: None,
+                    env: BTreeMap::from([("API_TOKEN".into(), "completed_at".into())]),
+                    timeout_ms: None,
+                    max_output_bytes: None,
+                }],
+            },
+            thresholds: None,
+        };
+        let plan = plan_eval_checks(&config, None, temp.path()).unwrap();
+
+        let error = plan
+            .validate_exact_derived_bytes(br#"{"completed_at":"1"}"#)
+            .expect_err("exact derived envelopes must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "derived evaluation artifact contains prohibited credential material"
+        );
+    }
+
+    #[test]
+    fn eval_plan_raw_scans_marker_spanning_derived_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = EvalConfig {
+            evals: EvalGroup {
+                allow_commands: vec!["true".into()],
+                required: vec![EvalCommandConfig {
+                    name: "envelope".into(),
+                    command: "true".into(),
+                    cwd: None,
+                    env: BTreeMap::from([("API_TOKEN".into(), "TOKEN=[REDACTED]".into())]),
+                    timeout_ms: None,
+                    max_output_bytes: None,
+                }],
+            },
+            thresholds: None,
+        };
+        let plan = plan_eval_checks(&config, None, temp.path()).unwrap();
+
+        let error = plan
+            .validate_exact_derived_bytes(br#"{"stdout":"TOKEN=[REDACTED]\n"}"#)
+            .expect_err("persisted derived bytes cannot claim marker provenance");
+
+        assert_eq!(
+            error.to_string(),
+            "derived evaluation artifact contains prohibited credential material"
+        );
+    }
 
     #[test]
     fn execution_and_storage_share_one_output_limit_normalizer() {

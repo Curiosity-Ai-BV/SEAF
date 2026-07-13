@@ -279,15 +279,23 @@ source and supersession verification, live command lock-release evidence, and a
 literal production-used v2/v3 transition table were added after the first
 independent review. Corrected focused and boundary gates pass, and final
 independent specification, quality, and evidence re-reviews approve the slice.
-M1-11b2 and M1-11b are complete.
-Second re-review additionally requires every staged v2/v3 source to select the
+M1-11b2 and M1-11b are complete. Second re-review additionally required every
+staged v2/v3 source to select the
 active latest factual attempt. That binding and end-to-end authentic
 CreateMissing residual coverage are implemented, and the live command-lock
 test is bounded and cleanup-safe. Corrected Rust owner gates pass, including library
 225/225, provider/candidate boundary 65/65, and full-workspace CLI 138/138;
 strict lint, formatting, and diff-hygiene gates pass as well.
-M1-11c bounded secret redaction is active, so
-M1-11 is not yet complete.
+M1-11c bounded secret redaction is accepted after independent
+specification/security and quality review. Bounded corpus derivation and
+byte-oriented screening now protect exact provider, evaluation, operator,
+recovery, context, scaffold, log, and run-state envelopes before side effects;
+versioned intent keeps configured values out of derived evidence, clean v1/v2
+history remains readable, and unsafe legacy history fails closed. Fresh
+isolated provisioning requires authoritative input snapshots and screens its
+exact state and scaffold before creating the run leaf, candidate, or lock.
+Full workspace, strict lint, formatting, SDK, and diff gates pass. M1-11 is
+complete and M1-12 interruption-recovery acceptance is active.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF

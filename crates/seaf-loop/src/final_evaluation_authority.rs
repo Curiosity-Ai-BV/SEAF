@@ -114,6 +114,15 @@ pub fn load_verified_final_evaluation_authority(
     }
 
     let approved_run = reconstruct_approved_authority(workspace, run)?;
+    let eval_config = load_eval_config(workspace, run)?;
+    let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&eval_config)
+        .map_err(|_| prohibited_evaluation_artifact())?;
+    validate_persisted_derived_bytes(
+        workspace,
+        &testing_reference.path,
+        "final Testing evidence",
+        &redactor,
+    )?;
     let testing_evidence =
         TestingEvidence::load_for_approved_run(workspace, &testing_reference, &approved_run)
             .map_err(|error| {
@@ -147,7 +156,24 @@ pub fn load_verified_final_evaluation_authority(
         )
         .map_err(FinalEvaluationAuthorityError::invalid)?,
     };
+    validate_persisted_derived_bytes(
+        workspace,
+        &execution_intent_reference.path,
+        "final evaluation intent",
+        &redactor,
+    )?;
     let execution_intent = load_intent(workspace, &execution_intent_reference)
+        .map_err(FinalEvaluationAuthorityError::invalid)?;
+    for check in &testing_evidence.checks {
+        for path in [check.stdout_path.as_deref(), check.stderr_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            validate_persisted_derived_bytes(workspace, path, "final evaluation log", &redactor)?;
+        }
+    }
+    execution_intent
+        .validate_observed_check_names(&testing_evidence.checks)
         .map_err(FinalEvaluationAuthorityError::invalid)?;
     if execution_intent.attempt() != evaluation_attempt {
         return Err(FinalEvaluationAuthorityError::invalid(
@@ -165,7 +191,6 @@ pub fn load_verified_final_evaluation_authority(
             "Testing evidence recovery does not match its execution intent",
         ));
     }
-    let eval_config = load_eval_config(workspace, run)?;
     execution_intent
         .validate_against_with_recovery(
             &approved_run,
@@ -176,7 +201,7 @@ pub fn load_verified_final_evaluation_authority(
                 .and_then(|recovery| recovery.as_ref()),
         )
         .map_err(FinalEvaluationAuthorityError::invalid)?;
-    let eval_report = load_verified_eval_report(workspace, &report_reference)?;
+    let eval_report = load_verified_eval_report(workspace, &report_reference, &redactor)?;
     let loop_evidence = eval_report.loop_evidence.as_ref().ok_or_else(|| {
         FinalEvaluationAuthorityError::invalid("final EvalReport requires integrated loop evidence")
     })?;
@@ -267,8 +292,11 @@ fn load_eval_config(
             "final evaluation config bytes or digest mismatch",
         ));
     }
-    serde_json::from_value(value)
-        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))
+    let config: EvalConfig = serde_json::from_value(value)
+        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    seaf_core::validate_eval_config(&config)
+        .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    Ok(config)
 }
 
 fn reconstruct_approved_authority(
@@ -354,6 +382,7 @@ fn step_artifact_reference(
 fn load_verified_eval_report(
     workspace: &LoopWorkspace,
     reference: &ArtifactReference,
+    redactor: &crate::secret_redaction::SecretRedactor,
 ) -> Result<EvalReport, FinalEvaluationAuthorityError> {
     if !is_portable_artifact_path(&reference.path) {
         return Err(FinalEvaluationAuthorityError::invalid(
@@ -366,6 +395,7 @@ fn load_verified_eval_report(
         "final EvalReport",
     )
     .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    validate_exact_derived_bytes(redactor, &bytes)?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         FinalEvaluationAuthorityError::invalid(format!("invalid EvalReport JSON: {error}"))
     })?;
@@ -396,6 +426,37 @@ fn load_verified_eval_report(
         )));
     }
     Ok(report)
+}
+
+fn validate_persisted_derived_bytes(
+    workspace: &LoopWorkspace,
+    path: &str,
+    label: &str,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), FinalEvaluationAuthorityError> {
+    let bytes = crate::immutable_artifact::read_verified_regular_file(
+        workspace.run_directory(),
+        path,
+        label,
+    )
+    .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    validate_exact_derived_bytes(redactor, &bytes)
+}
+
+fn validate_exact_derived_bytes(
+    redactor: &crate::secret_redaction::SecretRedactor,
+    bytes: &[u8],
+) -> Result<(), FinalEvaluationAuthorityError> {
+    match redactor.contains_prohibited_bytes(bytes) {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(_) => Err(prohibited_evaluation_artifact()),
+    }
+}
+
+fn prohibited_evaluation_artifact() -> FinalEvaluationAuthorityError {
+    FinalEvaluationAuthorityError::invalid(
+        "derived evaluation artifact contains prohibited credential material",
+    )
 }
 
 fn format_field_errors(errors: Vec<seaf_core::FieldError>) -> String {

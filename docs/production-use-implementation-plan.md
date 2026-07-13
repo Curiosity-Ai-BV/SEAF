@@ -1632,9 +1632,8 @@ Commit boundary: atomic persistence and locking only.
 
 Roadmap: U5. Dependencies: M1-10.
 
-Status: active. Split into M1-11a private run artifacts, M1-11b bounded
-artifact storage, and M1-11c bounded secret redaction. M1-11a is complete and
-M1-11b is active.
+Status: accepted on 2026-07-13. M1-11a private run artifacts, M1-11b bounded
+artifact storage, and M1-11c bounded secret redaction are complete.
 
 Objective: make local run artifacts safe enough for live provider use.
 
@@ -1946,7 +1945,8 @@ independent specification, quality, and evidence re-reviews approve the slice.
 
 #### M1-11c - Bounded Secret Redaction
 
-Status: active. Dependencies: M1-11b (complete).
+Status: accepted on 2026-07-13. Dependencies: M1-11b (complete). M1-11 is
+complete; M1-12 is active.
 
 Objective: prevent configured and obvious credentials from escaping their one
 private authoritative input snapshot into provider requests or derived run
@@ -1969,7 +1969,46 @@ request-only crash recovery, and no-raw-leak tests.
 
 Commit boundary: bounded secret derivation and redaction only.
 
+Accepted implementation: a shared byte-oriented redactor enforces the
+64-occurrence, 4 KiB-per-value, 64 KiB aggregate, and 2 MiB input/output bounds.
+Evaluation output uses the complete authenticated corpus before lossy
+conversion or truncation and keeps markers atomic. Indexed evaluation intent
+v3 persists only structural check projections and sorted env names;
+secret-free v1/v2 history stays readable while secret-bearing legacy intent
+fails closed.
+
+Provider requests are sanitized before audit and call. Exact request,
+response, provider-record, prospective-run, replay, and historical-run bytes
+are screened before provider invocation or durable publication. Under-cap
+secret-bearing provider results become the fixed non-retryable safe failure
+only after exact raw audit-size measurement. Approval, promotion, recovery,
+adoption, invalidation, evaluation, context expansion, scaffold, log, and
+generic run-state paths screen their exact prospective envelopes before the
+paired mutation and again at authority-changing compare-and-swap boundaries.
+Full context-source screening is bounded at the first byte beyond 2 MiB rather
+than reading an unbounded tail.
+
+Fresh isolated provisioning now requires `AuthoritativeRunInputSnapshots` at
+`InitializedLoopRun::create_isolated`, screens the exact Provisioning and
+Active state plus scaffold bytes before creating the run leaf, candidate, or
+lock, and rederives the corpus from authenticated inputs on resume. This is a
+pre-preview Rust source compatibility change that M1-12 and the preview release
+notes must carry. Arbitrary configured values that collide with fixed
+structural literals fail closed before side effects; supporting those values
+successfully would require a future encoded/versioned representation and is
+outside this slice.
+
+Independent specification/security and quality re-reviews approve the final
+boundary. Final gates pass: `cargo test --workspace --no-fail-fast --
+--test-threads=1`, including CLI 142/142, provider/candidate boundary 75/75,
+state 44/44, provider exchange 22/22, and every remaining Rust integration and
+doc-test suite; strict all-target/all-feature Clippy; workspace check; Rust and
+Prettier formatting; pinned-pnpm lint/typecheck/test/build with 8 SDK tests;
+and diff hygiene.
+
 ### M1-12 - Interruption Recovery Acceptance
+
+Status: active on 2026-07-13. Dependencies: M1-11 (complete).
 
 Roadmap: U5 and Milestone 1 exit gate. Dependencies: M1-11.
 
@@ -1983,7 +2022,10 @@ Acceptance criteria:
   dataflow, candidate isolation, approval, eval, promotion, and recovery.
 - The preview handoff records that M1-09c1 added public v2 `TestingEvidence`
   fields: downstream Rust struct literals require an update, while persisted v1
-  JSON remains readable. This note is carried into preview release notes.
+  JSON remains readable. It also records that M1-11c made
+  `InitializedLoopRun::create_isolated` require
+  `AuthoritativeRunInputSnapshots`. Both notes are carried into preview release
+  notes.
 - Roadmap/docs claim only the verified source-workspace path.
 
 Likely seams: integration test harness, CLI tests, docs, and CI focused step.

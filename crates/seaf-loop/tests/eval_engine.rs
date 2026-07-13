@@ -156,9 +156,70 @@ fn returned_output_is_redacted_before_it_is_capped() {
         run_eval_checks(&config, None, root.path()).expect("controlled command should run");
 
     assert_eq!(executions.len(), 1);
-    assert!(executions[0].stdout.starts_with("[REDACT"));
+    assert_eq!(executions[0].stdout, "");
     assert!(executions[0].stdout.len() <= 8);
     assert!(!executions[0].stdout.contains("plain"));
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_eval_output_cannot_hide_a_configured_secret_across_a_literal_marker() {
+    let root = tempfile::tempdir().expect("execution root");
+    let script = root.path().join("emit-marker-secret");
+    write_executable(&script, "#!/bin/sh\nprintf 'prefix[REDACTED]suffix\\n'\n");
+    let mut configured_check = check("secret", script.display().to_string());
+    configured_check.env.insert(
+        "SECRET_TOKEN".to_string(),
+        "prefix[REDACTED]suffix".to_string(),
+    );
+    let config = config(vec![script.display().to_string()], vec![configured_check]);
+
+    let executions = run_eval_checks(&config, None, root.path()).expect("controlled command runs");
+
+    assert_eq!(executions[0].stdout, "[REDACTED]\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn every_check_uses_the_full_authenticated_secret_corpus() {
+    let root = tempfile::tempdir().expect("execution root");
+    let emitter = root.path().join("emit-cross-check-secret");
+    write_executable(
+        &emitter,
+        "#!/bin/sh\nprintf 'only-second-check-knows-this-value\\n'\n",
+    );
+    let first = check("first", emitter.display().to_string());
+    let mut second = check("second", "true".to_string());
+    second.env.insert(
+        "SECOND_CHECK_TOKEN".to_string(),
+        "only-second-check-knows-this-value".to_string(),
+    );
+    let config = config(
+        vec![emitter.display().to_string(), "true".to_string()],
+        vec![first, second],
+    );
+
+    let executions = run_eval_checks(&config, None, root.path()).expect("checks run");
+
+    assert_eq!(executions[0].stdout, "[REDACTED]\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_secret_corpus_rejects_before_any_command_spawn() {
+    let root = tempfile::tempdir().expect("execution root");
+    let marker = root.path().join("must-not-spawn");
+    let mut configured_check = check("bounded", format!("touch {}", marker.display()));
+    configured_check.env = (0..65)
+        .map(|index| (format!("TOKEN_{index}"), "same".to_string()))
+        .collect();
+    let config = config(vec!["touch".to_string()], vec![configured_check]);
+
+    let error = run_eval_checks(&config, None, root.path())
+        .expect_err("invalid secret corpus must reject during planning");
+
+    assert!(error.to_string().contains("more than 64"));
+    assert!(!marker.exists());
 }
 
 #[cfg(unix)]
@@ -178,7 +239,7 @@ fn obvious_secret_starting_before_output_cap_is_classified_before_truncation() {
         run_eval_checks(&config, None, root.path()).expect("controlled command should run");
 
     assert_eq!(executions.len(), 1);
-    assert!(executions[0].stdout.contains("[REDA"));
+    assert_eq!(executions[0].stdout, "ok ");
     assert!(executions[0].stdout.len() <= 12);
     assert!(!executions[0].stdout.contains("sk-proj-"));
 }

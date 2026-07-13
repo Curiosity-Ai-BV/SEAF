@@ -109,6 +109,14 @@ pub trait StepRunner {
     ) -> Option<Vec<ProviderExchangeRecordReference>> {
         None
     }
+
+    fn validate_prospective_run(&self, _run: &LoopRun) -> Result<(), RunnerError> {
+        Ok(())
+    }
+
+    fn validate_log_append(&self, _line: &str) -> Result<(), RunnerError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +152,7 @@ pub struct LoopRunner<'a, R: StepRunner + ?Sized> {
 pub struct InitializedLoopRun {
     workspace: LoopWorkspace,
     run: LoopRun,
+    redactor: crate::secret_redaction::SecretRedactor,
 }
 
 #[derive(Debug)]
@@ -202,15 +211,45 @@ impl InitializedLoopRun {
     pub fn create_isolated(
         config: LoopRunnerConfig,
         source_worktree_root: &Path,
+        snapshots: &AuthoritativeRunInputSnapshots,
     ) -> Result<Self, RunnerError> {
         if config.input_digests.eval_config.is_none() {
             return Err(RunnerError::Step(
                 "isolated provider run requires an authoritative eval config digest".to_string(),
             ));
         }
-        let workspace = LoopWorkspace::create_minimal(&config.runs_root, &config.run_id)?;
+        let mut run = state::create_run(NewLoopRun {
+            run_id: config.run_id,
+            ticket_id: config.ticket_id,
+            goal_id: config.goal_id,
+            provider: config.provider,
+            model: config.model,
+            input_digests: config.input_digests,
+        });
+        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+        let redactor = validate_authoritative_run_input_payloads(&run, snapshots)?;
+        validate_runtime_scaffold_payloads(
+            &crate::workspace::runtime_scaffold_default_payloads()?,
+            &redactor,
+        )?;
+        fs::create_dir_all(&config.runs_root).map_err(WorkspaceError::Io)?;
+        let canonical_runs_root = config
+            .runs_root
+            .canonicalize()
+            .map_err(WorkspaceError::Io)?;
+        let prospective_run_directory = canonical_runs_root.join(&run.run_id);
+        run.candidate_workspace = Some(
+            crate::candidate_workspace::plan_candidate_workspace(
+                &prospective_run_directory,
+                source_worktree_root,
+                &run.input_digests.repository,
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?,
+        );
+        let pending_bytes = preflight_provisioning_run_envelopes(&run, &redactor)?;
+        let workspace = LoopWorkspace::create_minimal(&canonical_runs_root, &run.run_id)?;
         let result =
-            Self::create_isolated_in_workspace(workspace.clone(), config, source_worktree_root);
+            Self::create_isolated_in_workspace(workspace.clone(), run, &pending_bytes, redactor);
         if result.is_err() && !workspace.run_file().exists() {
             let entries = fs::read_dir(workspace.run_directory())
                 .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
@@ -238,33 +277,21 @@ impl InitializedLoopRun {
 
     fn create_isolated_in_workspace(
         workspace: LoopWorkspace,
-        config: LoopRunnerConfig,
-        source_worktree_root: &Path,
+        run: LoopRun,
+        pending_bytes: &[u8],
+        redactor: crate::secret_redaction::SecretRedactor,
     ) -> Result<Self, RunnerError> {
-        let mut run = state::create_run(NewLoopRun {
-            run_id: config.run_id,
-            ticket_id: config.ticket_id,
-            goal_id: config.goal_id,
-            provider: config.provider,
-            model: config.model,
-            input_digests: config.input_digests,
-        });
-        run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-        run.candidate_workspace = Some(
-            crate::candidate_workspace::plan_candidate_workspace(
-                workspace.run_directory(),
-                source_worktree_root,
-                &run.input_digests.repository,
-            )
-            .map_err(|error| RunnerError::Step(error.to_string()))?,
-        );
-        state::save_run(&workspace, &run).map_err(|error| {
-            RunnerError::Step(format!("failed to publish provisioning run: {error}"))
-        })?;
+        state::publish_prevalidated_isolated_run(&workspace, &run, pending_bytes).map_err(
+            |error| RunnerError::Step(format!("failed to publish provisioning run: {error}")),
+        )?;
         crate::candidate_workspace::provision_candidate_workspace(&workspace)
             .map_err(|error| RunnerError::Step(error.to_string()))?;
         let run = state::load_run(&workspace)?;
-        Ok(Self { workspace, run })
+        Ok(Self {
+            workspace,
+            run,
+            redactor,
+        })
     }
 
     pub fn run(&self) -> &LoopRun {
@@ -272,6 +299,22 @@ impl InitializedLoopRun {
     }
 
     pub fn resume_isolated(runs_root: &Path, verified_run: LoopRun) -> Result<Self, RunnerError> {
+        Self::resume_isolated_impl(runs_root, verified_run, None)
+    }
+
+    pub fn resume_isolated_with_inputs(
+        runs_root: &Path,
+        verified_run: LoopRun,
+        snapshots: &AuthoritativeRunInputSnapshots,
+    ) -> Result<Self, RunnerError> {
+        Self::resume_isolated_impl(runs_root, verified_run, Some(snapshots))
+    }
+
+    fn resume_isolated_impl(
+        runs_root: &Path,
+        verified_run: LoopRun,
+        snapshots: Option<&AuthoritativeRunInputSnapshots>,
+    ) -> Result<Self, RunnerError> {
         if verified_run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
             return Err(RunnerError::Step(
                 "incomplete legacy provider run cannot be resumed; start a new isolated run"
@@ -284,6 +327,9 @@ impl InitializedLoopRun {
                     .to_string(),
             ));
         }
+        let mut redactor = snapshots
+            .map(|snapshots| validate_authoritative_run_input_payloads(&verified_run, snapshots))
+            .transpose()?;
         validate_human_review_execution_barrier(&verified_run)?;
         let workspace = LoopWorkspace::open_minimal(runs_root, &verified_run.run_id)?;
         let persisted = state::load_run_before_provider_reconciliation(&workspace)?;
@@ -296,6 +342,23 @@ impl InitializedLoopRun {
         let candidate = persisted.candidate_workspace.as_ref().ok_or_else(|| {
             RunnerError::Step("isolated run has no candidate authority".to_string())
         })?;
+        if candidate.lifecycle == seaf_core::CandidateWorkspaceLifecycle::Provisioning {
+            let redactor = redactor.as_ref().ok_or_else(|| {
+                RunnerError::Step(
+                    "candidate Provisioning resume requires authoritative input snapshots"
+                        .to_string(),
+                )
+            })?;
+            preflight_provisioning_run_envelopes(&persisted, redactor)?;
+        }
+        if redactor.is_none() {
+            let snapshots = load_verified_authoritative_run_inputs(&workspace, &persisted)?;
+            redactor = Some(validate_authoritative_run_input_payloads(
+                &persisted, &snapshots,
+            )?);
+        }
+        let redactor = redactor.expect("authenticated redactor is required before mutation");
+        preflight_runtime_scaffold_payloads(&workspace, &redactor)?;
         crate::candidate_workspace::ensure_candidate_lock_file(&workspace)
             .map_err(|error| RunnerError::Step(error.to_string()))?;
         let recovered = match candidate.lifecycle {
@@ -328,7 +391,11 @@ impl InitializedLoopRun {
             }
         };
         let run = normalize_completed_development_candidate(&workspace, recovered)?;
-        Ok(Self { workspace, run })
+        Ok(Self {
+            workspace,
+            run,
+            redactor,
+        })
     }
 
     pub fn resume_isolated_for_rerun(
@@ -354,7 +421,11 @@ impl InitializedLoopRun {
             candidate,
         )
         .map_err(|error| RunnerError::Step(error.to_string()))?;
-        self.workspace.scaffold_runtime()?;
+        let redactor = &self.redactor;
+        self.workspace.scaffold_runtime_with_validator(|payloads| {
+            validate_runtime_scaffold_payloads(payloads, redactor)
+                .map_err(|error| error.to_string())
+        })?;
         Ok(ScaffoldedLoopRun {
             workspace: self.workspace,
             run: self.run,
@@ -597,7 +668,7 @@ fn authoritative_run_input_entries<'a>(
 fn validate_authoritative_run_input_payloads(
     run: &LoopRun,
     snapshots: &AuthoritativeRunInputSnapshots,
-) -> Result<(), RunnerError> {
+) -> Result<crate::secret_redaction::SecretRedactor, RunnerError> {
     let eval_config: seaf_core::EvalConfig = serde_json::from_slice(&snapshots.eval_config)
         .map_err(|error| {
             RunnerError::Step(format!(
@@ -619,6 +690,30 @@ fn validate_authoritative_run_input_payloads(
             "authoritative inputs/eval-config.json bytes are not canonical typed eval config"
                 .to_string(),
         ));
+    }
+
+    let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&eval_config)
+        .map_err(|_| {
+            RunnerError::Step(
+                "authoritative run inputs contain prohibited credential material".to_string(),
+            )
+        })?;
+    for bytes in [
+        &snapshots.ticket,
+        &snapshots.policy,
+        &snapshots.config,
+        &snapshots.repository,
+        &snapshots.provider_ticket,
+    ] {
+        if redactor.contains_prohibited_bytes(bytes).map_err(|_| {
+            RunnerError::Step(
+                "authoritative run inputs contain prohibited credential material".to_string(),
+            )
+        })? {
+            return Err(RunnerError::Step(
+                "authoritative run inputs contain prohibited credential material".to_string(),
+            ));
+        }
     }
 
     for (name, bytes, expected_digest) in authoritative_run_input_entries(run, snapshots)? {
@@ -649,7 +744,101 @@ fn validate_authoritative_run_input_payloads(
             "provider ticket snapshot differs from the authoritative ticket".to_string(),
         ));
     }
+    Ok(redactor)
+}
+
+fn preflight_provisioning_run_envelopes(
+    provisioning: &LoopRun,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<Vec<u8>, RunnerError> {
+    let pending_bytes = state::run_file_bytes(provisioning).map_err(|_| {
+        RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        )
+    })?;
+    if redactor
+        .contains_prohibited_bytes(&pending_bytes)
+        .unwrap_or(true)
+    {
+        return Err(RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        ));
+    }
+    let mut active = provisioning.clone();
+    let candidate = active.candidate_workspace.as_mut().ok_or_else(|| {
+        RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        )
+    })?;
+    if candidate.lifecycle != seaf_core::CandidateWorkspaceLifecycle::Provisioning {
+        return Err(RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        ));
+    }
+    candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Active;
+    let active_bytes = state::run_file_bytes(&active).map_err(|_| {
+        RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        )
+    })?;
+    if redactor
+        .contains_prohibited_bytes(&active_bytes)
+        .unwrap_or(true)
+    {
+        return Err(RunnerError::Step(
+            "prospective isolated run contains prohibited credential material".to_string(),
+        ));
+    }
+    Ok(pending_bytes)
+}
+
+fn validate_runtime_scaffold_payloads(
+    payloads: &[(&'static str, Vec<u8>)],
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    for (_, bytes) in payloads {
+        if redactor.contains_prohibited_bytes(bytes).unwrap_or(true) {
+            return Err(RunnerError::Step(
+                "prospective runtime scaffold contains prohibited credential material".to_string(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn preflight_runtime_scaffold_payloads(
+    workspace: &LoopWorkspace,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    let mut payloads = Vec::new();
+    for (name, default) in crate::workspace::runtime_scaffold_default_payloads()? {
+        let path = workspace.run_directory().join(name);
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(RunnerError::Step(
+                    "runtime scaffold contains prohibited credential material".to_string(),
+                ));
+            }
+            Ok(_) => crate::immutable_artifact::read_verified_regular_file(
+                workspace.run_directory(),
+                name,
+                "runtime scaffold preflight",
+            )
+            .map_err(|_| {
+                RunnerError::Step(
+                    "runtime scaffold contains prohibited credential material".to_string(),
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => default,
+            Err(_) => {
+                return Err(RunnerError::Step(
+                    "runtime scaffold contains prohibited credential material".to_string(),
+                ));
+            }
+        };
+        payloads.push((name, bytes));
+    }
+    validate_runtime_scaffold_payloads(&payloads, redactor)
 }
 
 fn preflight_authoritative_snapshot_prefix(
@@ -824,6 +1013,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         )
         .map_err(|error| RunnerError::Step(error.to_string()))?;
         step_runner.prepare_fresh_run(&initialized.workspace, &initialized.run)?;
+        step_runner.validate_log_append("started isolated provider run")?;
         initialized
             .workspace
             .append_log("started isolated provider run")?;
@@ -868,6 +1058,12 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             input_digests: config.input_digests,
         });
         if let Err(error) = step_runner.prepare_fresh_run(&workspace, &run) {
+            return Err(cleanup_failed_start_workspace(&workspace, error));
+        }
+        if let Err(error) = step_runner.validate_log_append("started run") {
+            return Err(cleanup_failed_start_workspace(&workspace, error));
+        }
+        if let Err(error) = step_runner.validate_prospective_run(&run) {
             return Err(cleanup_failed_start_workspace(&workspace, error));
         }
         if let Err(error) = state::save_run(&workspace, &run) {
@@ -923,6 +1119,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             .map(|step| next_step_attempt(&workspace, step).map(|attempt| (step, attempt)))
             .transpose()?;
         step_runner.prepare_run(&workspace, &run)?;
+        step_runner.validate_log_append("resumed run")?;
         let mut runner = Self {
             workspace,
             run,
@@ -982,6 +1179,8 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             Some((cached_step, attempt)) if cached_step == step => attempt,
             Some(_) | None => next_step_attempt(&self.workspace, step)?,
         };
+        let started_log = format!("started step {step:?}");
+        self.step_runner.validate_log_append(&started_log)?;
 
         self.step_runner
             .prepare_step_attempt(&self.workspace, &self.run, step, attempt)?;
@@ -989,8 +1188,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
         let pending = self.run.clone();
         state::mark_step_running(&mut self.run, step)?;
         self.persist_run_state(&pending)?;
-        self.workspace
-            .append_log(&format!("started step {step:?}"))?;
+        self.workspace.append_log(&started_log)?;
 
         let request = self.step_runner.step_request(step)?;
         write_step_request(&self.workspace, step, attempt, &request)?;
@@ -1005,6 +1203,8 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
                 return Err(error);
             }
         };
+        let finished_log = format!("finished step {step:?} as {:?}", output.status);
+        self.step_runner.validate_log_append(&finished_log)?;
         self.import_durable_provider_exchange_records()?;
         let running_with_provider_history = self.run.clone();
         write_step_response(&self.workspace, step, attempt, &output.response)?;
@@ -1065,8 +1265,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
             }
             self.run = applied;
         }
-        self.workspace
-            .append_log(&format!("finished step {step:?} as {:?}", output.status))?;
+        self.workspace.append_log(&finished_log)?;
 
         Ok(true)
     }
@@ -1102,6 +1301,7 @@ impl<'a, R: StepRunner + ?Sized> LoopRunner<'a, R> {
     }
 
     fn persist_run_state(&self, expected: &LoopRun) -> Result<(), RunnerError> {
+        self.step_runner.validate_prospective_run(&self.run)?;
         let result = if state::is_frozen_review_or_evaluation_authority(&self.run) {
             crate::provider_exchange::persist_run_with_full_compare(
                 &self.workspace,
@@ -1242,6 +1442,120 @@ impl From<state::StateError> for RunnerError {
 #[cfg(all(test, unix))]
 mod bounded_preflight_tests {
     use super::*;
+
+    #[test]
+    fn only_exact_eval_config_may_publish_configured_secret_material() {
+        const SECRET: &str = "authoritative-input-secret-value";
+
+        let eval_config = seaf_core::parse_eval_config(&format!(
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: {SECRET}\n"
+        ))
+        .unwrap();
+        let eval_config_bytes = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+        let clean = seaf_core::canonical_json_bytes(&serde_json::json!({"value":"clean"})).unwrap();
+        let clean_snapshots = AuthoritativeRunInputSnapshots {
+            ticket: clean.clone(),
+            policy: clean.clone(),
+            config: clean.clone(),
+            repository: clean.clone(),
+            eval_config: eval_config_bytes.clone(),
+            provider_ticket: clean.clone(),
+        };
+        let run_for = |run_id: &str, snapshots: &AuthoritativeRunInputSnapshots| {
+            let digest = |bytes: &[u8]| {
+                let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                seaf_core::canonical_sha256_digest(&value).unwrap()
+            };
+            let mut run = state::create_run(state::NewLoopRun {
+                run_id: run_id.to_string(),
+                ticket_id: "ticket".to_string(),
+                goal_id: "goal".to_string(),
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_digests: seaf_core::LoopInputDigests {
+                    ticket: digest(&snapshots.ticket),
+                    policy: digest(&snapshots.policy),
+                    config: digest(&snapshots.config),
+                    repository: digest(&snapshots.repository),
+                    eval_config: Some(digest(&snapshots.eval_config)),
+                },
+            });
+            run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+            run
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let clean_workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "eval-only").unwrap();
+        let clean_run = run_for("eval-only", &clean_snapshots);
+        ensure_authoritative_run_inputs(&clean_workspace, &clean_run, &clean_snapshots)
+            .expect("the exact private eval config may retain its configured secret");
+        for (relative, _, _) in
+            authoritative_run_input_entries(&clean_run, &clean_snapshots).unwrap()
+        {
+            let bytes = fs::read(clean_workspace.run_directory().join(relative)).unwrap();
+            assert_eq!(
+                bytes
+                    .windows(SECRET.len())
+                    .any(|window| window == SECRET.as_bytes()),
+                relative == "inputs/eval-config.json",
+                "{relative}"
+            );
+        }
+
+        let configured =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"value":SECRET})).unwrap();
+        let obvious =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"value":"sk-0123456789abcdef"}))
+                .unwrap();
+        let oversized = seaf_core::canonical_json_bytes(
+            &serde_json::json!({"value":"x".repeat(crate::secret_redaction::MAX_REDACTION_BYTES + 1)}),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        let mut snapshots = clean_snapshots.clone();
+        snapshots.ticket = configured.clone();
+        cases.push(("ticket", snapshots));
+        let mut snapshots = clean_snapshots.clone();
+        snapshots.policy = obvious.clone();
+        cases.push(("policy", snapshots));
+        let mut snapshots = clean_snapshots.clone();
+        snapshots.config = configured.clone();
+        cases.push(("config", snapshots));
+        let mut snapshots = clean_snapshots.clone();
+        snapshots.repository = obvious;
+        cases.push(("repository", snapshots));
+        let mut snapshots = clean_snapshots.clone();
+        snapshots.provider_ticket = configured;
+        cases.push(("provider-ticket", snapshots));
+        let mut snapshots = clean_snapshots;
+        snapshots.config = oversized;
+        cases.push(("oversized", snapshots));
+
+        for (label, leaked_snapshots) in cases {
+            let leaked_workspace = LoopWorkspace::create(&temp.path().join("runs"), label).unwrap();
+            let leaked_run = run_for(label, &leaked_snapshots);
+            let error = ensure_authoritative_run_inputs(
+                &leaked_workspace,
+                &leaked_run,
+                &leaked_snapshots,
+            )
+            .expect_err(
+                "configured, obvious, and oversized non-eval inputs must fail before publication",
+            );
+
+            assert!(
+                error.to_string().contains("prohibited credential material"),
+                "{label}: {error}"
+            );
+            assert!(!error.to_string().contains(SECRET));
+            assert!(!leaked_workspace.run_directory().join("inputs").exists());
+            assert!(!leaked_workspace
+                .run_directory()
+                .join("ticket.snapshot.json")
+                .exists());
+        }
+    }
 
     #[test]
     fn sparse_oversized_authoritative_prefix_rejects_before_prepare_or_mutation() {

@@ -222,8 +222,17 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
             eval_config: Some(digest(&eval_config_bytes)),
         },
     );
+    let snapshots = AuthoritativeRunInputSnapshots {
+        ticket: ticket_bytes.clone(),
+        policy: policy_bytes,
+        config: config_bytes,
+        repository: repository_bytes,
+        eval_config: eval_config_bytes,
+        provider_ticket: ticket_bytes,
+    };
 
-    let initialized = InitializedLoopRun::create_isolated(config, &source).expect("initialize");
+    let initialized =
+        InitializedLoopRun::create_isolated(config, &source, &snapshots).expect("initialize");
     assert_eq!(
         initialized
             .run()
@@ -266,14 +275,7 @@ fn isolated_initialization_persists_and_provisions_before_runtime_scaffold_and_p
         );
     }
     let prepared = scaffolded
-        .publish_authoritative_inputs(AuthoritativeRunInputSnapshots {
-            ticket: ticket_bytes.clone(),
-            policy: policy_bytes,
-            config: config_bytes,
-            repository: repository_bytes,
-            eval_config: eval_config_bytes,
-            provider_ticket: ticket_bytes,
-        })
+        .publish_authoritative_inputs(snapshots)
         .expect("publish exact input set");
     let mut step_runner = RecordingStepRunner::new();
     let runner =
@@ -310,11 +312,485 @@ fn isolated_initialization_requires_eval_authority_before_run_directory_creation
             test_input_digests(),
         ),
         temp.path(),
+        &AuthoritativeRunInputSnapshots {
+            ticket: Vec::new(),
+            policy: Vec::new(),
+            config: Vec::new(),
+            repository: Vec::new(),
+            eval_config: Vec::new(),
+            provider_ticket: Vec::new(),
+        },
     )
     .expect_err("isolated provider authority must include eval config");
 
     assert!(error.to_string().contains("eval config"), "{error}");
     assert!(!runs_root.join("missing-eval-authority").exists());
+}
+
+#[test]
+fn isolated_initialization_screens_exact_run_and_scaffold_payloads_before_creating_its_leaf() {
+    for (label, secret) in [
+        ("status", "pending"),
+        ("active", "active"),
+        ("key", "run_id"),
+        ("boundary", "\"status\": \"pending\""),
+        ("scaffold-log", "# Loop run log\n"),
+        ("scaffold-key", "max_bytes_per_file"),
+        (
+            "scaffold-boundary",
+            "\"max_bytes_per_file\": 0,\n  \"max_total_bytes\"",
+        ),
+        ("scaffold-marker", UNTRUSTED_CONTEXT_MARKER),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let run_id = format!("prospective-run-{label}");
+        let runs_root = temp.path().join("runs");
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        git_ok(&source, &["init", "-q"]);
+        git_ok(&source, &["config", "user.email", "test@example.com"]);
+        git_ok(&source, &["config", "user.name", "SEAF Test"]);
+        fs::write(source.join("tracked.txt"), "source\n").unwrap();
+        git_ok(&source, &["add", "tracked.txt"]);
+        git_ok(&source, &["commit", "-qm", "initial"]);
+        let eval_config: seaf_core::EvalConfig = serde_json::from_value(serde_json::json!({
+            "evals": {
+                "allow_commands": ["true"],
+                "required": [{
+                    "name": "tests",
+                    "command": "true",
+                    "env": {"API_TOKEN": secret}
+                }]
+            }
+        }))
+        .unwrap();
+        let eval_config = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+        let ticket_bytes = seaf_core::canonical_json_bytes(&ticket()).unwrap();
+        let policy =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"policy": label})).unwrap();
+        let project_config =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"config": label})).unwrap();
+        let repository = seaf_core::canonical_json_bytes(&serde_json::json!({
+            "repository": source.canonicalize().unwrap(),
+            "case": label
+        }))
+        .unwrap();
+        let digest = |bytes: &[u8]| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        let snapshots = AuthoritativeRunInputSnapshots {
+            ticket: ticket_bytes.clone(),
+            provider_ticket: ticket_bytes.clone(),
+            policy: policy.clone(),
+            config: project_config.clone(),
+            repository: repository.clone(),
+            eval_config: eval_config.clone(),
+        };
+        let config = LoopRunnerConfig::for_ticket(
+            &runs_root,
+            &run_id,
+            &ticket(),
+            "fake-provider",
+            "fake-model",
+            LoopInputDigests {
+                ticket: digest(&ticket_bytes),
+                policy: digest(&policy),
+                config: digest(&project_config),
+                repository: digest(&repository),
+                eval_config: Some(digest(&eval_config)),
+            },
+        );
+
+        let result = InitializedLoopRun::create_isolated(config, &source, &snapshots);
+        let error = match result {
+            Ok(initialized) => {
+                let candidate = initialized
+                    .run()
+                    .candidate_workspace
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .clone();
+                git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+                drop(initialized);
+                fs::remove_dir_all(runs_root.join(&run_id)).unwrap();
+                panic!("{label} collision unexpectedly created an isolated run")
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!runs_root.join(&run_id).exists(), "{label}");
+    }
+}
+
+#[test]
+fn isolated_scaffold_rechecks_exact_existing_payloads_under_the_run_guard() {
+    let temp = tempfile::tempdir().expect("temp");
+    let secret = "historical-scaffold-secret-value";
+    let (source, initialized, snapshots) =
+        isolated_fixture_with_secret(temp.path(), "guarded-scaffold-recheck", secret);
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let run = initialized.run().clone();
+    let run_directory = initialized.workspace().run_directory().to_path_buf();
+    write_private_fixture_file(
+        run_directory.join("log.md"),
+        format!("# Loop run log\n{secret}").as_bytes(),
+    );
+    let before = read_tree_bytes(&run_directory);
+
+    let error = initialized
+        .scaffold()
+        .expect_err("exact existing scaffold bytes must be screened under the guard");
+
+    assert!(error.to_string().contains("credential material"), "{error}");
+    assert!(!error.to_string().contains(secret));
+    assert_eq!(read_tree_bytes(&run_directory), before);
+    for relative in ["prompts", "responses", "artifacts", "context-manifest.json"] {
+        assert!(!run_directory.join(relative).exists(), "{relative}");
+    }
+
+    fs::write(run_directory.join("log.md"), b"# Loop run log\n").unwrap();
+    InitializedLoopRun::resume_isolated_with_inputs(&temp.path().join("runs"), run, &snapshots)
+        .expect("clean authenticated retry")
+        .scaffold()
+        .expect("clean retry scaffold");
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn active_resume_rederives_redactor_and_rejects_unsafe_historical_scaffold_without_mutation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let secret = "persisted-scaffold-secret-value";
+    let (source, initialized, snapshots) =
+        isolated_fixture_with_secret(temp.path(), "historical-scaffold-resume", secret);
+    let candidate = initialized
+        .run()
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let prepared = initialized
+        .scaffold()
+        .unwrap()
+        .publish_authoritative_inputs(snapshots)
+        .unwrap();
+    let run = prepared.run().clone();
+    let run_directory = prepared.workspace().run_directory().to_path_buf();
+    fs::write(
+        run_directory.join("log.md"),
+        format!("# Loop run log\n{secret}"),
+    )
+    .unwrap();
+    let before = read_tree_bytes(&run_directory);
+
+    let error = InitializedLoopRun::resume_isolated(&temp.path().join("runs"), run.clone())
+        .expect_err("historical scaffold material must block resume");
+
+    assert!(error.to_string().contains("credential material"), "{error}");
+    assert!(!error.to_string().contains(secret));
+    assert_eq!(read_tree_bytes(&run_directory), before);
+
+    fs::write(run_directory.join("log.md"), b"# Loop run log\n").unwrap();
+    InitializedLoopRun::resume_isolated(&temp.path().join("runs"), run)
+        .expect("clean historical retry must resume");
+    git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+}
+
+#[test]
+fn isolated_provisioning_resume_screens_the_exact_active_run_before_candidate_creation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let run_id = "prospective-active-resume";
+    let runs_root = temp.path().join("runs");
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    git_ok(&source, &["init", "-q"]);
+    git_ok(&source, &["config", "user.email", "test@example.com"]);
+    git_ok(&source, &["config", "user.name", "SEAF Test"]);
+    fs::write(source.join("tracked.txt"), "source\n").unwrap();
+    git_ok(&source, &["add", "tracked.txt"]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    let eval_config = seaf_core::parse_eval_config(
+        "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: active\n",
+    )
+    .unwrap();
+    let eval_config = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+    let ticket_bytes = seaf_core::canonical_json_bytes(&ticket()).unwrap();
+    let policy = seaf_core::canonical_json_bytes(&serde_json::json!({"policy": run_id})).unwrap();
+    let project_config =
+        seaf_core::canonical_json_bytes(&serde_json::json!({"config": run_id})).unwrap();
+    let repository = seaf_core::canonical_json_bytes(&serde_json::json!({
+        "repository": source.canonicalize().unwrap(),
+        "run": run_id
+    }))
+    .unwrap();
+    let digest = |bytes: &[u8]| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let snapshots = AuthoritativeRunInputSnapshots {
+        ticket: ticket_bytes.clone(),
+        provider_ticket: ticket_bytes.clone(),
+        policy: policy.clone(),
+        config: project_config.clone(),
+        repository: repository.clone(),
+        eval_config: eval_config.clone(),
+    };
+    let workspace = LoopWorkspace::create(&runs_root, run_id).unwrap();
+    let mut provisioning = create_run(NewLoopRun {
+        run_id: run_id.to_string(),
+        ticket_id: ticket().ticket_id,
+        goal_id: ticket().goal_id,
+        provider: "fake-provider".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: digest(&ticket_bytes),
+            policy: digest(&policy),
+            config: digest(&project_config),
+            repository: digest(&repository),
+            eval_config: Some(digest(&eval_config)),
+        },
+    });
+    provisioning.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    provisioning.candidate_workspace = Some(
+        seaf_loop::plan_candidate_workspace(
+            workspace.run_directory(),
+            &source,
+            &provisioning.input_digests.repository,
+        )
+        .unwrap(),
+    );
+    let candidate_path = provisioning
+        .candidate_workspace
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let mut run_bytes = serde_json::to_vec_pretty(&provisioning).unwrap();
+    run_bytes.push(b'\n');
+    write_private_fixture_file(workspace.run_file(), &run_bytes);
+    let run_directory = workspace.run_directory().to_path_buf();
+    let before = read_tree_bytes(&run_directory);
+    drop(workspace);
+
+    let result =
+        InitializedLoopRun::resume_isolated_with_inputs(&runs_root, provisioning, &snapshots);
+    let error = match result {
+        Ok(resumed) => {
+            let created_candidate = resumed
+                .run()
+                .candidate_workspace
+                .as_ref()
+                .unwrap()
+                .path
+                .clone();
+            git_ok(
+                &source,
+                &["worktree", "remove", "--force", &created_candidate],
+            );
+            drop(resumed);
+            panic!("active collision unexpectedly resumed candidate provisioning")
+        }
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("credential material"), "{error}");
+    assert!(!error.to_string().contains("API_TOKEN"));
+    assert_eq!(read_tree_bytes(&run_directory), before);
+    assert!(!Path::new(&candidate_path).exists());
+}
+
+#[test]
+fn minimal_provisioning_resume_preflights_before_creating_candidate_locks() {
+    for case in ["missing-snapshots", "colliding-snapshots", "clean"] {
+        let temp = tempfile::tempdir().expect("temp");
+        let runs_root = temp.path().join("runs");
+        let run_id = format!("minimal-provisioning-{case}");
+        let run_directory = runs_root.join(&run_id);
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        git_ok(&source, &["init", "-q"]);
+        git_ok(&source, &["config", "user.email", "test@example.com"]);
+        git_ok(&source, &["config", "user.name", "SEAF Test"]);
+        fs::write(source.join("tracked.txt"), "source\n").unwrap();
+        git_ok(&source, &["add", "tracked.txt"]);
+        git_ok(&source, &["commit", "-qm", "initial"]);
+        create_private_fixture_directory(&runs_root);
+        create_private_fixture_directory(&run_directory);
+
+        let secret = if case == "colliding-snapshots" {
+            "\"lifecycle\": \"active\""
+        } else {
+            "never-present-in-run-authority"
+        };
+        let eval_config: seaf_core::EvalConfig = serde_json::from_value(serde_json::json!({
+            "evals": {
+                "allow_commands": ["true"],
+                "required": [{
+                    "name": "tests",
+                    "command": "true",
+                    "env": {"API_TOKEN": secret}
+                }]
+            }
+        }))
+        .unwrap();
+        let ticket_bytes = seaf_core::canonical_json_bytes(&ticket()).unwrap();
+        let policy =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"policy": run_id})).unwrap();
+        let project_config =
+            seaf_core::canonical_json_bytes(&serde_json::json!({"config": run_id})).unwrap();
+        let repository = seaf_core::canonical_json_bytes(&serde_json::json!({
+            "repository": source.canonicalize().unwrap(),
+            "run": run_id
+        }))
+        .unwrap();
+        let eval_config = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+        let digest = |bytes: &[u8]| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        let snapshots = AuthoritativeRunInputSnapshots {
+            ticket: ticket_bytes.clone(),
+            provider_ticket: ticket_bytes.clone(),
+            policy: policy.clone(),
+            config: project_config.clone(),
+            repository: repository.clone(),
+            eval_config: eval_config.clone(),
+        };
+        let mut provisioning = create_run(NewLoopRun {
+            run_id: run_id.clone(),
+            ticket_id: ticket().ticket_id,
+            goal_id: ticket().goal_id,
+            provider: "fake-provider".to_string(),
+            model: "fake-model".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: digest(&ticket_bytes),
+                policy: digest(&policy),
+                config: digest(&project_config),
+                repository: digest(&repository),
+                eval_config: Some(digest(&eval_config)),
+            },
+        });
+        provisioning.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+        provisioning.candidate_workspace = Some(
+            seaf_loop::plan_candidate_workspace(
+                &run_directory,
+                &source,
+                &provisioning.input_digests.repository,
+            )
+            .unwrap(),
+        );
+        assert!(seaf_core::validate_loop_run(&provisioning).is_empty());
+        let candidate_path = provisioning
+            .candidate_workspace
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let mut run_bytes = serde_json::to_vec_pretty(&provisioning).unwrap();
+        run_bytes.push(b'\n');
+        write_private_fixture_file(run_directory.join("run.json"), &run_bytes);
+        let before = read_tree_bytes(&run_directory);
+
+        if case == "clean" {
+            let resumed = InitializedLoopRun::resume_isolated_with_inputs(
+                &runs_root,
+                provisioning,
+                &snapshots,
+            )
+            .expect("clean authenticated Provisioning resume");
+            assert_eq!(
+                resumed
+                    .run()
+                    .candidate_workspace
+                    .as_ref()
+                    .unwrap()
+                    .lifecycle,
+                seaf_core::CandidateWorkspaceLifecycle::Active
+            );
+            assert!(run_directory.join(".candidate-workspace.lock").is_file());
+            git_ok(&source, &["worktree", "remove", "--force", &candidate_path]);
+        } else {
+            let error = if case == "missing-snapshots" {
+                InitializedLoopRun::resume_isolated(&runs_root, provisioning).unwrap_err()
+            } else {
+                InitializedLoopRun::resume_isolated_with_inputs(
+                    &runs_root,
+                    provisioning,
+                    &snapshots,
+                )
+                .unwrap_err()
+            };
+            assert!(
+                error.to_string().contains(if case == "missing-snapshots" {
+                    "requires authoritative input snapshots"
+                } else {
+                    "credential material"
+                }),
+                "{case}: {error}"
+            );
+            assert!(!error.to_string().contains(secret), "{case}: {error}");
+            assert_eq!(read_tree_bytes(&run_directory), before, "{case}");
+            assert!(!run_directory.join(".candidate-workspace.lock").exists());
+            assert!(!Path::new(&candidate_path).exists());
+        }
+    }
+}
+
+#[test]
+fn public_state_writer_cannot_bypass_isolated_provisioning_preflight() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runs_root = temp.path().join("runs");
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    git_ok(&source, &["init", "-q"]);
+    git_ok(&source, &["config", "user.email", "test@example.com"]);
+    git_ok(&source, &["config", "user.name", "SEAF Test"]);
+    fs::write(source.join("tracked.txt"), "source\n").unwrap();
+    git_ok(&source, &["add", "tracked.txt"]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    let workspace = LoopWorkspace::create(&runs_root, "isolated-writer-bypass").unwrap();
+    let mut run = create_run(NewLoopRun {
+        run_id: "isolated-writer-bypass".to_string(),
+        ticket_id: "P2-005".to_string(),
+        goal_id: "phase-2".to_string(),
+        provider: "fake-provider".to_string(),
+        model: "fake-model".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: "a".repeat(64),
+            policy: "b".repeat(64),
+            config: "c".repeat(64),
+            repository: "d".repeat(64),
+            eval_config: Some("e".repeat(64)),
+        },
+    });
+    run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
+    run.candidate_workspace = Some(
+        seaf_loop::plan_candidate_workspace(
+            workspace.run_directory(),
+            &source,
+            &run.input_digests.repository,
+        )
+        .unwrap(),
+    );
+    let before = read_tree_bytes(workspace.run_directory());
+
+    let error = seaf_loop::state::save_run(&workspace, &run)
+        .expect_err("the public writer must not mint isolated provisioning authority");
+
+    assert!(error.to_string().contains("public state writer"), "{error}");
+    assert_eq!(read_tree_bytes(workspace.run_directory()), before);
+    assert!(!workspace.run_file().exists());
+    assert!(!Path::new(&run.candidate_workspace.unwrap().path).exists());
 }
 
 #[test]
@@ -473,26 +949,11 @@ fn authoritative_eval_snapshot_requires_the_shared_typed_contract() {
         ),
     ] {
         let forged = seaf_core::canonical_json_bytes(&value).unwrap();
-        let (source, initialized, snapshots) =
-            isolated_fixture_with_eval_bytes(temp.path(), run_id, forged);
-        let candidate = initialized
-            .run()
-            .candidate_workspace
-            .as_ref()
-            .unwrap()
-            .path
-            .clone();
-        let scaffolded = initialized.scaffold().unwrap();
-        let run_dir = scaffolded.workspace().run_directory().to_path_buf();
-
-        let error = scaffolded
-            .publish_authoritative_inputs(snapshots)
+        let error = isolated_fixture_with_eval_bytes(temp.path(), run_id, forged)
             .expect_err("generic canonical JSON cannot forge typed eval authority");
 
         assert!(error.to_string().contains("eval config"), "{error}");
-        assert!(!run_dir.join("inputs").exists());
-        assert!(!run_dir.join("ticket.snapshot.json").exists());
-        git_ok(&source, &["worktree", "remove", "--force", &candidate]);
+        assert!(!temp.path().join("runs").join(run_id).exists());
     }
 }
 
@@ -1738,18 +2199,49 @@ fn isolated_fixture(
     )
     .unwrap();
     let eval_config = seaf_core::canonical_json_bytes(&eval_config).unwrap();
-    isolated_fixture_with_eval_bytes(root, run_id, eval_config)
+    isolated_fixture_with_eval_bytes(root, run_id, eval_config).unwrap()
+}
+
+fn isolated_fixture_with_secret(
+    root: &Path,
+    run_id: &str,
+    secret: &str,
+) -> (
+    std::path::PathBuf,
+    InitializedLoopRun,
+    AuthoritativeRunInputSnapshots,
+) {
+    let eval_config: seaf_core::EvalConfig = serde_json::from_value(serde_json::json!({
+        "evals": {
+            "allow_commands": ["true"],
+            "required": [{
+                "name": "tests",
+                "command": "true",
+                "env": {"API_TOKEN": secret}
+            }]
+        }
+    }))
+    .unwrap();
+    isolated_fixture_with_eval_bytes(
+        root,
+        run_id,
+        seaf_core::canonical_json_bytes(&eval_config).unwrap(),
+    )
+    .unwrap()
 }
 
 fn isolated_fixture_with_eval_bytes(
     root: &Path,
     run_id: &str,
     eval_config: Vec<u8>,
-) -> (
-    std::path::PathBuf,
-    InitializedLoopRun,
-    AuthoritativeRunInputSnapshots,
-) {
+) -> Result<
+    (
+        std::path::PathBuf,
+        InitializedLoopRun,
+        AuthoritativeRunInputSnapshots,
+    ),
+    seaf_loop::RunnerError,
+> {
     let source = root.join(format!("{run_id}-source"));
     fs::create_dir(&source).unwrap();
     git_ok(&source, &["init", "-q"]);
@@ -1786,9 +2278,16 @@ fn isolated_fixture_with_eval_bytes(
             },
         ),
         &source,
-    )
-    .unwrap();
-    (
+        &AuthoritativeRunInputSnapshots {
+            provider_ticket: ticket_bytes.clone(),
+            ticket: ticket_bytes.clone(),
+            policy: policy.clone(),
+            config: config.clone(),
+            repository: repository.clone(),
+            eval_config: eval_config.clone(),
+        },
+    )?;
+    Ok((
         source,
         initialized,
         AuthoritativeRunInputSnapshots {
@@ -1799,7 +2298,7 @@ fn isolated_fixture_with_eval_bytes(
             repository,
             eval_config,
         },
-    )
+    ))
 }
 
 fn create_test_run(runs_root: &Path, run_id: &str) {

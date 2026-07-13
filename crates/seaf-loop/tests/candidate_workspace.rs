@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -1784,7 +1785,7 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     authoritative.policy_decisions.push(
         serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
     );
-    authoritative.input_digests.eval_config = Some("4".repeat(64));
+    bind_empty_eval_config_fixture(&workspace, &mut authoritative);
     persist_run_fixture(&workspace, &authoritative).expect("Development authority");
 
     let applied =
@@ -1811,12 +1812,15 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     assert_eq!(fs::read(source.join("tracked.txt")).unwrap(), source_bytes);
     let persisted = seaf_loop::state::load_run(&workspace).expect("persisted run");
     assert_eq!(persisted.candidate_workspace.as_ref(), Some(&applied));
-    let resumed = seaf_loop::InitializedLoopRun::resume_isolated(
+    let resume_error = seaf_loop::InitializedLoopRun::resume_isolated(
         &temp.path().join("runs"),
         persisted.clone(),
     )
-    .expect("ordinary resume accepts exact Applied evidence");
-    assert_eq!(resumed.run(), &persisted);
+    .expect_err("resume requires a complete authenticated input snapshot prefix");
+    assert!(
+        resume_error.to_string().contains("exact prefix"),
+        "{resume_error}"
+    );
     let verified = seaf_loop::verify_candidate_patch_evidence(&workspace, &source)
         .expect("exact Applied review projection");
     assert_eq!(verified.candidate_tree, applied.candidate_tree);
@@ -2378,6 +2382,39 @@ fn write_private_artifact_fixture(workspace: &LoopWorkspace, relative: &str, byt
     seaf_loop::workspace::write_artifact(workspace.run_directory(), relative, bytes).unwrap();
 }
 
+fn bind_empty_eval_config_fixture(workspace: &LoopWorkspace, run: &mut seaf_core::LoopRun) {
+    let config = seaf_core::parse_eval_config(
+        "evals:\n  allow_commands: []\n  required:\n    - name: tests\n      command: true\n",
+    )
+    .expect("fixture eval config");
+    let bytes = seaf_core::canonical_json_bytes(&config).expect("canonical fixture eval config");
+    run.input_digests.eval_config =
+        Some(seaf_core::canonical_sha256_digest(&config).expect("fixture eval config digest"));
+    let inputs = workspace.run_directory().join("inputs");
+    if !inputs.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&inputs).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&inputs).unwrap();
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(inputs.join("eval-config.json"))
+        .expect("fixture eval config file");
+    file.write_all(&bytes).expect("fixture eval config bytes");
+    file.sync_all().expect("sync fixture eval config");
+}
+
 fn prepare_candidate_workspace(
     run_directory: &Path,
     source: &Path,
@@ -2605,9 +2642,6 @@ fn persist_run_fixture(
     workspace: &LoopWorkspace,
     run: &seaf_core::LoopRun,
 ) -> Result<(), seaf_loop::state::StateError> {
-    if !workspace.run_file().exists() {
-        return seaf_loop::state::save_run(workspace, run);
-    }
     let errors = seaf_core::validate_loop_run(run);
     if !errors.is_empty() {
         return Err(seaf_loop::state::StateError::InvalidRun(
@@ -2620,6 +2654,19 @@ fn persist_run_fixture(
     }
     let mut bytes = serde_json::to_vec_pretty(run)?;
     bytes.push(b'\n');
+    if !workspace.run_file().exists() {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(workspace.run_file())?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        return Ok(());
+    }
     fs::write(workspace.run_file(), bytes)?;
     Ok(())
 }

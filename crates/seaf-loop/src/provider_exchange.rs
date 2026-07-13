@@ -588,7 +588,7 @@ pub(crate) fn publish_provider_exchange_request_tail_with_validator<F>(
     validate_prospective: F,
 ) -> Result<(LoopRun, ArtifactReference), ProviderExchangeError>
 where
-    F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
+    F: Fn(&LoopRun, &[u8], &[u8]) -> Result<(), ProviderExchangeError>,
 {
     validate_coordinates(coordinates)?;
     crate::artifact_storage::validate_artifact_size(
@@ -671,11 +671,10 @@ where
                     .join("; "),
             ));
         }
-        validate_prospective(&prospective)?;
         let commitment =
             provider_request_tail_commitment(&prospective, &record, false, false, None)?;
-        let mut run_bytes = serde_json::to_vec_pretty(&prospective)?;
-        run_bytes.push(b'\n');
+        let run_bytes = state::run_file_bytes(&prospective)?;
+        validate_prospective(&prospective, &record_bytes, &run_bytes)?;
         let root = crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
         let run_file = root.open_existing_file(
             std::ffi::OsStr::new(crate::workspace::RUN_FILE),
@@ -905,16 +904,20 @@ pub(crate) fn stage_provider_exchange_response_record(
     Ok((reference, classification))
 }
 
-pub(crate) fn stage_provider_exchange_response_record_consuming_commitment(
+pub(crate) fn stage_provider_exchange_response_record_consuming_commitment<F>(
     run_directory: &Path,
     mut record: ProviderExchangeRecord,
+    validate_prospective: F,
 ) -> Result<
     (
         ProviderExchangeRecordReference,
         ProviderExchangeResponseClassification,
     ),
     ProviderExchangeError,
-> {
+>
+where
+    F: Fn(&[u8], &[u8]) -> Result<(), ProviderExchangeError>,
+{
     if record.phase != ProviderExchangePhase::Response || record.outcome.is_some() {
         return Err(ProviderExchangeError::Invalid(
             "derived response staging requires a response record without a caller outcome"
@@ -933,9 +936,35 @@ pub(crate) fn stage_provider_exchange_response_record_consuming_commitment(
         classify_bound_provider_exchange_response(run_directory, record.role, response)?;
     record.outcome = Some(classification.outcome);
     validate_record(&record)?;
-    let reference = record_reference(&record, canonical_sha256_digest(&record)?);
     let bytes = canonical_json_bytes(&record)?;
+    let reference = record_reference(&record, digest_bytes(&bytes));
     let guard = RunMutationGuard::acquire(run_directory)?;
+    let runs_root = run_directory.parent().ok_or_else(|| {
+        ProviderExchangeError::Invalid("provider run directory has no runs root".to_string())
+    })?;
+    let run_id = run_directory
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "provider run directory has no safe UTF-8 run ID".to_string(),
+            )
+        })?;
+    let workspace = LoopWorkspace::open_minimal(runs_root, run_id)
+        .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+    let mut prospective = state::load_run(&workspace)?;
+    if prospective.provider_exchange_records.last() != Some(&reference) {
+        if prospective.provider_exchange_records.contains(&reference) {
+            return Err(ProviderExchangeError::Invalid(
+                "provider response record is already referenced out of order".to_string(),
+            ));
+        }
+        prospective
+            .provider_exchange_records
+            .push(reference.clone());
+    }
+    let run_bytes = state::run_file_bytes(&prospective)?;
+    validate_prospective(&bytes, &run_bytes)?;
     if run_artifact_exists(run_directory, &reference.path)? {
         crate::immutable_artifact::publish_create_only_with_guard(&guard, &reference.path, &bytes)?;
     } else {
@@ -1363,8 +1392,7 @@ where
             validate_final_authority_cas_relation(workspace, &current, intended)?;
         }
         validate_run_for_atomic_publication(workspace, intended)?;
-        let mut bytes = serde_json::to_vec_pretty(intended)?;
-        bytes.push(b'\n');
+        let bytes = state::run_file_bytes(intended)?;
         replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))
     })();
     let unlock = lock.unlock();
@@ -3060,7 +3088,7 @@ mod tests {
             &coordinates,
             br#"{"request":"slots"}"#,
             None,
-            |_| Ok(()),
+            |_, _, _| Ok(()),
         )
         .unwrap();
         let audit = ProviderExchangeResponseAudit::ModelResponse {
@@ -3131,6 +3159,7 @@ mod tests {
         let collision = stage_provider_exchange_response_record_consuming_commitment(
             workspace.run_directory(),
             response_record.clone(),
+            |_, _| Ok(()),
         )
         .expect_err("wrong bytes in a reserved response-record slot must fail closed");
         assert!(
@@ -3147,6 +3176,7 @@ mod tests {
         let (response_reference, _) = stage_provider_exchange_response_record_consuming_commitment(
             workspace.run_directory(),
             response_record,
+            |_, _| Ok(()),
         )
         .unwrap();
         let after_record = derive_active_provider_storage_commitment(workspace.run_directory())
@@ -3205,7 +3235,7 @@ mod tests {
             &coordinates,
             br#"{"request":"namespace"}"#,
             None,
-            |_| Ok(()),
+            |_, _, _| Ok(()),
         )
         .unwrap();
         for directory in [
@@ -3300,7 +3330,7 @@ mod tests {
             &coordinates,
             br#"{"request":"partial-namespace"}"#,
             None,
-            |_| Ok(()),
+            |_, _, _| Ok(()),
         )
         .unwrap();
         std::fs::remove_dir(
@@ -3883,7 +3913,7 @@ mod tests {
         output_review.status = LoopStepStatus::Running;
         output_review.artifact_path = None;
         output_review.artifact_digest = None;
-        state::save_run(workspace, &pre_review).unwrap();
+        state::write_raw_canonical_run_fixture(&workspace.run_file(), &pre_review).unwrap();
         let with_ledger = persist_test_output_review_ledger(workspace, &awaiting.run_id);
         awaiting.provider_exchange_records = with_ledger.provider_exchange_records.clone();
         persist_run_with_full_compare(workspace, &with_ledger, &awaiting).unwrap();
@@ -4115,7 +4145,8 @@ mod tests {
         output_review.status = LoopStepStatus::Running;
         output_review.artifact_path = None;
         output_review.artifact_digest = None;
-        state::save_run(&workspace, &pre_review).expect("pre-review run");
+        state::write_raw_canonical_run_fixture(&workspace.run_file(), &pre_review)
+            .expect("pre-review run");
         let with_ledger = persist_test_output_review_ledger(&workspace, &run.run_id);
         run.provider_exchange_records = with_ledger.provider_exchange_records.clone();
         let before = fs::read(workspace.run_file()).unwrap();
@@ -4611,7 +4642,8 @@ mod tests {
             cleaned_at: None,
         });
         authoritative.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-        state::save_run(&workspace, &authoritative).expect("authoritative run");
+        state::write_raw_canonical_run_fixture(&workspace.run_file(), &authoritative)
+            .expect("authoritative run");
         crate::artifacts::write_step_request(&workspace, LoopStepName::Research, 1, "research")
             .expect("conventional request");
         let coordinates = ProviderExchangeCoordinates {

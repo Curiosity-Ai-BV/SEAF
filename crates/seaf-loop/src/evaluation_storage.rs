@@ -32,19 +32,20 @@ pub(crate) fn derive_active_evaluation_storage_commitment(
     if prefix_is_superseded_by_invalidation(run_directory, run, prefix.attempt)? {
         return Ok(None);
     }
-    if let Some(commitment) = derive_recovery_transition_commitment(run_directory, run, &prefix)? {
-        return Ok(Some(commitment));
-    }
-    let intent_reference = crate::evaluation_attempt::reference_for_path(
-        &workspace_from_run_directory(run_directory)?,
-        &prefix.intent,
-    )?;
-    let intent = crate::evaluation_attempt::load_intent(
-        &workspace_from_run_directory(run_directory)?,
-        &intent_reference,
-    )
-    .map_err(|error| format!("invalid evaluation intent {}: {error}", prefix.intent))?;
+    let workspace = workspace_from_run_directory(run_directory)?;
     let checks = load_eval_config(run_directory, run)?;
+    let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&checks)
+        .map_err(|_| prohibited_evaluation_artifact())?;
+    let intent_reference =
+        crate::evaluation_attempt::reference_for_path(&workspace, &prefix.intent)?;
+    validate_persisted_derived_bytes(
+        run_directory,
+        &prefix.intent,
+        "active evaluation intent",
+        &redactor,
+    )?;
+    let intent = crate::evaluation_attempt::load_intent(&workspace, &intent_reference)
+        .map_err(|error| format!("invalid evaluation intent {}: {error}", prefix.intent))?;
     validate_intent(run, &intent, &checks.evals.required)?;
     if intent.attempt() != prefix.attempt {
         return Err("evaluation commitment intent selects a different attempt".to_string());
@@ -56,7 +57,11 @@ pub(crate) fn derive_active_evaluation_storage_commitment(
         &prefix,
         &intent_reference,
         &intent,
+        &redactor,
     )?;
+    if let Some(commitment) = derive_recovery_transition_commitment(run_directory, run, &prefix)? {
+        return Ok(Some(commitment));
+    }
     normal_prefix_commitment(run, &prefix, &checks, |path| {
         existing_size(run_directory, path)?
             .ok_or_else(|| format!("evaluation commitment prefix artifact disappeared: {path}"))
@@ -71,6 +76,7 @@ fn validate_present_evaluation_evidence(
     prefix: &EvaluationCommitmentPrefix,
     intent_reference: &seaf_core::ArtifactReference,
     intent: &ApprovedEvaluationIntent,
+    redactor: &crate::secret_redaction::SecretRedactor,
 ) -> Result<(), String> {
     let Some(testing_path) = prefix.testing.as_deref() else {
         if prefix.report.is_some() {
@@ -81,11 +87,18 @@ fn validate_present_evaluation_evidence(
     let workspace = workspace_from_run_directory(run_directory)?;
     let testing_reference =
         crate::evaluation_attempt::reference_for_path(&workspace, testing_path)?;
+    validate_persisted_derived_bytes(
+        run_directory,
+        testing_path,
+        "active Testing evidence",
+        redactor,
+    )?;
     let testing =
         crate::TestingEvidence::load_for_approved_run(&workspace, &testing_reference, run)
             .map_err(|error| {
                 format!("existing Testing artifact has different bytes or authority: {error}")
             })?;
+    intent.validate_observed_check_names(&testing.checks)?;
     let testing_binds_intent = match intent {
         ApprovedEvaluationIntent::V1(_) => {
             testing.schema_version == 1
@@ -93,7 +106,7 @@ fn validate_present_evaluation_evidence(
                 && testing.execution_intent.is_none()
                 && testing.recovery.is_none()
         }
-        ApprovedEvaluationIntent::V2(_) => {
+        ApprovedEvaluationIntent::V2(_) | ApprovedEvaluationIntent::V3(_) => {
             testing.schema_version == 2
                 && testing.evaluation_attempt == Some(prefix.attempt)
                 && testing.execution_intent.as_ref() == Some(intent_reference)
@@ -114,6 +127,7 @@ fn validate_present_evaluation_evidence(
             };
             let bytes = read_verified_regular_file(run_directory, path, "Testing log")
                 .map_err(|error| error.to_string())?;
+            validate_exact_derived_bytes(redactor, &bytes)?;
             if format!("{:x}", sha2::Sha256::digest(&bytes)) != digest {
                 return Err("Testing evidence log digest mismatch".into());
             }
@@ -122,6 +136,7 @@ fn validate_present_evaluation_evidence(
     if let Some(report_path) = prefix.report.as_deref() {
         let report_bytes = read_verified_regular_file(run_directory, report_path, "EvalReport")
             .map_err(|error| error.to_string())?;
+        validate_exact_derived_bytes(redactor, &report_bytes)?;
         let report: seaf_core::EvalReport =
             serde_json::from_slice(&report_bytes).map_err(|error| error.to_string())?;
         if canonical_json_bytes(&report).map_err(|error| error.to_string())? != report_bytes {
@@ -179,6 +194,15 @@ pub(crate) fn derive_fresh_evaluation_storage_commitment(
         return Err("fresh evaluation commitment target is not the exact next attempt".to_string());
     }
     let checks = load_eval_config(run_directory, run)?;
+    let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&checks)
+        .map_err(|_| prohibited_evaluation_artifact())?;
+    let intent_bytes = match intent {
+        ApprovedEvaluationIntent::V1(intent) => canonical_json_bytes(intent),
+        ApprovedEvaluationIntent::V2(intent) => canonical_json_bytes(intent),
+        ApprovedEvaluationIntent::V3(intent) => canonical_json_bytes(intent),
+    }
+    .map_err(|error| error.to_string())?;
+    validate_exact_derived_bytes(&redactor, &intent_bytes)?;
     validate_intent(run, intent, &checks.evals.required)?;
     let prefix = EvaluationCommitmentPrefix {
         attempt,
@@ -701,6 +725,31 @@ fn load_eval_config(run_directory: &Path, run: &LoopRun) -> Result<EvalConfig, S
     Ok(config)
 }
 
+fn validate_persisted_derived_bytes(
+    run_directory: &Path,
+    relative_path: &str,
+    label: &str,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), String> {
+    let bytes = read_verified_regular_file(run_directory, relative_path, label)
+        .map_err(|error| error.to_string())?;
+    validate_exact_derived_bytes(redactor, &bytes)
+}
+
+fn validate_exact_derived_bytes(
+    redactor: &crate::secret_redaction::SecretRedactor,
+    bytes: &[u8],
+) -> Result<(), String> {
+    match redactor.contains_prohibited_bytes(bytes) {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(_) => Err(prohibited_evaluation_artifact()),
+    }
+}
+
+fn prohibited_evaluation_artifact() -> String {
+    "derived evaluation artifact contains prohibited credential material".to_string()
+}
+
 fn existing_size(run_directory: &Path, relative_path: &str) -> Result<Option<u64>, String> {
     let root = crate::artifact_safety::PinnedPrivateDirectory::open(run_directory)
         .map_err(|error| error.to_string())?;
@@ -872,6 +921,54 @@ mod tests {
     use seaf_core::{EvalCommandConfig, EvalGroup, LoopInputDigests};
 
     use super::*;
+
+    #[test]
+    fn active_storage_rejects_exact_secret_bearing_history_bytes() {
+        let config = EvalConfig {
+            evals: EvalGroup {
+                allow_commands: vec![],
+                required: vec![EvalCommandConfig {
+                    name: "envelope".into(),
+                    command: "true".into(),
+                    cwd: None,
+                    env: BTreeMap::from([("API_TOKEN".into(), "completed_at".into())]),
+                    timeout_ms: None,
+                    max_output_bytes: None,
+                }],
+            },
+            thresholds: None,
+        };
+        let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&config).unwrap();
+
+        assert_eq!(
+            validate_exact_derived_bytes(&redactor, br#"{"completed_at":"1"}"#).unwrap_err(),
+            "derived evaluation artifact contains prohibited credential material"
+        );
+    }
+
+    #[test]
+    fn active_storage_raw_scans_marker_spanning_history_bytes() {
+        let config = EvalConfig {
+            evals: EvalGroup {
+                allow_commands: vec![],
+                required: vec![EvalCommandConfig {
+                    name: "envelope".into(),
+                    command: "true".into(),
+                    cwd: None,
+                    env: BTreeMap::from([("API_TOKEN".into(), "prefix[REDACTED]suffix".into())]),
+                    timeout_ms: None,
+                    max_output_bytes: None,
+                }],
+            },
+            thresholds: None,
+        };
+        let redactor = crate::secret_redaction::SecretRedactor::from_eval_config(&config).unwrap();
+
+        assert_eq!(
+            validate_exact_derived_bytes(&redactor, b"prefix[REDACTED]suffix").unwrap_err(),
+            "derived evaluation artifact contains prohibited credential material"
+        );
+    }
 
     #[test]
     fn durable_recovery_transition_table_has_literal_remaining_capacity() {

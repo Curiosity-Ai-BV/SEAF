@@ -23,8 +23,8 @@ use crate::{
     },
     eval_engine::execute_eval_checks_with_pre_spawn,
     evaluation_attempt::{
-        ApprovedEvaluationIntent, ApprovedEvaluationIntentV2, EvaluationAttemptInventory,
-        EvaluationAttemptPaths,
+        project_eval_checks_v3, ApprovedEvaluationIntent, ApprovedEvaluationIntentV3,
+        EvaluationAttemptInventory, EvaluationAttemptPaths,
     },
     immutable_artifact::{
         publish_create_only_consuming_evaluation_slot,
@@ -149,6 +149,8 @@ fn execute_approved_evaluation_locked(
     }
     let (ticket, ticket_bytes) = load_ticket_snapshot(workspace, &approved)?;
     let (eval_config, eval_config_bytes) = load_eval_snapshot(workspace, &approved)?;
+    let planned_checks = project_eval_checks_v3(&eval_config.evals.required)
+        .map_err(ApprovedEvaluationError::invalid)?;
     if recovery_authorization.is_none() {
         refuse_incomplete_attempt(workspace)?;
     }
@@ -196,8 +198,8 @@ fn execute_approved_evaluation_locked(
         .map_or(1, |(_, attempt)| *attempt);
     let paths =
         EvaluationAttemptPaths::indexed(attempt).map_err(ApprovedEvaluationError::invalid)?;
-    let intent = ApprovedEvaluationIntentV2 {
-        schema_version: 2,
+    let intent = ApprovedEvaluationIntentV3 {
+        schema_version: 3,
         evaluation_attempt: attempt,
         run_id: approved.run_id.clone(),
         approved_run_digest,
@@ -219,10 +221,12 @@ fn execute_approved_evaluation_locked(
         recovery: recovery_authorization
             .as_ref()
             .map(|(reference, _)| reference.clone()),
-        planned_checks: eval_config.evals.required.clone(),
+        planned_checks,
     };
     let intent_bytes = canonical_json_bytes(&intent).map_err(ApprovedEvaluationError::wrapped)?;
-    let intent_authority = ApprovedEvaluationIntent::V2(Box::new(intent.clone()));
+    plan.validate_exact_derived_bytes(&intent_bytes)
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    let intent_authority = ApprovedEvaluationIntent::V3(Box::new(intent.clone()));
     let run_guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
         .map_err(ApprovedEvaluationError::wrapped)?;
     let locked = state::load_run(workspace).map_err(ApprovedEvaluationError::wrapped)?;
@@ -316,6 +320,8 @@ fn execute_approved_evaluation_locked(
                 &intent_bytes,
                 &sha256_bytes(&intent_bytes),
             )?;
+            plan.validate_exact_derived_bytes(&intent_bytes)
+                .map_err(ApprovedEvaluationError::wrapped)?;
             crate::evaluation_storage::validate_pre_spawn_evaluation_prefix(
                 workspace.run_directory(),
                 attempt,
@@ -340,6 +346,10 @@ fn execute_approved_evaluation_locked(
         let stderr_path = paths.stderr(number);
         let stdout = execution.stdout.as_bytes();
         let stderr = execution.stderr.as_bytes();
+        plan.validate_exact_derived_bytes(stdout)
+            .map_err(ApprovedEvaluationError::wrapped)?;
+        plan.validate_exact_derived_bytes(stderr)
+            .map_err(ApprovedEvaluationError::wrapped)?;
         publish_create_only_consuming_evaluation_slot(
             workspace.run_directory(),
             &stdout_path,
@@ -441,6 +451,8 @@ fn execute_approved_evaluation_locked(
     let testing_bytes = testing
         .canonical_bytes()
         .map_err(ApprovedEvaluationError::wrapped)?;
+    plan.validate_exact_derived_bytes(&testing_bytes)
+        .map_err(ApprovedEvaluationError::wrapped)?;
     let testing_reference = ArtifactReference {
         path: paths.testing.clone(),
         digest: testing
@@ -457,6 +469,8 @@ fn execute_approved_evaluation_locked(
     let passed = testing.passed;
     let report = build_integrated_eval_report(&approved, &testing, testing_reference.clone())?;
     let report_bytes = canonical_json_bytes(&report).map_err(ApprovedEvaluationError::wrapped)?;
+    plan.validate_exact_derived_bytes(&report_bytes)
+        .map_err(ApprovedEvaluationError::wrapped)?;
     let report_reference = ArtifactReference {
         path: paths.report.clone(),
         digest: canonical_sha256_digest(&report).map_err(ApprovedEvaluationError::wrapped)?,

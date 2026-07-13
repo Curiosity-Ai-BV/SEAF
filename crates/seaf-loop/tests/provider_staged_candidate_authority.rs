@@ -167,6 +167,7 @@ impl Fixture {
                 },
             ),
             &source,
+            &snapshots,
         )
         .expect("isolated initialization");
         let candidate_state = initialized

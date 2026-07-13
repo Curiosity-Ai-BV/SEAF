@@ -211,6 +211,13 @@ pub(crate) fn validate_staged_evaluation_source_for_storage(
     source_bytes: &[u8],
     expected_attempt: Option<u32>,
 ) -> Result<VerifiedStagedEvaluationSource, RecoveryError> {
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, current)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(current))
+        .and_then(|()| operator_guard.validate_exact_raw_bytes(source_bytes))
+        .map_err(RecoveryError::invalid)?;
     let value: serde_json::Value =
         serde_json::from_slice(source_bytes).map_err(RecoveryError::wrapped)?;
     if canonical_json_bytes(&value).map_err(RecoveryError::wrapped)? != source_bytes {
@@ -225,6 +232,9 @@ pub(crate) fn validate_staged_evaluation_source_for_storage(
         Some(schema) if schema == u64::from(EVALUATION_RECOVERY_SCHEMA_VERSION) => {
             let source: EvaluationRecoverySourceRunV2 =
                 serde_json::from_value(value).map_err(RecoveryError::wrapped)?;
+            operator_guard
+                .validate_recovery_fields(&source.actor, &source.reason)
+                .map_err(RecoveryError::invalid)?;
             if expected_attempt
                 .is_some_and(|attempt| attempt != source.evaluation_prefix.evaluation_attempt)
             {
@@ -232,7 +242,13 @@ pub(crate) fn validate_staged_evaluation_source_for_storage(
                     "staged evaluation adoption source is not for the active attempt",
                 ));
             }
-            validate_staged_adoption_source(workspace, current, source_path, &source)?;
+            validate_staged_adoption_source(
+                workspace,
+                current,
+                source_path,
+                &source,
+                &operator_guard,
+            )?;
             Ok(VerifiedStagedEvaluationSource::Adoption {
                 missing_report: source.evaluation_prefix.eval_report.is_none(),
             })
@@ -240,6 +256,9 @@ pub(crate) fn validate_staged_evaluation_source_for_storage(
         Some(schema) if schema == u64::from(EVALUATION_INVALIDATION_SCHEMA_VERSION) => {
             let source: EvaluationInvalidationSourceRunV3 =
                 serde_json::from_value(value).map_err(RecoveryError::wrapped)?;
+            operator_guard
+                .validate_recovery_fields(&source.actor, &source.reason)
+                .map_err(RecoveryError::invalid)?;
             if expected_attempt
                 .is_some_and(|attempt| attempt != source.evaluation_prefix.evaluation_attempt)
             {
@@ -247,7 +266,13 @@ pub(crate) fn validate_staged_evaluation_source_for_storage(
                     "staged evaluation invalidation source is not for the active attempt",
                 ));
             }
-            validate_staged_invalidation_source(workspace, current, source_path, &source)?;
+            validate_staged_invalidation_source(
+                workspace,
+                current,
+                source_path,
+                &source,
+                &operator_guard,
+            )?;
             Ok(VerifiedStagedEvaluationSource::Invalidation)
         }
         _ => Err(RecoveryError::invalid(
@@ -261,6 +286,7 @@ fn validate_staged_adoption_source(
     current: &LoopRun,
     source_path: &str,
     source: &EvaluationRecoverySourceRunV2,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<(), RecoveryError> {
     if source.schema_version != EVALUATION_RECOVERY_SCHEMA_VERSION
         || source.recovery_id == 0
@@ -293,13 +319,18 @@ fn validate_staged_adoption_source(
     } else {
         EvaluationPrefixSpellingV1::IndexedV2
     };
-    let intent_reference =
-        reference_for_path(workspace, &prefix.intent).map_err(RecoveryError::invalid)?;
-    let testing_reference =
-        reference_for_path(workspace, &prefix.testing).map_err(RecoveryError::invalid)?;
+    let screened_prefix = preflight_adoption_evaluation_prefix(
+        workspace,
+        operator_guard,
+        &prefix.intent,
+        &prefix.testing,
+        prefix.report_present.then_some(prefix.report.as_str()),
+    )?;
+    let intent_reference = screened_reference(&screened_prefix, &prefix.intent)?;
+    let testing_reference = screened_reference(&screened_prefix, &prefix.testing)?;
     let current_report_reference = prefix
         .report_present
-        .then(|| reference_for_path(workspace, &prefix.report).map_err(RecoveryError::invalid))
+        .then(|| screened_reference(&screened_prefix, &prefix.report))
         .transpose()?;
     if source.evaluation_prefix.evaluation_attempt != prefix.attempt
         || source.evaluation_prefix.spelling != expected_spelling
@@ -318,6 +349,9 @@ fn validate_staged_adoption_source(
     let testing = TestingEvidence::load_for_approved_run(workspace, &testing_reference, current)
         .map_err(RecoveryError::wrapped)?;
     let intent = load_intent(workspace, &intent_reference).map_err(RecoveryError::invalid)?;
+    intent
+        .validate_observed_check_names(&testing.checks)
+        .map_err(RecoveryError::invalid)?;
     let eval_config = load_recovery_eval_config(workspace, current)?;
     let expected_recovery = if prefix.attempt == 1 {
         None
@@ -343,6 +377,7 @@ fn validate_staged_adoption_source(
         .map_err(RecoveryError::invalid)?;
     verify_evaluation_prefix_references(
         workspace,
+        operator_guard,
         &testing,
         &intent_reference,
         &testing_reference,
@@ -382,6 +417,7 @@ fn validate_staged_invalidation_source(
     current: &LoopRun,
     source_path: &str,
     source: &EvaluationInvalidationSourceRunV3,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<(), RecoveryError> {
     if source.schema_version != EVALUATION_INVALIDATION_SCHEMA_VERSION
         || source.recovery_id == 0
@@ -447,11 +483,9 @@ fn validate_staged_invalidation_source(
     } else {
         EvaluationPrefixSpellingV1::IndexedV2
     };
-    let references = prefix
-        .paths
-        .iter()
-        .map(|path| reference_for_path(workspace, path).map_err(RecoveryError::invalid))
-        .collect::<Result<Vec<_>, _>>()?;
+    let screened_prefix =
+        preflight_evaluation_prefix_paths(workspace, operator_guard, &prefix.paths)?;
+    let references = screened_references(&screened_prefix);
     if source.evaluation_prefix.spelling != expected_spelling
         || source.evaluation_prefix.present_artifacts != references
     {
@@ -463,10 +497,10 @@ fn validate_staged_invalidation_source(
         .first()
         .ok_or_else(|| RecoveryError::invalid("staged invalidation source lost intent"))?;
     let intent = load_intent(workspace, intent_reference).map_err(RecoveryError::invalid)?;
-    let source_digest = match &intent {
-        ApprovedEvaluationIntent::V1(_) => String::new(),
-        ApprovedEvaluationIntent::V2(intent) => intent.source_worktree_state_digest.clone(),
-    };
+    let source_digest = intent
+        .source_worktree_state_digest()
+        .unwrap_or_default()
+        .to_string();
     let eval_config = load_recovery_eval_config(workspace, &source.approved_run)?;
     validate_invalidation_prefix(
         workspace,
@@ -475,6 +509,7 @@ fn validate_staged_invalidation_source(
         &eval_config.evals.required,
         &source_digest,
         (source.run.status == LoopStatus::Failed).then_some(false),
+        operator_guard,
     )?;
     Ok(())
 }
@@ -551,8 +586,22 @@ fn invalidate_approved_evaluation_locked(
     reason: &str,
 ) -> Result<EvaluationInvalidationOutcome, RecoveryError> {
     let source = state::load_run(workspace).map_err(RecoveryError::wrapped)?;
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&source))
+        .and_then(|()| operator_guard.validate_structural(actor))
+        .map_err(RecoveryError::invalid)?;
+    let reason = operator_guard
+        .sanitize_reason(reason, 1024)
+        .map_err(RecoveryError::invalid)?;
+    validate_note("reason", &reason, 1024)?;
     ensure_no_promotion_intent(workspace)?;
-    if let Some(retry) = exact_evaluation_invalidation_retry(workspace, &source, actor, reason)? {
+    if let Some(retry) = exact_evaluation_invalidation_retry(workspace, &source, actor, &reason)? {
+        operator_guard
+            .validate_future_run(&retry.run)
+            .map_err(RecoveryError::invalid)?;
         state::resync_exact_run(workspace, &retry.run).map_err(RecoveryError::wrapped)?;
         return Ok(retry);
     }
@@ -612,6 +661,7 @@ fn invalidate_approved_evaluation_locked(
         &eval_config.evals.required,
         &source_authority_digest,
         (source.status == LoopStatus::Failed).then_some(false),
+        &operator_guard,
     )?;
     if source.status == LoopStatus::Approved && prefix.testing_present {
         return Err(RecoveryError::invalid(
@@ -639,7 +689,8 @@ fn invalidate_approved_evaluation_locked(
         &source_path,
         &recovery_path,
         actor,
-        reason,
+        &reason,
+        &operator_guard,
     )?;
     let prior_final = if source.status == LoopStatus::Failed {
         Some(EvaluationInvalidationFinalAuthorityV1 {
@@ -653,7 +704,7 @@ fn invalidate_approved_evaluation_locked(
         schema_version: EVALUATION_INVALIDATION_SCHEMA_VERSION,
         recovery_id,
         actor: actor.to_string(),
-        reason: reason.to_string(),
+        reason: reason.clone(),
         created_at: created_at.clone(),
         run: source.clone(),
         approved_run: approved.clone(),
@@ -668,7 +719,9 @@ fn invalidate_approved_evaluation_locked(
         },
         prior_final,
     };
-    let source_bytes = canonical_json_bytes(&source_snapshot).map_err(RecoveryError::wrapped)?;
+    let source_bytes = operator_guard
+        .validate_canonical_artifact(&source_snapshot)
+        .map_err(RecoveryError::invalid)?;
     let source_reference = ArtifactReference {
         path: source_path.clone(),
         digest: digest_bytes(&source_bytes),
@@ -689,7 +742,7 @@ fn invalidate_approved_evaluation_locked(
         action: EvaluationInvalidationAction::InvalidateApprovedEvaluation,
         step: LoopStepName::Testing,
         actor: actor.to_string(),
-        reason: reason.to_string(),
+        reason: reason.clone(),
         created_at: created_at.clone(),
         source_run: source_reference,
         source_run_digest: canonical_sha256_digest(&source).map_err(RecoveryError::wrapped)?,
@@ -710,7 +763,9 @@ fn invalidate_approved_evaluation_locked(
             .map_err(RecoveryError::wrapped)?,
     };
     validate_evaluation_invalidation_contract(&recovery)?;
-    let recovery_bytes = canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)?;
+    let recovery_bytes = operator_guard
+        .validate_canonical_artifact(&recovery)
+        .map_err(RecoveryError::invalid)?;
     let reference = RecoveryReference {
         recovery_id,
         artifact: ArtifactReference {
@@ -718,8 +773,34 @@ fn invalidate_approved_evaluation_locked(
             digest: digest_bytes(&recovery_bytes),
         },
     };
-    preflight_exact_artifact(workspace, &source_path, &source_bytes, true)?;
-    preflight_exact_artifact(workspace, &recovery_path, &recovery_bytes, true)?;
+    let mut intended = zero_projection;
+    intended.latest_recovery = Some(reference.clone());
+    operator_guard
+        .validate_future_run(&intended)
+        .map_err(RecoveryError::invalid)?;
+    preflight_exact_artifact(
+        workspace,
+        &source_path,
+        &source_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
+    preflight_exact_artifact(
+        workspace,
+        &recovery_path,
+        &recovery_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
+    let publication_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source)
+            .map_err(RecoveryError::invalid)?;
+    publication_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&source_bytes))
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&recovery_bytes))
+        .and_then(|()| publication_guard.validate_future_run(&intended).map(drop))
+        .map_err(RecoveryError::invalid)?;
     publish_invalidation_source_activating_if_needed(
         workspace,
         &source,
@@ -735,8 +816,6 @@ fn invalidate_approved_evaluation_locked(
     )
     .map_err(RecoveryError::wrapped)?;
 
-    let mut intended = zero_projection;
-    intended.latest_recovery = Some(reference.clone());
     reauthenticate_evaluation_invalidation(
         workspace,
         &source,
@@ -793,8 +872,20 @@ fn adopt_approved_evaluation_locked(
     reason: &str,
 ) -> Result<EvaluationAdoptionOutcome, RecoveryError> {
     let approved = state::load_run(workspace).map_err(RecoveryError::wrapped)?;
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &approved)
+            .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&approved))
+        .and_then(|()| operator_guard.validate_structural(actor))
+        .map_err(RecoveryError::invalid)?;
+    let reason = operator_guard
+        .sanitize_reason(reason, 1024)
+        .map_err(RecoveryError::invalid)?;
+    validate_note("reason", &reason, 1024)?;
     if is_final_evaluation_status(&approved) {
-        return exact_evaluation_adoption_retry(workspace, approved, actor, reason);
+        return exact_evaluation_adoption_retry(workspace, approved, actor, &reason);
     }
     validate_evaluation_adoption_source(workspace, &approved)?;
 
@@ -828,13 +919,21 @@ fn adopt_approved_evaluation_locked(
     let prefix = inventory
         .recovery_prefix_paths()
         .map_err(RecoveryError::invalid)?;
-    let intent_reference =
-        reference_for_path(workspace, &prefix.intent).map_err(RecoveryError::invalid)?;
-    let testing_reference =
-        reference_for_path(workspace, &prefix.testing).map_err(RecoveryError::invalid)?;
+    let screened_prefix = preflight_adoption_evaluation_prefix(
+        workspace,
+        &operator_guard,
+        &prefix.intent,
+        &prefix.testing,
+        prefix.report_present.then_some(prefix.report.as_str()),
+    )?;
+    let intent_reference = screened_reference(&screened_prefix, &prefix.intent)?;
+    let testing_reference = screened_reference(&screened_prefix, &prefix.testing)?;
     let testing = TestingEvidence::load_for_approved_run(workspace, &testing_reference, &approved)
         .map_err(RecoveryError::wrapped)?;
     let intent = load_intent(workspace, &intent_reference).map_err(RecoveryError::invalid)?;
+    intent
+        .validate_observed_check_names(&testing.checks)
+        .map_err(RecoveryError::invalid)?;
     let eval_config = load_recovery_eval_config(workspace, &approved)?;
     let expected_attempt_recovery = if prefix.attempt == 1 {
         None
@@ -867,7 +966,7 @@ fn adopt_approved_evaluation_locked(
             if testing.evaluation_attempt.is_none()
                 && testing.execution_intent.is_none()
                 && testing.recovery.is_none() => {}
-        (ApprovedEvaluationIntent::V2(_), 2)
+        (ApprovedEvaluationIntent::V2(_) | ApprovedEvaluationIntent::V3(_), 2)
             if testing.evaluation_attempt == Some(prefix.attempt)
                 && testing.execution_intent.as_ref() == Some(&intent_reference)
                 && testing
@@ -880,8 +979,8 @@ fn adopt_approved_evaluation_locked(
             ))
         }
     }
-    if let ApprovedEvaluationIntent::V2(intent) = &intent {
-        if intent.source_worktree_state_digest != source_authority_digest {
+    if let Some(source_digest) = intent.source_worktree_state_digest() {
+        if source_digest != source_authority_digest {
             return Err(RecoveryError::invalid(
                 "adoption source worktree authority changed after command execution",
             ));
@@ -892,6 +991,7 @@ fn adopt_approved_evaluation_locked(
         .map_err(RecoveryError::invalid)?;
     verify_evaluation_prefix_references(
         workspace,
+        &operator_guard,
         &testing,
         &intent_reference,
         &testing_reference,
@@ -904,13 +1004,22 @@ fn adopt_approved_evaluation_locked(
     )
     .map_err(RecoveryError::wrapped)?;
     let report_bytes = canonical_json_bytes(&report).map_err(RecoveryError::wrapped)?;
+    operator_guard
+        .validate_exact_raw_bytes(&report_bytes)
+        .map_err(RecoveryError::invalid)?;
+    if prefix.report_present {
+        preflight_exact_artifact(
+            workspace,
+            &prefix.report,
+            &report_bytes,
+            false,
+            Some(&operator_guard),
+        )?;
+    }
     let report_reference = ArtifactReference {
         path: prefix.report.clone(),
         digest: digest_bytes(&report_bytes),
     };
-    if prefix.report_present {
-        preflight_exact_artifact(workspace, &prefix.report, &report_bytes, false)?;
-    }
 
     let recovery_id = next_evaluation_recovery_id(workspace, &approved)?;
     let source_path = recovery_source_path(recovery_id);
@@ -929,7 +1038,8 @@ fn adopt_approved_evaluation_locked(
         &source_path,
         &recovery_path,
         actor,
-        reason,
+        &reason,
+        &operator_guard,
     )?;
     let created_at = orphan
         .as_ref()
@@ -955,7 +1065,7 @@ fn adopt_approved_evaluation_locked(
         schema_version: EVALUATION_RECOVERY_SCHEMA_VERSION,
         recovery_id,
         actor: actor.to_string(),
-        reason: reason.to_string(),
+        reason: reason.clone(),
         created_at: created_at.clone(),
         run: approved.clone(),
         evaluation_prefix: EvaluationPrefixAuthorityV1 {
@@ -972,7 +1082,9 @@ fn adopt_approved_evaluation_locked(
                 .then(|| report_reference.clone()),
         },
     };
-    let source_bytes = canonical_json_bytes(&source_snapshot).map_err(RecoveryError::wrapped)?;
+    let source_bytes = operator_guard
+        .validate_canonical_artifact(&source_snapshot)
+        .map_err(RecoveryError::invalid)?;
     let source_reference = ArtifactReference {
         path: source_path.clone(),
         digest: digest_bytes(&source_bytes),
@@ -999,7 +1111,7 @@ fn adopt_approved_evaluation_locked(
         action: EvaluationRecoveryAction::AdoptApprovedEvaluation,
         step: LoopStepName::Testing,
         actor: actor.to_string(),
-        reason: reason.to_string(),
+        reason: reason.clone(),
         created_at: created_at.clone(),
         source_run: source_reference,
         source_run_digest: canonical_sha256_digest(&approved).map_err(RecoveryError::wrapped)?,
@@ -1020,7 +1132,9 @@ fn adopt_approved_evaluation_locked(
         expected_final_projection_digest: canonical_sha256_digest(&zero_projection)
             .map_err(RecoveryError::wrapped)?,
     };
-    let recovery_bytes = canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)?;
+    let recovery_bytes = operator_guard
+        .validate_canonical_artifact(&recovery)
+        .map_err(RecoveryError::invalid)?;
     let reference = RecoveryReference {
         recovery_id,
         artifact: ArtifactReference {
@@ -1028,15 +1142,51 @@ fn adopt_approved_evaluation_locked(
             digest: digest_bytes(&recovery_bytes),
         },
     };
+    let mut final_run = zero_projection;
+    final_run.latest_recovery = Some(reference.clone());
+    operator_guard
+        .validate_future_run(&final_run)
+        .map_err(RecoveryError::invalid)?;
 
     // Every possible collision is inspected before the first create-only publication.
-    preflight_exact_artifact(workspace, &source_path, &source_bytes, true)?;
-    preflight_exact_artifact(workspace, &recovery_path, &recovery_bytes, true)?;
+    preflight_exact_artifact(
+        workspace,
+        &source_path,
+        &source_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
+    preflight_exact_artifact(
+        workspace,
+        &recovery_path,
+        &recovery_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
     preflight_exact_artifact(
         workspace,
         &prefix.report,
         &report_bytes,
         report_disposition == EvaluationRecoveryReportDisposition::CreateMissing,
+        Some(&operator_guard),
+    )?;
+
+    let publication_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &approved)
+            .map_err(RecoveryError::invalid)?;
+    publication_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&report_bytes))
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&source_bytes))
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&recovery_bytes))
+        .and_then(|()| publication_guard.validate_future_run(&final_run).map(drop))
+        .map_err(RecoveryError::invalid)?;
+    preflight_exact_artifact(
+        workspace,
+        &prefix.report,
+        &report_bytes,
+        report_disposition == EvaluationRecoveryReportDisposition::CreateMissing,
+        Some(&publication_guard),
     )?;
 
     publish_create_only_consuming_evaluation_slot(
@@ -1060,8 +1210,6 @@ fn adopt_approved_evaluation_locked(
         .map_err(RecoveryError::wrapped)?;
     }
 
-    let mut final_run = zero_projection;
-    final_run.latest_recovery = Some(reference.clone());
     reauthenticate_evaluation_adoption(
         workspace,
         &approved,
@@ -1070,6 +1218,8 @@ fn adopt_approved_evaluation_locked(
         source_root,
         &source_authority,
         &verified,
+        &prefix.report,
+        &report_bytes,
     )?;
     persist_evaluation_adoption_with_validator(workspace, &approved, &final_run, |locked| {
         reauthenticate_evaluation_adoption(
@@ -1080,6 +1230,8 @@ fn adopt_approved_evaluation_locked(
             source_root,
             &source_authority,
             &verified,
+            &prefix.report,
+            &report_bytes,
         )
         .map_err(|error| {
             crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
@@ -1110,6 +1262,7 @@ fn exact_evaluation_adoption_retry(
     actor: &str,
     reason: &str,
 ) -> Result<EvaluationAdoptionOutcome, RecoveryError> {
+    validate_operator_run_envelope(workspace, &run)?;
     ensure_no_promotion_intent(workspace)?;
     let reference = run
         .latest_recovery
@@ -1298,6 +1451,7 @@ pub(crate) fn validate_final_evaluation_invalidation_retry(
     run: &LoopRun,
     recovery_id: u32,
 ) -> Result<RecoveryReference, RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     ensure_no_promotion_intent(workspace)?;
     let reference = run
         .latest_recovery
@@ -1316,6 +1470,103 @@ pub(crate) fn validate_final_evaluation_invalidation_retry(
     Ok(reference.clone())
 }
 
+struct ScreenedEvaluationPrefixArtifact {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+fn preflight_evaluation_prefix_paths(
+    workspace: &LoopWorkspace,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
+    paths: &[String],
+) -> Result<Vec<ScreenedEvaluationPrefixArtifact>, RecoveryError> {
+    paths
+        .iter()
+        .map(|path| {
+            let bytes = read_verified_regular_file(
+                workspace.run_directory(),
+                path,
+                "evaluation recovery prefix artifact",
+            )
+            .map_err(RecoveryError::wrapped)?;
+            operator_guard
+                .validate_exact_raw_bytes(&bytes)
+                .map_err(RecoveryError::invalid)?;
+            Ok(ScreenedEvaluationPrefixArtifact {
+                path: path.clone(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn preflight_adoption_evaluation_prefix(
+    workspace: &LoopWorkspace,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
+    intent_path: &str,
+    testing_path: &str,
+    report_path: Option<&str>,
+) -> Result<Vec<ScreenedEvaluationPrefixArtifact>, RecoveryError> {
+    let mut structural_paths = vec![intent_path.to_string(), testing_path.to_string()];
+    if let Some(report_path) = report_path {
+        structural_paths.push(report_path.to_string());
+    }
+    let mut screened =
+        preflight_evaluation_prefix_paths(workspace, operator_guard, &structural_paths)?;
+    let testing_bytes = screened
+        .iter()
+        .find(|artifact| artifact.path == testing_path)
+        .map(|artifact| artifact.bytes.as_slice())
+        .ok_or_else(|| RecoveryError::invalid("evaluation adoption prefix lost Testing bytes"))?;
+    let testing: TestingEvidence =
+        serde_json::from_slice(testing_bytes).map_err(RecoveryError::wrapped)?;
+    let mut log_paths = Vec::with_capacity(testing.checks.len().saturating_mul(2));
+    for check in &testing.checks {
+        log_paths.push(
+            check
+                .stdout_path
+                .clone()
+                .ok_or_else(|| RecoveryError::invalid("adoption prefix lost check log path"))?,
+        );
+        log_paths.push(
+            check
+                .stderr_path
+                .clone()
+                .ok_or_else(|| RecoveryError::invalid("adoption prefix lost check log path"))?,
+        );
+    }
+    screened.extend(preflight_evaluation_prefix_paths(
+        workspace,
+        operator_guard,
+        &log_paths,
+    )?);
+    Ok(screened)
+}
+
+fn screened_reference(
+    screened: &[ScreenedEvaluationPrefixArtifact],
+    path: &str,
+) -> Result<ArtifactReference, RecoveryError> {
+    let artifact = screened
+        .iter()
+        .find(|artifact| artifact.path == path)
+        .ok_or_else(|| RecoveryError::invalid("evaluation recovery prefix lost artifact bytes"))?;
+    Ok(ArtifactReference {
+        path: artifact.path.clone(),
+        digest: digest_bytes(&artifact.bytes),
+    })
+}
+
+fn screened_references(screened: &[ScreenedEvaluationPrefixArtifact]) -> Vec<ArtifactReference> {
+    screened
+        .iter()
+        .map(|artifact| ArtifactReference {
+            path: artifact.path.clone(),
+            digest: digest_bytes(&artifact.bytes),
+        })
+        .collect()
+}
+
 fn validate_invalidation_prefix(
     workspace: &LoopWorkspace,
     approved: &LoopRun,
@@ -1323,6 +1574,7 @@ fn validate_invalidation_prefix(
     planned_checks: &[seaf_core::EvalCommandConfig],
     source_worktree_state_digest: &str,
     expected_passed: Option<bool>,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<Vec<ArtifactReference>, RecoveryError> {
     if prefix.complete_log_pairs as usize > planned_checks.len()
         || (prefix.trailing_stdout && prefix.complete_log_pairs as usize >= planned_checks.len())
@@ -1333,11 +1585,9 @@ fn validate_invalidation_prefix(
             "evaluation invalidation prefix does not match the planned command sequence",
         ));
     }
-    let references = prefix
-        .paths
-        .iter()
-        .map(|path| reference_for_path(workspace, path).map_err(RecoveryError::invalid))
-        .collect::<Result<Vec<_>, _>>()?;
+    let screened_prefix =
+        preflight_evaluation_prefix_paths(workspace, operator_guard, &prefix.paths)?;
+    let references = screened_references(&screened_prefix);
     let intent_reference = references
         .first()
         .ok_or_else(|| RecoveryError::invalid("evaluation invalidation prefix lost intent"))?;
@@ -1355,8 +1605,8 @@ fn validate_invalidation_prefix(
             "evaluation invalidation intent selects another attempt",
         ));
     }
-    if let ApprovedEvaluationIntent::V2(intent) = intent {
-        if intent.source_worktree_state_digest != source_worktree_state_digest {
+    if let Some(source_digest) = intent.source_worktree_state_digest() {
+        if source_digest != source_worktree_state_digest {
             return Err(RecoveryError::invalid(
                 "evaluation invalidation source authority changed after command execution",
             ));
@@ -1386,6 +1636,9 @@ fn validate_invalidation_prefix(
         let testing =
             TestingEvidence::load_for_approved_run(workspace, testing_reference, approved)
                 .map_err(RecoveryError::wrapped)?;
+        intent
+            .validate_observed_check_names(&testing.checks)
+            .map_err(RecoveryError::invalid)?;
         if testing.evaluation_attempt.unwrap_or(1) != prefix.attempt
             || testing
                 .recovery
@@ -1534,11 +1787,20 @@ fn existing_invalidation_or_new_timestamp(
     recovery_path: &str,
     actor: &str,
     reason: &str,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<String, RecoveryError> {
     let source_bytes =
         read_optional_verified(workspace, source_path, "invalidation source orphan")?;
     let recovery_bytes =
         read_optional_verified(workspace, recovery_path, "invalidation recovery orphan")?;
+    for bytes in [source_bytes.as_deref(), recovery_bytes.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        operator_guard
+            .validate_exact_raw_bytes(bytes)
+            .map_err(RecoveryError::invalid)?;
+    }
     let source = source_bytes
         .map(|bytes| serde_json::from_slice::<EvaluationInvalidationSourceRunV3>(&bytes))
         .transpose()
@@ -1547,6 +1809,20 @@ fn existing_invalidation_or_new_timestamp(
         .map(|bytes| serde_json::from_slice::<EvaluationInvalidationAttemptV3>(&bytes))
         .transpose()
         .map_err(RecoveryError::wrapped)?;
+    if let Some(source) = source.as_ref() {
+        operator_guard
+            .validate_recovery_fields(&source.actor, &source.reason)
+            .map_err(RecoveryError::invalid)?;
+        operator_guard
+            .validate_run(&source.run)
+            .and_then(|()| operator_guard.validate_run(&source.approved_run))
+            .map_err(RecoveryError::invalid)?;
+    }
+    if let Some(recovery) = recovery.as_ref() {
+        operator_guard
+            .validate_recovery_fields(&recovery.actor, &recovery.reason)
+            .map_err(RecoveryError::invalid)?;
+    }
     match (source, recovery) {
         (None, None) => Ok(now_timestamp()),
         (Some(source), None)
@@ -1736,6 +2012,7 @@ pub(crate) fn validate_requested_evaluation_invalidation(
     run: &LoopRun,
     recovery_id: u32,
 ) -> Result<(RecoveryReference, u32), RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     let reference = run
         .latest_recovery
         .as_ref()
@@ -1782,6 +2059,7 @@ pub(crate) fn reauthenticate_evaluation_invalidation_execution(
     reference: &RecoveryReference,
     source_worktree_state_digest: &str,
 ) -> Result<(), RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     let (recovery, source) = load_verified_evaluation_invalidation(workspace, reference)?
         .ok_or_else(|| RecoveryError::invalid("evaluation execution lost V3 invalidation"))?;
     let mut expected =
@@ -1812,6 +2090,7 @@ pub(crate) fn reauthenticate_evaluation_invalidation_execution(
 
 fn verify_evaluation_prefix_references(
     workspace: &LoopWorkspace,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
     testing: &TestingEvidence,
     intent: &ArtifactReference,
     testing_reference: &ArtifactReference,
@@ -1839,6 +2118,9 @@ fn verify_evaluation_prefix_references(
             "evaluation adoption prefix artifact",
         )
         .map_err(RecoveryError::wrapped)?;
+        operator_guard
+            .validate_exact_raw_bytes(&bytes)
+            .map_err(RecoveryError::invalid)?;
         if digest_bytes(&bytes) != reference.digest {
             return Err(RecoveryError::invalid(
                 "evaluation adoption prefix artifact digest mismatch",
@@ -1892,9 +2174,13 @@ fn load_evaluation_adoption_orphan(
     recovery_path: &str,
     actor: &str,
     reason: &str,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<Option<EvaluationAdoptionOrphan>, RecoveryError> {
     let existing_source = read_optional_verified(workspace, source_path, "adoption source orphan")?
         .map(|bytes| {
+            operator_guard
+                .validate_exact_raw_bytes(&bytes)
+                .map_err(RecoveryError::invalid)?;
             let source: EvaluationRecoverySourceRunV2 =
                 serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
             if canonical_json_bytes(&source).map_err(RecoveryError::wrapped)? != bytes
@@ -1912,6 +2198,9 @@ fn load_evaluation_adoption_orphan(
     let existing_recovery =
         read_optional_verified(workspace, recovery_path, "adoption recovery orphan")?
             .map(|bytes| {
+                operator_guard
+                    .validate_exact_raw_bytes(&bytes)
+                    .map_err(RecoveryError::invalid)?;
                 let recovery: EvaluationRecoveryAttemptV2 =
                     serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
                 if canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)? != bytes
@@ -1926,6 +2215,17 @@ fn load_evaluation_adoption_orphan(
                 Ok(recovery)
             })
             .transpose()?;
+    if let Some(source) = existing_source.as_ref() {
+        operator_guard
+            .validate_recovery_fields(&source.actor, &source.reason)
+            .and_then(|()| operator_guard.validate_run(&source.run))
+            .map_err(RecoveryError::invalid)?;
+    }
+    if let Some(recovery) = existing_recovery.as_ref() {
+        operator_guard
+            .validate_recovery_fields(&recovery.actor, &recovery.reason)
+            .map_err(RecoveryError::invalid)?;
+    }
     match (existing_source, existing_recovery) {
         (None, None) => Ok(None),
         (Some(source), None) => {
@@ -1987,12 +2287,23 @@ fn preflight_exact_artifact(
     path: &str,
     expected: &[u8],
     allow_absent: bool,
+    operator_guard: Option<&crate::operator_evidence::OperatorEvidenceGuard>,
 ) -> Result<(), RecoveryError> {
     match read_optional_verified(workspace, path, "evaluation adoption artifact")? {
-        Some(bytes) if bytes == expected => Ok(()),
-        Some(_) => Err(RecoveryError::invalid(format!(
-            "evaluation adoption artifact collision at {path}"
-        ))),
+        Some(bytes) => {
+            if let Some(operator_guard) = operator_guard {
+                operator_guard
+                    .validate_exact_raw_bytes(&bytes)
+                    .map_err(RecoveryError::invalid)?;
+            }
+            if bytes == expected {
+                Ok(())
+            } else {
+                Err(RecoveryError::invalid(format!(
+                    "evaluation adoption artifact collision at {path}"
+                )))
+            }
+        }
         None if allow_absent => Ok(()),
         None => Err(RecoveryError::invalid(format!(
             "evaluation adoption requires existing exact artifact at {path}"
@@ -2000,6 +2311,20 @@ fn preflight_exact_artifact(
     }
 }
 
+fn validate_operator_run_envelope(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<(), RecoveryError> {
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, run)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(run))
+        .and_then(|()| operator_guard.validate_future_run(run).map(drop))
+        .map_err(RecoveryError::invalid)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reauthenticate_evaluation_adoption(
     workspace: &LoopWorkspace,
     approved: &LoopRun,
@@ -2008,12 +2333,28 @@ fn reauthenticate_evaluation_adoption(
     source_root: &Path,
     source_authority: &SourceWorktreeAuthority,
     verified: &VerifiedCandidatePatchEvidence,
+    report_path: &str,
+    report_bytes: &[u8],
 ) -> Result<(), RecoveryError> {
     if state::load_run(workspace).map_err(RecoveryError::wrapped)? != *approved {
         return Err(RecoveryError::invalid(
             "Approved authority changed before evaluation adoption CAS",
         ));
     }
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, approved)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(approved))
+        .and_then(|()| operator_guard.validate_future_run(final_run).map(|_| ()))
+        .map_err(RecoveryError::invalid)?;
+    preflight_exact_artifact(
+        workspace,
+        report_path,
+        report_bytes,
+        false,
+        Some(&operator_guard),
+    )?;
     validate_evaluation_adoption_source(workspace, approved)?;
     let current_verified =
         verify_candidate_patch_evidence_for_evaluation_locked(workspace, source_root)
@@ -2063,6 +2404,14 @@ fn reauthenticate_evaluation_invalidation(
             "evaluation authority changed before invalidation CAS",
         ));
     }
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, approved)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(source))
+        .and_then(|()| operator_guard.validate_run(approved))
+        .and_then(|()| operator_guard.validate_future_run(intended).map(|_| ()))
+        .map_err(RecoveryError::invalid)?;
     validate_evaluation_invalidation_source(workspace, source, approved)?;
     let current_verified =
         verify_candidate_patch_evidence_for_evaluation_locked(workspace, source_root)
@@ -2131,6 +2480,17 @@ fn revise_provider_step_locked(
     reason: &str,
 ) -> Result<RecoveryRevisionOutcome, RecoveryError> {
     let source = state::load_run(workspace).map_err(RecoveryError::wrapped)?;
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source)
+        .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&source))
+        .and_then(|()| operator_guard.validate_structural(actor))
+        .map_err(RecoveryError::invalid)?;
+    let reason = operator_guard
+        .sanitize_reason(reason, 1024)
+        .map_err(RecoveryError::invalid)?;
+    validate_note("reason", &reason, 1024)?;
     if source.status == LoopStatus::Pending && source.current_step == step {
         if let Some(reference) = source.latest_recovery.clone() {
             let recovery = load_verified_recovery(workspace, &source, &reference)?;
@@ -2142,6 +2502,9 @@ fn revise_provider_step_locked(
                         reference.recovery_id,
                     )?;
                     validate_pending_adoption(workspace, &source, step, &recovery)?;
+                    operator_guard
+                        .validate_future_run(&source)
+                        .map_err(RecoveryError::invalid)?;
                     state::resync_exact_run(workspace, &source).map_err(RecoveryError::wrapped)?;
                     return Ok(RecoveryRevisionOutcome {
                         run: source,
@@ -2197,22 +2560,23 @@ fn revise_provider_step_locked(
         recovery_id,
     )?;
 
+    let recovery_path = recovery_path(recovery_id);
+    let created_at = existing_or_new_timestamp(workspace, &recovery_path, &operator_guard)?;
+
     let source_snapshot = RecoverySourceRunV1 {
         schema_version: RECOVERY_SCHEMA_VERSION,
         recovery_id,
         run: source.clone(),
     };
-    let source_bytes = canonical_json_bytes(&source_snapshot).map_err(RecoveryError::wrapped)?;
+    let source_bytes = operator_guard
+        .validate_canonical_artifact(&source_snapshot)
+        .map_err(RecoveryError::invalid)?;
     let source_path = recovery_source_path(recovery_id);
-    publish_create_only(workspace.run_directory(), &source_path, &source_bytes)
-        .map_err(RecoveryError::wrapped)?;
     let source_reference = ArtifactReference {
-        path: source_path,
+        path: source_path.clone(),
         digest: digest_bytes(&source_bytes),
     };
 
-    let recovery_path = recovery_path(recovery_id);
-    let created_at = existing_or_new_timestamp(workspace, &recovery_path)?;
     let mut projection = reset_run(&source, step, recovery_id, &recovery_path, &created_at)?;
     let projection_digest = canonical_sha256_digest(&projection).map_err(RecoveryError::wrapped)?;
     let recovery = RecoveryAttemptV1 {
@@ -2222,7 +2586,7 @@ fn revise_provider_step_locked(
         action: RecoveryAction::ReviseProviderStep,
         step,
         actor: actor.to_string(),
-        reason: reason.to_string(),
+        reason,
         created_at: created_at.clone(),
         source_run: source_reference,
         source_run_digest: canonical_sha256_digest(&source).map_err(RecoveryError::wrapped)?,
@@ -2241,7 +2605,9 @@ fn revise_provider_step_locked(
         expected_reset_projection_digest: projection_digest,
     };
     validate_recovery_contract(&recovery)?;
-    let recovery_bytes = canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)?;
+    let recovery_bytes = operator_guard
+        .validate_canonical_artifact(&recovery)
+        .map_err(RecoveryError::invalid)?;
     let recovery_digest = digest_bytes(&recovery_bytes);
     let reference = RecoveryReference {
         recovery_id,
@@ -2251,11 +2617,38 @@ fn revise_provider_step_locked(
         },
     };
     projection.latest_recovery = Some(reference.clone());
+    let intended = projection;
+    operator_guard
+        .validate_future_run(&intended)
+        .map_err(RecoveryError::invalid)?;
+    validate_reset_relation(&source, &intended, &recovery)?;
+    preflight_exact_artifact(
+        workspace,
+        &source_path,
+        &source_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
+    preflight_exact_artifact(
+        workspace,
+        &recovery_path,
+        &recovery_bytes,
+        true,
+        Some(&operator_guard),
+    )?;
+    let publication_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source)
+            .map_err(RecoveryError::invalid)?;
+    publication_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&source_bytes))
+        .and_then(|()| publication_guard.validate_exact_raw_bytes(&recovery_bytes))
+        .and_then(|()| publication_guard.validate_future_run(&intended).map(drop))
+        .map_err(RecoveryError::invalid)?;
+    publish_create_only(workspace.run_directory(), &source_path, &source_bytes)
+        .map_err(RecoveryError::wrapped)?;
     publish_create_only(workspace.run_directory(), &recovery_path, &recovery_bytes)
         .map_err(RecoveryError::wrapped)?;
-
-    let intended = projection;
-    validate_reset_relation(&source, &intended, &recovery)?;
     persist_recovery_reset_with_full_compare_and_validator(
         workspace,
         &source,
@@ -2267,6 +2660,19 @@ fn revise_provider_step_locked(
                         "source run changed before recovery CAS",
                     ));
                 }
+                let operator_guard =
+                    crate::operator_evidence::OperatorEvidenceGuard::load(workspace, current)
+                        .map_err(RecoveryError::invalid)?;
+                operator_guard
+                    .validate_current_run_file(workspace)
+                    .and_then(|()| operator_guard.validate_run(current))
+                    .and_then(|()| {
+                        operator_guard.validate_recovery_fields(&recovery.actor, &recovery.reason)
+                    })
+                    .and_then(|()| operator_guard.validate_exact_raw_bytes(&source_bytes))
+                    .and_then(|()| operator_guard.validate_exact_raw_bytes(&recovery_bytes))
+                    .and_then(|()| operator_guard.validate_future_run(&intended).map(drop))
+                    .map_err(RecoveryError::invalid)?;
                 validate_source_worktree_authority(
                     source_root,
                     Some(workspace.run_directory()),
@@ -2366,6 +2772,7 @@ pub fn ensure_no_pending_recovery(
     let Some(reference) = &run.latest_recovery else {
         return Ok(());
     };
+    validate_operator_run_envelope(workspace, run)?;
     let consumed = match load_verified_any_recovery_entry(workspace, reference)? {
         VerifiedRecoveryLineage::Provider { .. } => {
             recovery_is_consumed(workspace, run, reference)?
@@ -2393,6 +2800,7 @@ pub(crate) fn verify_recovery_authorization(
     step: LoopStepName,
     attempt: u32,
 ) -> Result<(), RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     let mut reference = run.latest_recovery.clone().ok_or_else(|| {
         RecoveryError::invalid("provider attempt has no active recovery authorization")
     })?;
@@ -2421,6 +2829,7 @@ pub(crate) fn verify_latest_recovery_authorization(
     step: LoopStepName,
     attempt: u32,
 ) -> Result<(), RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     let reference = run.latest_recovery.as_ref().ok_or_else(|| {
         RecoveryError::invalid("provider attempt has no latest recovery authorization")
     })?;
@@ -2579,6 +2988,7 @@ fn load_verified_recovery(
     run: &LoopRun,
     reference: &RecoveryReference,
 ) -> Result<RecoveryAttemptV1, RecoveryError> {
+    validate_operator_run_envelope(workspace, run)?;
     let (recovery, source, projection) = load_verified_recovery_lineage(workspace, reference)?;
     validate_current_descendant(workspace, run, reference, &source, &projection, &recovery)?;
     Ok(recovery)
@@ -2650,6 +3060,15 @@ fn load_verified_provider_recovery_entry(
             "recovery source snapshot binding mismatch",
         ));
     }
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &snapshot.run)
+            .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_exact_raw_bytes(&bytes)
+        .and_then(|()| operator_guard.validate_exact_raw_bytes(&snapshot_bytes))
+        .and_then(|()| operator_guard.validate_run(&snapshot.run))
+        .and_then(|()| operator_guard.validate_recovery_fields(&recovery.actor, &recovery.reason))
+        .map_err(RecoveryError::invalid)?;
     let source_errors = seaf_core::validate_loop_run(&snapshot.run);
     if !source_errors.is_empty() {
         return Err(RecoveryError::invalid(format!(
@@ -2696,6 +3115,7 @@ pub(crate) fn load_evaluation_recovery_source_for_final(
     let Some(reference) = run.latest_recovery.as_ref() else {
         return Ok(None);
     };
+    validate_operator_run_envelope(workspace, run)?;
     if let Some((recovery, source)) = load_verified_evaluation_invalidation(workspace, reference)? {
         let testing_reference = final_step_reference(run, LoopStepName::Testing)?;
         let report_reference = final_step_reference(run, LoopStepName::EvalReport)?;
@@ -3080,6 +3500,16 @@ fn load_verified_evaluation_recovery_lineage(
             "evaluation recovery source snapshot binding mismatch",
         ));
     }
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source.run)
+            .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_exact_raw_bytes(bytes)
+        .and_then(|()| operator_guard.validate_exact_raw_bytes(&source_bytes))
+        .and_then(|()| operator_guard.validate_run(&source.run))
+        .and_then(|()| operator_guard.validate_recovery_fields(&source.actor, &source.reason))
+        .and_then(|()| operator_guard.validate_recovery_fields(&recovery.actor, &recovery.reason))
+        .map_err(RecoveryError::invalid)?;
     let errors = seaf_core::validate_loop_run(&source.run);
     if !errors.is_empty()
         || source.run.status != LoopStatus::Approved
@@ -3186,6 +3616,17 @@ fn load_verified_evaluation_invalidation_lineage(
             "evaluation invalidation source binding mismatch",
         ));
     }
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &source.approved_run)
+            .map_err(RecoveryError::invalid)?;
+    operator_guard
+        .validate_exact_raw_bytes(bytes)
+        .and_then(|()| operator_guard.validate_exact_raw_bytes(&source_bytes))
+        .and_then(|()| operator_guard.validate_run(&source.run))
+        .and_then(|()| operator_guard.validate_run(&source.approved_run))
+        .and_then(|()| operator_guard.validate_recovery_fields(&source.actor, &source.reason))
+        .and_then(|()| operator_guard.validate_recovery_fields(&recovery.actor, &recovery.reason))
+        .map_err(RecoveryError::invalid)?;
     let source_errors = seaf_core::validate_loop_run(&source.run);
     let approved_errors = seaf_core::validate_loop_run(&source.approved_run);
     if !source_errors.is_empty()
@@ -3228,6 +3669,7 @@ fn load_verified_evaluation_invalidation_lineage(
         &eval_config.evals.required,
         &recovery.source_worktree_state_digest,
         (source.run.status == LoopStatus::Failed).then_some(false),
+        &operator_guard,
     )?;
     if verified_manifest != recovery.present_artifacts {
         return Err(RecoveryError::invalid(
@@ -3600,6 +4042,9 @@ fn validate_evaluation_prefix(
     }
     let intent =
         load_intent(workspace, &recovery.execution_intent).map_err(RecoveryError::invalid)?;
+    intent
+        .validate_observed_check_names(&testing.checks)
+        .map_err(RecoveryError::invalid)?;
     let eval_config = load_recovery_eval_config(workspace, &source.run)?;
     let expected_attempt_recovery = if attempt == 1 {
         None
@@ -3624,23 +4069,24 @@ fn validate_evaluation_prefix(
                 && testing.evaluation_attempt.is_none()
                 && testing.recovery.is_none()
                 && testing.execution_intent.is_none() => {}
-        (EvaluationPrefixSpellingV1::IndexedV2, ApprovedEvaluationIntent::V2(intent))
-            if testing.schema_version == 2
+        (EvaluationPrefixSpellingV1::IndexedV2, intent)
+            if intent.is_indexed()
+                && testing.schema_version == 2
                 && testing.evaluation_attempt == Some(attempt)
                 && testing
                     .recovery
                     .as_ref()
                     .is_some_and(|recovery| recovery.as_ref() == expected_attempt_recovery)
                 && testing.execution_intent.as_ref() == Some(&recovery.execution_intent)
-                && intent.recovery.as_ref() == expected_attempt_recovery => {}
+                && intent.recovery() == expected_attempt_recovery => {}
         _ => {
             return Err(RecoveryError::invalid(
                 "evaluation recovery prefix spelling and schema authority disagree",
             ))
         }
     }
-    if let ApprovedEvaluationIntent::V2(intent) = &intent {
-        if intent.source_worktree_state_digest != recovery.source_worktree_state_digest {
+    if let Some(source_digest) = intent.source_worktree_state_digest() {
+        if source_digest != recovery.source_worktree_state_digest {
             return Err(RecoveryError::invalid(
                 "evaluation recovery source worktree authority mismatch",
             ));
@@ -3718,7 +4164,10 @@ fn load_recovery_eval_config(
             "evaluation recovery eval config bytes or digest mismatch",
         ));
     }
-    serde_json::from_value(value).map_err(RecoveryError::wrapped)
+    let config: seaf_core::EvalConfig =
+        serde_json::from_value(value).map_err(RecoveryError::wrapped)?;
+    seaf_core::validate_eval_config(&config).map_err(RecoveryError::wrapped)?;
+    Ok(config)
 }
 
 fn validate_source_bindings(
@@ -4175,6 +4624,7 @@ fn validate_note(field: &str, value: &str, max: usize) -> Result<(), RecoveryErr
 fn existing_or_new_timestamp(
     workspace: &LoopWorkspace,
     path: &str,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<String, RecoveryError> {
     match fs::symlink_metadata(workspace.run_directory().join(path)) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
@@ -4184,8 +4634,19 @@ fn existing_or_new_timestamp(
             let bytes =
                 read_verified_regular_file(workspace.run_directory(), path, "recovery orphan")
                     .map_err(RecoveryError::wrapped)?;
+            operator_guard
+                .validate_exact_raw_bytes(&bytes)
+                .map_err(RecoveryError::invalid)?;
             let recovery: RecoveryAttemptV1 =
                 serde_json::from_slice(&bytes).map_err(RecoveryError::wrapped)?;
+            if canonical_json_bytes(&recovery).map_err(RecoveryError::wrapped)? != bytes {
+                return Err(RecoveryError::invalid(
+                    "recovery orphan is not canonical JSON",
+                ));
+            }
+            operator_guard
+                .validate_recovery_fields(&recovery.actor, &recovery.reason)
+                .map_err(RecoveryError::invalid)?;
             Ok(recovery.created_at)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(now_timestamp()),

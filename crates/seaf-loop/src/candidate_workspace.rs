@@ -285,6 +285,14 @@ where
     let expected = crate::state::load_run(workspace)
         .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
     validate_workspace_run_id(workspace, &expected)?;
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &expected)
+            .map_err(CandidateWorkspaceError::Unsafe)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&expected))
+        .and_then(|()| operator_guard.validate_structural(reviewer))
+        .map_err(CandidateWorkspaceError::Unsafe)?;
     if !matches!(
         expected.status,
         LoopStatus::AwaitingHumanReview | LoopStatus::Approved
@@ -308,6 +316,9 @@ where
             )
         })?;
         validate_exact_approval_retry(&evidence, reviewer, &bindings)?;
+        operator_guard
+            .validate_future_run(&expected)
+            .map_err(CandidateWorkspaceError::Unsafe)?;
         crate::state::resync_exact_run(workspace, &expected)
             .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
         return Ok(CandidateApprovalOutcome {
@@ -336,6 +347,9 @@ where
     intended.status = LoopStatus::Approved;
     intended.updated_at = evidence.approved_at.clone();
     intended.human_approval = Some(evidence.clone());
+    operator_guard
+        .validate_future_run(&intended)
+        .map_err(CandidateWorkspaceError::Unsafe)?;
     before_provider_lock()?;
     crate::provider_exchange::persist_run_with_full_compare_and_validator(
         workspace,
@@ -344,6 +358,15 @@ where
         |current| {
             let result = (|| {
                 validate_workspace_run_id(workspace, current)?;
+                let operator_guard =
+                    crate::operator_evidence::OperatorEvidenceGuard::load(workspace, current)
+                        .map_err(CandidateWorkspaceError::Unsafe)?;
+                operator_guard
+                    .validate_current_run_file(workspace)
+                    .and_then(|()| operator_guard.validate_run(current))
+                    .and_then(|()| operator_guard.validate_structural(reviewer))
+                    .and_then(|()| operator_guard.validate_future_run(&intended).map(drop))
+                    .map_err(CandidateWorkspaceError::Unsafe)?;
                 if current.status != LoopStatus::AwaitingHumanReview {
                     return Err(CandidateWorkspaceError::Unsafe(
                         "approval publication requires awaiting_human_review authority".to_string(),
@@ -2155,8 +2178,46 @@ fn persist_candidate_run(
 ) -> Result<(), CandidateWorkspaceError> {
     // Lock order is candidate-workspace lock, then provider-exchange lock. Code that already
     // holds the provider lock must never enter candidate cleanup.
-    crate::provider_exchange::persist_run_with_full_compare(workspace, expected, intended)
-        .map_err(|error| CandidateWorkspaceError::State(error.to_string()))
+    let requires_operator_screen = expected.input_digests.eval_config.is_some()
+        && expected
+            .candidate_workspace
+            .as_ref()
+            .is_some_and(|candidate| {
+                candidate.lifecycle != CandidateWorkspaceLifecycle::Provisioning
+            });
+    if requires_operator_screen {
+        let operator_guard =
+            crate::operator_evidence::OperatorEvidenceGuard::load(workspace, expected)
+                .map_err(CandidateWorkspaceError::Unsafe)?;
+        operator_guard
+            .validate_future_run(intended)
+            .map_err(CandidateWorkspaceError::Unsafe)?;
+    }
+    crate::provider_exchange::persist_run_with_full_compare_and_validator(
+        workspace,
+        expected,
+        intended,
+        |current| {
+            let requires_operator_screen = current.input_digests.eval_config.is_some()
+                && current
+                    .candidate_workspace
+                    .as_ref()
+                    .is_some_and(|candidate| {
+                        candidate.lifecycle != CandidateWorkspaceLifecycle::Provisioning
+                    });
+            if !requires_operator_screen {
+                return Ok(());
+            }
+            let operator_guard =
+                crate::operator_evidence::OperatorEvidenceGuard::load(workspace, current)
+                    .map_err(crate::ProviderExchangeError::Invalid)?;
+            operator_guard
+                .validate_current_run_file(workspace)
+                .and_then(|()| operator_guard.validate_future_run(intended).map(drop))
+                .map_err(crate::ProviderExchangeError::Invalid)
+        },
+    )
+    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))
 }
 
 fn preflight_workspace_run_directory_authority(
@@ -2217,7 +2278,19 @@ fn validate_run_directory_authority(
 }
 
 fn run_directory_digest(run_directory: &Path) -> Result<String, CandidateWorkspaceError> {
-    let canonical = canonical_real_directory(run_directory, "candidate run directory")?;
+    let canonical = match fs::symlink_metadata(run_directory) {
+        Ok(_) => canonical_real_directory(run_directory, "candidate run directory")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let runs_root = run_directory.parent().ok_or_else(|| {
+                CandidateWorkspaceError::Unsafe(
+                    "prospective candidate run directory has no runs root".to_string(),
+                )
+            })?;
+            canonical_real_directory(runs_root, "candidate runs root")?
+                .join(safe_run_id(run_directory)?)
+        }
+        Err(error) => return Err(CandidateWorkspaceError::Io(error)),
+    };
     Ok(sha256_bytes(canonical.as_os_str().as_encoded_bytes()))
 }
 
@@ -3590,7 +3663,8 @@ mod tests {
             });
             run.execution_mode = LoopExecutionMode::IsolatedCandidate;
             run.candidate_workspace = Some(plan.clone());
-            crate::state::save_run(workspace, &run).expect("planned run");
+            crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+                .expect("planned run");
         }
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -3782,7 +3856,7 @@ mod tests {
         });
         run.execution_mode = LoopExecutionMode::IsolatedCandidate;
         run.candidate_workspace = Some(planned.clone());
-        crate::state::save_run(&workspace, &run).unwrap();
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).unwrap();
         (temp, source, workspace, planned)
     }
 
@@ -4254,7 +4328,8 @@ mod tests {
         });
         run.candidate_workspace = Some(planned);
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-        crate::state::save_run(&workspace, &run).expect("candidate plan");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("candidate plan");
         let candidate = create_candidate_workspace(
             workspace.run_directory(),
             &source,
@@ -4373,7 +4448,8 @@ mod tests {
         });
         run.candidate_workspace = Some(planned);
         run.execution_mode = seaf_core::LoopExecutionMode::IsolatedCandidate;
-        crate::state::save_run(&workspace, &run).expect("candidate plan");
+        crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run)
+            .expect("candidate plan");
         let candidate = create_candidate_workspace(
             workspace.run_directory(),
             &source,
@@ -4821,7 +4897,43 @@ mod tests {
         test_git(&source, &["commit", "-qm", "initial"]);
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), run_id).expect("workspace");
-        let repository_identity_digest = sha256_bytes(source.as_os_str().as_encoded_bytes());
+        let eval_config: seaf_core::EvalConfig = serde_json::from_value(serde_json::json!({
+            "evals": {
+                "allow_commands": ["true"],
+                "required": [{"name": "tests", "command": "true", "env": {}}]
+            }
+        }))
+        .unwrap();
+        let eval_bytes = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+        let eval_digest = seaf_core::canonical_sha256_digest(&eval_config).unwrap();
+        let snapshot = serde_json::json!({});
+        let snapshot_bytes = seaf_core::canonical_json_bytes(&snapshot).unwrap();
+        let snapshot_digest = seaf_core::canonical_sha256_digest(&snapshot).unwrap();
+        let repository_snapshot = serde_json::json!({"source": source.canonicalize().unwrap()});
+        let repository_bytes = seaf_core::canonical_json_bytes(&repository_snapshot).unwrap();
+        let repository_identity_digest =
+            seaf_core::canonical_sha256_digest(&repository_snapshot).unwrap();
+        let inputs = workspace.run_directory().join("inputs");
+        crate::artifact_safety::create_private_directory(&inputs).unwrap();
+        for relative in ["ticket.json", "policy.json", "config.json"] {
+            crate::artifact_safety::write_private_fixture(
+                inputs.join(relative),
+                snapshot_bytes.clone(),
+            )
+            .unwrap();
+        }
+        crate::artifact_safety::write_private_fixture(
+            inputs.join("repository.json"),
+            repository_bytes,
+        )
+        .unwrap();
+        crate::artifact_safety::write_private_fixture(
+            workspace.run_directory().join("ticket.snapshot.json"),
+            snapshot_bytes,
+        )
+        .unwrap();
+        crate::artifact_safety::write_private_fixture(inputs.join("eval-config.json"), eval_bytes)
+            .unwrap();
         let planned = plan_candidate_workspace(
             workspace.run_directory(),
             &source,
@@ -4835,16 +4947,18 @@ mod tests {
             provider: "fake".to_string(),
             model: "model".to_string(),
             input_digests: LoopInputDigests {
-                ticket: "1".repeat(64),
-                policy: "2".repeat(64),
-                config: "3".repeat(64),
+                ticket: snapshot_digest.clone(),
+                policy: snapshot_digest.clone(),
+                config: snapshot_digest.clone(),
                 repository: repository_identity_digest.clone(),
-                eval_config: Some("4".repeat(64)),
+                eval_config: Some(eval_digest),
             },
         });
         run.candidate_workspace = Some(planned);
         run.execution_mode = LoopExecutionMode::IsolatedCandidate;
-        crate::state::save_run(&workspace, &run).expect("candidate plan");
+        let run_bytes = crate::state::run_file_bytes(&run).expect("candidate plan bytes");
+        crate::state::publish_prevalidated_isolated_run(&workspace, &run, &run_bytes)
+            .expect("candidate plan");
         let candidate = create_candidate_workspace(
             workspace.run_directory(),
             &source,
@@ -4904,6 +5018,73 @@ mod tests {
             source,
             workspace,
             candidate,
+        }
+    }
+
+    #[test]
+    fn candidate_patch_lifecycle_envelopes_are_screened_before_run_publication() {
+        for (case, secret) in [
+            ("applying", "\"phase\": \"applying\""),
+            ("applied", "\"phase\": \"applied\""),
+        ] {
+            let fixture = application_fixture(&format!("application-{case}-envelope"));
+            let eval_config: seaf_core::EvalConfig = serde_json::from_value(serde_json::json!({
+                "evals": {
+                    "allow_commands": ["true"],
+                    "required": [{
+                        "name": "tests",
+                        "command": "true",
+                        "env": {"API_TOKEN": secret}
+                    }]
+                }
+            }))
+            .unwrap();
+            let eval_bytes = seaf_core::canonical_json_bytes(&eval_config).unwrap();
+            let eval_digest = seaf_core::canonical_sha256_digest(&eval_config).unwrap();
+            let mut run = crate::state::load_run(&fixture.workspace).unwrap();
+            run.input_digests.eval_config = Some(eval_digest);
+            crate::artifact_safety::write_private_fixture(
+                fixture
+                    .workspace
+                    .run_directory()
+                    .join("inputs/eval-config.json"),
+                eval_bytes,
+            )
+            .unwrap();
+            crate::state::write_raw_canonical_run_fixture(&fixture.workspace.run_file(), &run)
+                .unwrap();
+            let before = fs::read(fixture.workspace.run_file()).unwrap();
+
+            let error = apply_candidate_development_evidence(&fixture.workspace, &fixture.source)
+                .expect_err("unsafe candidate lifecycle envelope must fail closed");
+
+            assert!(
+                error.to_string().contains("prohibited credential material"),
+                "{case}: {error}"
+            );
+            assert!(!error.to_string().contains(secret), "{case}: {error}");
+            let after = fs::read(fixture.workspace.run_file()).unwrap();
+            assert!(
+                !after
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_bytes()),
+                "{case}"
+            );
+            if case == "applying" {
+                assert_eq!(after, before);
+            } else {
+                assert_eq!(
+                    crate::state::load_run(&fixture.workspace)
+                        .unwrap()
+                        .candidate_workspace
+                        .unwrap()
+                        .patch_transaction
+                        .unwrap()
+                        .phase,
+                    CandidatePatchPhase::Applying
+                );
+            }
+            fixture.cleanup();
         }
     }
 

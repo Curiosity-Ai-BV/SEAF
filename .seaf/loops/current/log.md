@@ -2283,3 +2283,63 @@ library 225/225, and provider/candidate boundary 65/65; strict all-target and
 all-feature Clippy; Rust formatting; pinned-pnpm format/typecheck/test/build
 with 8 SDK tests; and diff hygiene. M1-11b2 and M1-11b are complete. M1-11c
 bounded secret redaction is active.
+
+## 2026-07-13 implemented | M1-11c bounded secret redaction
+
+Witnessed RED began with the absent shared redactor API. The implementation now
+validates the sensitive eval-env corpus in `seaf-core`, performs deterministic
+leftmost-longest byte redaction under fixed bounds, keeps markers atomic, and
+uses full-corpus 4,095-byte lookahead for eval output and truncated context
+classification. Evaluation intent v3 omits all env values and binds ordered
+safe check projections; secret-free v1/v2 remains readable and secret-bearing
+legacy intent fails closed.
+
+Provider preparation derives the redactor from canonical digest-bound eval
+authority before reconciliation. Typed request free text is sanitized before
+audit and provider call, structural authority rejects instead of mutating, and
+provider success/error content plus nested metadata is screened only after the
+existing exact size measurement. A hit persists only the fixed non-retryable
+`provider_response_contains_secret` failure. Exact typed oversize and secret
+synthetic failures remain replay-safe.
+
+Focused green evidence includes core corpus 3/3, shared redactor 7/7, eval
+engine 9/9, intent authority 10/10, CLI v3 secret omission, provider
+request/audit byte identity, raw provider response/secret/audit-digest absence,
+structural denial before intent or spawn, ordered Testing-name rejection, and
+secret-free V2 final-authority compatibility. Independent acceptance remains
+pending the configured request-only replay, durable synthetic no-recall
+collision, and unsafe historical provider-history pre-call regressions.
+
+## 2026-07-13 accepted | M1-11c bounded secret propagation
+
+Independent review rejected the first implementation on recovery-prefix
+digesting before raw screening, context-tail hashing beyond the screened
+source, fresh run publication before corpus authority, and incomplete provider
+record/run-envelope coverage. The corrected paths screen exact recovery,
+adoption, invalidation, provider request/response/record, prospective run,
+historical run, operator, evaluation, context, scaffold, fixed-log, and generic
+run-state bytes before the paired side effect and again at authority-changing
+compare-and-swap boundaries. Provisioning resume now preflights authenticated
+input snapshots before candidate-lock creation, and Active resume rederives the
+corpus from persisted authority.
+
+Quality review then found unscreened scaffold defaults and log headers,
+unscreened context manifest/expansion envelopes, an unbounded full-source read
+past the 2 MiB classification cap, and a test fixture exposed in production.
+The accepted implementation screens each exact envelope, stops source reading
+at the first byte beyond the cap, and keeps raw fixture publication test-only.
+Fresh `create_isolated` callers now supply `AuthoritativeRunInputSnapshots`;
+this pre-preview Rust compatibility change joins the earlier additive v2
+`TestingEvidence` fields in the M1-12 and preview handoff. Fixed structural
+collisions fail closed before side effects; representing every arbitrary
+collision successfully would require a future encoded/versioned format.
+
+Final independent specification/security and quality re-reviews approve with
+no remaining findings. The unsandboxed definitive
+`cargo test --workspace --no-fail-fast -- --test-threads=1` exits zero,
+including CLI 142/142, provider/candidate boundary 75/75, provider exchange
+22/22, state 44/44, and every remaining Rust integration and doc-test suite.
+Workspace check, strict all-target/all-feature Clippy, Rust and Prettier
+formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK tests, and diff
+hygiene pass. M1-11 is complete and M1-12 interruption recovery acceptance is
+active.

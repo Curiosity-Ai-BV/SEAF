@@ -843,6 +843,7 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
         .join(run_id)
         .join("artifacts/07-testing.attempt-001.execution-intent.json");
     let lock_probe = repo.join("provider-lock-check.pl");
+    let intent_secret = "cli-intent-secret-value";
     fs::write(
         &lock_probe,
         "#!/usr/bin/perl\nuse Fcntl qw(:flock);\nopen(my $lock, '+<', $ARGV[0]) or die $!;\nflock($lock, LOCK_EX | LOCK_NB) or exit 42;\n",
@@ -854,7 +855,7 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     fs::write(
         repo.join("seaf.evals.yaml"),
         format!(
-            "evals:\n  allow_commands: [test, ./provider-lock-check.pl]\n  required:\n    - name: intent_precedes_execution\n      command: test -f {}\n    - name: provider_lock_is_not_held_during_execution\n      command: ./provider-lock-check.pl {}\n",
+            "evals:\n  allow_commands: [test, ./provider-lock-check.pl]\n  required:\n    - name: intent_precedes_execution\n      command: test -f {}\n      env:\n        API_TOKEN: {intent_secret}\n    - name: provider_lock_is_not_held_during_execution\n      command: ./provider-lock-check.pl {}\n",
             intent_path.display(),
             runs_root.join(run_id).join("provider-exchange.lock").display()
         ),
@@ -992,6 +993,30 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     assert!(String::from_utf8_lossy(&unsafe_reviewer.stderr).contains("control characters"));
     assert_eq!(read_tree_bytes(&run_dir), before_rejected);
 
+    for secret_reviewer in [intent_secret, "sk-0123456789abcdef"] {
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "approve",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                secret_reviewer,
+                "--confirm-candidate-diff",
+                &diff,
+                "--confirm-target-head",
+                &head,
+            ])
+            .output()
+            .expect("reject credential-bearing reviewer identity");
+        assert!(!rejected.status.success(), "{secret_reviewer}");
+        let stderr = String::from_utf8(rejected.stderr).unwrap();
+        assert!(!stderr.contains(secret_reviewer), "{stderr}");
+        assert_eq!(read_tree_bytes(&run_dir), before_rejected);
+    }
+
     fs::write(repo.join("tracked.txt"), "dirty but preserved\n").expect("dirty tracked file");
     fs::write(repo.join("untracked.txt"), "also preserved\n").expect("dirty untracked file");
     fs::write(
@@ -1047,6 +1072,37 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
             "{absent} must remain absent"
         );
     }
+
+    let exact_approved_run_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    let mut unsafe_approved_run = read_run_json(&run_dir);
+    unsafe_approved_run["human_approval"]["reviewer"] =
+        serde_json::Value::String(intent_secret.to_string());
+    let mut unsafe_approved_run_bytes = serde_json::to_vec_pretty(&unsafe_approved_run).unwrap();
+    unsafe_approved_run_bytes.push(b'\n');
+    fs::write(run_dir.join("run.json"), &unsafe_approved_run_bytes).unwrap();
+    let unsafe_history_before = read_tree_bytes(&run_dir);
+    let unsafe_history_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "approve",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            &diff,
+            "--confirm-target-head",
+            &head,
+        ])
+        .output()
+        .expect("reject credential-bearing approval history");
+    assert!(!unsafe_history_retry.status.success());
+    let stderr = String::from_utf8(unsafe_history_retry.stderr).unwrap();
+    assert!(!stderr.contains(intent_secret), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), unsafe_history_before);
+    fs::write(run_dir.join("run.json"), exact_approved_run_bytes).unwrap();
 
     let approved_bytes = read_tree_bytes(&run_dir);
     let approved_provider_records = read_run_json(&run_dir)["provider_exchange_records"].clone();
@@ -1120,9 +1176,12 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     let testing_path = "artifacts/07-testing.attempt-001.json";
     let report_path = "artifacts/08-eval-report.attempt-001.json";
     assert!(run_dir.join(intent_path).is_file());
+    let intent_bytes = fs::read(run_dir.join(intent_path)).expect("execution intent");
+    assert!(!intent_bytes
+        .windows(intent_secret.len())
+        .any(|part| part == intent_secret.as_bytes()));
     let intent: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join(intent_path)).expect("execution intent"))
-            .expect("canonical intent JSON");
+        serde_json::from_slice(&intent_bytes).expect("canonical intent JSON");
     let approved_run: serde_json::Value = serde_json::from_slice(
         approved_bytes
             .iter()
@@ -1132,11 +1191,16 @@ fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
             .as_slice(),
     )
     .expect("approved run JSON");
-    assert_eq!(intent["schema_version"], 2);
+    assert_eq!(intent["schema_version"], 3);
     assert_eq!(intent["evaluation_attempt"], 1);
     assert_eq!(intent["recovery"], serde_json::Value::Null);
     assert_eq!(intent["input_digests"], approved_run["input_digests"]);
     assert_eq!(intent["planned_checks"].as_array().unwrap().len(), 2);
+    assert!(intent["planned_checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|check| check.get("env").is_none() && check.get("env_names").is_some()));
     assert_eq!(
         intent["approved_run_digest"],
         canonical_sha256_digest(&approved_run).expect("Approved digest")
@@ -1280,9 +1344,12 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     let repo = temp_dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
     init_git_repo(&repo);
+    let promotion_secret = "promotion-configured-secret";
     fs::write(
         repo.join("seaf.evals.yaml"),
-        "evals:\n  allow_commands: [printf]\n  required:\n    - name: promotion_gate\n      command: printf promotion-ready\n",
+        format!(
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: promotion_gate\n      command: printf promotion-ready\n      env:\n        API_TOKEN: {promotion_secret}\n"
+        ),
     )
     .expect("passing eval config");
     commit_all(&repo, "Configure promotion eval");
@@ -1338,6 +1405,65 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     );
 
     let source_before = git_evidence(&repo);
+    let run_before_secret_rejection = read_tree_bytes(&run_dir);
+    for secret_reviewer in [promotion_secret, "sk-0123456789abcdef"] {
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                secret_reviewer,
+                "--confirm-candidate-diff",
+                diff,
+                "--confirm-eval-report",
+                eval_report,
+                "--confirm-target-head",
+                head,
+            ])
+            .output()
+            .expect("reject credential-bearing promotion reviewer");
+        assert!(!rejected.status.success(), "{secret_reviewer}");
+        let stderr = String::from_utf8(rejected.stderr).unwrap();
+        assert!(!stderr.contains(secret_reviewer), "{stderr}");
+        assert_eq!(read_tree_bytes(&run_dir), run_before_secret_rejection);
+        assert_eq!(git_evidence(&repo), source_before);
+    }
+    let unsafe_intent_path = run_dir.join("artifacts/09-promotion.intent.json");
+    fs::write(
+        &unsafe_intent_path,
+        canonical_json_bytes(&promotion_intent_json(&evaluated, promotion_secret)).unwrap(),
+    )
+    .unwrap();
+    let unsafe_intent_before = read_tree_bytes(&run_dir);
+    let unsafe_intent_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "promotion-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            diff,
+            "--confirm-eval-report",
+            eval_report,
+            "--confirm-target-head",
+            head,
+        ])
+        .output()
+        .expect("reject credential-bearing promotion intent history");
+    assert!(!unsafe_intent_retry.status.success());
+    let stderr = String::from_utf8(unsafe_intent_retry.stderr).unwrap();
+    assert!(!stderr.contains(promotion_secret), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), unsafe_intent_before);
+    assert_eq!(git_evidence(&repo), source_before);
+    fs::remove_file(&unsafe_intent_path).unwrap();
     for (flag, value, expected) in [
         (
             "--confirm-candidate-diff",
@@ -1508,6 +1634,148 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     assert!(retry.status.success(), "{retry:?}");
     assert_eq!(read_tree_bytes(&run_dir), run_bytes);
     assert_eq!(git_evidence(&repo), source_after);
+}
+
+#[test]
+fn operator_publications_reject_fixed_envelope_secret_collisions_before_side_effects() {
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("approval-repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: approval_envelope\n      command: printf ready\n      env:\n        API_TOKEN: approved_at\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure approval envelope collision");
+        let runs_root = temp.path().join("runs");
+        let run_id = "approval-envelope-collision";
+        let ticket = write_provider_loop_ticket(temp.path(), true);
+        run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+        let run_dir = runs_root.join(run_id);
+        let awaiting = read_run_json(&run_dir);
+        let diff = awaiting["candidate_workspace"]["candidate_diff_digest"]
+            .as_str()
+            .unwrap();
+        let head = awaiting["candidate_workspace"]["starting_head"]
+            .as_str()
+            .unwrap();
+        let before = read_tree_bytes(&run_dir);
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "approve",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                "reviewer@example.invalid",
+                "--confirm-candidate-diff",
+                diff,
+                "--confirm-target-head",
+                head,
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert_eq!(read_tree_bytes(&run_dir), before);
+    }
+
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("promotion-repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: promotion_envelope\n      command: printf ready\n      env:\n        API_TOKEN: eval_passed_run_digest\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure promotion envelope collision");
+        let runs_root = temp.path().join("runs");
+        let run_id = "promotion-envelope-collision";
+        let ticket = write_provider_loop_ticket(temp.path(), true);
+        let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket, &runs_root, run_id);
+        let run_dir = runs_root.join(run_id);
+        let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
+            .as_str()
+            .unwrap();
+        let report = evaluated["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"] == "eval_report")
+            .unwrap()["artifact_digest"]
+            .as_str()
+            .unwrap();
+        let head = evaluated["human_approval"]["starting_head"]
+            .as_str()
+            .unwrap();
+        let before = read_tree_bytes(&run_dir);
+        let source_before = git_evidence(&repo);
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "promote",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--reviewer",
+                "reviewer@example.invalid",
+                "--confirm-candidate-diff",
+                diff,
+                "--confirm-eval-report",
+                report,
+                "--confirm-target-head",
+                head,
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert_eq!(read_tree_bytes(&run_dir), before);
+        assert_eq!(git_evidence(&repo), source_before);
+    }
+
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("recovery-repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: recovery_envelope\n      command: printf ready\n      env:\n        API_TOKEN: expected_reset_projection_digest\n",
+        )
+        .unwrap();
+        commit_all(&repo, "Configure recovery envelope collision");
+        let runs_root = temp.path().join("runs");
+        let run_id = "recovery-envelope-collision";
+        let ticket = write_provider_loop_ticket(temp.path(), false);
+        run_fake_provider(&repo, &ticket, &runs_root, run_id, &[]);
+        let run_dir = runs_root.join(run_id);
+        let before = read_tree_bytes(&run_dir);
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "revise",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--from-step",
+                "output-review",
+                "--actor",
+                "operator@example.invalid",
+                "--reason",
+                "Retry reviewed output.",
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert_eq!(read_tree_bytes(&run_dir), before);
+    }
 }
 
 #[test]
@@ -2471,6 +2739,13 @@ fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands(
             "duplicated check names",
         ),
         (
+            "secret-intent-envelope",
+            "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n      env:\n        API_TOKEN: planned_checks\n",
+            "touch",
+            "none",
+            "contains prohibited credential material",
+        ),
+        (
             "approval-artifact-substitution",
             "evals:\n  allow_commands: [touch]\n  required:\n    - name: marker\n      command: touch eval-marker\n",
             "touch",
@@ -2558,6 +2833,71 @@ fn approved_eval_prevalidation_denials_and_partial_intent_execute_zero_commands(
                 "{case}: prevalidation must not claim an execution attempt"
             );
         }
+    }
+}
+
+#[test]
+fn approved_eval_rejects_secret_collisions_before_testing_or_report_publication() {
+    for (case, secret, testing_exists) in [
+        ("testing", "completed_at", false),
+        ("report", "eval_report_id", true),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        init_git_repo(&repo);
+        fs::write(
+            repo.join("seaf.evals.yaml"),
+            format!(
+                "evals:\n  allow_commands: [true]\n  required:\n    - name: envelope\n      command: true\n      env:\n        API_TOKEN: {secret}\n"
+            ),
+        )
+        .expect("eval config");
+        commit_all(&repo, "Configure envelope collision eval");
+        let runs_root = temp_dir.path().join("runs");
+        let run_id = format!("approved-envelope-{case}");
+        let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+        let ticket = fs::read_to_string(&ticket_path)
+            .expect("ticket")
+            .replace("    - printf", "    - true");
+        fs::write(&ticket_path, ticket).expect("ticket allowlist");
+        run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, &run_id);
+        let run_dir = runs_root.join(&run_id);
+
+        let resume = seaf_in(&repo)
+            .args([
+                "loop",
+                "resume",
+                "--run-id",
+                &run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("resume colliding evaluation");
+
+        assert!(!resume.status.success(), "{case}: {resume:?}");
+        let stderr = String::from_utf8(resume.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("contains prohibited credential material"),
+            "{case}: {stderr}"
+        );
+        assert!(!stderr.contains(secret), "{case}: {stderr}");
+        assert_eq!(
+            run_dir
+                .join("artifacts/07-testing.attempt-001.json")
+                .exists(),
+            testing_exists,
+            "{case}: the rejected envelope itself must not be published"
+        );
+        assert!(
+            !run_dir
+                .join("artifacts/08-eval-report.attempt-001.json")
+                .exists(),
+            "{case}: no rejected report may be published"
+        );
+        assert_eq!(read_run_json(&run_dir)["status"], "approved", "{case}");
     }
 }
 
@@ -6009,6 +6349,16 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     init_git_repo(&repo);
+    let recovery_secret = "recovery-configured-secret";
+    let marker_spanning_secret = "prefix[REDACTED]suffix";
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        format!(
+            "evals:\n  allow_commands: [printf]\n  required:\n    - name: recovery_probe\n      command: printf ready\n      env:\n        API_TOKEN: {recovery_secret}\n        MARKER_TOKEN: \"{marker_spanning_secret}\"\n"
+        ),
+    )
+    .unwrap();
+    commit_all(&repo, "Configure recovery secret probe");
     let runs_root = repo.join("runs");
     let ticket = write_provider_loop_ticket(temp.path(), false);
     let run_id = "audited-provider-recovery";
@@ -6032,6 +6382,36 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
         .unwrap()
         .len();
 
+    let run_before_secret_rejection = read_tree_bytes(&run_dir);
+    for secret_actor in [recovery_secret, "sk-0123456789abcdef"] {
+        let rejected = seaf_in(&repo)
+            .args([
+                "loop",
+                "revise",
+                "--run-id",
+                run_id,
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--from-step",
+                "output-review",
+                "--actor",
+                secret_actor,
+                "--reason",
+                "Reviewer requested one correction.",
+            ])
+            .output()
+            .expect("reject credential-bearing recovery actor");
+        assert!(!rejected.status.success(), "{secret_actor}");
+        let stderr = String::from_utf8(rejected.stderr).unwrap();
+        assert!(!stderr.contains(secret_actor), "{stderr}");
+        assert_eq!(read_tree_bytes(&run_dir), run_before_secret_rejection);
+        assert_eq!(git_evidence(&candidate_root), source_before);
+    }
+
+    let raw_reason =
+        format!("Reviewer requested one correction: {recovery_secret} sk-0123456789abcdef");
+    let sanitized_reason = "Reviewer requested one correction: [REDACTED] [REDACTED]";
+
     let revised = seaf_in(&repo)
         .args([
             "loop",
@@ -6045,7 +6425,7 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
             "--actor",
             "operator@example.invalid",
             "--reason",
-            "Reviewer requested one correction.",
+            &raw_reason,
             "--json",
         ])
         .output()
@@ -6070,6 +6450,18 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
     let reset_bytes = fs::read(run_dir.join("run.json")).unwrap();
     let recovery_bytes = fs::read(run_dir.join("artifacts/recovery-001.json")).unwrap();
     let source_bytes = fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap();
+    let recovery_value: serde_json::Value = serde_json::from_slice(&recovery_bytes).unwrap();
+    assert_eq!(recovery_value["reason"], sanitized_reason);
+    for (path, bytes) in read_tree_bytes(&run_dir) {
+        if path != Path::new("inputs/eval-config.json") {
+            assert!(!bytes
+                .windows(recovery_secret.len())
+                .any(|window| window == recovery_secret.as_bytes()));
+            assert!(!bytes
+                .windows("sk-0123456789abcdef".len())
+                .any(|window| window == b"sk-0123456789abcdef"));
+        }
+    }
 
     let exact_retry = seaf_in(&repo)
         .args([
@@ -6084,7 +6476,7 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
             "--actor",
             "operator@example.invalid",
             "--reason",
-            "Reviewer requested one correction.",
+            &raw_reason,
             "--json",
         ])
         .output()
@@ -6099,6 +6491,46 @@ fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() 
         fs::read(run_dir.join("artifacts/recovery-001.source-run.json")).unwrap(),
         source_bytes
     );
+
+    let mut unsafe_recovery: serde_json::Value = serde_json::from_slice(&recovery_bytes).unwrap();
+    unsafe_recovery["reason"] = serde_json::Value::String(marker_spanning_secret.to_string());
+    let unsafe_recovery_bytes = canonical_json_bytes(&unsafe_recovery).unwrap();
+    let unsafe_recovery_digest = format!("{:x}", Sha256::digest(&unsafe_recovery_bytes));
+    fs::write(
+        run_dir.join("artifacts/recovery-001.json"),
+        &unsafe_recovery_bytes,
+    )
+    .unwrap();
+    let mut unsafe_reset = read_run_json(&run_dir);
+    unsafe_reset["latest_recovery"]["artifact"]["digest"] =
+        serde_json::Value::String(unsafe_recovery_digest);
+    let mut unsafe_reset_bytes = serde_json::to_vec_pretty(&unsafe_reset).unwrap();
+    unsafe_reset_bytes.push(b'\n');
+    fs::write(run_dir.join("run.json"), &unsafe_reset_bytes).unwrap();
+    let unsafe_history_before = read_tree_bytes(&run_dir);
+    let unsafe_history_retry = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "output-review",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            &raw_reason,
+        ])
+        .output()
+        .expect("reject credential-bearing recovery history");
+    assert!(!unsafe_history_retry.status.success());
+    let stderr = String::from_utf8(unsafe_history_retry.stderr).unwrap();
+    assert!(!stderr.contains(marker_spanning_secret), "{stderr}");
+    assert_eq!(read_tree_bytes(&run_dir), unsafe_history_before);
+    fs::write(run_dir.join("run.json"), &reset_bytes).unwrap();
+    fs::write(run_dir.join("artifacts/recovery-001.json"), &recovery_bytes).unwrap();
 
     let substituted_retry = seaf_in(&repo)
         .args([
@@ -8639,9 +9071,9 @@ printf '%s\n' "$SECRET_TOKEN"
     assert!(output.status.success(), "{output:?}");
     let stdout_log = fs::read_to_string(temp_dir.path().join("logs/secret_prefix.stdout.log"))
         .expect("stdout log");
-    assert!(
-        stdout_log.starts_with("[RED"),
-        "redaction marker should be capped instead of leaking secret prefix: {stdout_log}"
+    assert_eq!(
+        stdout_log, "",
+        "an indivisible redaction marker that exceeds the cap must be omitted"
     );
     assert!(!stdout_log.contains(secret), "{stdout_log}");
     assert!(
@@ -8705,9 +9137,9 @@ printf 'SECRET_TOKEN:%s\n' "$SECRET_TOKEN"
             .join("logs/labeled_secret_prefix.stdout.log"),
     )
     .expect("stdout log");
-    assert!(
-        stdout_log.starts_with("[REDACTED]"),
-        "labeled secret prefix should be redacted before capping: {stdout_log}"
+    assert_eq!(
+        stdout_log, "[REDACTED]\n",
+        "the sensitive assignment must be replaced as one fixed-point marker"
     );
     assert!(
         !stdout_log.contains("pla"),
@@ -8812,14 +9244,14 @@ fn eval_run_classifies_obvious_secret_before_persisted_log_cap() {
     assert!(output.status.success(), "{output:?}");
     let stdout_log = fs::read_to_string(temp_dir.path().join("logs/capped_secret.stdout.log"))
         .expect("stdout log");
-    assert!(stdout_log.contains("[REDA"), "{stdout_log}");
+    assert_eq!(stdout_log, "ok ");
     assert!(stdout_log.len() <= 12, "{stdout_log}");
     assert!(!stdout_log.contains("sk-proj-"), "{stdout_log}");
 }
 
 #[cfg(unix)]
 #[test]
-fn eval_run_redacts_colon_labeled_obvious_secret_tokens_from_logs() {
+fn eval_run_redacts_labeled_tokens_without_persisting_sensitive_assignments() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let config_path = temp_dir.path().join("seaf.evals.yaml");
     let report_path = temp_dir.path().join("eval-report.json");
@@ -8866,14 +9298,9 @@ fn eval_run_redacts_colon_labeled_obvious_secret_tokens_from_logs() {
     let stdout_log =
         fs::read_to_string(temp_dir.path().join("logs/redact_labeled_token.stdout.log"))
             .expect("stdout log");
-    assert!(stdout_log.contains("API_KEY:[REDACTED]"), "{stdout_log}");
-    assert!(stdout_log.contains("TOKEN:[REDACTED]"), "{stdout_log}");
-    assert!(stdout_log.contains("LABEL:[REDACTED]"), "{stdout_log}");
-    assert!(stdout_log.contains("api-key:[REDACTED]"), "{stdout_log}");
-    assert!(stdout_log.contains("openai-key:[REDACTED]"), "{stdout_log}");
-    assert!(
-        stdout_log.contains("status:ok"),
-        "ordinary colon-delimited output should remain: {stdout_log}"
+    assert_eq!(
+        stdout_log,
+        "[REDACTED]\n[REDACTED]\nLABEL:[REDACTED]\n[REDACTED]\n[REDACTED]\nstatus:ok\n"
     );
     assert!(!stdout_log.contains(sk_token), "{stdout_log}");
     assert!(!stdout_log.contains(ghp_token), "{stdout_log}");
@@ -8935,6 +9362,121 @@ fn eval_run_prevalidates_all_checks_before_executing_any_command() {
             .exists(),
         "prevalidation failure should not write per-check logs"
     );
+}
+
+#[test]
+fn eval_run_rejects_secret_bearing_structure_before_any_command_or_artifact() {
+    const SECRET: &str = "standalone-structural-secret-value";
+    for (case, unsafe_check) in [
+        (
+            "name",
+            format!(
+                "    - name: {SECRET}\n      command: \"printf ok\"\n      env:\n        API_TOKEN: {SECRET}\n"
+            ),
+        ),
+        (
+            "command",
+            format!(
+                "    - name: unsafe_command\n      command: \"printf {SECRET}\"\n      env:\n        API_TOKEN: {SECRET}\n"
+            ),
+        ),
+        (
+            "cwd",
+            String::new(),
+        ),
+        (
+            "env name",
+            format!(
+                "    - name: unsafe_env_name\n      command: \"printf ok\"\n      env:\n        API_TOKEN: {SECRET}\n        {SECRET}: ordinary\n"
+            ),
+        ),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("seaf.evals.yaml");
+        let marker_path = temp_dir.path().join("marker");
+        let report_path = temp_dir.path().join("eval-report.json");
+        let secret_cwd = temp_dir.path().join(SECRET);
+        fs::create_dir(&secret_cwd).expect("secret-bearing cwd fixture");
+        let unsafe_check = if case == "cwd" {
+            format!(
+                "    - name: unsafe_cwd\n      command: \"printf ok\"\n      cwd: \"{}\"\n      env:\n        API_TOKEN: {SECRET}\n",
+                secret_cwd.display()
+            )
+        } else {
+            unsafe_check
+        };
+        fs::write(
+            &config_path,
+            format!(
+                "evals:\n  allow_commands:\n    - touch\n    - printf\n  required:\n    - name: first_would_touch_marker\n      command: \"touch {}\"\n{unsafe_check}",
+                marker_path.display()
+            ),
+        )
+        .expect("write eval config");
+
+        let output = seaf()
+            .args([
+                "eval",
+                "run",
+                config_path.to_str().unwrap(),
+                "--output",
+                report_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run eval");
+
+        assert!(!output.status.success(), "{case}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("contains prohibited credential material"),
+            "{case}: {stderr}"
+        );
+        assert!(!stderr.contains(SECRET), "{case}: {stderr}");
+        assert!(!marker_path.exists(), "{case}: no command may execute");
+        assert!(!report_path.exists(), "{case}: no report may be written");
+        assert!(
+            !temp_dir
+                .path()
+                .join("logs/first_would_touch_marker.stdout.log")
+                .exists(),
+            "{case}: no log may be written"
+        );
+    }
+}
+
+#[test]
+fn eval_run_rejects_pretty_only_report_secret_before_write_or_json_print() {
+    const PRETTY_BOUNDARY: &str = "\",\n  \"";
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let config_path = temp_dir.path().join("seaf.evals.yaml");
+    let report_path = temp_dir.path().join("eval-report.json");
+    fs::write(
+        &config_path,
+        "evals:\n  allow_commands: [true]\n  required:\n    - name: report_envelope\n      command: true\n      env:\n        API_TOKEN: \"\\\",\\n  \\\"\"\n",
+    )
+    .expect("write eval config");
+
+    let output = seaf()
+        .args([
+            "eval",
+            "run",
+            config_path.to_str().unwrap(),
+            "--output",
+            report_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run eval");
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("contains prohibited credential material"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(PRETTY_BOUNDARY), "{stderr}");
+    assert!(output.stdout.is_empty(), "report JSON must not be printed");
+    assert!(!report_path.exists(), "report bytes must not be written");
 }
 
 #[test]

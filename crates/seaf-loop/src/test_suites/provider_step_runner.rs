@@ -1064,6 +1064,27 @@ fn provider_step_runner_does_not_repair_schema_invalid_json() {
 }
 
 #[test]
+fn invalid_json_containing_an_obvious_secret_is_dropped_without_repair() {
+    let provider = FakeProvider::new(vec![Ok(model_response(
+        "not-json sk-proj-abcdefghijklmnop",
+    ))]);
+    let mut runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000);
+    let request = runner
+        .step_request(LoopStepName::Research)
+        .expect("research request");
+
+    let error = runner
+        .run_step(LoopStepName::Research, &request)
+        .expect_err("secret-bearing result must become a safe provider failure");
+
+    assert!(error
+        .to_string()
+        .contains("provider response contained prohibited credential material"));
+    assert_eq!(provider.requests().expect("provider requests").len(), 1);
+}
+
+#[test]
 fn provider_step_runner_persists_provider_response_when_parse_failure_stops_loop() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runs_root = temp_dir.path().join("runs");
@@ -1313,6 +1334,51 @@ fn response_audit_appearing_before_call_reauthentication_prevents_provider_side_
     );
     assert_ne!(persisted.status, LoopStatus::Completed);
     assert_ne!(persisted.status, LoopStatus::Failed);
+}
+
+#[test]
+fn context_manifest_tamper_before_call_reauthentication_prevents_provider_side_effects() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    let runs_root = temp_dir.path().join("runs");
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(repo.join("src/lib.rs"), "pub fn live() {}\n").expect("source file");
+    let ticket = ticket_with_context(vec!["src/lib.rs"], Vec::new());
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let observer = |workspace: &seaf_loop::LoopWorkspace,
+                    _run: &LoopRun,
+                    _coordinates: &seaf_loop::ProviderExchangeCoordinates,
+                    _request: &seaf_core::ArtifactReference| {
+        std::fs::write(
+            workspace.run_directory().join("context-manifest.json"),
+            b"not canonical context authority",
+        )
+        .expect("tamper context manifest before provider reauthentication");
+    };
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone())
+            .with_context_pack_request(context_request(&repo, &ticket, Vec::new()))
+            .with_before_provider_reauthentication_observer(&observer);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "context-manifest-pre-call-race",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    let error = loop_runner
+        .run_next_step()
+        .expect_err("manifest tamper must stop before provider invocation");
+
+    assert!(error.to_string().contains("context manifest"), "{error}");
+    assert!(provider.requests().expect("provider requests").is_empty());
 }
 
 #[test]

@@ -517,10 +517,39 @@ pub(crate) struct ApprovedEvaluationIntentV2 {
     pub planned_checks: Vec<EvalCommandConfig>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RedactedEvalCommandProjectionV3 {
+    pub name: String,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub env_names: Vec<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApprovedEvaluationIntentV3 {
+    pub schema_version: u32,
+    pub evaluation_attempt: u32,
+    pub run_id: String,
+    pub approved_run_digest: String,
+    pub input_digests: LoopInputDigests,
+    pub ticket: ArtifactReference,
+    pub eval_config: ArtifactReference,
+    pub candidate_state_digest: String,
+    pub candidate_diff: ArtifactReference,
+    pub source_worktree_state_digest: String,
+    pub recovery: Option<RecoveryReference>,
+    pub planned_checks: Vec<RedactedEvalCommandProjectionV3>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovedEvaluationIntent {
     V1(Box<ApprovedEvaluationIntentV1>),
     V2(Box<ApprovedEvaluationIntentV2>),
+    V3(Box<ApprovedEvaluationIntentV3>),
 }
 
 impl ApprovedEvaluationIntent {
@@ -528,13 +557,7 @@ impl ApprovedEvaluationIntent {
         match self {
             Self::V1(_) => 1,
             Self::V2(intent) => intent.evaluation_attempt,
-        }
-    }
-
-    pub fn planned_checks(&self) -> &[EvalCommandConfig] {
-        match self {
-            Self::V1(intent) => &intent.planned_checks,
-            Self::V2(intent) => &intent.planned_checks,
+            Self::V3(intent) => intent.evaluation_attempt,
         }
     }
 
@@ -542,7 +565,59 @@ impl ApprovedEvaluationIntent {
         match self {
             Self::V1(_) => None,
             Self::V2(intent) => intent.recovery.as_ref(),
+            Self::V3(intent) => intent.recovery.as_ref(),
         }
+    }
+
+    pub fn planned_check_count(&self) -> usize {
+        match self {
+            Self::V1(intent) => intent.planned_checks.len(),
+            Self::V2(intent) => intent.planned_checks.len(),
+            Self::V3(intent) => intent.planned_checks.len(),
+        }
+    }
+
+    pub fn is_indexed(&self) -> bool {
+        matches!(self, Self::V2(_) | Self::V3(_))
+    }
+
+    pub fn source_worktree_state_digest(&self) -> Option<&str> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(intent) => Some(&intent.source_worktree_state_digest),
+            Self::V3(intent) => Some(&intent.source_worktree_state_digest),
+        }
+    }
+
+    pub fn validate_observed_check_names(&self, observed: &[EvalCheck]) -> Result<(), String> {
+        let expected = match self {
+            Self::V1(intent) => intent
+                .planned_checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            Self::V2(intent) => intent
+                .planned_checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            Self::V3(intent) => intent
+                .planned_checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+        };
+        if expected.len() != observed.len()
+            || expected
+                .iter()
+                .zip(observed)
+                .any(|(expected, actual)| **expected != actual.name)
+        {
+            return Err(
+                "Testing check names do not match the ordered evaluation intent".to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub fn validate_against_with_recovery(
@@ -561,8 +636,7 @@ impl ApprovedEvaluationIntent {
                             digest: &str,
                             ticket: &ArtifactReference,
                             eval: &ArtifactReference,
-                            candidate: &ArtifactReference,
-                            checks: &[EvalCommandConfig]| {
+                            candidate: &ArtifactReference| {
             run_id == approved.run_id
                 && digest == approved_digest
                 && ticket.path == "inputs/ticket.json"
@@ -570,19 +644,20 @@ impl ApprovedEvaluationIntent {
                 && eval.path == "inputs/eval-config.json"
                 && Some(&eval.digest) == approved.input_digests.eval_config.as_ref()
                 && candidate == &approval.candidate_diff
-                && checks == planned_checks
         };
+        let legacy_checks_are_secret_free = || legacy_eval_checks_are_secret_free(planned_checks);
         match self {
             Self::V1(intent)
                 if intent.schema_version == 1
                     && expected_recovery.is_none()
+                    && legacy_checks_are_secret_free()
+                    && intent.planned_checks == planned_checks
                     && common_valid(
                         &intent.run_id,
                         &intent.approved_run_digest,
                         &intent.ticket,
                         &intent.eval_config,
                         &intent.candidate_diff,
-                        &intent.planned_checks,
                     ) =>
             {
                 Ok(())
@@ -590,6 +665,8 @@ impl ApprovedEvaluationIntent {
             Self::V2(intent)
                 if intent.schema_version == 2
                     && intent.evaluation_attempt > 0
+                    && legacy_checks_are_secret_free()
+                    && intent.planned_checks == planned_checks
                     && intent.input_digests == approved.input_digests
                     && intent.recovery.as_ref() == expected_recovery
                     && approved
@@ -606,7 +683,31 @@ impl ApprovedEvaluationIntent {
                         &intent.ticket,
                         &intent.eval_config,
                         &intent.candidate_diff,
-                        &intent.planned_checks,
+                    ) =>
+            {
+                Ok(())
+            }
+            Self::V3(intent)
+                if intent.schema_version == 3
+                    && intent.evaluation_attempt > 0
+                    && intent.input_digests == approved.input_digests
+                    && intent.recovery.as_ref() == expected_recovery
+                    && project_eval_checks_v3(planned_checks).ok().as_ref()
+                        == Some(&intent.planned_checks)
+                    && approved
+                        .candidate_workspace
+                        .as_ref()
+                        .is_some_and(|candidate| {
+                            canonical_sha256_digest(candidate).ok().as_deref()
+                                == Some(intent.candidate_state_digest.as_str())
+                        })
+                    && is_digest(&intent.source_worktree_state_digest)
+                    && common_valid(
+                        &intent.run_id,
+                        &intent.approved_run_digest,
+                        &intent.ticket,
+                        &intent.eval_config,
+                        &intent.candidate_diff,
                     ) =>
             {
                 Ok(())
@@ -643,10 +744,16 @@ pub(crate) fn load_intent(
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
     {
-        Some(1) if reference.path == FIXED_INTENT_PATH => serde_json::from_value(value)
-            .map(Box::new)
-            .map(ApprovedEvaluationIntent::V1)
-            .map_err(|error| error.to_string()),
+        Some(1) if reference.path == FIXED_INTENT_PATH => {
+            let intent: ApprovedEvaluationIntentV1 =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            if !legacy_eval_checks_are_secret_free(&intent.planned_checks) {
+                return Err(
+                    "legacy evaluation intent contains prohibited credential material".into(),
+                );
+            }
+            Ok(ApprovedEvaluationIntent::V1(Box::new(intent)))
+        }
         Some(2) => {
             if value
                 .as_object()
@@ -658,6 +765,11 @@ pub(crate) fn load_intent(
             }
             let intent: ApprovedEvaluationIntentV2 =
                 serde_json::from_value(value).map_err(|error| error.to_string())?;
+            if !legacy_eval_checks_are_secret_free(&intent.planned_checks) {
+                return Err(
+                    "legacy evaluation intent contains prohibited credential material".into(),
+                );
+            }
             if parsed != (intent.evaluation_attempt, Spelling::Indexed, Kind::Intent) {
                 return Err(
                     "Approved evaluation intent path does not match its exact attempt".into(),
@@ -665,8 +777,95 @@ pub(crate) fn load_intent(
             }
             Ok(ApprovedEvaluationIntent::V2(Box::new(intent)))
         }
+        Some(3) => {
+            if value
+                .as_object()
+                .is_none_or(|object| !object.contains_key("recovery"))
+            {
+                return Err(
+                    "Approved evaluation intent v3 requires an explicit recovery member".into(),
+                );
+            }
+            let intent: ApprovedEvaluationIntentV3 =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            if parsed != (intent.evaluation_attempt, Spelling::Indexed, Kind::Intent) {
+                return Err(
+                    "Approved evaluation intent path does not match its exact attempt".into(),
+                );
+            }
+            Ok(ApprovedEvaluationIntent::V3(Box::new(intent)))
+        }
         _ => Err("unsupported Approved evaluation intent schema or path".into()),
     }
+}
+
+fn legacy_eval_checks_are_secret_free(checks: &[EvalCommandConfig]) -> bool {
+    let Ok(redactor) = crate::secret_redaction::SecretRedactor::from_env_maps(
+        checks.iter().map(|check| &check.env),
+    ) else {
+        return false;
+    };
+    checks.iter().all(|check| {
+        canonical_json_bytes(check)
+            .ok()
+            .and_then(|bytes| redactor.contains_prohibited_bytes(&bytes).ok())
+            == Some(false)
+    })
+}
+
+pub(crate) fn project_eval_checks_v3(
+    checks: &[EvalCommandConfig],
+) -> Result<Vec<RedactedEvalCommandProjectionV3>, String> {
+    let redactor = crate::secret_redaction::SecretRedactor::from_env_maps(
+        checks.iter().map(|check| &check.env),
+    )
+    .map_err(|error| error.to_string())?;
+    checks
+        .iter()
+        .enumerate()
+        .map(|(index, check)| {
+            let cwd = check
+                .cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            let env_names = check.env.keys().cloned().collect::<Vec<_>>();
+            for (label, value) in [
+                ("name", Some(check.name.as_str())),
+                ("command", Some(check.command.as_str())),
+                ("cwd", cwd.as_deref()),
+            ] {
+                if value.is_some_and(|value| {
+                    redactor
+                        .contains_prohibited_bytes(value.as_bytes())
+                        .unwrap_or(true)
+                }) {
+                    return Err(format!(
+                        "eval check {} {label} contains prohibited credential material",
+                        index + 1
+                    ));
+                }
+            }
+            for name in &env_names {
+                if redactor
+                    .contains_prohibited_bytes(name.as_bytes())
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(format!(
+                        "eval check {} env name contains prohibited credential material",
+                        index + 1
+                    ));
+                }
+            }
+            Ok(RedactedEvalCommandProjectionV3 {
+                name: check.name.clone(),
+                command: check.command.clone(),
+                cwd,
+                env_names,
+                timeout_ms: check.timeout_ms,
+                max_output_bytes: check.max_output_bytes,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn reference_for_path(
@@ -740,6 +939,8 @@ fn is_digest(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use seaf_core::{CheckStatus, EvalCheck};
 
@@ -803,6 +1004,101 @@ mod tests {
             source_worktree_state_digest: "3".repeat(64),
             recovery: None,
             planned_checks: Vec::new(),
+        }
+    }
+
+    fn v3_intent(attempt: u32) -> ApprovedEvaluationIntentV3 {
+        let v2 = v2_intent(attempt);
+        ApprovedEvaluationIntentV3 {
+            schema_version: 3,
+            evaluation_attempt: v2.evaluation_attempt,
+            run_id: v2.run_id,
+            approved_run_digest: v2.approved_run_digest,
+            input_digests: v2.input_digests,
+            ticket: v2.ticket,
+            eval_config: v2.eval_config,
+            candidate_state_digest: v2.candidate_state_digest,
+            candidate_diff: v2.candidate_diff,
+            source_worktree_state_digest: v2.source_worktree_state_digest,
+            recovery: v2.recovery,
+            planned_checks: vec![RedactedEvalCommandProjectionV3 {
+                name: "tests".to_string(),
+                command: "true".to_string(),
+                cwd: None,
+                env_names: Vec::new(),
+                timeout_ms: None,
+                max_output_bytes: None,
+            }],
+        }
+    }
+
+    fn projected_check(env: BTreeMap<String, String>) -> EvalCommandConfig {
+        EvalCommandConfig {
+            name: "unit".to_string(),
+            command: "true".to_string(),
+            cwd: Some(PathBuf::from(".")),
+            env,
+            timeout_ms: Some(1000),
+            max_output_bytes: Some(1024),
+        }
+    }
+
+    #[test]
+    fn v3_projection_omits_all_env_values_and_rejects_secret_bearing_structure() {
+        let secret = "projection-secret-value";
+        let projected = project_eval_checks_v3(&[projected_check(BTreeMap::from([
+            ("PUBLIC_MODE".to_string(), "ordinary-value".to_string()),
+            ("API_TOKEN".to_string(), secret.to_string()),
+        ]))])
+        .unwrap();
+        let bytes = canonical_json_bytes(&projected).unwrap();
+        assert!(!bytes
+            .windows(secret.len())
+            .any(|part| part == secret.as_bytes()));
+        assert!(!bytes
+            .windows("ordinary-value".len())
+            .any(|part| part == b"ordinary-value"));
+        assert_eq!(projected[0].env_names, vec!["API_TOKEN", "PUBLIC_MODE"]);
+
+        let mut unsafe_check = projected_check(BTreeMap::from([(
+            "API_TOKEN".to_string(),
+            secret.to_string(),
+        )]));
+        unsafe_check.command = format!("printf {secret}");
+        let error = project_eval_checks_v3(&[unsafe_check]).unwrap_err();
+        assert!(error.contains("command contains prohibited"));
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn legacy_intent_loader_rejects_credential_material_but_reads_clean_v2() {
+        for (name, env, accepted) in [
+            (
+                "unsafe",
+                BTreeMap::from([("API_TOKEN".to_string(), "raw-legacy-secret".to_string())]),
+                false,
+            ),
+            (
+                "clean",
+                BTreeMap::from([("MODE".to_string(), "test".to_string())]),
+                true,
+            ),
+        ] {
+            let (_temp, workspace) = workspace(name);
+            let mut intent = v2_intent(1);
+            intent.planned_checks = vec![projected_check(env)];
+            let bytes = canonical_json_bytes(&intent).unwrap();
+            let path = "artifacts/07-testing.attempt-001.execution-intent.json";
+            write(
+                &workspace,
+                "07-testing.attempt-001.execution-intent.json",
+                &bytes,
+            );
+            let reference = ArtifactReference {
+                path: path.to_string(),
+                digest: format!("{:x}", sha2::Sha256::digest(&bytes)),
+            };
+            assert_eq!(load_intent(&workspace, &reference).is_ok(), accepted);
         }
     }
 
@@ -1013,5 +1309,47 @@ mod tests {
             .expect_err("omitted recovery member must not alias explicit null");
 
         assert!(error.contains("explicit recovery member"), "{error}");
+    }
+
+    #[test]
+    fn v3_intent_requires_explicit_recovery_and_exact_attempt_path() {
+        for (name, intent, remove_recovery) in [
+            ("missing-recovery", v3_intent(1), true),
+            ("wrong-attempt", v3_intent(2), false),
+        ] {
+            let (_temp, workspace) = workspace(name);
+            let mut value = serde_json::to_value(intent).unwrap();
+            if remove_recovery {
+                value.as_object_mut().unwrap().remove("recovery");
+            }
+            let bytes = canonical_json_bytes(&value).unwrap();
+            let path = "artifacts/07-testing.attempt-001.execution-intent.json";
+            write(
+                &workspace,
+                "07-testing.attempt-001.execution-intent.json",
+                &bytes,
+            );
+            let reference = ArtifactReference {
+                path: path.to_string(),
+                digest: canonical_sha256_digest(&value).unwrap(),
+            };
+            assert!(load_intent(&workspace, &reference).is_err());
+        }
+    }
+
+    #[test]
+    fn v3_intent_rejects_ordered_testing_name_substitution() {
+        let intent = ApprovedEvaluationIntent::V3(Box::new(v3_intent(1)));
+        let observed = EvalCheck {
+            name: "substituted".to_string(),
+            status: CheckStatus::Passed,
+            duration_ms: None,
+            stdout_path: None,
+            stdout_digest: None,
+            stderr_path: None,
+            stderr_digest: None,
+            summary: None,
+        };
+        assert!(intent.validate_observed_check_names(&[observed]).is_err());
     }
 }

@@ -24,6 +24,7 @@ use seaf_loop::recovery::{
 use seaf_loop::{
     adopt_approved_evaluation, approve_candidate_for_testing, artifacts::write_step_request,
     cleanup_candidate_workspace_outcome, invalidate_approved_evaluation,
+    load_provider_exchange_record, load_provider_exchange_request,
     load_verified_final_evaluation_authority, load_verified_recovery_authority_kind,
     persist_provider_exchange_record_reference, promote_evaluated_candidate,
     rerun_invalidated_evaluation, revise_provider_step, stage_provider_exchange_record,
@@ -31,8 +32,8 @@ use seaf_loop::{
     AuthoritativeRunInputSnapshots, CommandOutput, ContextLimits, ContextPackRequest,
     InitializedLoopRun, LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchCommand,
     PatchCommandRunner, PatchGateError, PreparedLoopRun, ProviderExchangeCoordinates,
-    ProviderPatchGateConfig, ProviderStepRunner, StepRunner, TestingEvidence,
-    PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    ProviderExchangeResponseAudit, ProviderPatchGateConfig, ProviderStepRunner, StepRunner,
+    TestingEvidence, PROVIDER_EXCHANGE_SCHEMA_VERSION,
 };
 use seaf_models::{FakeProvider, ModelResponse};
 use sha2::{Digest, Sha256};
@@ -40,6 +41,327 @@ use sha2::{Digest, Sha256};
 const RUN_TREE_BYTE_CAP: u64 = 32 * 1024 * 1024;
 const RUN_TREE_ENTRY_CAP: usize = 4096;
 const EVALUATION_EVIDENCE_CAP: u64 = 2 * 1024 * 1024;
+
+#[test]
+fn secret_free_v2_indexed_final_authority_remains_readable() {
+    let (fixture, approved) = approved_fixture("v2-final-compatibility");
+    let run = publish_indexed_final_eval_artifacts_v2(&fixture.workspace, &approved, true);
+    load_verified_final_evaluation_authority(&fixture.workspace, &run)
+        .expect("secret-free V2 final authority remains compatible");
+    fixture.cleanup();
+}
+
+#[test]
+fn final_authority_rejects_ordered_testing_name_substitution() {
+    let (fixture, approved) = approved_fixture("testing-name-substitution");
+    let mut run = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let testing_path = "artifacts/07-testing.attempt-001.json";
+    let mut testing: TestingEvidence = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(testing_path)).unwrap(),
+    )
+    .unwrap();
+    testing.checks[0].name = "substituted".to_string();
+    let bytes = canonical_json_bytes(&testing).unwrap();
+    write_private_run_fixture(&fixture.workspace, testing_path, &bytes);
+    let testing_step = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    testing_step.artifact_digest = Some(format!("{:x}", Sha256::digest(&bytes)));
+
+    let error = load_verified_final_evaluation_authority(&fixture.workspace, &run)
+        .expect_err("substituted Testing name must fail exact intent binding");
+
+    assert!(error.to_string().contains("ordered evaluation intent"));
+    fixture.cleanup();
+}
+
+#[test]
+fn structural_secret_rejection_precedes_intent_and_command_side_effects() {
+    let (fixture, _approved) = approved_fixture_with_eval_mode(
+        "evaluation-structural-secret",
+        FixtureEvalMode::StructuralSecret,
+    );
+    let marker = fixture._temp.path().join("eval-spawned.marker");
+
+    let error = seaf_loop::execute_approved_evaluation(&fixture.workspace, &fixture.source)
+        .expect_err("secret-bearing planned command must fail closed");
+
+    assert!(error.to_string().contains("prohibited credential material"));
+    assert!(!error.to_string().contains(PROVIDER_SECRET_FIXTURE));
+    assert!(!marker.exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.execution-intent.json")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn configured_secret_is_identical_and_safe_in_provider_call_and_request_audit() {
+    let Fixture {
+        _temp,
+        runs_root,
+        source,
+        candidate,
+        ticket,
+        policy,
+        prepared,
+    } = fixture_with_eval_mode(
+        "provider-request-redaction",
+        FixtureEvalMode::ProviderRequestSecret,
+    );
+    let provider = FakeProvider::new(candidate_responses(true));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
+        .with_context_pack_request(context_request(&candidate, &ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+            &mut patch_runner,
+        );
+    let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).unwrap();
+    runner.run_next_step().unwrap();
+    let run_directory = runs_root.join("provider-request-redaction");
+    let sent = provider.requests().unwrap().remove(0);
+    let sent_bytes = serde_json::to_vec_pretty(&sent).unwrap();
+    assert!(!sent_bytes
+        .windows(PROVIDER_SECRET_FIXTURE.len())
+        .any(|part| { part == PROVIDER_SECRET_FIXTURE.as_bytes() }));
+    let role_input: serde_json::Value = serde_json::from_str(&sent.messages[0].content).unwrap();
+    let context_authority = &role_input["repository_context_authority"];
+    assert!(context_authority["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains(
+                "excluded src/provider-context.txt because it contains prohibited credential material"
+            ))));
+    assert!(!context_authority["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "src/provider-context.txt"));
+    let record_reference = runner.run().provider_exchange_records[0].clone();
+    let record = load_provider_exchange_record(&run_directory, &record_reference).unwrap();
+    let audited = load_provider_exchange_request(&run_directory, &record.request).unwrap();
+    assert_eq!(audited, sent_bytes);
+    let secret_digest = hex::encode(Sha256::digest(PROVIDER_SECRET_FIXTURE.as_bytes()));
+    for (path, bytes) in directory_snapshot(&run_directory) {
+        if path == Path::new("inputs/eval-config.json") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(PROVIDER_SECRET_FIXTURE),
+            "{}",
+            path.display()
+        );
+        assert!(!text.contains(&secret_digest), "{}", path.display());
+    }
+    drop(runner);
+    drop(step_runner);
+    remove_candidate(&source, &candidate);
+}
+
+#[test]
+fn provider_exact_record_and_future_run_envelopes_fail_before_unsafe_publication() {
+    for (case, secret, expected_provider_calls) in [
+        ("running-run", "\"status\": \"running\"", 0),
+        ("request-record", "\"phase\": \"request\"", 0),
+        ("request-run", "\"provider_exchange_records\": [\n    {", 0),
+        ("response-record", "\"phase\": \"response\"", 1),
+        ("response-run", "\n    },\n    {\n      \"run_id\"", 1),
+    ] {
+        let Fixture {
+            _temp,
+            runs_root,
+            source,
+            candidate,
+            ticket,
+            policy,
+            prepared,
+        } = fixture_with_eval_mode(
+            &format!("provider-envelope-{case}"),
+            FixtureEvalMode::ProviderEnvelopeSecret(secret),
+        );
+        let provider = FakeProvider::new(candidate_responses(true));
+        let mut patch_runner = RecordingPatchRunner::default();
+        let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone())
+            .with_context_pack_request(context_request(&candidate, &ticket))
+            .with_patch_gate(
+                ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+                &mut patch_runner,
+            );
+        let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).unwrap();
+        let run_directory = runs_root.join(format!("provider-envelope-{case}"));
+        let raw_digest = hex::encode(Sha256::digest(secret.as_bytes()));
+
+        let error = runner
+            .run_next_step()
+            .expect_err("an unsafe exact provider envelope must fail closed");
+
+        assert!(
+            error.to_string().contains("prohibited credential material"),
+            "{case}: {error}"
+        );
+        assert!(!error.to_string().contains(secret), "{case}: {error}");
+        assert!(!error.to_string().contains(&raw_digest), "{case}: {error}");
+        assert_eq!(
+            provider.requests().unwrap().len(),
+            expected_provider_calls,
+            "{case}"
+        );
+        let persisted = seaf_loop::state::load_run(
+            &LoopWorkspace::open(&runs_root, &format!("provider-envelope-{case}")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.provider_exchange_records.len(),
+            expected_provider_calls,
+            "{case}"
+        );
+        let stem = "01-research.attempt-001.exchange-001.initial";
+        if expected_provider_calls == 0 {
+            assert!(!run_directory
+                .join(format!("prompts/{stem}.request.md"))
+                .exists());
+            assert!(!run_directory
+                .join(format!("artifacts/{stem}.request.record.json"))
+                .exists());
+        } else {
+            assert!(!run_directory
+                .join(format!("artifacts/{stem}.response.record.json"))
+                .exists());
+        }
+        for (path, bytes) in directory_snapshot(&run_directory) {
+            if path == Path::new("inputs/eval-config.json") {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(secret), "{case}: {}", path.display());
+            assert!(!text.contains(&raw_digest), "{case}: {}", path.display());
+        }
+        drop(runner);
+        drop(step_runner);
+        remove_candidate(&source, &candidate);
+    }
+}
+
+#[test]
+fn provider_fixed_log_line_rejects_before_the_paired_run_mutation() {
+    let secret = "started step Research\n";
+    let Fixture {
+        _temp,
+        runs_root,
+        source,
+        candidate,
+        ticket,
+        policy,
+        prepared,
+    } = fixture_with_eval_mode(
+        "provider-started-log-envelope",
+        FixtureEvalMode::ProviderEnvelopeSecret(secret),
+    );
+    let provider = FakeProvider::new(candidate_responses(true));
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
+        .with_context_pack_request(context_request(&candidate, &ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+            &mut patch_runner,
+        );
+    let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).unwrap();
+    let run_directory = runs_root.join("provider-started-log-envelope");
+    let before_run = runner.run().clone();
+    let before_tree = directory_snapshot(&run_directory);
+
+    let error = runner
+        .run_next_step()
+        .expect_err("unsafe fixed log line must reject before starting the step");
+
+    assert!(
+        error.to_string().contains("prohibited credential material"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(secret));
+    assert_eq!(runner.run(), &before_run);
+    assert_eq!(directory_snapshot(&run_directory), before_tree);
+    assert!(provider.requests().unwrap().is_empty());
+    drop(runner);
+    drop(step_runner);
+    remove_candidate(&source, &candidate);
+}
+
+#[test]
+fn configured_secret_provider_response_persists_only_fixed_safe_failure() {
+    let Fixture {
+        _temp,
+        runs_root,
+        source,
+        candidate,
+        ticket,
+        policy,
+        prepared,
+        ..
+    } = fixture_with_eval_mode(
+        "provider-response-redaction",
+        FixtureEvalMode::ProviderSecret,
+    );
+    let raw = format!("invalid {PROVIDER_SECRET_FIXTURE}");
+    let raw_digest = hex::encode(Sha256::digest(raw.as_bytes()));
+    let secret_digest = hex::encode(Sha256::digest(PROVIDER_SECRET_FIXTURE.as_bytes()));
+    let raw_response = ModelResponse {
+        content: raw,
+        latency_ms: 1,
+        raw_provider_metadata: serde_json::json!({"provider": "fake"}),
+    };
+    let raw_audit_digest = canonical_sha256_digest(&ProviderExchangeResponseAudit::ModelResponse {
+        response: raw_response.clone(),
+    })
+    .unwrap();
+    let provider = FakeProvider::new(vec![Ok(raw_response)]);
+    let mut patch_runner = RecordingPatchRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(ticket.clone())
+        .with_context_pack_request(context_request(&candidate, &ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(&candidate, &ticket, policy, true),
+            &mut patch_runner,
+        );
+    let mut runner = LoopRunner::start_initialized(prepared, &mut step_runner).unwrap();
+    runner.run_next_step().unwrap();
+    let run_directory = runs_root.join("provider-response-redaction");
+    for (path, bytes) in directory_snapshot(&run_directory) {
+        if matches!(path.to_string_lossy().as_ref(), "inputs/eval-config.json") {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(PROVIDER_SECRET_FIXTURE),
+            "{}",
+            path.display()
+        );
+        assert!(!text.contains(&raw_digest), "{}", path.display());
+        assert!(!text.contains(&secret_digest), "{}", path.display());
+        assert!(!text.contains(&raw_audit_digest), "{}", path.display());
+    }
+    let response = fs::read_to_string(
+        run_directory.join("responses/01-research.attempt-001.exchange-001.initial.response.json"),
+    )
+    .unwrap();
+    assert!(response.contains("provider_response_contains_secret"));
+    assert_eq!(provider.requests().unwrap().len(), 1);
+    drop(runner);
+    drop(step_runner);
+    remove_candidate(&source, &candidate);
+}
 
 #[test]
 fn evaluation_intent_capacity_boundaries_refuse_before_intent_or_child_process() {
@@ -2195,6 +2517,211 @@ fn evaluation_adoption_finalizes_complete_prefix_without_command_execution_and_r
 }
 
 #[test]
+fn evaluation_adoption_rejects_report_credentials_before_any_recovery_publication() {
+    for (intent_schema, report_present, secret) in [
+        (1, false, "eval_report_id"),
+        (1, true, "prefix[REDACTED]suffix"),
+        (2, false, "\"passed\": true"),
+        (2, true, "eval_report_id"),
+        (3, false, "eval_report_id"),
+        (3, true, "\"passed\": true"),
+        (3, true, "prefix[REDACTED]suffix"),
+    ] {
+        let run_id = format!(
+            "adoption-report-secret-v{intent_schema}-{}-{}",
+            if report_present {
+                "existing"
+            } else {
+                "missing"
+            },
+            if secret == "eval_report_id" {
+                "key"
+            } else if secret.contains("passed") {
+                "boundary"
+            } else {
+                "marker"
+            }
+        );
+        let (fixture, approved) = approved_fixture_with_eval_mode(
+            &run_id,
+            FixtureEvalMode::EvaluationReportEnvelopeSecret(secret),
+        );
+        let final_shape = match intent_schema {
+            1 => publish_final_eval_artifacts(&fixture.workspace, &approved, true),
+            2 => publish_indexed_final_eval_artifacts_v2(&fixture.workspace, &approved, true),
+            3 => publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true),
+            _ => unreachable!(),
+        };
+        let report_path = final_shape.eval_report_path.unwrap();
+        if report_present && secret == "prefix[REDACTED]suffix" {
+            let path = fixture.workspace.run_directory().join(&report_path);
+            let mut report: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            report["summary"] = serde_json::Value::String(secret.to_string());
+            write_private_run_fixture(
+                &fixture.workspace,
+                &report_path,
+                canonical_json_bytes(&report).unwrap(),
+            );
+        } else if !report_present {
+            fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+        }
+        let before = directory_snapshot(fixture.workspace.run_directory());
+
+        let error = adopt_approved_evaluation(
+            &fixture.workspace,
+            "operator@example.invalid",
+            "reject report credential material",
+        )
+        .expect_err("report credential material must reject before publication");
+
+        // The exact-prefix preflight now scans every schema's raw intent, log, and optional
+        // report bytes before any typed legacy parsing or recovery publication.
+        let expected_error =
+            "audited recovery failed: operator evidence contains prohibited credential material";
+        assert_eq!(
+            error.to_string(),
+            expected_error,
+            "schema v{intent_schema}, report_present={report_present}, secret={secret}"
+        );
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(
+            directory_snapshot(fixture.workspace.run_directory()),
+            before,
+            "schema v{intent_schema}, report_present={report_present}, secret={secret}"
+        );
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/recovery-001.source-run.json")
+            .exists());
+        assert!(!fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/recovery-001.json")
+            .exists());
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn evaluation_recovery_rejects_secret_bearing_prefix_before_any_publication() {
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "adoption-secret-bearing-prefix",
+        FixtureEvalMode::ProviderSecret,
+    );
+    let final_shape = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let report_path = final_shape.eval_report_path.unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let stdout_path = "artifacts/07-testing.attempt-001.check-001.stdout.log";
+    write_private_run_fixture(
+        &fixture.workspace,
+        stdout_path,
+        PROVIDER_SECRET_FIXTURE.as_bytes(),
+    );
+    let testing_path = "artifacts/07-testing.attempt-001.json";
+    let mut testing: TestingEvidence = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(testing_path)).unwrap(),
+    )
+    .unwrap();
+    testing.checks[0].stdout_digest = Some(hex::encode(Sha256::digest(
+        PROVIDER_SECRET_FIXTURE.as_bytes(),
+    )));
+    write_private_run_fixture(
+        &fixture.workspace,
+        testing_path,
+        testing.canonical_bytes().unwrap(),
+    );
+    let before = directory_snapshot(fixture.workspace.run_directory());
+    let raw_digest = hex::encode(Sha256::digest(PROVIDER_SECRET_FIXTURE.as_bytes()));
+
+    let error = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "reject secret-bearing prefix",
+    )
+    .expect_err("a secret-bearing log must reject adoption before publication");
+
+    assert!(
+        error.to_string().contains("prohibited credential material"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(PROVIDER_SECRET_FIXTURE));
+    assert!(!error.to_string().contains(&raw_digest));
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.source-run.json")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.json")
+        .exists());
+    assert!(!fixture.workspace.run_directory().join(report_path).exists());
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "invalidation-secret-bearing-prefix",
+        FixtureEvalMode::ProviderSecret,
+    );
+    let final_shape = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/07-testing.attempt-001.json"),
+    )
+    .unwrap();
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(final_shape.eval_report_path.unwrap()),
+    )
+    .unwrap();
+    write_private_run_fixture(
+        &fixture.workspace,
+        stdout_path,
+        PROVIDER_SECRET_FIXTURE.as_bytes(),
+    );
+    let before = directory_snapshot(fixture.workspace.run_directory());
+
+    let error = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "reject secret-bearing prefix",
+    )
+    .expect_err("a secret-bearing log must reject invalidation before publication");
+
+    assert!(
+        error.to_string().contains("prohibited credential material"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(PROVIDER_SECRET_FIXTURE));
+    assert!(!error.to_string().contains(&raw_digest));
+    assert_eq!(
+        directory_snapshot(fixture.workspace.run_directory()),
+        before
+    );
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.source-run.json")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/recovery-001.json")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
 fn evaluation_adoption_rejects_input_and_report_drift_before_recovery_publication() {
     for target in ["input", "report", "attempt2"] {
         let (fixture, approved) = approved_fixture(&format!("adoption-preflight-{target}"));
@@ -3143,6 +3670,34 @@ fn final_authority_loader_rejects_log_incomplete_testing_evidence() {
         .expect_err("log-incomplete Testing evidence must fail");
     assert!(error.to_string().contains("stdout"), "{error}");
     fixture.cleanup();
+}
+
+#[test]
+fn final_authority_v1_v2_v3_loaders_raw_scan_marker_spanning_history() {
+    const SECRET: &str = "prefix[REDACTED]suffix";
+    for schema in [1, 2, 3] {
+        let (fixture, approved) = approved_fixture_with_eval_mode(
+            &format!("final-loader-marker-envelope-v{schema}"),
+            FixtureEvalMode::EvaluationMarkerEnvelopeSecret,
+        );
+        let mut final_run = match schema {
+            1 => publish_final_eval_artifacts(&fixture.workspace, &approved, true),
+            2 => publish_indexed_final_eval_artifacts_v2(&fixture.workspace, &approved, true),
+            3 => publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true),
+            _ => unreachable!(),
+        };
+        replace_testing_summary(&fixture.workspace, &mut final_run, SECRET);
+
+        let error = load_verified_final_evaluation_authority(&fixture.workspace, &final_run)
+            .expect_err("marker-spanning Testing bytes must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "derived evaluation artifact contains prohibited credential material",
+            "schema v{schema}"
+        );
+        fixture.cleanup();
+    }
 }
 
 #[test]
@@ -4096,7 +4651,7 @@ fn intended_evaluation_intent_bytes(
     )
     .unwrap();
     let intent = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "evaluation_attempt": 1,
         "run_id": approved.run_id,
         "approved_run_digest": canonical_sha256_digest(approved).unwrap(),
@@ -4113,9 +4668,32 @@ fn intended_evaluation_intent_bytes(
         "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
         "source_worktree_state_digest": source_worktree_authority_digest(approved),
         "recovery": null,
-        "planned_checks": eval_config["evals"]["required"],
+        "planned_checks": planned_check_projections(&eval_config),
     });
     canonical_json_bytes(&intent).unwrap()
+}
+
+fn planned_check_projections(eval_config: &serde_json::Value) -> Vec<serde_json::Value> {
+    eval_config["evals"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| {
+            let mut env_names = check["env"]
+                .as_object()
+                .map(|env| env.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            env_names.sort();
+            serde_json::json!({
+                "name": check["name"],
+                "command": check["command"],
+                "cwd": check.get("cwd").cloned().unwrap_or(serde_json::Value::Null),
+                "env_names": env_names,
+                "timeout_ms": check.get("timeout_ms").cloned().unwrap_or(serde_json::Value::Null),
+                "max_output_bytes": check.get("max_output_bytes").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
 }
 
 fn run_tree_usage(root: &Path) -> (u64, usize) {
@@ -4250,6 +4828,14 @@ fn publish_final_eval_artifacts(
     approved: &seaf_core::LoopRun,
     passed: bool,
 ) -> seaf_core::LoopRun {
+    let eval_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap(),
+    )
+    .unwrap();
+    let check_name = eval_config["evals"]["required"][0]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let stdout = b"fixture stdout\n";
     let stderr = b"fixture stderr\n";
     let stdout_path = "artifacts/07-testing.check-001.stdout.log";
@@ -4257,7 +4843,7 @@ fn publish_final_eval_artifacts(
     write_private_run_fixture(workspace, stdout_path, stdout);
     write_private_run_fixture(workspace, stderr_path, stderr);
     let check = EvalCheck {
-        name: "unit".to_string(),
+        name: check_name,
         status: if passed {
             CheckStatus::Passed
         } else {
@@ -4281,10 +4867,6 @@ fn publish_final_eval_artifacts(
         approved_at.clone(),
         approved_at,
         vec![check.clone()],
-    )
-    .unwrap();
-    let eval_config: serde_json::Value = serde_json::from_slice(
-        &fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap(),
     )
     .unwrap();
     let intent = serde_json::json!({
@@ -4545,6 +5127,23 @@ fn publish_indexed_final_eval_artifacts(
     approved: &seaf_core::LoopRun,
     passed: bool,
 ) -> seaf_core::LoopRun {
+    publish_indexed_final_eval_artifacts_schema(workspace, approved, passed, 3)
+}
+
+fn publish_indexed_final_eval_artifacts_v2(
+    workspace: &LoopWorkspace,
+    approved: &seaf_core::LoopRun,
+    passed: bool,
+) -> seaf_core::LoopRun {
+    publish_indexed_final_eval_artifacts_schema(workspace, approved, passed, 2)
+}
+
+fn publish_indexed_final_eval_artifacts_schema(
+    workspace: &LoopWorkspace,
+    approved: &seaf_core::LoopRun,
+    passed: bool,
+    intent_schema: u32,
+) -> seaf_core::LoopRun {
     let fixed = publish_final_eval_artifacts(workspace, approved, passed);
     let fixed_testing_path = "artifacts/07-testing.json";
     let fixed_report_path = "artifacts/08-eval-report.json";
@@ -4581,8 +5180,19 @@ fn publish_indexed_final_eval_artifacts(
         &fs::read(workspace.run_directory().join("inputs/eval-config.json")).unwrap(),
     )
     .unwrap();
+    let expected_name = eval_config["evals"]["required"][0]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    testing.checks[0].name = expected_name.clone();
+    report.checks[0].name = expected_name;
+    let planned_checks = if intent_schema == 2 {
+        eval_config["evals"]["required"].clone()
+    } else {
+        serde_json::Value::Array(planned_check_projections(&eval_config))
+    };
     let intent = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": intent_schema,
         "evaluation_attempt": 1,
         "run_id": approved.run_id,
         "approved_run_digest": canonical_sha256_digest(approved).unwrap(),
@@ -4599,7 +5209,7 @@ fn publish_indexed_final_eval_artifacts(
         "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
         "source_worktree_state_digest": source_worktree_authority_digest(approved),
         "recovery": null,
-        "planned_checks": eval_config["evals"]["required"],
+        "planned_checks": planned_checks,
     });
     let intent_path = "artifacts/07-testing.attempt-001.execution-intent.json";
     let intent_bytes = canonical_json_bytes(&intent).unwrap();
@@ -4726,6 +5336,43 @@ fn publish_report_variant(
     run
 }
 
+fn replace_testing_summary(workspace: &LoopWorkspace, run: &mut seaf_core::LoopRun, summary: &str) {
+    let testing_step = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::Testing)
+        .unwrap();
+    let testing_path = testing_step.artifact_path.clone().unwrap();
+    let mut testing: TestingEvidence =
+        serde_json::from_slice(&fs::read(workspace.run_directory().join(&testing_path)).unwrap())
+            .unwrap();
+    testing.checks[0].summary = Some(summary.to_string());
+    let testing_bytes = canonical_json_bytes(&testing).unwrap();
+    write_private_run_fixture(workspace, &testing_path, &testing_bytes);
+    let testing_digest = format!("{:x}", Sha256::digest(&testing_bytes));
+    testing_step.artifact_digest = Some(testing_digest.clone());
+
+    let report_step = run
+        .steps
+        .iter_mut()
+        .find(|step| step.name == LoopStepName::EvalReport)
+        .unwrap();
+    let report_path = report_step.artifact_path.clone().unwrap();
+    let mut report: EvalReport =
+        serde_json::from_slice(&fs::read(workspace.run_directory().join(&report_path)).unwrap())
+            .unwrap();
+    report.checks[0].summary = Some(summary.to_string());
+    report
+        .loop_evidence
+        .as_mut()
+        .unwrap()
+        .testing_evidence
+        .digest = testing_digest;
+    let report_bytes = canonical_json_bytes(&report).unwrap();
+    write_private_run_fixture(workspace, &report_path, &report_bytes);
+    report_step.artifact_digest = Some(format!("{:x}", Sha256::digest(&report_bytes)));
+}
+
 fn write_raw_run(workspace: &LoopWorkspace, run: &seaf_core::LoopRun) {
     let mut bytes = serde_json::to_vec_pretty(run).unwrap();
     bytes.push(b'\n');
@@ -4814,7 +5461,15 @@ enum FixtureEvalMode {
     Marker,
     CapacityAfterFirstCheck,
     Blocking,
+    ProviderSecret,
+    ProviderRequestSecret,
+    ProviderEnvelopeSecret(&'static str),
+    StructuralSecret,
+    EvaluationMarkerEnvelopeSecret,
+    EvaluationReportEnvelopeSecret(&'static str),
 }
+
+const PROVIDER_SECRET_FIXTURE: &str = "configured-provider-secret-value";
 
 fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -4826,6 +5481,13 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
     git_ok(&source, &["config", "user.name", "SEAF Test"]);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), "pub fn existing() {}\n").unwrap();
+    if matches!(eval_mode, FixtureEvalMode::ProviderRequestSecret) {
+        fs::write(
+            source.join("src/provider-context.txt"),
+            PROVIDER_SECRET_FIXTURE,
+        )
+        .unwrap();
+    }
     if matches!(eval_mode, FixtureEvalMode::DriftAfterFirstCheck) {
         fs::write(
             source.join("drift-authority.sh"),
@@ -4833,7 +5495,10 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
         )
         .unwrap();
     }
-    if matches!(eval_mode, FixtureEvalMode::Marker) {
+    if matches!(
+        eval_mode,
+        FixtureEvalMode::Marker | FixtureEvalMode::StructuralSecret
+    ) {
         fs::write(
             source.join("eval-marker.sh"),
             "#!/bin/sh\nprintf spawned > \"$1\"\n",
@@ -4879,6 +5544,28 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
         FixtureEvalMode::Blocking => {
             ticket.autonomy.allow_shell_commands = vec!["sh".into()];
         }
+        FixtureEvalMode::ProviderSecret => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+        }
+        FixtureEvalMode::ProviderRequestSecret => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+            ticket
+                .context
+                .relevant_files
+                .push("src/provider-context.txt".to_string());
+        }
+        FixtureEvalMode::ProviderEnvelopeSecret(_) => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+        }
+        FixtureEvalMode::StructuralSecret => {
+            ticket.autonomy.allow_shell_commands = vec!["sh".into()];
+        }
+        FixtureEvalMode::EvaluationMarkerEnvelopeSecret => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+        }
+        FixtureEvalMode::EvaluationReportEnvelopeSecret(_) => {
+            ticket.autonomy.allow_shell_commands = vec!["true".into()];
+        }
     }
     let policy = policy();
     let config = serde_json::json!({"policy_path":"seaf.policy.json"});
@@ -4914,6 +5601,23 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
             temp.path().join("eval-blocking.started").display(),
             temp.path().join("eval-blocking.release").display(),
         ),
+        FixtureEvalMode::ProviderSecret | FixtureEvalMode::ProviderRequestSecret => format!(
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: {PROVIDER_SECRET_FIXTURE}\n"
+        ),
+        FixtureEvalMode::ProviderEnvelopeSecret(secret) => format!(
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: {secret:?}\n"
+        ),
+        FixtureEvalMode::StructuralSecret => format!(
+            "evals:\n  allow_commands: [sh]\n  required:\n    - name: structural\n      command: sh eval-marker.sh {} {PROVIDER_SECRET_FIXTURE}\n      env:\n        API_TOKEN: {PROVIDER_SECRET_FIXTURE}\n",
+            temp.path().join("eval-spawned.marker").display(),
+        ),
+        FixtureEvalMode::EvaluationMarkerEnvelopeSecret => {
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: prefix[REDACTED]suffix\n"
+                .to_string()
+        }
+        FixtureEvalMode::EvaluationReportEnvelopeSecret(secret) => format!(
+            "evals:\n  allow_commands: [true]\n  required:\n    - name: tests\n      command: true\n      env:\n        API_TOKEN: '{secret}'\n"
+        ),
     };
     let eval_config = seaf_core::parse_eval_config(&eval_yaml).unwrap();
     let ticket_bytes = canonical_json_bytes(&ticket).unwrap();
@@ -4936,6 +5640,14 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
             },
         ),
         &source,
+        &AuthoritativeRunInputSnapshots {
+            ticket: ticket_bytes.clone(),
+            provider_ticket: ticket_bytes.clone(),
+            policy: policy_bytes.clone(),
+            config: config_bytes.clone(),
+            repository: repository_bytes.clone(),
+            eval_config: canonical_json_bytes(&eval_config).unwrap(),
+        },
     )
     .unwrap();
     let candidate = PathBuf::from(&initialized.run().candidate_workspace.as_ref().unwrap().path);

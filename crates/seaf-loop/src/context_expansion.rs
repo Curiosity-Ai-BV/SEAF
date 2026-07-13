@@ -91,9 +91,23 @@ pub struct CreatedContextExpansion {
 pub fn create_context_expansion(
     request: &ContextExpansionRequest,
 ) -> Result<CreatedContextExpansion, ContextExpansionError> {
+    create_context_expansion_impl(request, None)
+}
+
+pub(crate) fn create_context_expansion_with_redactor(
+    request: &ContextExpansionRequest,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<CreatedContextExpansion, ContextExpansionError> {
+    create_context_expansion_impl(request, Some(redactor))
+}
+
+fn create_context_expansion_impl(
+    request: &ContextExpansionRequest,
+    redactor: Option<&crate::secret_redaction::SecretRedactor>,
+) -> Result<CreatedContextExpansion, ContextExpansionError> {
     let prepared = PreparedRequest::new(request)?;
     verify_initial_provider_request(request, &prepared.initial_provider_request)?;
-    let prior = load_prior_chain(request, &prepared)?;
+    let prior = load_prior_chain(request, &prepared, redactor)?;
     let relative_path =
         expansion_artifact_path(request.step, request.step_attempt, request.context_round);
 
@@ -141,7 +155,15 @@ pub fn create_context_expansion(
             .max_total_bytes
             .saturating_sub(resulting_total_context_bytes);
         let retain_limit = request.limits.max_bytes_per_file.min(remaining);
-        let source = read_context_source(&repository_root, &path, retain_limit)?;
+        let source = match redactor {
+            Some(redactor) => read_context_source_with_redaction_lookahead(
+                &repository_root,
+                &path,
+                retain_limit,
+                redactor,
+            )?,
+            None => read_context_source(&repository_root, &path, retain_limit)?,
+        };
         if source.source_bytes == 0 {
             return Err(ContextExpansionError::Safety(format!(
                 "requested context file has zero useful bytes: {path}"
@@ -192,6 +214,11 @@ pub fn create_context_expansion(
     };
     validate_artifact_structure(&artifact)?;
     let bytes = canonical_json_bytes(&artifact)?;
+    if redactor.is_some_and(|redactor| redactor.contains_prohibited_bytes(&bytes).unwrap_or(true)) {
+        return Err(ContextExpansionError::PublicationSafety(
+            "context expansion contains prohibited credential material".to_string(),
+        ));
+    }
     publish_create_only(&request.run_directory, &relative_path, &bytes)
         .map_err(ContextExpansionError::from_publication)?;
     Ok(CreatedContextExpansion {
@@ -203,13 +230,46 @@ pub fn create_context_expansion(
     })
 }
 
+pub(crate) fn reconstruct_context_expansion_files_with_redactor(
+    request: &ContextExpansionRequest,
+    identity: &ArtifactReference,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<Vec<ContextExpansionFile>, ContextExpansionError> {
+    let prepared = PreparedRequest::new(request)?;
+    verify_initial_provider_request(request, &prepared.initial_provider_request)?;
+    let prior = load_prior_chain(request, &prepared, Some(redactor))?;
+    let expected_path =
+        expansion_artifact_path(request.step, request.step_attempt, request.context_round);
+    if identity.path != expected_path {
+        return Err(ContextExpansionError::Invalid(
+            "context expansion artifact path does not match its identity".to_string(),
+        ));
+    }
+    let bytes =
+        read_verified_regular_file(&request.run_directory, &identity.path, "context expansion")?;
+    validate_expansion_history_bytes(&bytes, redactor)?;
+    let current = decode_artifact(&bytes, &identity.digest)?;
+    validate_expected_artifact(&current, request, &prepared, &prior)?;
+    let mut files = Vec::new();
+    for artifact in prior.into_iter().chain(std::iter::once(current)) {
+        files.extend(artifact.files);
+    }
+    let mut paths = BTreeSet::new();
+    if files.iter().any(|file| !paths.insert(file.path.clone())) {
+        return Err(ContextExpansionError::Invalid(
+            "context expansion chain contains duplicate file paths".to_string(),
+        ));
+    }
+    Ok(files)
+}
+
 pub fn load_context_expansion(
     request: &ContextExpansionRequest,
     identity: &ArtifactReference,
 ) -> Result<ContextExpansionArtifact, ContextExpansionError> {
     let prepared = PreparedRequest::new(request)?;
     verify_initial_provider_request(request, &prepared.initial_provider_request)?;
-    let prior = load_prior_chain(request, &prepared)?;
+    let prior = load_prior_chain(request, &prepared, None)?;
     let expected_path =
         expansion_artifact_path(request.step, request.step_attempt, request.context_round);
     if identity.path != expected_path {
@@ -230,7 +290,7 @@ pub fn reconstruct_context_expansion_files(
 ) -> Result<Vec<ContextExpansionFile>, ContextExpansionError> {
     let prepared = PreparedRequest::new(request)?;
     verify_initial_provider_request(request, &prepared.initial_provider_request)?;
-    let prior = load_prior_chain(request, &prepared)?;
+    let prior = load_prior_chain(request, &prepared, None)?;
     let current = load_context_expansion(request, identity)?;
     let mut files = Vec::new();
     for artifact in prior.into_iter().chain(std::iter::once(current)) {
@@ -583,6 +643,7 @@ fn validate_artifact_structure(
 fn load_prior_chain(
     request: &ContextExpansionRequest,
     prepared: &PreparedRequest,
+    redactor: Option<&crate::secret_redaction::SecretRedactor>,
 ) -> Result<Vec<ContextExpansionArtifact>, ContextExpansionError> {
     let Some(mut identity) = request.previous_expansion.clone() else {
         return Ok(Vec::new());
@@ -602,6 +663,9 @@ fn load_prior_chain(
             &identity.path,
             "previous context expansion",
         )?;
+        if let Some(redactor) = redactor {
+            validate_expansion_history_bytes(&bytes, redactor)?;
+        }
         let artifact = decode_artifact(&bytes, &identity.digest)?;
         if artifact.run_id != request.run_id
             || artifact.step != request.step
@@ -675,6 +739,22 @@ fn load_prior_chain(
         total = artifact.resulting_total_context_bytes;
     }
     Ok(reversed)
+}
+
+fn validate_expansion_history_bytes(
+    bytes: &[u8],
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), ContextExpansionError> {
+    if redactor.contains_prohibited_bytes(bytes).map_err(|_| {
+        ContextExpansionError::AuditSafety(
+            "context expansion history could not be screened for credential material".to_string(),
+        )
+    })? {
+        return Err(ContextExpansionError::AuditSafety(
+            "context expansion history contains prohibited credential material".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_artifact(
@@ -758,6 +838,7 @@ fn verify_initial_provider_request(
     Ok(())
 }
 
+#[derive(Debug)]
 struct StreamedContextSource {
     source_bytes: usize,
     source_sha256: String,
@@ -768,6 +849,15 @@ fn read_context_source(
     repository_root: &Path,
     repo_path: &str,
     retain_limit: usize,
+) -> Result<StreamedContextSource, ContextExpansionError> {
+    read_context_source_with_cap(repository_root, repo_path, retain_limit, None)
+}
+
+fn read_context_source_with_cap(
+    repository_root: &Path,
+    repo_path: &str,
+    retain_limit: usize,
+    source_cap: Option<usize>,
 ) -> Result<StreamedContextSource, ContextExpansionError> {
     reject_repository_symlink_components(repository_root, repo_path)?;
     let source_path = repository_root.join(repo_path);
@@ -801,13 +891,38 @@ fn read_context_source(
         )));
     }
 
-    stream_context_source(&mut file, repo_path, retain_limit)
+    stream_context_source(&mut file, repo_path, retain_limit, source_cap)
 }
 
-fn stream_context_source(
-    file: &mut fs::File,
+fn read_context_source_with_redaction_lookahead(
+    repository_root: &Path,
     repo_path: &str,
     retain_limit: usize,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<StreamedContextSource, ContextExpansionError> {
+    let mut source = read_context_source_with_cap(
+        repository_root,
+        repo_path,
+        crate::secret_redaction::MAX_REDACTION_BYTES,
+        Some(crate::secret_redaction::MAX_REDACTION_BYTES),
+    )?;
+    if redactor
+        .contains_prohibited_bytes(&source.retained_prefix)
+        .unwrap_or(true)
+    {
+        return Err(ContextExpansionError::Safety(format!(
+            "requested context file contains prohibited credential material: {repo_path}"
+        )));
+    }
+    source.retained_prefix.truncate(retain_limit);
+    Ok(source)
+}
+
+fn stream_context_source<R: Read>(
+    file: &mut R,
+    repo_path: &str,
+    retain_limit: usize,
+    source_cap: Option<usize>,
 ) -> Result<StreamedContextSource, ContextExpansionError> {
     let mut hasher = Sha256::new();
     let mut retained_prefix = Vec::with_capacity(retain_limit.min(SOURCE_READ_BUFFER_BYTES));
@@ -823,12 +938,18 @@ fn stream_context_source(
         if read == 0 {
             break;
         }
-        let bytes = &buffer[..read];
-        source_bytes = source_bytes.checked_add(read).ok_or_else(|| {
+        let next_source_bytes = source_bytes.checked_add(read).ok_or_else(|| {
             ContextExpansionError::Safety(format!(
                 "requested context file is too large to count: {repo_path}"
             ))
         })?;
+        if source_cap.is_some_and(|cap| next_source_bytes > cap) {
+            return Err(ContextExpansionError::Safety(format!(
+                "requested context file exceeds the bounded 2097152-byte credential scan: {repo_path}"
+            )));
+        }
+        let bytes = &buffer[..read];
+        source_bytes = next_source_bytes;
         hasher.update(bytes);
         let retain = retain_limit.saturating_sub(retained_prefix.len()).min(read);
         retained_prefix.extend_from_slice(&bytes[..retain]);
@@ -1040,7 +1161,20 @@ fn valid_digest(digest: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::opened_file_matches_path_identity;
+    use std::collections::BTreeMap;
+    use std::io::{self, Read};
+
+    use seaf_core::{ArtifactReference, LoopStepName};
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        create_context_expansion, create_context_expansion_with_redactor,
+        opened_file_matches_path_identity, read_context_source_with_redaction_lookahead,
+        reconstruct_context_expansion_files_with_redactor, stream_context_source,
+        ContextExpansionRequest, SOURCE_READ_BUFFER_BYTES,
+    };
+    use crate::secret_redaction::MAX_REDACTION_BYTES;
+    use crate::{ContextLimits, ContextRequest, Role};
 
     #[test]
     fn opened_file_identity_rejects_a_replaced_current_path() {
@@ -1052,5 +1186,234 @@ mod tests {
         std::fs::write(&path, "replacement").expect("replacement");
 
         assert!(!opened_file_matches_path_identity(&opened, &path).expect("identity check"));
+    }
+
+    #[test]
+    fn context_redaction_lookahead_rejects_secret_crossing_the_retained_boundary() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("source.txt");
+        let secret = "boundary-secret-value";
+        std::fs::write(&path, format!("1234567{secret} trailing")).expect("source");
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let error = read_context_source_with_redaction_lookahead(&root, "source.txt", 8, &redactor)
+            .expect_err("secret beginning before the retained boundary must classify as unsafe");
+
+        assert!(
+            error.to_string().contains("prohibited credential material"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn context_redaction_scans_the_full_source_before_derived_evidence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("source.txt");
+        let secret = "tail-secret-value";
+        let mut bytes = vec![b'a'; 8 + 4095 + 1];
+        bytes.extend_from_slice(secret.as_bytes());
+        std::fs::write(&path, bytes).expect("source");
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let error = read_context_source_with_redaction_lookahead(&root, "source.txt", 8, &redactor)
+            .expect_err("a secret beyond the former lookahead must fail closed");
+
+        assert!(
+            error.to_string().contains("prohibited credential material"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(secret));
+    }
+
+    #[test]
+    fn context_redaction_accepts_the_exact_source_cap_and_rejects_cap_plus_one() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("source.txt");
+        let redactor = crate::secret_redaction::SecretRedactor::empty();
+        let root = temp.path().canonicalize().unwrap();
+
+        std::fs::write(&path, vec![b'a'; MAX_REDACTION_BYTES]).expect("exact-cap source");
+        let exact = read_context_source_with_redaction_lookahead(&root, "source.txt", 8, &redactor)
+            .expect("the exact full-source scan cap must remain accepted");
+        assert_eq!(exact.source_bytes, MAX_REDACTION_BYTES);
+        assert_eq!(exact.retained_prefix, b"aaaaaaaa");
+
+        std::fs::write(&path, vec![b'a'; MAX_REDACTION_BYTES + 1]).expect("cap-plus-one source");
+        let error = read_context_source_with_redaction_lookahead(&root, "source.txt", 8, &redactor)
+            .expect_err("a source above the bounded full-scan cap must fail closed");
+        assert!(error.to_string().contains("2097152"), "{error}");
+    }
+
+    #[test]
+    fn bounded_context_scan_stops_within_one_buffer_after_the_source_cap() {
+        struct FailAfterReader {
+            bytes_read: usize,
+            hard_limit: usize,
+        }
+
+        impl Read for FailAfterReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.bytes_read == self.hard_limit {
+                    return Err(io::Error::other(
+                        "reader was polled beyond the permitted cap plus one buffer",
+                    ));
+                }
+                let read = buffer
+                    .len()
+                    .min(self.hard_limit.saturating_sub(self.bytes_read));
+                buffer[..read].fill(if self.bytes_read < MAX_REDACTION_BYTES {
+                    b'a'
+                } else {
+                    0xff
+                });
+                self.bytes_read += read;
+                Ok(read)
+            }
+        }
+
+        let mut reader = FailAfterReader {
+            bytes_read: 0,
+            hard_limit: MAX_REDACTION_BYTES + SOURCE_READ_BUFFER_BYTES,
+        };
+        let error = stream_context_source(
+            &mut reader,
+            "unbounded-source.txt",
+            MAX_REDACTION_BYTES,
+            Some(MAX_REDACTION_BYTES),
+        )
+        .expect_err("the bounded scan must reject before polling past cap plus one buffer");
+
+        assert!(error.to_string().contains("2097152"), "{error}");
+        assert_eq!(
+            reader.bytes_read,
+            MAX_REDACTION_BYTES + SOURCE_READ_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn context_expansion_screens_exact_canonical_bytes_before_publication() {
+        let (_temp, request) = expansion_fixture();
+        let secret = "schema_version";
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+
+        let error = create_context_expansion_with_redactor(&request, &redactor)
+            .expect_err("canonical expansion material must fail before publication");
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!request
+            .run_directory
+            .join("artifacts/01-research.attempt-002.context-round-001.json")
+            .exists());
+    }
+
+    #[test]
+    fn redactor_aware_reconstruction_screens_exact_current_bytes_before_decode() {
+        let (_temp, request) = expansion_fixture();
+        let created = create_context_expansion(&request).expect("initial expansion");
+        let secret = "raw-expansion-history-secret";
+        let raw = format!("not-json:{secret}").into_bytes();
+        std::fs::write(request.run_directory.join(&created.identity.path), &raw)
+            .expect("corrupt persisted expansion");
+        let identity = ArtifactReference {
+            path: created.identity.path,
+            digest: hex::encode(Sha256::digest(&raw)),
+        };
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+
+        let error =
+            reconstruct_context_expansion_files_with_redactor(&request, &identity, &redactor)
+                .expect_err("raw current history must be screened before JSON decode");
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn redactor_aware_creation_screens_exact_prior_bytes_before_decode() {
+        let (_temp, first) = expansion_fixture();
+        let created = create_context_expansion(&first).expect("initial expansion");
+        let secret = "raw-prior-expansion-secret";
+        let raw = format!("not-json:{secret}").into_bytes();
+        std::fs::write(first.run_directory.join(&created.identity.path), &raw)
+            .expect("corrupt prior expansion");
+        std::fs::write(first.repository_root.join("src/b.rs"), "beta\n").expect("second source");
+        let mut second = first.clone();
+        second.context_round = 2;
+        second.context_request = ContextRequest {
+            paths: vec!["src/b.rs".to_string()],
+            reason: "need second source".to_string(),
+        };
+        second.previous_expansion = Some(ArtifactReference {
+            path: created.identity.path,
+            digest: hex::encode(Sha256::digest(&raw)),
+        });
+        let env = BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        let redactor = crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap();
+
+        let error = create_context_expansion_with_redactor(&second, &redactor)
+            .expect_err("raw prior history must be screened before JSON decode");
+
+        assert!(error.to_string().contains("credential material"), "{error}");
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.to_string().contains("JSON"), "{error}");
+    }
+
+    fn expansion_fixture() -> (tempfile::TempDir, ContextExpansionRequest) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repository_root = temp.path().join("repo");
+        let run_directory = temp.path().join("run");
+        std::fs::create_dir_all(repository_root.join("src")).expect("repository");
+        crate::artifact_safety::create_private_directory(&run_directory).expect("run directory");
+        crate::artifact_safety::create_private_directory(&run_directory.join("artifacts"))
+            .expect("artifacts directory");
+        crate::artifact_safety::create_private_directory(&run_directory.join("prompts"))
+            .expect("prompts directory");
+        std::fs::write(repository_root.join("src/a.rs"), "alpha\n").expect("source");
+        let initial_path = "prompts/01-research.attempt-002.prompt.md";
+        let initial_bytes = b"immutable provider request";
+        crate::artifact_safety::write_private_fixture(
+            run_directory.join(initial_path),
+            initial_bytes,
+        )
+        .expect("initial request");
+        (
+            temp,
+            ContextExpansionRequest {
+                repository_root,
+                run_directory,
+                run_id: "run-1".to_string(),
+                step: LoopStepName::Research,
+                role: Role::Researcher,
+                step_attempt: 2,
+                context_round: 1,
+                context_request: ContextRequest {
+                    paths: vec!["src/a.rs".to_string()],
+                    reason: "need source".to_string(),
+                },
+                initial_provider_request: ArtifactReference {
+                    path: initial_path.to_string(),
+                    digest: hex::encode(Sha256::digest(initial_bytes)),
+                },
+                previous_expansion: None,
+                candidate_authority: None,
+                initial_loaded_paths: vec!["README.md".to_string()],
+                initial_context_bytes: 10,
+                ticket_forbidden_files: Vec::new(),
+                policy_forbidden_paths: Vec::new(),
+                default_exclude_globs: Vec::new(),
+                limits: ContextLimits {
+                    max_bytes_per_file: 64,
+                    max_total_bytes: 64,
+                },
+            },
+        )
     }
 }

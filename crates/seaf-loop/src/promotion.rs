@@ -91,6 +91,14 @@ where
     F: FnOnce() -> Result<(), PromotionError>,
 {
     let expected = state::load_run(workspace).map_err(PromotionError::wrapped)?;
+    let operator_guard =
+        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &expected)
+            .map_err(PromotionError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&expected))
+        .and_then(|()| operator_guard.validate_structural(reviewer))
+        .map_err(PromotionError::invalid)?;
     if expected.status == LoopStatus::Promoted {
         return validate_exact_retry(
             workspace,
@@ -117,14 +125,14 @@ where
         confirmed_target_head,
     )?;
 
-    let existing_intent = load_optional_intent(workspace)?;
+    let existing_intent = load_optional_intent(workspace, &operator_guard)?;
     if existing_intent.is_none() {
         require_clean_target(workspace, source_worktree_root, &bindings.target_head)?;
     }
-    let intent = match existing_intent {
+    let (intent, publish_intent) = match existing_intent {
         Some(intent) => {
             validate_intent(&intent, reviewer, &bindings)?;
-            intent
+            (intent, false)
         }
         None => {
             let intent = PromotionIntent {
@@ -139,16 +147,53 @@ where
                 target_head: bindings.target_head.clone(),
                 eval_passed_run_digest: bindings.eval_passed_run_digest.clone(),
             };
-            let bytes = canonical_json_bytes(&intent).map_err(PromotionError::wrapped)?;
-            publish_create_only(workspace.run_directory(), PROMOTION_INTENT_PATH, &bytes)
-                .map_err(PromotionError::wrapped)?;
-            intent
+            (intent, true)
         }
     };
+    let intent_bytes = operator_guard
+        .validate_canonical_artifact(&intent)
+        .map_err(PromotionError::invalid)?;
     let intent_reference = ArtifactReference {
         path: PROMOTION_INTENT_PATH.to_string(),
-        digest: canonical_sha256_digest(&intent).map_err(PromotionError::wrapped)?,
+        digest: digest_bytes(&intent_bytes),
     };
+    let evidence = PromotionEvidence {
+        schema_version: PROMOTION_SCHEMA_VERSION,
+        run_id: expected.run_id.clone(),
+        reviewer: reviewer.to_string(),
+        promoted_at: intent.started_at.clone(),
+        intent: intent_reference.clone(),
+        candidate_diff: bindings.candidate_diff.clone(),
+        testing_evidence: bindings.testing_evidence.clone(),
+        eval_report: bindings.eval_report.clone(),
+        policy_decision_digest: bindings.policy_decision_digest.clone(),
+        target_head: bindings.target_head.clone(),
+        eval_passed_run_digest: bindings.eval_passed_run_digest.clone(),
+        eval_passed_updated_at: expected.updated_at.clone(),
+    };
+    let mut intended = expected.clone();
+    intended.status = LoopStatus::Promoted;
+    intended.updated_at = evidence.promoted_at.clone();
+    intended.promotion = Some(evidence.clone());
+    operator_guard
+        .validate_future_run(&intended)
+        .map_err(PromotionError::invalid)?;
+    if publish_intent {
+        let current_guard =
+            crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &expected)
+                .map_err(PromotionError::invalid)?;
+        current_guard
+            .validate_current_run_file(workspace)
+            .and_then(|()| current_guard.validate_canonical_artifact(&intent).map(drop))
+            .and_then(|()| current_guard.validate_future_run(&intended).map(drop))
+            .map_err(PromotionError::invalid)?;
+        publish_create_only(
+            workspace.run_directory(),
+            PROMOTION_INTENT_PATH,
+            &intent_bytes,
+        )
+        .map_err(PromotionError::wrapped)?;
+    }
 
     let candidate = expected.candidate_workspace.as_ref().ok_or_else(|| {
         PromotionError::invalid("EvalPassed authority has no candidate workspace")
@@ -164,6 +209,24 @@ where
         }
         let reverified =
             authenticate_promotion_authority(workspace, source_worktree_root, &current)?;
+        let current_operator_guard =
+            crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &current)
+                .map_err(PromotionError::invalid)?;
+        current_operator_guard
+            .validate_current_run_file(workspace)
+            .and_then(|()| current_operator_guard.validate_run(&current))
+            .and_then(|()| current_operator_guard.validate_structural(reviewer))
+            .and_then(|()| {
+                current_operator_guard
+                    .validate_canonical_artifact(&intent)
+                    .map(drop)
+            })
+            .and_then(|()| {
+                current_operator_guard
+                    .validate_future_run(&intended)
+                    .map(drop)
+            })
+            .map_err(PromotionError::invalid)?;
         let current_bindings = promotion_bindings(&current, &reverified)?;
         if current_bindings != bindings {
             return Err(PromotionError::invalid(
@@ -171,7 +234,12 @@ where
             ));
         }
         validate_intent(&intent, reviewer, &current_bindings)?;
-        load_exact_intent(workspace, &intent, &intent_reference)?;
+        load_exact_intent(
+            workspace,
+            &intent,
+            &intent_reference,
+            &current_operator_guard,
+        )?;
 
         match classify_target(
             workspace,
@@ -224,24 +292,6 @@ where
             &reverified,
         )?;
 
-        let evidence = PromotionEvidence {
-            schema_version: PROMOTION_SCHEMA_VERSION,
-            run_id: current.run_id.clone(),
-            reviewer: reviewer.to_string(),
-            promoted_at: intent.started_at.clone(),
-            intent: intent_reference.clone(),
-            candidate_diff: current_bindings.candidate_diff.clone(),
-            testing_evidence: current_bindings.testing_evidence.clone(),
-            eval_report: current_bindings.eval_report.clone(),
-            policy_decision_digest: current_bindings.policy_decision_digest.clone(),
-            target_head: current_bindings.target_head.clone(),
-            eval_passed_run_digest: current_bindings.eval_passed_run_digest.clone(),
-            eval_passed_updated_at: current.updated_at.clone(),
-        };
-        let mut intended = current.clone();
-        intended.status = LoopStatus::Promoted;
-        intended.updated_at = evidence.promoted_at.clone();
-        intended.promotion = Some(evidence.clone());
         crate::provider_exchange::persist_run_with_full_compare_and_validator(
             workspace,
             &current,
@@ -252,10 +302,23 @@ where
                         "EvalPassed authority changed before Promoted publication".to_string(),
                     ));
                 }
-                let latest =
-                    load_exact_intent(workspace, &intent, &intent_reference).map_err(|error| {
-                        crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
-                    })?;
+                let latest = {
+                    let operator_guard =
+                        crate::operator_evidence::OperatorEvidenceGuard::load(workspace, locked)
+                            .map_err(crate::provider_exchange::ProviderExchangeError::Invalid)?;
+                    operator_guard
+                        .validate_current_run_file(workspace)
+                        .and_then(|()| operator_guard.validate_run(locked))
+                        .and_then(|()| operator_guard.validate_structural(reviewer))
+                        .and_then(|()| operator_guard.validate_future_run(&intended).map(drop))
+                        .map_err(crate::provider_exchange::ProviderExchangeError::Invalid)?;
+                    load_exact_intent(workspace, &intent, &intent_reference, &operator_guard)
+                        .map_err(|error| {
+                            crate::provider_exchange::ProviderExchangeError::Invalid(
+                                error.to_string(),
+                            )
+                        })?
+                };
                 validate_intent(&latest, reviewer, &current_bindings).map_err(|error| {
                     crate::provider_exchange::ProviderExchangeError::Invalid(error.to_string())
                 })?;
@@ -281,8 +344,8 @@ where
         )
         .map_err(PromotionError::wrapped)?;
         Ok(PromotionOutcome {
-            run: intended,
-            evidence,
+            run: intended.clone(),
+            evidence: evidence.clone(),
         })
     })();
     let unlock = repository_lock.unlock();
@@ -412,7 +475,7 @@ fn verify_final_supporting_artifacts(
     )
     .map_err(PromotionError::wrapped)?;
     if digest_bytes(&intent_bytes) != intent_reference.digest
-        || authority.execution_intent().planned_checks().is_empty()
+        || authority.execution_intent().planned_check_count() == 0
     {
         return Err(PromotionError::invalid(
             "Testing execution intent does not match final evaluation authority",
@@ -472,6 +535,14 @@ fn validate_exact_retry(
     eval_report: &str,
     target_head: &str,
 ) -> Result<PromotionOutcome, PromotionError> {
+    let operator_guard = crate::operator_evidence::OperatorEvidenceGuard::load(workspace, &run)
+        .map_err(PromotionError::invalid)?;
+    operator_guard
+        .validate_current_run_file(workspace)
+        .and_then(|()| operator_guard.validate_run(&run))
+        .and_then(|()| operator_guard.validate_structural(reviewer))
+        .and_then(|()| operator_guard.validate_future_run(&run).map(drop))
+        .map_err(PromotionError::invalid)?;
     let evidence = run
         .promotion
         .clone()
@@ -485,7 +556,7 @@ fn validate_exact_retry(
             "promotion retry must exactly match the original fresh confirmation",
         ));
     }
-    let intent = load_optional_intent(workspace)?
+    let intent = load_optional_intent(workspace, &operator_guard)?
         .ok_or_else(|| PromotionError::invalid("Promoted authority lost promotion intent"))?;
     if evidence.intent.path != PROMOTION_INTENT_PATH
         || canonical_sha256_digest(&intent).map_err(PromotionError::wrapped)?
@@ -546,13 +617,14 @@ fn load_exact_intent(
     workspace: &LoopWorkspace,
     expected: &PromotionIntent,
     reference: &ArtifactReference,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<PromotionIntent, PromotionError> {
     if reference.path != PROMOTION_INTENT_PATH {
         return Err(PromotionError::invalid(
             "promotion intent reference path is not canonical",
         ));
     }
-    let loaded = load_optional_intent(workspace)?
+    let loaded = load_optional_intent(workspace, operator_guard)?
         .ok_or_else(|| PromotionError::invalid("promotion intent disappeared"))?;
     if &loaded != expected
         || canonical_sha256_digest(&loaded).map_err(PromotionError::wrapped)? != reference.digest
@@ -571,6 +643,7 @@ fn canonical_unix_seconds(value: &str) -> Option<u64> {
 
 fn load_optional_intent(
     workspace: &LoopWorkspace,
+    operator_guard: &crate::operator_evidence::OperatorEvidenceGuard,
 ) -> Result<Option<PromotionIntent>, PromotionError> {
     let path = workspace.run_directory().join(PROMOTION_INTENT_PATH);
     match fs::symlink_metadata(&path) {
@@ -586,6 +659,9 @@ fn load_optional_intent(
                 "promotion intent",
             )
             .map_err(PromotionError::wrapped)?;
+            operator_guard
+                .validate_exact_raw_bytes(&bytes)
+                .map_err(PromotionError::invalid)?;
             let intent: PromotionIntent =
                 serde_json::from_slice(&bytes).map_err(PromotionError::wrapped)?;
             if canonical_json_bytes(&intent).map_err(PromotionError::wrapped)? != bytes {
@@ -593,6 +669,9 @@ fn load_optional_intent(
                     "promotion intent is not canonical JSON",
                 ));
             }
+            operator_guard
+                .validate_structural(&intent.reviewer)
+                .map_err(PromotionError::invalid)?;
             Ok(Some(intent))
         }
     }

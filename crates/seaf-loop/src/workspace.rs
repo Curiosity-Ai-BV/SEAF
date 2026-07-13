@@ -16,6 +16,7 @@ pub const RESPONSES_DIR: &str = "responses";
 pub const ARTIFACTS_DIR: &str = "artifacts";
 pub const LOG_FILE: &str = "log.md";
 pub(crate) const CANDIDATE_LOCK_FILE: &str = ".candidate-workspace.lock";
+pub(crate) const LOG_HEADER: &[u8] = b"# Loop run log\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopWorkspace {
@@ -110,8 +111,26 @@ impl LoopWorkspace {
         self.run_directory.join(RUN_FILE)
     }
 
-    pub(crate) fn scaffold_runtime(&self) -> Result<(), WorkspaceError> {
-        self.ensure_layout()
+    pub(crate) fn scaffold_runtime_with_validator<F>(
+        &self,
+        validator: F,
+    ) -> Result<(), WorkspaceError>
+    where
+        F: FnOnce(&[(&'static str, Vec<u8>)]) -> Result<(), String>,
+    {
+        self.ensure_layout_with_hooks(
+            |payloads| {
+                validator(payloads).map_err(|message| {
+                    WorkspaceError::UnsafeExistingLayout(self.run_directory.clone(), message)
+                })
+            },
+            || Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    fn scaffold_runtime(&self) -> Result<(), WorkspaceError> {
+        self.scaffold_runtime_with_validator(|_| Ok(()))
     }
 
     pub fn append_log(&self, line: &str) -> Result<(), WorkspaceError> {
@@ -136,7 +155,7 @@ impl LoopWorkspace {
     }
 
     fn ensure_layout(&self) -> Result<(), WorkspaceError> {
-        self.ensure_layout_with_hooks(|| Ok(()), || Ok(()))
+        self.ensure_layout_with_hooks(|_| Ok(()), || Ok(()))
     }
 
     #[cfg(test)]
@@ -144,7 +163,7 @@ impl LoopWorkspace {
     where
         F: FnOnce() -> Result<(), WorkspaceError>,
     {
-        self.ensure_layout_with_hooks(after_inspection, || Ok(()))
+        self.ensure_layout_with_hooks(|_| after_inspection(), || Ok(()))
     }
 
     fn ensure_layout_with_hooks<AfterInspection, AfterDirectories>(
@@ -153,19 +172,15 @@ impl LoopWorkspace {
         after_directories: AfterDirectories,
     ) -> Result<(), WorkspaceError>
     where
-        AfterInspection: FnOnce() -> Result<(), WorkspaceError>,
+        AfterInspection: FnOnce(&[(&'static str, Vec<u8>)]) -> Result<(), WorkspaceError>,
         AfterDirectories: FnOnce() -> Result<(), WorkspaceError>,
     {
         let guard = RunMutationGuard::acquire(&self.run_directory).map_err(io::Error::other)?;
         let directory = artifact_safety::PinnedPrivateDirectory::open(&self.run_directory)?;
-        let manifest = empty_context_manifest_bytes()?;
-        let files = [
-            (CONTEXT_MANIFEST_PLACEHOLDER_FILE, manifest.as_slice()),
-            (LOG_FILE, b"# Loop run log\n".as_slice()),
-            (CANDIDATE_LOCK_FILE, b"".as_slice()),
-        ];
+        let files = runtime_scaffold_default_payloads()?;
         let mut existing_files = Vec::new();
         let mut missing_files = Vec::new();
+        let mut prospective_payloads = Vec::new();
         for directory_name in [PROMPTS_DIR, RESPONSES_DIR, ARTIFACTS_DIR] {
             match directory.open_child_directory(OsStr::new(directory_name)) {
                 Ok(_) => {}
@@ -184,13 +199,14 @@ impl LoopWorkspace {
                 Ok(mut file) if name == LOG_FILE => {
                     let identity = file.metadata()?;
                     let bytes = read_bounded_run_artifact(&mut file, name)?;
-                    if !bytes.starts_with(b"# Loop run log\n") {
+                    if !bytes.starts_with(LOG_HEADER) {
                         return Err(WorkspaceError::UnsafeExistingLayout(
                             path,
                             "runtime log does not begin with the canonical header".to_string(),
                         ));
                     }
                     directory.validate_file(OsStr::new(name), &identity)?;
+                    prospective_payloads.push((name, bytes));
                     existing_files.push((name, file, identity));
                 }
                 Ok(mut file) if name == CANDIDATE_LOCK_FILE => {
@@ -203,6 +219,7 @@ impl LoopWorkspace {
                         ));
                     }
                     directory.validate_file(OsStr::new(name), &identity)?;
+                    prospective_payloads.push((name, bytes));
                     existing_files.push((name, file, identity));
                 }
                 Ok(mut file) => {
@@ -222,9 +239,11 @@ impl LoopWorkspace {
                         ));
                     }
                     directory.validate_file(OsStr::new(name), &identity)?;
+                    prospective_payloads.push((name, bytes));
                     existing_files.push((name, file, identity));
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    prospective_payloads.push((name, expected.clone()));
                     missing_files.push((name, expected));
                 }
                 Err(error) => {
@@ -235,7 +254,7 @@ impl LoopWorkspace {
                 }
             }
         }
-        after_inspection()?;
+        after_inspection(&prospective_payloads)?;
         directory.validate_identity()?;
         for (name, _file, identity) in &existing_files {
             directory.validate_file(OsStr::new(name), identity)?;
@@ -262,7 +281,7 @@ impl LoopWorkspace {
             child.validate_identity()?;
         }
         for (name, expected) in missing_files {
-            crate::immutable_artifact::publish_create_only_with_guard(&guard, name, expected)
+            crate::immutable_artifact::publish_create_only_with_guard(&guard, name, &expected)
                 .map_err(|error| {
                     WorkspaceError::UnsafeExistingLayout(
                         self.run_directory.join(name),
@@ -389,6 +408,18 @@ fn empty_context_manifest_bytes() -> Result<Vec<u8>, WorkspaceError> {
     let mut json = serde_json::to_vec_pretty(&manifest)?;
     json.push(b'\n');
     Ok(json)
+}
+
+pub(crate) fn runtime_scaffold_default_payloads(
+) -> Result<Vec<(&'static str, Vec<u8>)>, WorkspaceError> {
+    Ok(vec![
+        (
+            CONTEXT_MANIFEST_PLACEHOLDER_FILE,
+            empty_context_manifest_bytes()?,
+        ),
+        (LOG_FILE, LOG_HEADER.to_vec()),
+        (CANDIDATE_LOCK_FILE, Vec::new()),
+    ])
 }
 
 fn read_bounded_run_artifact(file: &mut fs::File, relative_path: &str) -> io::Result<Vec<u8>> {
@@ -906,7 +937,7 @@ mod tests {
 
             let error = workspace
                 .ensure_layout_with_hooks(
-                    || Ok(()),
+                    |_| Ok(()),
                     || {
                         fs::rename(&prompts, &parked)?;
                         symlink(&outside, &prompts)?;

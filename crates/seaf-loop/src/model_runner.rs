@@ -13,7 +13,8 @@ use crate::provider_exchange::authorize_provider_exchange_rerun;
 use crate::provider_exchange::{
     classify_provider_exchange_response, load_provider_exchange_record,
     load_provider_exchange_request, load_provider_exchange_response_audit,
-    persist_provider_exchange_record_reference, preflight_provider_exchange_reconciliation,
+    persist_provider_exchange_record_reference_with_validator,
+    preflight_provider_exchange_reconciliation,
     publish_provider_exchange_request_tail_with_validator,
     reconcile_provider_exchange_state_with_validator,
     stage_provider_exchange_response_record_consuming_commitment,
@@ -24,19 +25,20 @@ use crate::provider_exchange::{
 };
 #[cfg(test)]
 use crate::provider_exchange::{
-    persist_provider_exchange_record_reference_with_validator, stage_provider_exchange_record,
+    persist_provider_exchange_record_reference, stage_provider_exchange_record,
     write_provider_exchange_request,
 };
 use crate::role_response::{parse_role_response, repair_prompt, RoleResponseError};
 use crate::{
     artifacts::{latest_step_attempt, next_step_attempt},
     context::{
-        pack_live_context, CandidateContextAuthority, CandidateContextAuthorityKind, ContextBundle,
-        ContextFile, ContextLimits, ContextPackRequest,
+        load_context_manifest_with_redactor, pack_live_context_with_redactor,
+        CandidateContextAuthority, CandidateContextAuthorityKind, ContextBundle, ContextFile,
+        ContextLimits, ContextPackRequest,
     },
     context_expansion::{
-        create_context_expansion, reconstruct_context_expansion_files, ContextExpansionError,
-        ContextExpansionRequest,
+        create_context_expansion_with_redactor, reconstruct_context_expansion_files_with_redactor,
+        ContextExpansionError, ContextExpansionRequest,
     },
     parse_role_response_with_repair,
     policy_gate::{
@@ -135,6 +137,7 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
+    secret_redactor: crate::secret_redaction::SecretRedactor,
     #[cfg(test)]
     legacy_unit_test_harness: bool,
     #[cfg(test)]
@@ -215,6 +218,7 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             exchange_workspace: None,
             step_attempt: None,
             durable_provider_exchange_records: None,
+            secret_redactor: crate::secret_redaction::SecretRedactor::empty(),
             #[cfg(test)]
             legacy_unit_test_harness: false,
             #[cfg(test)]
@@ -289,6 +293,14 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             temperature: 0.0,
             timeout_ms: self.timeout_ms,
         }
+    }
+
+    fn sanitize_model_request(&self, request: ModelRequest) -> Result<ModelRequest, RunnerError> {
+        sanitize_typed_model_request(request, &self.secret_redactor)
+    }
+
+    fn validate_model_request_is_safe(&self, request: &ModelRequest) -> Result<(), RunnerError> {
+        validate_recovered_model_request(request, &self.secret_redactor)
     }
 
     fn gate_developer_patch(
@@ -375,11 +387,13 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             )
         })?;
         validate_prepared_ticket(ticket, run)?;
+        self.secret_redactor = load_provider_secret_redactor(workspace, run)?;
+        let prospective = preflight_provider_exchange_reconciliation(workspace, run)
+            .map_err(exchange_recovery_error)?;
+        self.validate_provider_history_is_safe(workspace, &prospective)?;
         let mut expected_output_review = None;
         if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
             self.validate_isolated_candidate_authority(workspace, run)?;
-            let prospective = preflight_provider_exchange_reconciliation(workspace, run)
-                .map_err(exchange_recovery_error)?;
             if !prospective.provider_exchange_records.is_empty() {
                 validate_all_audited_initial_candidate_authorities(workspace, &prospective)?;
                 let request = self.context_pack_request.as_ref().ok_or_else(|| {
@@ -415,6 +429,8 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         }
         let reconciled = if workspace.run_file().exists() {
             reconcile_provider_exchange_state_with_validator(workspace, run, |prospective| {
+                self.validate_provider_history_is_safe(workspace, prospective)
+                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))?;
                 if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
                     return Ok(());
                 }
@@ -595,12 +611,14 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         let user_prompt = self
             .structured_role_prompt(step, role)?
             .unwrap_or_else(|| role_step_prompt(step, role, self.context_bundle.as_ref()));
-        let request = self.model_request(role, user_prompt);
-        serde_json::to_string_pretty(&request).map_err(|error| {
+        let request = self.sanitize_model_request(self.model_request(role, user_prompt))?;
+        let serialized = serde_json::to_string_pretty(&request).map_err(|error| {
             RunnerError::Step(format!(
                 "failed to serialize {step:?} model request: {error}"
             ))
-        })
+        })?;
+        validate_provider_request_bytes_are_safe(serialized.as_bytes(), &self.secret_redactor)?;
+        Ok(serialized)
     }
 
     fn run_step(&mut self, step: LoopStepName, request: &str) -> Result<StepOutput, RunnerError> {
@@ -617,12 +635,19 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             return self.run_audited_provider_step(step, role, request);
         }
 
+        validate_provider_request_bytes_are_safe(request.as_bytes(), &self.secret_redactor)?;
         let model_request: ModelRequest = serde_json::from_str(request).map_err(|error| {
             RunnerError::Step(format!(
                 "failed to parse {step:?} model request audit: {error}"
             ))
         })?;
-        let initial_response = match self.provider.complete(model_request) {
+        self.validate_model_request_is_safe(&model_request)?;
+        let initial_response = match bounded_provider_result_audit_with_redactor(
+            self.provider.complete(model_request),
+            &self.secret_redactor,
+        )?
+        .0
+        {
             Ok(response) => response,
             Err(error) => {
                 self.last_error_response = Some(provider_error_transcript(step, &error));
@@ -637,9 +662,32 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         let mut repair_error = None;
         let parsed =
             parse_role_response_with_repair(role, &initial_response.content, |repair_prompt| {
-                let repair_request = self.model_request(role, repair_prompt.to_string());
+                let repair_request = match self
+                    .sanitize_model_request(self.model_request(role, repair_prompt.to_string()))
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        repair_error = Some(seaf_models::ModelError::provider(
+                            error.to_string(),
+                            false,
+                            serde_json::json!({"code": "provider_request_contains_secret"}),
+                        ));
+                        return String::new();
+                    }
+                };
                 repair_request_audit = serde_json::to_string_pretty(&repair_request).ok();
-                match self.provider.complete(repair_request) {
+                match bounded_provider_result_audit_with_redactor(
+                    self.provider.complete(repair_request),
+                    &self.secret_redactor,
+                )
+                .map(|result| result.0)
+                .unwrap_or_else(|error| {
+                    Err(seaf_models::ModelError::provider(
+                        error.to_string(),
+                        false,
+                        serde_json::json!({"code": "provider_response_scan_failed"}),
+                    ))
+                }) {
                     Ok(response) => {
                         repair_response_content = Some(response.content.clone());
                         response.content
@@ -701,6 +749,18 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         &mut self,
     ) -> Option<Vec<seaf_core::ProviderExchangeRecordReference>> {
         self.durable_provider_exchange_records.take()
+    }
+
+    fn validate_prospective_run(&self, run: &LoopRun) -> Result<(), RunnerError> {
+        let bytes = crate::state::run_file_bytes(run)
+            .map_err(|_| RunnerError::Step("provider run evidence is invalid".to_string()))?;
+        validate_provider_evidence_bytes_are_safe(&bytes, &self.secret_redactor)
+    }
+
+    fn validate_log_append(&self, line: &str) -> Result<(), RunnerError> {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        validate_provider_evidence_bytes_are_safe(&bytes, &self.secret_redactor)
     }
 }
 
@@ -798,18 +858,92 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         Ok(())
     }
 
+    fn validate_provider_history_is_safe(
+        &self,
+        workspace: &LoopWorkspace,
+        run: &LoopRun,
+    ) -> Result<(), RunnerError> {
+        load_context_manifest_with_redactor(workspace.run_directory(), &self.secret_redactor)
+            .map_err(|error| {
+                RunnerError::Step(format!(
+                    "failed to reauthenticate provider context manifest: {error}"
+                ))
+            })?;
+        let run_bytes = crate::state::run_file_bytes(run).map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to serialize provider run evidence: {error}"
+            ))
+        })?;
+        validate_provider_evidence_bytes_are_safe(&run_bytes, &self.secret_redactor)?;
+        for reference in &run.provider_exchange_records {
+            let record_bytes = crate::immutable_artifact::read_verified_regular_file(
+                workspace.run_directory(),
+                &reference.path,
+                "provider exchange record",
+            )
+            .map_err(|error| RunnerError::Step(error.to_string()))?;
+            validate_provider_evidence_bytes_are_safe(&record_bytes, &self.secret_redactor)?;
+            let record = load_provider_exchange_record(workspace.run_directory(), reference)
+                .map_err(exchange_recovery_error)?;
+            let request_bytes =
+                load_provider_exchange_request(workspace.run_directory(), &record.request)
+                    .map_err(exchange_recovery_error)?;
+            validate_recovered_model_request_bytes(&request_bytes, &self.secret_redactor)?;
+            let request: ModelRequest =
+                serde_json::from_slice(&request_bytes).map_err(|error| {
+                    RunnerError::Step(format!(
+                        "failed to parse recovered provider request audit: {error}"
+                    ))
+                })?;
+            self.validate_model_request_is_safe(&request)?;
+            if let Some(response) = &record.response {
+                let audit =
+                    load_provider_exchange_response_audit(workspace.run_directory(), response)
+                        .map_err(exchange_recovery_error)?;
+                if provider_audit_contains_prohibited_material(&audit, &self.secret_redactor)? {
+                    return Err(RunnerError::Step(
+                        "recovered provider response contains prohibited credential material"
+                            .to_string(),
+                    ));
+                }
+            }
+            if let Some(expansion) = &record.expansion {
+                let bytes = crate::immutable_artifact::read_verified_regular_file(
+                    workspace.run_directory(),
+                    &expansion.path,
+                    "provider context expansion",
+                )
+                .map_err(|error| RunnerError::Step(error.to_string()))?;
+                if format!("{:x}", Sha256::digest(&bytes)) != expansion.digest
+                    || self
+                        .secret_redactor
+                        .contains_prohibited_bytes(&bytes)
+                        .map_err(|error| RunnerError::Step(error.to_string()))?
+                {
+                    return Err(RunnerError::Step(
+                        "recovered context expansion contains prohibited credential material"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_audited_provider_step(
         &mut self,
         step: LoopStepName,
         role: Role,
         request: &str,
     ) -> Result<StepOutput, RunnerError> {
+        validate_provider_request_bytes_are_safe(request.as_bytes(), &self.secret_redactor)?;
         let fallback_initial_request: ModelRequest =
             serde_json::from_str(request).map_err(|error| {
                 RunnerError::Step(format!(
                     "failed to parse {step:?} model request audit: {error}"
                 ))
             })?;
+        self.validate_model_request_is_safe(&fallback_initial_request)?;
         let attempt = self.step_attempt.ok_or_else(|| {
             RunnerError::Step("audited provider execution is missing its step attempt".to_string())
         })?;
@@ -856,6 +990,17 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     &initial_record.request,
                 )
                 .map_err(exchange_recovery_error)?;
+                validate_recovered_model_request_bytes(
+                    &initial_request_bytes,
+                    &self.secret_redactor,
+                )?;
+                let recovered_initial_request: ModelRequest =
+                    serde_json::from_slice(&initial_request_bytes).map_err(|error| {
+                        RunnerError::Step(format!(
+                            "failed to parse recovered initial provider request audit: {error}"
+                        ))
+                    })?;
+                self.validate_model_request_is_safe(&recovered_initial_request)?;
                 initial_request_reference = Some(initial_record.request.clone());
                 for reference in group
                     .iter()
@@ -873,6 +1018,12 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                         })?,
                     )
                     .map_err(exchange_recovery_error)?;
+                    if provider_audit_contains_prohibited_material(&audit, &self.secret_redactor)? {
+                        return Err(RunnerError::Step(
+                            "recovered provider response contains prohibited credential material"
+                                .to_string(),
+                        ));
+                    }
                     if let ProviderExchangeResponseAudit::ModelResponse { response } = audit {
                         transcript.push(response.content);
                     }
@@ -887,11 +1038,13 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 let request_bytes =
                     load_provider_exchange_request(workspace.run_directory(), &last.request)
                         .map_err(exchange_recovery_error)?;
+                validate_recovered_model_request_bytes(&request_bytes, &self.secret_redactor)?;
                 model_request = serde_json::from_slice(&request_bytes).map_err(|error| {
                     RunnerError::Step(format!(
                         "failed to parse recovered provider request audit: {error}"
                     ))
                 })?;
+                self.validate_model_request_is_safe(&model_request)?;
                 match last.phase {
                     ProviderExchangePhase::Request => durable_request = Some(last.request),
                     ProviderExchangePhase::Response => {
@@ -905,6 +1058,15 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                             response_reference,
                         )
                         .map_err(exchange_recovery_error)?;
+                        if provider_audit_contains_prohibited_material(
+                            &audit,
+                            &self.secret_redactor,
+                        )? {
+                            return Err(RunnerError::Step(
+                                "recovered provider response contains prohibited credential material"
+                                    .to_string(),
+                            ));
+                        }
                         let classification =
                             classify_provider_exchange_response(provider_role_for(role), &audit);
                         durable_response = Some((last.request, audit, classification));
@@ -967,8 +1129,20 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     observer(workspace, run, &coordinates, &request_reference);
                 }
                 self.reauthenticate_provider_call_commitment(&coordinates, &request_reference)?;
-                let (provider_result, audit) =
-                    bounded_provider_result_audit(self.provider.complete(model_request.clone()))?;
+                let provider_call_bytes =
+                    serde_json::to_vec_pretty(&model_request).map_err(|error| {
+                        RunnerError::Step(format!(
+                            "failed to serialize provider request before call: {error}"
+                        ))
+                    })?;
+                validate_provider_request_bytes_are_safe(
+                    &provider_call_bytes,
+                    &self.secret_redactor,
+                )?;
+                let (provider_result, audit) = bounded_provider_result_audit_with_redactor(
+                    self.provider.complete(model_request.clone()),
+                    &self.secret_redactor,
+                )?;
                 let classification = self.append_exchange_response(
                     &coordinates,
                     request_reference,
@@ -1033,7 +1207,10 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                                 return self.terminal_context_denial(step, context_request, reason)
                             }
                         };
-                        let created = match create_context_expansion(&expansion_request) {
+                        let created = match create_context_expansion_with_redactor(
+                            &expansion_request,
+                            &self.secret_redactor,
+                        ) {
                             Ok(created) => created,
                             Err(
                                 ContextExpansionError::Safety(reason)
@@ -1087,6 +1264,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                                 )
                             }
                         };
+                        model_request = self.sanitize_model_request(model_request)?;
                         expansion = Some(created.identity);
                         context_round = Some(next_round);
                         kind = ProviderExchangeKind::ContextRetry;
@@ -1116,6 +1294,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                         role: ModelMessageRole::User,
                         content: repair_prompt(role, &response.content, &error),
                     });
+                    model_request = self.sanitize_model_request(model_request)?;
                     kind = ProviderExchangeKind::JsonRepair;
                     exchange_index += 1;
                 }
@@ -1161,6 +1340,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         bytes: &[u8],
         expansion: Option<ArtifactReference>,
     ) -> Result<ArtifactReference, RunnerError> {
+        validate_provider_request_bytes_are_safe(bytes, &self.secret_redactor)?;
         if coordinates.step == LoopStepName::OutputReview
             && coordinates.role == ProviderRole::OutputReviewer
             && coordinates.kind == ProviderExchangeKind::Initial
@@ -1205,7 +1385,12 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             coordinates,
             bytes,
             expansion,
-            |_prospective| {
+            |_prospective, record_bytes, run_bytes| {
+                validate_provider_evidence_bytes_are_safe(record_bytes, &self.secret_redactor)
+                    .and_then(|()| {
+                        validate_provider_evidence_bytes_are_safe(run_bytes, &self.secret_redactor)
+                    })
+                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))?;
                 if let Some(expected) = expected_output_review.as_ref() {
                     validate_all_output_review_initial_subjects(
                         &workspace,
@@ -1265,10 +1450,28 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             stage_provider_exchange_response_record_consuming_commitment(
                 workspace.run_directory(),
                 record,
+                |record_bytes, run_bytes| {
+                    validate_provider_evidence_bytes_are_safe(record_bytes, &self.secret_redactor)
+                        .and_then(|()| {
+                            validate_provider_evidence_bytes_are_safe(
+                                run_bytes,
+                                &self.secret_redactor,
+                            )
+                        })
+                        .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))
+                },
             )
             .map_err(exchange_write_error)?;
-        let run = persist_provider_exchange_record_reference(&workspace, reference)
-            .map_err(exchange_write_error)?;
+        let run = persist_provider_exchange_record_reference_with_validator(
+            &workspace,
+            reference,
+            |prospective| {
+                let run_bytes = crate::state::run_file_bytes(prospective)?;
+                validate_provider_evidence_bytes_are_safe(&run_bytes, &self.secret_redactor)
+                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))
+            },
+        )
+        .map_err(exchange_write_error)?;
         self.run = Some(run.clone());
         self.durable_provider_exchange_records = Some(run.provider_exchange_records.clone());
         #[cfg(test)]
@@ -1327,6 +1530,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     .to_string(),
             ));
         }
+        self.validate_provider_history_is_safe(workspace, &current)?;
         guard
             .validate_active_provider_commitment()
             .map_err(exchange_write_error)?;
@@ -1416,8 +1620,12 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             serde_json::from_slice(&initial_bytes).map_err(|error| {
                 format!("failed to parse verified initial provider request audit: {error}")
             })?;
-        let files = reconstruct_context_expansion_files(expansion_request, identity)
-            .map_err(|error| format!("failed to verify context expansion chain: {error}"))?;
+        let files = reconstruct_context_expansion_files_with_redactor(
+            expansion_request,
+            identity,
+            &self.secret_redactor,
+        )
+        .map_err(|error| format!("failed to verify context expansion chain: {error}"))?;
         request.messages.push(ModelMessage {
             role: ModelMessageRole::User,
             content: serde_json::to_string(&serde_json::json!({
@@ -1443,7 +1651,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "context_request": request,
             "reason": reason,
         });
-        Ok(StepOutput {
+        let output = StepOutput {
             response: serde_json::to_string(&evidence)
                 .map_err(|error| RunnerError::Step(error.to_string()))?,
             artifact: Some(crate::ArtifactContent::new(
@@ -1452,7 +1660,9 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     .map_err(|error| RunnerError::Step(error.to_string()))?,
             )),
             status: LoopStepStatus::Blocked,
-        })
+        };
+        self.validate_step_output_evidence(&output)?;
+        Ok(output)
     }
 
     fn terminal_exchange_failure(
@@ -1468,7 +1678,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "step": step,
             "reason": reason,
         });
-        Ok(StepOutput {
+        let output = StepOutput {
             response: self
                 .last_error_response
                 .clone()
@@ -1479,7 +1689,9 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                     .map_err(|error| RunnerError::Step(error.to_string()))?,
             )),
             status: LoopStepStatus::Failed,
-        })
+        };
+        self.validate_step_output_evidence(&output)?;
+        Ok(output)
     }
 
     fn finish_parsed_response(
@@ -1579,12 +1791,236 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             None
         };
 
-        Ok(StepOutput {
+        let output = StepOutput {
             response,
             artifact,
             status: gated_patch.map_or(status, |gated| gated.status),
-        })
+        };
+        self.validate_step_output_evidence(&output)?;
+        Ok(output)
     }
+
+    fn validate_step_output_evidence(&self, output: &StepOutput) -> Result<(), RunnerError> {
+        validate_provider_evidence_bytes_are_safe(
+            output.response.as_bytes(),
+            &self.secret_redactor,
+        )?;
+        if let Some(artifact) = output.artifact.as_ref() {
+            validate_provider_evidence_bytes_are_safe(artifact.bytes(), &self.secret_redactor)?;
+        }
+        Ok(())
+    }
+}
+
+fn load_provider_secret_redactor(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<crate::secret_redaction::SecretRedactor, RunnerError> {
+    let Some(expected_digest) = run.input_digests.eval_config.as_deref() else {
+        return Ok(crate::secret_redaction::SecretRedactor::empty());
+    };
+    let bytes = crate::immutable_artifact::read_verified_regular_file(
+        workspace.run_directory(),
+        "inputs/eval-config.json",
+        "provider eval config",
+    )
+    .map_err(|error| RunnerError::Step(error.to_string()))?;
+    let config: seaf_core::EvalConfig = serde_json::from_slice(&bytes).map_err(|error| {
+        RunnerError::Step(format!("provider eval config is not typed: {error}"))
+    })?;
+    seaf_core::validate_eval_config(&config)
+        .map_err(|error| RunnerError::Step(format!("provider eval config is invalid: {error}")))?;
+    if seaf_core::canonical_json_bytes(&config)
+        .map_err(|error| RunnerError::Step(error.to_string()))?
+        != bytes
+        || seaf_core::canonical_sha256_digest(&config)
+            .map_err(|error| RunnerError::Step(error.to_string()))?
+            != expected_digest
+    {
+        return Err(RunnerError::Step(
+            "provider eval config does not match exact input authority".to_string(),
+        ));
+    }
+    crate::secret_redaction::SecretRedactor::from_eval_config(&config)
+        .map_err(|error| RunnerError::Step(error.to_string()))
+}
+
+fn redact_request_free_text(
+    value: &str,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<String, RunnerError> {
+    redactor
+        .redact_string(value, crate::secret_redaction::MAX_REDACTION_BYTES)
+        .map_err(|error| RunnerError::Step(format!("provider request redaction failed: {error}")))
+}
+
+fn sanitize_typed_model_request(
+    mut request: ModelRequest,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<ModelRequest, RunnerError> {
+    reject_prohibited_structural_string("model", &request.model, redactor)?;
+    request.system = redact_request_free_text(&request.system, redactor)?;
+    for message in &mut request.messages {
+        message.content = sanitize_request_content(&message.content, redactor)?;
+    }
+    if let Some(schema) = &request.response_schema {
+        if json_contains_prohibited_material(schema, redactor)? {
+            return Err(RunnerError::Step(
+                "provider response schema contains prohibited credential material".to_string(),
+            ));
+        }
+    }
+    let envelope = serde_json::to_vec_pretty(&request).map_err(|error| {
+        RunnerError::Step(format!(
+            "failed to serialize sanitized provider request: {error}"
+        ))
+    })?;
+    validate_provider_request_bytes_are_safe(&envelope, redactor)?;
+    let _ = raw_safe_prohibited_provider_failure(redactor)?;
+    Ok(request)
+}
+
+fn validate_provider_request_bytes_are_safe(
+    bytes: &[u8],
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    if redactor
+        .contains_prohibited_bytes(bytes)
+        .map_err(|error| RunnerError::Step(format!("provider request scan failed: {error}")))?
+    {
+        return Err(RunnerError::Step(
+            "provider request envelope contains prohibited credential material".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_evidence_bytes_are_safe(
+    bytes: &[u8],
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    if redactor.contains_prohibited_bytes(bytes).map_err(|_| {
+        RunnerError::Step(
+            "provider evidence envelope contains prohibited credential material".to_string(),
+        )
+    })? {
+        return Err(RunnerError::Step(
+            "provider evidence envelope contains prohibited credential material".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovered_model_request_bytes(
+    bytes: &[u8],
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    validate_provider_request_bytes_are_safe(bytes, redactor).map_err(|_| {
+        RunnerError::Step(
+            "recovered provider request contains prohibited credential material".to_string(),
+        )
+    })
+}
+
+fn validate_recovered_model_request(
+    request: &ModelRequest,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    let sanitized = sanitize_typed_model_request(request.clone(), redactor).map_err(|_| {
+        RunnerError::Step(
+            "recovered provider request contains prohibited credential material".to_string(),
+        )
+    })?;
+    if sanitized != *request {
+        return Err(RunnerError::Step(
+            "recovered provider request contains prohibited credential material".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_prohibited_structural_string(
+    label: &str,
+    value: &str,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<(), RunnerError> {
+    if redactor
+        .contains_prohibited_bytes(value.as_bytes())
+        .map_err(|error| RunnerError::Step(format!("provider request scan failed: {error}")))?
+    {
+        return Err(RunnerError::Step(format!(
+            "provider request structural {label} contains prohibited credential material"
+        )));
+    }
+    Ok(())
+}
+
+fn sanitize_request_content(
+    content: &str,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<String, RunnerError> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return redact_request_free_text(content, redactor);
+    };
+    let original = value.clone();
+    sanitize_request_json_value(&mut value, redactor, false)?;
+    if value == original {
+        return Ok(content.to_string());
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| RunnerError::Step(format!("sanitized provider request failed: {error}")))
+}
+
+fn sanitize_request_json_value(
+    value: &mut serde_json::Value,
+    redactor: &crate::secret_redaction::SecretRedactor,
+    structural: bool,
+) -> Result<(), RunnerError> {
+    match value {
+        serde_json::Value::String(text) => {
+            if structural {
+                reject_prohibited_structural_string("value", text, redactor)
+            } else {
+                *text = redact_request_free_text(text, redactor)?;
+                Ok(())
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sanitize_request_json_value(value, redactor, structural)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(entries) => {
+            let keys = entries.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                reject_prohibited_structural_string("key", &key, redactor)?;
+                if crate::secret_redaction::is_sensitive_name(&key) {
+                    entries.remove(&key);
+                    continue;
+                }
+                let value = entries
+                    .get_mut(&key)
+                    .expect("the key came from this JSON object");
+                sanitize_request_json_value(
+                    value,
+                    redactor,
+                    structural || is_structural_request_key(&key),
+                )?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn is_structural_request_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["id", "path", "digest", "sha", "authority", "role", "step"]
+        .iter()
+        .any(|part| key.contains(part))
 }
 
 fn validate_prepared_ticket(ticket: &TicketSpec, run: &LoopRun) -> Result<(), RunnerError> {
@@ -1641,9 +2077,30 @@ fn exchange_write_error(error: impl std::fmt::Display) -> RunnerError {
 
 const OVERSIZED_PROVIDER_AUDIT_MESSAGE: &str =
     "provider response audit exceeded the 1048576-byte durable limit";
+const PROHIBITED_PROVIDER_MATERIAL_MESSAGE: &str =
+    "provider response contained prohibited credential material";
+const PROHIBITED_PROVIDER_MATERIAL_ALTERNATE_MESSAGE: &str =
+    "provider result rejected by credential policy";
 
+#[cfg(test)]
 fn bounded_provider_result_audit(
     provider_result: Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+) -> Result<
+    (
+        Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+        ProviderExchangeResponseAudit,
+    ),
+    RunnerError,
+> {
+    bounded_provider_result_audit_with_redactor(
+        provider_result,
+        &crate::secret_redaction::SecretRedactor::empty(),
+    )
+}
+
+fn bounded_provider_result_audit_with_redactor(
+    provider_result: Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+    redactor: &crate::secret_redaction::SecretRedactor,
 ) -> Result<
     (
         Result<seaf_models::ModelResponse, seaf_models::ModelError>,
@@ -1665,6 +2122,9 @@ fn bounded_provider_result_audit(
                 "failed to measure provider response audit: {error}"
             ))
         })?;
+        if provider_audit_contains_prohibited_material(&audit, redactor).unwrap_or(true) {
+            return raw_safe_prohibited_provider_failure(redactor);
+        }
         let bounded_result = match &audit {
             ProviderExchangeResponseAudit::ModelResponse { response } => Ok(response.clone()),
             ProviderExchangeResponseAudit::ProviderFailure { error } => Err(error.clone()),
@@ -1685,6 +2145,144 @@ fn bounded_provider_result_audit(
         Err(error.clone()),
         ProviderExchangeResponseAudit::ProviderFailure { error },
     ))
+}
+
+fn raw_safe_prohibited_provider_failure(
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<
+    (
+        Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+        ProviderExchangeResponseAudit,
+    ),
+    RunnerError,
+> {
+    for (message, code) in [
+        (
+            PROHIBITED_PROVIDER_MATERIAL_MESSAGE,
+            "provider_response_contains_secret",
+        ),
+        (
+            PROHIBITED_PROVIDER_MATERIAL_ALTERNATE_MESSAGE,
+            "credential_policy_rejection",
+        ),
+    ] {
+        let error =
+            seaf_models::ModelError::provider(message, false, serde_json::json!({"code": code}));
+        let audit = ProviderExchangeResponseAudit::ProviderFailure {
+            error: error.clone(),
+        };
+        if !provider_audit_contains_prohibited_material(&audit, redactor)? {
+            return Ok((Err(error), audit));
+        }
+    }
+    Err(RunnerError::Step(
+        "provider response rejection artifact contains prohibited credential material".to_string(),
+    ))
+}
+
+fn provider_audit_contains_prohibited_material(
+    audit: &ProviderExchangeResponseAudit,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<bool, RunnerError> {
+    if is_exact_oversized_provider_failure(audit) {
+        return Ok(false);
+    }
+    let envelope = canonical_json_bytes(audit).map_err(|error| {
+        RunnerError::Step(format!(
+            "failed to serialize provider response for credential screening: {error}"
+        ))
+    })?;
+    if redactor
+        .contains_prohibited_bytes(&envelope)
+        .map_err(|error| RunnerError::Step(format!("provider response scan failed: {error}")))?
+    {
+        return Ok(true);
+    }
+    let string_has_secret = |value: &str| {
+        redactor
+            .contains_prohibited_bytes(value.as_bytes())
+            .map_err(|error| RunnerError::Step(format!("provider response scan failed: {error}")))
+    };
+    match audit {
+        ProviderExchangeResponseAudit::ModelResponse { response } => {
+            Ok(string_has_secret(&response.content)?
+                || json_contains_prohibited_material(&response.raw_provider_metadata, redactor)?)
+        }
+        ProviderExchangeResponseAudit::ProviderFailure { error } => {
+            Ok(string_has_secret(&error.message)?
+                || json_contains_prohibited_material(&error.metadata, redactor)?)
+        }
+    }
+}
+
+fn json_contains_prohibited_material(
+    value: &serde_json::Value,
+    redactor: &crate::secret_redaction::SecretRedactor,
+) -> Result<bool, RunnerError> {
+    match value {
+        serde_json::Value::String(value) => redactor
+            .contains_prohibited_bytes(value.as_bytes())
+            .map_err(|error| RunnerError::Step(format!("provider metadata scan failed: {error}"))),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                if json_contains_prohibited_material(value, redactor)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        serde_json::Value::Object(entries) => {
+            for (key, value) in entries {
+                if redactor
+                    .contains_prohibited_bytes(key.as_bytes())
+                    .map_err(|error| {
+                        RunnerError::Step(format!("provider metadata key scan failed: {error}"))
+                    })?
+                    || (crate::secret_redaction::is_sensitive_name(key)
+                        && !metadata_value_is_empty(value))
+                    || json_contains_prohibited_material(value, redactor)?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        serde_json::Value::Bool(value) => redactor
+            .contains_prohibited_bytes(value.to_string().as_bytes())
+            .map_err(|error| RunnerError::Step(format!("provider metadata scan failed: {error}"))),
+        serde_json::Value::Number(value) => redactor
+            .contains_prohibited_bytes(value.to_string().as_bytes())
+            .map_err(|error| RunnerError::Step(format!("provider metadata scan failed: {error}"))),
+        serde_json::Value::Null => Ok(false),
+    }
+}
+
+fn is_exact_oversized_provider_failure(audit: &ProviderExchangeResponseAudit) -> bool {
+    let ProviderExchangeResponseAudit::ProviderFailure { error } = audit else {
+        return false;
+    };
+    if error.kind != seaf_models::ModelErrorKind::Provider
+        || error.retryable
+        || error.timeout_ms.is_some()
+    {
+        return false;
+    }
+    error.message == OVERSIZED_PROVIDER_AUDIT_MESSAGE
+        && error.metadata
+            == serde_json::json!({
+                "code": "provider_response_audit_too_large",
+                "limit_bytes": crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP,
+            })
+}
+
+fn metadata_value_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.is_empty(),
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(entries) => entries.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
 }
 
 struct CappedJsonCounter {
@@ -2040,7 +2638,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         }
         let mut request = request.clone();
         request.run_directory = workspace.run_directory().to_path_buf();
-        let bundle = pack_live_context(&request)
+        let bundle = pack_live_context_with_redactor(&request, &self.secret_redactor)
             .map_err(|error| RunnerError::Step(format!("failed to pack live context: {error}")))?;
         self.context_bundle = Some(bundle);
         Ok(())
@@ -2719,6 +3317,11 @@ fn context_prompt(context: &ContextBundle) -> String {
     prompt
 }
 
+#[cfg(test)]
+mod provider_secret_recovery_tests {
+    include!("test_suites/provider_secret_recovery.rs");
+}
+
 fn status_for_response(response: &RoleResponse) -> LoopStepStatus {
     match response {
         RoleResponse::Agent(response) => match response.status {
@@ -2794,6 +3397,408 @@ mod live_context_cap_tests {
             size
         );
         response
+    }
+
+    fn redactor(secret: &str) -> crate::secret_redaction::SecretRedactor {
+        let env = std::collections::BTreeMap::from([("API_TOKEN".to_string(), secret.to_string())]);
+        crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap()
+    }
+
+    fn redactor_for(secrets: &[&str]) -> crate::secret_redaction::SecretRedactor {
+        let env = secrets
+            .iter()
+            .enumerate()
+            .map(|(index, secret)| (format!("API_TOKEN_{index}"), (*secret).to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        crate::secret_redaction::SecretRedactor::from_env_maps([&env]).unwrap()
+    }
+
+    #[test]
+    fn provider_secret_hits_become_one_fixed_safe_failure_after_size_measurement() {
+        let secret = "provider-secret-value";
+        let secret_redactor = redactor(secret);
+        let cases = [
+            Ok(seaf_models::ModelResponse {
+                content: format!("content {secret}"),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::json!({"safe": true}),
+            }),
+            Ok(seaf_models::ModelResponse {
+                content: "clean".to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::json!({"nested": {"API_TOKEN": "value"}}),
+            }),
+            Err(seaf_models::ModelError::provider(
+                format!("failed with {secret}"),
+                true,
+                serde_json::json!({"safe": true}),
+            )),
+        ];
+        for case in cases {
+            let (result, audit) =
+                bounded_provider_result_audit_with_redactor(case, &secret_redactor).unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.message, PROHIBITED_PROVIDER_MATERIAL_MESSAGE);
+            assert!(!error.retryable);
+            assert_eq!(error.metadata["code"], "provider_response_contains_secret");
+            let bytes = serde_json::to_vec(&audit).unwrap();
+            assert!(!bytes
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn raw_provider_response_cannot_hide_a_configured_secret_across_a_literal_marker() {
+        let secret = "prefix[REDACTED]suffix";
+        let (result, audit) = bounded_provider_result_audit_with_redactor(
+            Ok(seaf_models::ModelResponse {
+                content: secret.to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::Value::Null,
+            }),
+            &redactor(secret),
+        )
+        .unwrap();
+
+        let error = result.expect_err("raw provider bytes must scan across literal markers");
+        assert_eq!(error.message, PROHIBITED_PROVIDER_MATERIAL_MESSAGE);
+        assert!(!serde_json::to_vec(&audit)
+            .unwrap()
+            .windows(secret.len())
+            .any(|part| part == secret.as_bytes()));
+    }
+
+    #[test]
+    fn secret_failure_uses_a_raw_safe_alternate_when_the_primary_code_collides() {
+        let raw_secret = "provider-secret-value";
+        let redactor = redactor_for(&[raw_secret, "provider_response_contains_secret"]);
+
+        let (result, audit) = bounded_provider_result_audit_with_redactor(
+            Ok(seaf_models::ModelResponse {
+                content: raw_secret.to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::Value::Null,
+            }),
+            &redactor,
+        )
+        .expect("a noncolliding fixed alternate is available");
+
+        let error = result.expect_err("the raw provider response is unsafe");
+        assert_eq!(error.metadata["code"], "credential_policy_rejection");
+        assert!(!provider_audit_contains_prohibited_material(&audit, &redactor).unwrap());
+    }
+
+    #[test]
+    fn only_the_typed_oversize_failure_has_an_exact_collision_exception() {
+        let secret_failure = ProviderExchangeResponseAudit::ProviderFailure {
+            error: seaf_models::ModelError::provider(
+                PROHIBITED_PROVIDER_MATERIAL_MESSAGE,
+                false,
+                serde_json::json!({"code": "provider_response_contains_secret"}),
+            ),
+        };
+        assert!(provider_audit_contains_prohibited_material(
+            &secret_failure,
+            &redactor("provider_response_contains_secret")
+        )
+        .unwrap());
+
+        let oversize = ProviderExchangeResponseAudit::ProviderFailure {
+            error: seaf_models::ModelError::provider(
+                OVERSIZED_PROVIDER_AUDIT_MESSAGE,
+                false,
+                serde_json::json!({
+                    "code": "provider_response_audit_too_large",
+                    "limit_bytes": crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP,
+                }),
+            ),
+        };
+        assert!(!provider_audit_contains_prohibited_material(
+            &oversize,
+            &redactor("provider_response_audit_too_large")
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn numeric_metadata_values_are_credential_screened() {
+        let audit = ProviderExchangeResponseAudit::ModelResponse {
+            response: seaf_models::ModelResponse {
+                content: "clean".to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::json!({"nested": 42}),
+            },
+        };
+        assert!(provider_audit_contains_prohibited_material(&audit, &redactor("42")).unwrap());
+    }
+
+    #[test]
+    fn provider_audit_size_precedes_secret_screen_and_clean_results_stay_exact() {
+        let secret = "x";
+        let secret_redactor = redactor(secret);
+        let cap = usize::try_from(crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP).unwrap();
+        let oversized = response_with_canonical_audit_size(cap + 1);
+        let (result, _) =
+            bounded_provider_result_audit_with_redactor(Ok(oversized), &secret_redactor).unwrap();
+        assert_eq!(
+            result.unwrap_err().message,
+            OVERSIZED_PROVIDER_AUDIT_MESSAGE
+        );
+
+        let clean = seaf_models::ModelResponse {
+            content: "clean response".to_string(),
+            latency_ms: 7,
+            raw_provider_metadata: serde_json::json!({"provider": "fake"}),
+        };
+        let (result, audit) = bounded_provider_result_audit_with_redactor(
+            Ok(clean.clone()),
+            &redactor("configured-but-absent"),
+        )
+        .unwrap();
+        assert_eq!(result, Ok(clean.clone()));
+        assert_eq!(
+            audit,
+            ProviderExchangeResponseAudit::ModelResponse { response: clean }
+        );
+    }
+
+    #[test]
+    fn typed_request_sanitization_redacts_nested_sensitive_values_and_rejects_structural_hits() {
+        let secret = "configured-request-secret";
+        let redactor = redactor(secret);
+        let content = serde_json::json!({
+            "instructions": format!("use {secret}"),
+            "nested": {"API_TOKEN": "unconfigured-but-sensitive"}
+        })
+        .to_string();
+        let sanitized = sanitize_request_content(&content, &redactor).unwrap();
+        assert!(!sanitized.contains(secret));
+        assert!(!sanitized.contains("unconfigured-but-sensitive"));
+        assert!(sanitized.contains(crate::secret_redaction::REDACTION_MARKER));
+        let sanitized_json: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert!(sanitized_json["nested"].get("API_TOKEN").is_none());
+
+        let request_with_sensitive_key = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content,
+            }],
+            response_schema: None,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+        };
+        let sanitized_request = sanitize_typed_model_request(request_with_sensitive_key, &redactor)
+            .expect("a sensitive nested value is safe after typed redaction");
+        let envelope = serde_json::to_vec(&sanitized_request).unwrap();
+        assert!(!envelope
+            .windows(secret.len())
+            .any(|part| part == secret.as_bytes()));
+        assert!(!envelope
+            .windows("unconfigured-but-sensitive".len())
+            .any(|part| part == b"unconfigured-but-sensitive"));
+
+        let structural = serde_json::json!({"artifact_digest": secret}).to_string();
+        assert!(sanitize_request_content(&structural, &redactor)
+            .unwrap_err()
+            .to_string()
+            .contains("structural value"));
+        let nested_structural =
+            serde_json::json!({"input_digests": {"ticket": secret}}).to_string();
+        assert!(sanitize_request_content(&nested_structural, &redactor)
+            .unwrap_err()
+            .to_string()
+            .contains("structural value"));
+    }
+
+    #[test]
+    fn sanitized_request_envelope_is_raw_safe_without_marker_provenance() {
+        let request = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "TOKEN=raw-unclassified-tail".to_string(),
+            }],
+            response_schema: None,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+        };
+
+        let sanitized = sanitize_typed_model_request(request, &redactor("TOKEN=[REDACTED]"))
+            .expect("the request sanitizer owns the marker provenance");
+
+        assert_eq!(sanitized.messages[0].content, "[REDACTED]");
+        let envelope = serde_json::to_vec_pretty(&sanitized).unwrap();
+        assert_eq!(
+            redactor("TOKEN=[REDACTED]").contains_prohibited_bytes(&envelope),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn sanitized_request_fails_if_the_marker_creates_a_pretty_boundary_secret() {
+        let request = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "TOKEN=raw-unclassified-tail".to_string(),
+            }],
+            response_schema: None,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+        };
+
+        let error = sanitize_typed_model_request(request, &redactor("\"content\": \"[REDACTED]\""))
+            .expect_err("the exact pretty envelope must remain raw-safe");
+
+        assert!(error.to_string().contains("prohibited credential material"));
+    }
+
+    #[test]
+    fn recovered_request_rejects_a_literal_marker_with_unclassified_tail() {
+        let request = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "TOKEN=[REDACTED]unclassified-tail".to_string(),
+            }],
+            response_schema: None,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+        };
+
+        let error = validate_recovered_model_request(&request, &redactor("absent-secret"))
+            .expect_err("raw recovered marker tails cannot claim sanitizer provenance");
+
+        assert!(error
+            .to_string()
+            .contains("recovered provider request contains prohibited"));
+    }
+
+    #[test]
+    fn typed_request_envelope_rejects_secrets_in_keys_roles_and_scalar_values() {
+        let clean_request = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::Assistant,
+                content: "clean content".to_string(),
+            }],
+            response_schema: Some(serde_json::json!({"enabled": true, "count": 314_159})),
+            temperature: 0.25,
+            timeout_ms: 4_567,
+        };
+
+        for (case, secret) in [
+            ("field name", "temperature"),
+            ("message role", "assistant"),
+            ("temperature", "0.25"),
+            ("timeout", "4567"),
+            ("JSON boolean", "true"),
+            ("JSON number", "314159"),
+            ("pretty-print boundary", "\",\n  \"messages\""),
+            ("unrepresentable provider failure", "retryable"),
+        ] {
+            let error = sanitize_typed_model_request(clean_request.clone(), &redactor(secret))
+                .expect_err(case);
+            assert!(
+                error
+                    .to_string()
+                    .contains("contains prohibited credential material"),
+                "{case}: {error}"
+            );
+        }
+
+        assert_eq!(
+            sanitize_typed_model_request(clean_request.clone(), &redactor("configured-but-absent"))
+                .unwrap(),
+            clean_request
+        );
+    }
+
+    #[test]
+    fn recovered_request_rejects_scalar_secret_before_replay() {
+        let request = ModelRequest {
+            model: "clean-model".to_string(),
+            system: "clean system".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "clean content".to_string(),
+            }],
+            response_schema: None,
+            temperature: 0.0,
+            timeout_ms: 91_919,
+        };
+
+        let error = validate_recovered_model_request(&request, &redactor("91919"))
+            .expect_err("recovered scalar secret must fail before provider replay");
+        assert!(
+            error
+                .to_string()
+                .contains("recovered provider request contains prohibited"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn complete_provider_audit_envelope_screens_keys_and_non_metadata_scalars() {
+        let response = seaf_models::ModelResponse {
+            content: "clean".to_string(),
+            latency_ms: 424_242,
+            raw_provider_metadata: serde_json::Value::Null,
+        };
+        for (case, secret) in [
+            ("fixed response field", "latency_ms"),
+            ("response latency", "424242"),
+            ("canonical pretty boundary", "\",\n    \"latency_ms\""),
+        ] {
+            let (result, audit) = bounded_provider_result_audit_with_redactor(
+                Ok(response.clone()),
+                &redactor(secret),
+            )
+            .unwrap();
+            let error = result.expect_err(case);
+            assert_eq!(error.message, PROHIBITED_PROVIDER_MATERIAL_MESSAGE);
+            assert_eq!(
+                audit,
+                ProviderExchangeResponseAudit::ProviderFailure {
+                    error: error.clone()
+                }
+            );
+        }
+
+        let timeout =
+            seaf_models::ModelError::timeout("clean failure", 73_731, serde_json::Value::Null);
+        for (case, secret) in [
+            ("error kind", "timeout"),
+            ("retryable", "true"),
+            ("timeout scalar", "73731"),
+            ("fixed error field", "retryable"),
+        ] {
+            let bounded = bounded_provider_result_audit_with_redactor(
+                Err(timeout.clone()),
+                &redactor(secret),
+            );
+            if secret == "retryable" {
+                assert!(
+                    bounded
+                        .unwrap_err()
+                        .to_string()
+                        .contains("prohibited credential material"),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    bounded.unwrap().0.expect_err(case).message,
+                    PROHIBITED_PROVIDER_MATERIAL_MESSAGE
+                );
+            }
+        }
     }
 
     #[test]
