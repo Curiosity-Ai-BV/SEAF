@@ -3453,7 +3453,7 @@ where
             }
             let mut newline = [0_u8; 1];
             stdout.read_exact(&mut newline)?;
-            if newline != [b'\n'] {
+            if newline != *b"\n" {
                 return Err(CandidateWorkspaceError::Git(
                     "git cat-file --batch blob terminator was malformed".to_string(),
                 ));

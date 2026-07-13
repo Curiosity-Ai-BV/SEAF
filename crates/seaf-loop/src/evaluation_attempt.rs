@@ -904,7 +904,8 @@ fn parse_name(name: &str) -> Option<(u32, Spelling, Kind)> {
             Kind::Intent
         } else if suffix == "json" {
             Kind::Testing
-        } else if let Some(log) = suffix.strip_prefix("check-") {
+        } else {
+            let log = suffix.strip_prefix("check-")?;
             let (check, stream) = log.split_once('.')?;
             let check = canonical_number(check)?;
             match stream {
@@ -912,8 +913,6 @@ fn parse_name(name: &str) -> Option<(u32, Spelling, Kind)> {
                 "stderr.log" => Kind::Stderr(check),
                 _ => return None,
             }
-        } else {
-            return None;
         };
         return Some((attempt, Spelling::Indexed, kind));
     }
