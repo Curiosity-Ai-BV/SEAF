@@ -44,54 +44,32 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M2-04 - Release artifact workflow. Milestone 1 and M2-01 through M2-03 are
-accepted. Status: active on 2026-07-13.
+M2-05 - Human-authorized tagged prerelease. Milestone 1 and M2-01 through
+M2-04 are accepted. Status: awaiting-explicit-user-authorization on 2026-07-14.
 
-Build checksummed native CLI artifacts without creating a tag or publishing a
-GitHub Release. The binding prebuilt matrix is intentionally limited to
-`ubuntu-22.04` / `x86_64-unknown-linux-gnu` and `macos-15` /
-`aarch64-apple-darwin`; broader Linux, Intel macOS, Windows, musl, and cross-
-compiled targets remain unsupported until they have their own native evidence.
-The Cargo workspace version is authoritative, so version `0.1.0` requires the
-exact future tag `v0.1.0` and exact binary output `seaf 0.1.0`.
+M2-04 now provides the reviewed deterministic archive/checksum scripts and the
+read-only tag-push workflow for exactly `x86_64-unknown-linux-gnu` on Ubuntu
+22.04 and `aarch64-apple-darwin` on macOS 15. It did not create or push a tag,
+create a GitHub Release, or publish any durable artifact.
 
-Each native build produces exactly
-`seaf-v0.1.0-<target>.tar.gz`. The archive has one matching root directory and
-exactly four regular entries in stable order: `CHANGELOG.md`, `LICENSE`,
-`README.md`, and executable `seaf`. Normalize modes, owners, timestamps, USTAR
-metadata, and the gzip header so identical input bytes produce identical
-archives. Bound every input and output, reject unsafe archive entries before
-extraction, keep build/output/install roots outside the repository, and prove
-the repository status is unchanged.
+M2-05 may begin only after the user explicitly authorizes external repository
+state changes. The authorized operation must identify the exact accepted clean
+commit, create and push only tag `v0.1.0`, wait for the tag workflow, and require
+both native jobs plus checksum assembly to succeed. Download the workflow
+outputs into a fresh external root, verify the exact two-archive inventory and
+`SHA256SUMS`, install the native macOS archive externally, and prove exact
+`seaf 0.1.0`, `info`, and fake-provider doctor output. Native Linux execution
+remains the Ubuntu workflow row's evidence.
 
-The aggregate release-assets directory contains exactly the two native archives
-and a newline-terminated `SHA256SUMS`. Its two lowercase SHA-256 lines use two
-spaces, basenames only, and lexical filename order. Assembly and verification
-must reject missing, extra, duplicate, renamed, path-bearing, malformed, or
-tampered inputs. A local native smoke extracts only after validation, installs
-the archive binary into a fresh external `bin`, and proves exact `--version` and
-`info` without resolving the source or Cargo target binary.
+If separately authorized, create a GitHub prerelease for the existing tag with
+only the two verified archives and `SHA256SUMS`; do not rebuild or substitute
+assets during publication. Record the tag, immutable commit SHA, workflow URL,
+release URL, asset checksums, and smoke results in repository evidence and the
+roadmap before accepting M2-05.
 
-Add a tag-push-only GitHub Actions workflow that hard-codes the two native
-runners, checks exact tag/version/ref/host authority, builds with locked Cargo,
-packages and smokes each artifact, assembles the exact checksum bundle, and
-uploads only short-lived immutable workflow artifacts. Use top-level
-`contents: read`, no secrets or deployment environment, checkout without
-persisted credentials, full-SHA action pins, and context values passed through
-environment variables. Do not grant write/OIDC/attestation permissions or add
-`workflow_dispatch`, `pull_request_target`, release API calls, tag creation, or
-publication. Ordinary CI runs the same native artifact contract locally but
-never takes tag or publication authority.
-
-Mandatory RED first proves the artifact scripts, workflow, documentation, and
-CI seam are absent. Focused GREEN proves deterministic packaging, exact
-inventory/modes/metadata, target/version refusal, aggregate checksum shape and
-tamper rejection, installed artifact identity, workflow formatting, and status
-preservation. Full repository gates remain required.
-
-Keep this slice limited to deterministic artifact construction, checksum
-assembly, tag-gated read-only workflow artifacts, native smoke coverage,
-release-artifact documentation, and matching trackers. Do not create or push a
-tag, create a GitHub Release, publish a registry package, sign/notarize, modify
-release-capsule domain commands, run the external golden path, or execute Ollama
-acceptance. Those authorities remain M2-05 through M2-07.
+Do not move or replace an existing tag, overwrite a release or asset, publish a
+registry package, grant workflow write/OIDC/attestation authority, sign,
+notarize, run the external golden path, or execute Ollama acceptance. Any tag,
+workflow, checksum, asset, install, or doctor mismatch stops the slice without
+claiming acceptance. M2-06 and M2-07 remain dependency-blocked until M2-05 is
+accepted.

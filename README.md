@@ -63,7 +63,9 @@ seaf --version
 
 Do **not** run `cargo install seaf-cli`: the package with that name on crates.io
 is an unrelated project. All SEAF workspace packages have registry publication
-disabled. Tagged SEAF binaries are planned but are not available yet.
+disabled. The deterministic native archive and checksum contract is documented
+in [docs/release-artifacts.md](docs/release-artifacts.md), but public tagged
+downloads are not available until a separately authorized prerelease.
 
 Current support is limited to macOS and Linux; see the
 [supported-platform policy](https://github.com/Curiosity-Ai-BV/SEAF/blob/main/docs/supported-platforms.md).

@@ -2714,3 +2714,97 @@ four-file `seaf-v0.1.0-<target>.tar.gz` archives, an exact two-archive
 workflow that uploads only short-lived Actions artifacts. M2-04 does not create
 or push a tag or publish a GitHub Release; that external authority remains
 M2-05.
+
+## 2026-07-13 implementation-pending-review | M2-04 release artifact workflow
+
+RED was witnessed before production wiring: `./scripts/test-release-artifacts.sh`
+exited 1 because `scripts/build-release-artifact.sh` and
+`scripts/assemble-release-assets.sh` were missing. The same preflight recorded
+that `.github/workflows/release-artifacts.yml`, `docs/release-artifacts.md`, and
+the ordinary-CI release-artifact step were absent. After the two scripts reached
+a focused dynamic GREEN, exact static workflow/documentation assertions were
+added and failed because the release workflow was still absent.
+
+The implementation constructs normalized USTAR plus no-name/no-time gzip
+archives for the exact Ubuntu x86_64 GNU/Linux and Apple Silicon macOS targets,
+validates bounded regular inputs and outputs before extraction, creates and
+verifies the exact two-line `SHA256SUMS` bundle, and installs the validated local
+native artifact into an external bin for exact version and information smoke.
+The first dynamic script-only run was GREEN. A follow-up executable-probe test
+then exited 2 at the missing `verify-structure` command, proving that aggregate
+validation still needed a non-executing foreign-platform seam. The corrected
+assembler performs complete byte, inventory, metadata, documentation, and
+checksum validation without executing either downloaded member; each native
+matrix row retains exact executable identity authority.
+The read-only tag-push workflow hard-codes the two native rows, validates ref,
+version, SHA, Rust host, and binary identity, and uploads only two-day workflow
+artifacts. Ordinary CI invokes the same local test. Final GREEN passed shell
+syntax and the complete local release-artifact gate. Focused and full Prettier,
+stable Rust formatting, latest-stable all-target/all-feature strict Clippy, the
+complete package-readiness regression, all SDK lint/typecheck/8-test/build
+gates, and diff hygiene also pass. Local macOS directly proves the bsdtar path;
+the GNU tar creation branch is structurally locked here and remains ordinary
+Ubuntu CI execution evidence. No tag, GitHub Release, registry publication,
+signing, notarization, release-capsule change, external golden path, or Ollama
+execution is claimed. M2-04 remains implementation-pending-review and M2-05
+remains pending.
+
+## 2026-07-14 rejected quality review; M2-04 correction pending re-review
+
+Quality review found four complete correction groups. Command substitution had
+discarded nonzero status and stderr while checking only apparent stdout in the
+builder, full verifier, and workflow. Bash 3.2 documents `ulimit -f` in
+1024-byte increments, so the prior `/ 512` limit allowed writing up to 256 MiB
+before the post-write check. Failed late builds left a newly created output
+directory, and partially populated assembly failures did the same. Raw archive
+validation checked only eight gzip header bytes and omitted canonical/valid
+USTAR checksums, link names, device fields, prefixes, reserved bytes, and member
+padding.
+
+Focused dynamic regressions were added first. After correcting one fixture-only
+awk variable error, the clean RED exited 1 with `17 review regression assertions
+failed`. It proved acceptance of exact-looking exit-7 and stderr-emitting
+binaries in both build and full verify, leaked absent build outputs, a completed
+write beyond 128 MiB, leaked partial assembly, and accepted gzip XFL/OS,
+checksum-form, linkname, device-major/minor, reserved-byte, and member-padding
+mutations. Invalid checksum value and nonempty prefix were already rejected by
+the existing tar/inventory boundary. A later static RED exited 1 because the
+workflow identity helper was defined in a different run step from its four
+calls.
+
+A final controller audit then found that identity stdout/stderr capture itself
+had no file-size bound. The focused dynamic RED exited 1 with four assertions:
+oversized stdout and stderr reached a completion marker in both build and full
+verify. A separate static RED proved the workflow helper lacked the same bound.
+The correction caps each capture stream at exactly 64 MiB with the Bash 3.2
+1024-byte unit inside only the identity subprocess; all four completion markers
+now remain absent, and the workflow helper/calls/limit share one run block.
+
+The minimum correction captures stdout and stderr to separate bounded temporary
+files, records status explicitly, compares exact stdout bytes, and requires
+empty stderr in build, full verify, and the same workflow run block for raw and
+installed binaries. Each identity subprocess applies the Bash 1024-byte file
+unit for a 64 MiB per-stream cap without leaking that limit into later work.
+Decompression uses the same unit for exactly 128 MiB while retaining the
+post-write size check. Failure traps remove only
+the exact script-owned archive/assets and remove a script-created directory only
+when empty; caller-owned directories and sibling sentinels remain. Verification
+requires the complete host-normalized gzip header, canonical and valid USTAR
+checksum bytes, empty link/prefix/reserved fields, zero devices, and zero member
+padding before extraction. The focused review suite and complete local artifact
+test are GREEN. M2-04 remains implementation-pending-review pending fresh
+independent review; M2-05 remains pending and no publication action occurred.
+
+## 2026-07-14 accepted | M2-04 release artifact workflow
+
+Fresh independent specification and quality/security re-reviews approved the
+complete corrected slice with no findings. The controller passed shell syntax,
+the complete local artifact gate, stable formatting and strict all-target/all-
+feature Clippy, the package-readiness gate, every locked Rust workspace test,
+Prettier, SDK lint/typecheck/8-test/build, exact 13-file scope, Git-status
+preservation, and diff hygiene. Local macOS directly executes bsdtar; GNU tar
+remains the documented ordinary Ubuntu CI evidence.
+
+No tag, GitHub Release, registry publication, signing, notarization, golden
+path, or Ollama action was taken. M2-04 is accepted; M2-05 awaits explicit user
+authorization.

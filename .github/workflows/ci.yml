@@ -47,6 +47,8 @@ jobs:
         run: ./scripts/test-milestone-one-acceptance.sh
       - name: Package readiness
         run: ./scripts/test-package-readiness.sh
+      - name: Release artifact readiness
+        run: ./scripts/test-release-artifacts.sh
       - name: Cargo tests
         run: cargo test --locked --workspace
       - name: P2-012 schema fixture checks

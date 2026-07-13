@@ -1,0 +1,156 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Validate tag, checkout, and native host authority
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          workspace_version="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)"
+          test "$workspace_version" = "0.1.0"
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "v${workspace_version}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
+      - name: Build, validate, and smoke the native artifact
+        id: build
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          assert_cli_identity() {
+            binary="$1"
+            label="$2"
+            expected="$3"
+            shift 3
+            identity_path="$RUNNER_TEMP/identity-$label"
+            stdout_path="$identity_path.stdout"
+            stderr_path="$identity_path.stderr"
+            expected_path="$identity_path.expected"
+            status=0
+
+            if (
+              ulimit -f "$((64 * 1024 * 1024 / 1024))"
+              "$binary" "$@" >"$stdout_path" 2>"$stderr_path"
+            ); then
+              status=0
+            else
+              status=$?
+            fi
+            printf '%s\n' "$expected" >"$expected_path"
+            test "$status" -eq 0
+            test ! -s "$stderr_path"
+            cmp -s "$expected_path" "$stdout_path"
+          }
+
+          workspace_version="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          output_dir="$RUNNER_TEMP/native-artifact"
+          extract_dir="$RUNNER_TEMP/native-extract"
+          install_dir="$RUNNER_TEMP/native-install"
+          mkdir "$output_dir" "$extract_dir" "$install_dir"
+
+          cargo build --locked --release -p seaf-cli --bin seaf
+          assert_cli_identity \
+            "$CARGO_TARGET_DIR/release/seaf" \
+            raw-version \
+            "seaf $workspace_version" \
+            --version
+          assert_cli_identity \
+            "$CARGO_TARGET_DIR/release/seaf" \
+            raw-info \
+            "Self-Evolving Application Framework" \
+            info
+
+          ./scripts/build-release-artifact.sh build \
+            "$EXPECTED_TARGET" \
+            "$CARGO_TARGET_DIR/release/seaf" \
+            "$output_dir"
+          archive="$output_dir/seaf-v${workspace_version}-${EXPECTED_TARGET}.tar.gz"
+          ./scripts/build-release-artifact.sh verify "$EXPECTED_TARGET" "$archive"
+
+          tar -xzf "$archive" -C "$extract_dir"
+          install -m 0755 \
+            "$extract_dir/seaf-v${workspace_version}-${EXPECTED_TARGET}/seaf" \
+            "$install_dir/seaf"
+          assert_cli_identity \
+            "$install_dir/seaf" \
+            installed-version \
+            "seaf $workspace_version" \
+            --version
+          assert_cli_identity \
+            "$install_dir/seaf" \
+            installed-info \
+            "Self-Evolving Application Framework" \
+            info
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+      - name: Upload native artifact wrapper
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: seaf-native-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ steps.build.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  assemble:
+    name: Assemble checksum bundle
+    needs: build-native
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Validate aggregate checkout authority
+        run: |
+          workspace_version="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)"
+          test "$workspace_version" = "0.1.0"
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "v${workspace_version}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Download and merge the two native wrappers
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
+        with:
+          pattern: seaf-native-*-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-inputs
+          merge-multiple: true
+      - name: Assemble and verify release assets
+        run: |
+          ./scripts/assemble-release-assets.sh assemble \
+            "$RUNNER_TEMP/native-inputs" \
+            "$RUNNER_TEMP/release-assets"
+          ./scripts/assemble-release-assets.sh verify "$RUNNER_TEMP/release-assets"
+      - name: Upload final ephemeral release-assets wrapper
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: seaf-release-assets-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0

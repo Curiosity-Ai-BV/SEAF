@@ -2157,8 +2157,8 @@ remaining integration and doc-test suite.
 
 ### M2-02 - Project Doctor
 
-Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 is
-accepted; M2-04 is active.
+Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 and M2-04
+are accepted; M2-05 awaits explicit user authorization.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2230,12 +2230,12 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 is accepted; M2-04 is active.
+M2-03 and M2-04 are accepted; M2-05 awaits explicit user authorization.
 
 ### M2-03 - Package Metadata And Version Identity
 
 Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 is
-active.
+accepted; M2-05 awaits explicit user authorization.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2291,7 +2291,8 @@ suite, and doc tests.
 
 ### M2-04 - Release Artifact Workflow
 
-Status: active on 2026-07-13. Dependencies: M2-03 (accepted).
+Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is
+awaiting explicit user authorization.
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2330,7 +2331,40 @@ Docs/tracker: release procedure and M2-04 status.
 
 Commit boundary: release artifact automation only.
 
+Implementation evidence on 2026-07-13: the initial test exited 1 because both
+release scripts were absent and recorded the absent workflow, documentation,
+and ordinary-CI seam. The script-only implementation then reached GREEN before
+workflow wiring. Static contract assertions next failed on the absent workflow,
+and an executable probe separately exited 2 on the absent structure-only
+foreign-platform verifier. The final local gate passes deterministic double
+construction, normalized USTAR/gzip metadata, exact bounded inventories,
+negative target/version/type/size/path/tamper cases, checksum assembly,
+non-executing aggregate verification, external install, exact identity smoke,
+and source-status preservation. Focused and full Prettier, stable Rust format
+and strict Clippy, package readiness, all SDK gates, and diff hygiene pass. That
+evidence alone left M2-04 pending review and M2-05 inactive.
+
+Quality review rejected the first implementation on 2026-07-14. Exact-looking
+stdout could mask a nonzero exit or unexpected stderr; the Bash 3.2 file limit
+used 512-byte rather than 1024-byte units; late build and assembly failures left
+script-created directories; and raw verification did not cover the complete
+gzip header or all normalized USTAR metadata and padding. Focused regressions
+then failed with 17 assertions across those counterexamples. A separate static
+RED proved the workflow helper definition and calls were split across run steps.
+The corrected focused suite passes exact status/stdout/stderr identity in build,
+full verify, and one workflow run block; scoped 64 MiB identity-output and exact
+128 MiB decompression boundaries; transactional absent/caller-owned output
+behavior; and all required byte-level metadata mutations. Fresh independent
+specification and quality/security reviews approved the correction with no
+findings. The controller's corrected artifact gate, complete Rust workspace
+suite, stable strict Clippy, package readiness, formatting, SDK
+lint/typecheck/8-test/build suite, and diff hygiene pass. M2-04 is accepted;
+M2-05 awaits explicit user authorization.
+
 ### M2-05 - Human-Authorized Tagged Prerelease
+
+Status: awaiting explicit user authorization on 2026-07-14. Dependencies:
+M2-04 (accepted).
 
 Roadmap: U7. Dependencies: M2-04.
 

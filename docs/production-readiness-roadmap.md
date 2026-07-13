@@ -409,11 +409,11 @@ source-workspace boundary above and runs in Ubuntu CI. Independent specification
 and quality reviews approved the corrected fault coverage. The controller also
 passed workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-Milestone 1 and M2-01 through M2-03 are complete. Package identity is private,
+Milestone 1 and M2-01 through M2-04 are complete. Package identity is private,
 exact, warning-free, and proven through pristine archives plus an external
 installed-CLI smoke. Independent specification and quality reviews approved the
-corrected package boundary, and the full controller gate passed. M2-04 release
-artifact workflow is active.
+corrected package and release-artifact boundaries, and the full controller gates
+passed. M2-05 awaits explicit user authorization for the tagged prerelease.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -452,8 +452,30 @@ and complete snapshots prove project, Git, worktree, and candidate namespaces
 remain unchanged. The full Rust and SDK controller gates passed. M2-03 package
 identity is accepted after exact archive/install smoke, adversarial boundary
 guards, independent reviews, and the full controller matrix. M2-04 release
-artifact workflow is active; tagged publication and the external golden path are
-not claimed.
+artifact workflow is accepted; tagged publication and the external golden path
+are not claimed.
+
+M2-04 implementation evidence on 2026-07-13 records the required missing-script
+and missing-workflow REDs plus a missing structure-only verifier RED. The final
+local gate proves deterministic native archive bytes, normalized metadata,
+bounded adversarial inventory and checksum refusal, non-executing aggregate
+validation, external installed-binary identity, static read-only workflow
+authority, and Git-status preservation. Formatting, stable strict Clippy,
+package readiness, SDK, and diff gates pass. That first implementation evidence
+was not acceptance or tagged publication; final acceptance follows the
+correction and reviews below. M2-05 awaits explicit user authorization.
+
+Quality review rejected M2-04 on 2026-07-14 for incomplete process identity,
+incorrect Bash 3.2 file-limit units, nontransactional failed outputs, and
+incomplete gzip/USTAR byte validation. The correction has dynamic RED evidence
+for all four groups plus a static cross-step workflow-helper RED. The corrected
+focused suite is GREEN for zero-status/exact-stdout/empty-stderr identity,
+scoped 64 MiB identity-output and 128 MiB decompression boundaries, exact output
+rollback, full normalized metadata mutations, and same-step workflow helper
+authority. Fresh independent specification and quality/security reviews
+approved the correction with no findings, and the complete controller gate
+passed. M2-04 is accepted. No M2-05 external authority or acceptance is claimed;
+the tagged prerelease awaits explicit user authorization.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario
