@@ -276,13 +276,7 @@ fn plan_eval_check(
             check.name
         )));
     }
-    let max_output_bytes = check.max_output_bytes.unwrap_or(DEFAULT_EVAL_OUTPUT_BYTES);
-    if max_output_bytes == 0 || max_output_bytes > MAX_EVAL_OUTPUT_BYTES {
-        return Err(EvalEngineError::message(format!(
-            "eval check {} max_output_bytes must be between 1 and {MAX_EVAL_OUTPUT_BYTES}",
-            check.name
-        )));
-    }
+    let max_output_bytes = normalize_eval_output_limit(&check.name, check.max_output_bytes)?;
 
     Ok(EvalCheckPlan {
         name: check.name.clone(),
@@ -294,6 +288,19 @@ fn plan_eval_check(
         cwd_identity,
         executable_identity,
     })
+}
+
+pub(crate) fn normalize_eval_output_limit(
+    check_name: &str,
+    configured: Option<usize>,
+) -> Result<usize, EvalEngineError> {
+    let max_output_bytes = configured.unwrap_or(DEFAULT_EVAL_OUTPUT_BYTES);
+    if max_output_bytes == 0 || max_output_bytes > MAX_EVAL_OUTPUT_BYTES {
+        return Err(EvalEngineError::message(format!(
+            "eval check {check_name} max_output_bytes must be between 1 and {MAX_EVAL_OUTPUT_BYTES}"
+        )));
+    }
+    Ok(max_output_bytes)
 }
 
 fn run_eval_check(plan: &EvalCheckPlan) -> Result<EvalCheckExecution, EvalEngineError> {
@@ -1146,4 +1153,24 @@ fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_string()
+}
+
+#[cfg(test)]
+mod storage_commitment_tests {
+    use super::normalize_eval_output_limit;
+
+    #[test]
+    fn execution_and_storage_share_one_output_limit_normalizer() {
+        assert_eq!(
+            normalize_eval_output_limit("default", None).unwrap(),
+            64 * 1024
+        );
+        assert_eq!(normalize_eval_output_limit("minimum", Some(1)).unwrap(), 1);
+        assert_eq!(
+            normalize_eval_output_limit("maximum", Some(1024 * 1024)).unwrap(),
+            1024 * 1024
+        );
+        assert!(normalize_eval_output_limit("zero", Some(0)).is_err());
+        assert!(normalize_eval_output_limit("too-large", Some(1024 * 1024 + 1)).is_err());
+    }
 }

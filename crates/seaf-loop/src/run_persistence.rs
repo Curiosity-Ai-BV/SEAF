@@ -96,6 +96,10 @@ impl RunMutationGuard {
             let _ = file.unlock();
             return Err(error.into());
         }
+        if let Err(error) = cleanup_orphaned_run_replacement_temps(&directory) {
+            let _ = file.unlock();
+            return Err(error.into());
+        }
         Ok(Self {
             directory,
             file,
@@ -158,20 +162,19 @@ impl RunMutationGuard {
             );
         }
         self.validate()?;
-        let commitment =
-            crate::provider_exchange::derive_provider_storage_commitment_for_run_bytes(
-                self.run_directory(),
-                bytes,
-            )
-            .map_err(|error| RunPersistenceError::Invalid(error.to_string()))?
-            .unwrap_or_else(|| crate::artifact_storage::StorageCommitment {
-                permanent_bytes: 0,
-                transient_bytes: 0,
-                permanent_entries: 0,
-                transient_entries: 0,
-                consumable_permanent_paths: Vec::new(),
-                consumable_transient_path: None,
-            });
+        let commitment = crate::storage_authority::derive_storage_commitment_for_run_bytes(
+            self.run_directory(),
+            bytes,
+        )
+        .map_err(RunPersistenceError::Invalid)?
+        .unwrap_or_else(|| crate::artifact_storage::StorageCommitment {
+            permanent_bytes: 0,
+            transient_bytes: 0,
+            permanent_entries: 0,
+            transient_entries: 0,
+            consumable_permanent_paths: Vec::new(),
+            consumable_transient_path: None,
+        });
         crate::artifact_storage::validate_atomic_replacement_projection_with_commitment(
             &self.directory,
             relative_path,
@@ -194,6 +197,36 @@ impl RunMutationGuard {
             )
         })?;
         crate::artifact_storage::validate_usage_with_commitment(&self.directory, &commitment)?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_active_storage_commitment(&self) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        let commitment =
+            crate::storage_authority::derive_active_storage_commitment(self.run_directory())
+                .map_err(RunPersistenceError::Invalid)?
+                .ok_or_else(|| {
+                    RunPersistenceError::Invalid(
+                        "durable authority has no active storage commitment".into(),
+                    )
+                })?;
+        crate::artifact_storage::validate_usage_with_commitment(&self.directory, &commitment)?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_create_activating_commitment(
+        &self,
+        relative_path: &str,
+        size: usize,
+        commitment: &crate::artifact_storage::StorageCommitment,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_create_activating_commitment(
+            &self.directory,
+            relative_path,
+            size,
+            commitment,
+        )?;
         self.validate()
     }
 
@@ -236,6 +269,38 @@ impl RunMutationGuard {
             size,
             &commitment,
         )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_evaluation_slot_create_projection(
+        &self,
+        relative_path: &str,
+        size: usize,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        let commitment =
+            crate::storage_authority::derive_active_storage_commitment(self.run_directory())
+                .map_err(RunPersistenceError::Invalid)?
+                .ok_or_else(|| {
+                    RunPersistenceError::Invalid(
+                        "evaluation slot publication requires an active commitment".to_string(),
+                    )
+                })?;
+        if relative_path.ends_with(".stdout.log") || relative_path.ends_with(".stderr.log") {
+            crate::artifact_storage::validate_evaluation_log_create_projection(
+                &self.directory,
+                relative_path,
+                size,
+                &commitment,
+            )?;
+        } else {
+            crate::artifact_storage::validate_provider_slot_create_projection(
+                &self.directory,
+                relative_path,
+                size,
+                &commitment,
+            )?;
+        }
         self.validate()
     }
 
@@ -321,6 +386,56 @@ impl RunMutationGuard {
         self.locked = false;
         Ok(())
     }
+}
+
+fn cleanup_orphaned_run_replacement_temps(
+    directory: &artifact_safety::PinnedPrivateDirectory,
+) -> std::io::Result<()> {
+    let mut stale = Vec::new();
+    let mut entries = 0_usize;
+    directory.for_each_entry_name(|name| {
+        entries = entries.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "run replacement temp enumeration overflowed",
+            )
+        })?;
+        if entries > crate::artifact_storage::RUN_TREE_ENTRY_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "run replacement temp enumeration exceeds the run entry cap",
+            ));
+        }
+        let Some(name_text) = name.to_str() else {
+            return Ok(());
+        };
+        let Some(suffix) = name_text.strip_prefix(".run.json.run-state.tmp-") else {
+            return Ok(());
+        };
+        let Some((pid, sequence)) = suffix.split_once('-') else {
+            return Ok(());
+        };
+        let (Ok(pid_number), Ok(sequence_number)) = (pid.parse::<u32>(), sequence.parse::<u64>())
+        else {
+            return Ok(());
+        };
+        if format!("{pid_number}-{sequence_number}") != suffix {
+            return Ok(());
+        }
+        let file = directory.open_existing_file(name, true, false)?;
+        let metadata = file.metadata()?;
+        directory.validate_single_link_file(name, &metadata)?;
+        stale.push((name.to_os_string(), metadata));
+        Ok(())
+    })?;
+    let changed = !stale.is_empty();
+    for (name, metadata) in stale {
+        directory.unlink_if_same(&name, &metadata)?;
+    }
+    if changed {
+        directory.sync_all()?;
+    }
+    directory.validate_identity()
 }
 
 impl Drop for RunMutationGuard {
@@ -1125,6 +1240,28 @@ mod tests {
             assert_eq!(fs::read(orphan).unwrap(), b"orphan");
         }
         fs::remove_file(reserved).unwrap();
+    }
+
+    #[test]
+    fn reopening_the_run_guard_cleans_only_authenticated_orphan_replacement_temps() {
+        let temp = private_temp();
+        initialize_run_lock(temp.path());
+        let stale = temp.path().join(".run.json.run-state.tmp-999999-1");
+        crate::artifact_safety::write_private_fixture(&stale, b"synced intended run").unwrap();
+        let unrelated = temp
+            .path()
+            .join(".run.json.run-state.tmp-not-a-canonical-owner");
+        crate::artifact_safety::write_private_fixture(&unrelated, b"unrelated").unwrap();
+        let leading_zero = temp.path().join(".run.json.run-state.tmp-0999999-1");
+        crate::artifact_safety::write_private_fixture(&leading_zero, b"lookalike").unwrap();
+
+        let guard = RunMutationGuard::acquire(temp.path())
+            .expect("the next guard owner must reclaim a dead replacement temp");
+
+        assert!(!stale.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(fs::read(&leading_zero).unwrap(), b"lookalike");
+        guard.validate().unwrap();
     }
 
     #[test]

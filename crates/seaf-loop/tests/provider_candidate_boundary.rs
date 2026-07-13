@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -35,6 +36,737 @@ use seaf_loop::{
 };
 use seaf_models::{FakeProvider, ModelResponse};
 use sha2::{Digest, Sha256};
+
+const RUN_TREE_BYTE_CAP: u64 = 32 * 1024 * 1024;
+const RUN_TREE_ENTRY_CAP: usize = 4096;
+const EVALUATION_EVIDENCE_CAP: u64 = 2 * 1024 * 1024;
+
+#[test]
+fn evaluation_intent_capacity_boundaries_refuse_before_intent_or_child_process() {
+    for (label, extra, should_succeed) in [("byte-exact", 0_u64, true), ("byte-short", 1, false)] {
+        let (fixture, approved) = approved_fixture_with_eval_mode(
+            &format!("evaluation-capacity-{label}"),
+            FixtureEvalMode::Marker,
+        );
+        let intent_size = intended_evaluation_intent_size(&fixture, &approved);
+        let commitment = 2 * 64 * 1024 + 5 * EVALUATION_EVIDENCE_CAP;
+        let current = run_tree_usage(fixture.workspace.run_directory()).0;
+        let target = RUN_TREE_BYTE_CAP
+            .checked_sub(current)
+            .and_then(|bytes| bytes.checked_sub(u64::try_from(intent_size).unwrap()))
+            .and_then(|bytes| bytes.checked_sub(commitment))
+            .unwrap()
+            + extra;
+        fill_run_bytes(fixture.workspace.run_directory(), target, label);
+        let marker = fixture.source.parent().unwrap().join("eval-spawned.marker");
+        let result = seaf_loop::execute_approved_evaluation(&fixture.workspace, &fixture.source);
+        assert_eq!(result.is_ok(), should_succeed, "{result:?}");
+        assert_eq!(marker.exists(), should_succeed);
+        assert_eq!(
+            fixture
+                .workspace
+                .run_directory()
+                .join("artifacts/07-testing.attempt-001.execution-intent.json")
+                .exists(),
+            should_succeed
+        );
+        fixture.cleanup();
+    }
+
+    for (label, free_entries, should_succeed) in [
+        ("entry-exact", 8_usize, true),
+        ("entry-short", 7_usize, false),
+    ] {
+        let (fixture, _approved) = approved_fixture_with_eval_mode(
+            &format!("evaluation-capacity-{label}"),
+            FixtureEvalMode::Marker,
+        );
+        let current = run_tree_usage(fixture.workspace.run_directory()).1;
+        fill_run_entries(
+            fixture.workspace.run_directory(),
+            RUN_TREE_ENTRY_CAP - current - free_entries,
+            label,
+        );
+        let marker = fixture.source.parent().unwrap().join("eval-spawned.marker");
+        let result = seaf_loop::execute_approved_evaluation(&fixture.workspace, &fixture.source);
+        assert_eq!(result.is_ok(), should_succeed, "{result:?}");
+        assert_eq!(marker.exists(), should_succeed);
+        assert_eq!(
+            fixture
+                .workspace
+                .run_directory()
+                .join("artifacts/07-testing.attempt-001.execution-intent.json")
+                .exists(),
+            should_succeed
+        );
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn wrong_same_name_log_retains_residual_and_cannot_fund_a_generic_writer() {
+    let (fixture, approved) =
+        approved_fixture_with_eval_mode("evaluation-wrong-log-residual", FixtureEvalMode::Marker);
+    let intent = intended_evaluation_intent_bytes(&fixture, &approved);
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/07-testing.attempt-001.execution-intent.json",
+        &intent,
+    );
+    let commitment = 2 * 64 * 1024 + 5 * EVALUATION_EVIDENCE_CAP;
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    fill_run_bytes(
+        fixture.workspace.run_directory(),
+        RUN_TREE_BYTE_CAP - current - commitment,
+        "wrong-log-residual",
+    );
+    let wrong_log = fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.check-001.stdout.log");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    std::io::Write::write_all(&mut options.open(&wrong_log).unwrap(), b"x").unwrap();
+
+    let error = write_step_request(&fixture.workspace, LoopStepName::Testing, 99, "unrelated")
+        .expect_err("a one-byte wrong log must not release the other 65,535 reserved bytes");
+
+    assert!(error.to_string().contains("commitment"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn hard_linked_same_name_log_cannot_release_capacity() {
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "evaluation-hardlinked-log-residual",
+        FixtureEvalMode::Marker,
+    );
+    let intent = intended_evaluation_intent_bytes(&fixture, &approved);
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/07-testing.attempt-001.execution-intent.json",
+        &intent,
+    );
+    let source = fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/hardlink-source.log");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    std::io::Write::write_all(&mut options.open(&source).unwrap(), b"x").unwrap();
+    let wrong_log = fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.check-001.stdout.log");
+    fs::hard_link(&source, &wrong_log).unwrap();
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("a hard-linked canonical log name cannot consume an evaluation slot");
+
+    assert!(
+        error.to_string().contains("single-link") || error.to_string().contains("link"),
+        "{error}"
+    );
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn malformed_or_substituted_testing_cannot_release_capacity() {
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "evaluation-malformed-testing-residual",
+        FixtureEvalMode::Marker,
+    );
+    let intent = intended_evaluation_intent_bytes(&fixture, &approved);
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/07-testing.attempt-001.execution-intent.json",
+        &intent,
+    );
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/07-testing.attempt-001.json",
+        b"{}\n",
+    );
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("malformed Testing bytes cannot release log or Testing slots");
+    assert!(error.to_string().contains("Testing") || error.to_string().contains("missing field"));
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture("evaluation-substituted-testing-residual");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/08-eval-report.attempt-001.json"),
+    )
+    .unwrap();
+    let testing_path = "artifacts/07-testing.attempt-001.json";
+    let mut testing: TestingEvidence = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(testing_path)).unwrap(),
+    )
+    .unwrap();
+    testing.run_id = "substituted-run".into();
+    let bytes = canonical_json_bytes(&testing).unwrap();
+    write_private_run_fixture(&fixture.workspace, testing_path, &bytes);
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("substituted Testing authority cannot release its slot");
+    assert!(error.to_string().contains("Testing"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn forged_staged_evaluation_sources_cannot_release_capacity_or_fund_generic_writes() {
+    let (fixture, approved) = approved_fixture("forged-staged-adoption-source");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/08-eval-report.attempt-001.json"),
+    )
+    .unwrap();
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "stage adoption authority",
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&adopted.reference.artifact.path),
+    )
+    .unwrap();
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join("artifacts/08-eval-report.attempt-001.json"),
+    )
+    .unwrap();
+    let source_path = format!(
+        "artifacts/recovery-{:03}.source-run.json",
+        adopted.reference.recovery_id
+    );
+    let mut source: EvaluationRecoverySourceRunV2 = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap(),
+    )
+    .unwrap();
+    source.evaluation_prefix.execution_intent.digest = "0".repeat(64);
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    write_private_run_fixture(&fixture.workspace, &source_path, &source_bytes);
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("a forged canonical v2 source cannot release its source/report slots");
+    assert!(error.to_string().contains("source"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture("forged-staged-adoption-report");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "stage report-bound adoption authority",
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&adopted.reference.artifact.path),
+    )
+    .unwrap();
+    let report_path = "artifacts/08-eval-report.attempt-001.json";
+    let mut report: EvalReport = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(report_path)).unwrap(),
+    )
+    .unwrap();
+    report.checks[0].summary = Some("substituted report semantics".into());
+    let report_bytes = canonical_json_bytes(&report).unwrap();
+    write_private_run_fixture(&fixture.workspace, report_path, &report_bytes);
+    let source_path = format!(
+        "artifacts/recovery-{:03}.source-run.json",
+        adopted.reference.recovery_id
+    );
+    let mut source: EvaluationRecoverySourceRunV2 = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap(),
+    )
+    .unwrap();
+    source
+        .evaluation_prefix
+        .eval_report
+        .as_mut()
+        .unwrap()
+        .digest = format!("{:x}", Sha256::digest(&report_bytes));
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    write_private_run_fixture(&fixture.workspace, &source_path, &source_bytes);
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("an unbound staged report cannot release its report slot");
+    assert!(error.to_string().contains("EvalReport"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+
+    let (fixture, approved) = approved_fixture("forged-staged-invalidation-source");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "stage invalidation authority",
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&invalidated.reference.artifact.path),
+    )
+    .unwrap();
+    let source_path = format!(
+        "artifacts/recovery-{:03}.source-run.json",
+        invalidated.reference.recovery_id
+    );
+    let mut source: EvaluationInvalidationSourceRunV3 = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(&source_path)).unwrap(),
+    )
+    .unwrap();
+    source.evaluation_prefix.present_artifacts[0].digest = "0".repeat(64);
+    let source_bytes = canonical_json_bytes(&source).unwrap();
+    write_private_run_fixture(&fixture.workspace, &source_path, &source_bytes);
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("a forged canonical v3 source cannot release its source slot");
+    assert!(error.to_string().contains("source"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn forged_invalidation_reference_cannot_supersede_an_active_prefix() {
+    let (fixture, approved) = approved_fixture("forged-invalidation-supersession");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "publish valid invalidation",
+    )
+    .unwrap();
+    let recovery_path = invalidated.reference.artifact.path.clone();
+    let mut recovery: EvaluationInvalidationAttemptV3 = serde_json::from_slice(
+        &fs::read(fixture.workspace.run_directory().join(&recovery_path)).unwrap(),
+    )
+    .unwrap();
+    recovery.next_evaluation_attempt += 1;
+    let recovery_bytes = canonical_json_bytes(&recovery).unwrap();
+    write_private_run_fixture(&fixture.workspace, &recovery_path, &recovery_bytes);
+    let mut forged_run = invalidated.run;
+    forged_run.latest_recovery.as_mut().unwrap().artifact.digest =
+        format!("{:x}", Sha256::digest(&recovery_bytes));
+    write_raw_run(&fixture.workspace, &forged_run);
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("a forged v3 reference cannot supersede the factual attempt prefix");
+    assert!(error.to_string().contains("invalidation"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn staged_invalidation_source_cannot_select_an_older_contiguous_attempt() {
+    let (fixture, approved) = approved_fixture("staged-invalidation-older-attempt");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "capture valid attempt-one invalidation source",
+    )
+    .unwrap();
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&invalidated.reference.artifact.path),
+    )
+    .unwrap();
+    let first_intent = fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.execution-intent.json");
+    let mut second_intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(first_intent).unwrap()).unwrap();
+    second_intent["evaluation_attempt"] = serde_json::json!(2);
+    write_private_run_fixture(
+        &fixture.workspace,
+        "artifacts/07-testing.attempt-002.execution-intent.json",
+        canonical_json_bytes(&second_intent).unwrap(),
+    );
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    let newer_attempt_commitment = 2 * 64 * 1024 + 5 * EVALUATION_EVIDENCE_CAP;
+    fill_run_bytes(
+        fixture.workspace.run_directory(),
+        RUN_TREE_BYTE_CAP - current - newer_attempt_commitment,
+        "newer-attempt-commitment",
+    );
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("a staged v3 source for attempt one cannot release attempt two capacity");
+
+    assert!(error.to_string().contains("active attempt"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn create_missing_unbound_report_retains_residual_capacity_end_to_end() {
+    let (fixture, approved) = approved_fixture("create-missing-unbound-report-residual");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let report_path = "artifacts/08-eval-report.attempt-001.json";
+    fs::remove_file(fixture.workspace.run_directory().join(report_path)).unwrap();
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "capture authentic CreateMissing source",
+    )
+    .unwrap();
+    assert_eq!(
+        adopted.recovery.report_disposition,
+        EvaluationRecoveryReportDisposition::CreateMissing
+    );
+    write_raw_run(&fixture.workspace, &approved);
+    fs::remove_file(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&adopted.reference.artifact.path),
+    )
+    .unwrap();
+    fs::remove_file(fixture.workspace.run_directory().join(report_path)).unwrap();
+    let source: EvaluationRecoverySourceRunV2 = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .workspace
+                .run_directory()
+                .join(&adopted.recovery.source_run.path),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(source.evaluation_prefix.eval_report.is_none());
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    fill_run_bytes(
+        fixture.workspace.run_directory(),
+        RUN_TREE_BYTE_CAP - current - 3 * EVALUATION_EVIDENCE_CAP,
+        "create-missing-residual",
+    );
+    write_private_run_fixture(&fixture.workspace, report_path, b"x");
+
+    let error = write_step_request(
+        &fixture.workspace,
+        LoopStepName::Testing,
+        99,
+        "must not publish",
+    )
+    .expect_err("an unbound same-name report cannot finance one unrelated byte");
+
+    assert!(error.to_string().contains("commitment"), "{error}");
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("prompts/07-testing.attempt-099.prompt.md")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_lost_capacity_after_check_one_prevents_check_two_and_testing_authority() {
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "evaluation-capacity-between-checks",
+        FixtureEvalMode::CapacityAfterFirstCheck,
+    );
+    let intent_size = intended_evaluation_intent_size(&fixture, &approved);
+    let commitment = 4 * 64 * 1024 + 5 * EVALUATION_EVIDENCE_CAP;
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    let target = RUN_TREE_BYTE_CAP
+        .checked_sub(current)
+        .and_then(|bytes| bytes.checked_sub(u64::try_from(intent_size).unwrap()))
+        .and_then(|bytes| bytes.checked_sub(commitment))
+        .unwrap();
+    fill_run_bytes(fixture.workspace.run_directory(), target, "between-checks");
+    let root = fixture.source.parent().unwrap();
+
+    let error = seaf_loop::execute_approved_evaluation(&fixture.workspace, &fixture.source)
+        .expect_err("capacity lost by check one must abort before check two");
+
+    assert!(error.to_string().contains("commitment"), "{error}");
+    assert!(root.join("eval-first.marker").exists());
+    assert!(!root.join("eval-second.marker").exists());
+    assert!(fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.execution-intent.json")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.json")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.check-001.stdout.log")
+        .exists());
+    assert!(!fixture
+        .workspace
+        .run_directory()
+        .join("artifacts/07-testing.attempt-001.check-001.stderr.log")
+        .exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_command_latency_does_not_hold_the_run_mutation_lock() {
+    let (fixture, approved) = approved_fixture_with_eval_mode(
+        "evaluation-command-lock-release",
+        FixtureEvalMode::Blocking,
+    );
+    let workspace = fixture.workspace.clone();
+    let source = fixture.source.clone();
+    let worker =
+        std::thread::spawn(move || seaf_loop::execute_approved_evaluation(&workspace, &source));
+    let root = fixture.source.parent().unwrap();
+    let started = root.join("eval-blocking.started");
+    let release = root.join("eval-blocking.release");
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !started.exists() {
+        let release_result = fs::write(&release, b"release");
+        let evaluation_result = worker.join();
+        fixture.cleanup();
+        release_result.expect("release a blocking command that missed its start marker");
+        panic!("blocking evaluation command never started: {evaluation_result:?}");
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let lock_workspace = fixture.workspace.clone();
+    let exact = approved.clone();
+    let lock_worker = std::thread::spawn(move || {
+        sender
+            .send(seaf_loop::state::save_run(&lock_workspace, &exact))
+            .unwrap();
+    });
+    let lock_result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+    let release_result = fs::write(&release, b"release");
+    lock_worker.join().unwrap();
+    let evaluation_result = worker.join().unwrap();
+    release_result.expect("release blocking evaluation command");
+    lock_result
+        .expect("idempotent run-lock operation must finish during command latency")
+        .expect("idempotent run save");
+    let final_run = evaluation_result.expect("evaluation completes");
+    assert_eq!(final_run.status, seaf_core::LoopStatus::EvalPassed);
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_final_reopen_reclaims_orphan_run_temp_before_recovery_publication() {
+    let (fixture, approved) = approved_fixture("evaluation-final-orphan-temp");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    let active_complete_prefix = 3 * EVALUATION_EVIDENCE_CAP;
+    fill_run_bytes(
+        fixture.workspace.run_directory(),
+        RUN_TREE_BYTE_CAP - current - active_complete_prefix,
+        "final-orphan",
+    );
+    let stale = fixture
+        .workspace
+        .run_directory()
+        .join(".run.json.run-state.tmp-999999-1");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stale)
+        .unwrap();
+    file.set_len(EVALUATION_EVIDENCE_CAP).unwrap();
+
+    let adopted = adopt_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "recover final publication after dead run temp",
+    )
+    .expect("reopened final recovery must reclaim the prior owner's run temp");
+
+    assert_eq!(adopted.run.status, seaf_core::LoopStatus::EvalPassed);
+    assert!(!stale.exists());
+    assert_eq!(
+        seaf_loop::state::load_run(&fixture.workspace).unwrap(),
+        adopted.run
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn evaluation_invalidation_reopen_reclaims_orphan_run_temp_before_reset_cas() {
+    let (fixture, approved) = approved_fixture("evaluation-invalidation-orphan-temp");
+    publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stdout.log",
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(fixture.workspace.run_directory().join(path)).unwrap();
+    }
+    let current = run_tree_usage(fixture.workspace.run_directory()).0;
+    let active_intent_prefix = 2 * 64 * 1024 + 5 * EVALUATION_EVIDENCE_CAP;
+    fill_run_bytes(
+        fixture.workspace.run_directory(),
+        RUN_TREE_BYTE_CAP - current - active_intent_prefix,
+        "invalidation-orphan",
+    );
+    let stale = fixture
+        .workspace
+        .run_directory()
+        .join(".run.json.run-state.tmp-999999-2");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stale)
+        .unwrap();
+    file.set_len(EVALUATION_EVIDENCE_CAP).unwrap();
+
+    let invalidated = invalidate_approved_evaluation(
+        &fixture.workspace,
+        "operator@example.invalid",
+        "recover invalidation after dead run temp",
+    )
+    .expect("reopened invalidation must reclaim the prior owner's run temp");
+
+    assert_eq!(invalidated.run.status, seaf_core::LoopStatus::Approved);
+    assert!(!stale.exists());
+    assert_eq!(
+        seaf_loop::state::load_run(&fixture.workspace).unwrap(),
+        invalidated.run
+    );
+    fixture.cleanup();
+}
 
 #[test]
 fn evaluation_invalidation_preserves_an_intent_only_prefix_and_resets_exact_approved_authority() {
@@ -3322,6 +4054,120 @@ fn approved_fixture_with_eval_execution(
     (fixture, approved)
 }
 
+fn approved_fixture_with_eval_mode(
+    run_id: &str,
+    mode: FixtureEvalMode,
+) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
+    let fixture = awaiting_approval_fixture_with_eval_mode(run_id, mode);
+    let awaiting = seaf_loop::state::load_run(&fixture.workspace).unwrap();
+    let candidate = awaiting.candidate_workspace.as_ref().unwrap();
+    let approved = approve_candidate_for_testing(
+        &fixture.workspace,
+        &fixture.source,
+        "reviewer@example.invalid",
+        &candidate.candidate_diff_digest,
+        &candidate.starting_head,
+    )
+    .unwrap()
+    .run;
+    (fixture, approved)
+}
+
+fn intended_evaluation_intent_size(
+    fixture: &AwaitingApprovalFixture,
+    approved: &seaf_core::LoopRun,
+) -> usize {
+    intended_evaluation_intent_bytes(fixture, approved).len()
+}
+
+fn intended_evaluation_intent_bytes(
+    fixture: &AwaitingApprovalFixture,
+    approved: &seaf_core::LoopRun,
+) -> Vec<u8> {
+    let candidate = approved.candidate_workspace.as_ref().unwrap();
+    let eval_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .workspace
+                .run_directory()
+                .join("inputs/eval-config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let intent = serde_json::json!({
+        "schema_version": 2,
+        "evaluation_attempt": 1,
+        "run_id": approved.run_id,
+        "approved_run_digest": canonical_sha256_digest(approved).unwrap(),
+        "input_digests": approved.input_digests,
+        "ticket": {
+            "path": "inputs/ticket.json",
+            "digest": approved.input_digests.ticket,
+        },
+        "eval_config": {
+            "path": "inputs/eval-config.json",
+            "digest": approved.input_digests.eval_config,
+        },
+        "candidate_state_digest": canonical_sha256_digest(candidate).unwrap(),
+        "candidate_diff": approved.human_approval.as_ref().unwrap().candidate_diff,
+        "source_worktree_state_digest": source_worktree_authority_digest(approved),
+        "recovery": null,
+        "planned_checks": eval_config["evals"]["required"],
+    });
+    canonical_json_bytes(&intent).unwrap()
+}
+
+fn run_tree_usage(root: &Path) -> (u64, usize) {
+    fn walk(path: &Path, identities: &mut BTreeSet<(u64, u64)>) -> (u64, usize) {
+        use std::os::unix::fs::MetadataExt;
+        let mut bytes = 0_u64;
+        let mut entries = 0_usize;
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            entries += 1;
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                let nested = walk(&entry.path(), identities);
+                bytes += nested.0;
+                entries += nested.1;
+            } else if metadata.is_file() && identities.insert((metadata.dev(), metadata.ino())) {
+                bytes += metadata.len();
+            }
+        }
+        (bytes, entries)
+    }
+    walk(root, &mut BTreeSet::new())
+}
+
+fn fill_run_bytes(root: &Path, mut bytes: u64, label: &str) {
+    let mut index = 0;
+    while bytes > 0 {
+        let size = bytes.min(EVALUATION_EVIDENCE_CAP);
+        let path = root.join(format!("{label}-byte-filler-{index:03}"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.set_len(size).unwrap();
+        bytes -= size;
+        index += 1;
+    }
+}
+
+fn fill_run_entries(root: &Path, count: usize, label: &str) {
+    for index in 0..count {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(format!("{label}-entry-filler-{index:04}")))
+            .unwrap();
+    }
+}
+
 fn approved_fixture_with_drifting_eval(
     run_id: &str,
 ) -> (AwaitingApprovalFixture, seaf_core::LoopRun) {
@@ -3965,6 +4811,9 @@ enum FixtureEvalMode {
     Disabled,
     Cargo,
     DriftAfterFirstCheck,
+    Marker,
+    CapacityAfterFirstCheck,
+    Blocking,
 }
 
 fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
@@ -3984,6 +4833,32 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
         )
         .unwrap();
     }
+    if matches!(eval_mode, FixtureEvalMode::Marker) {
+        fs::write(
+            source.join("eval-marker.sh"),
+            "#!/bin/sh\nprintf spawned > \"$1\"\n",
+        )
+        .unwrap();
+    }
+    if matches!(eval_mode, FixtureEvalMode::CapacityAfterFirstCheck) {
+        fs::write(
+            source.join("eval-capacity-first.sh"),
+            "#!/bin/sh\nprintf first > \"$1\"\numask 077\ntruncate -s 1 \"$2\"\nchmod 600 \"$2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("eval-capacity-second.sh"),
+            "#!/bin/sh\nprintf second > \"$1\"\n",
+        )
+        .unwrap();
+    }
+    if matches!(eval_mode, FixtureEvalMode::Blocking) {
+        fs::write(
+            source.join("eval-blocking.sh"),
+            "#!/bin/sh\nprintf started > \"$1\"\nwhile [ ! -f \"$2\" ]; do sleep 0.01; done\n",
+        )
+        .unwrap();
+    }
     git_ok(&source, &["add", "."]);
     git_ok(&source, &["commit", "-qm", "initial"]);
     let mut ticket = ticket();
@@ -3994,6 +4869,15 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
         }
         FixtureEvalMode::DriftAfterFirstCheck => {
             ticket.autonomy.allow_shell_commands = vec!["sh".into(), "true".into()];
+        }
+        FixtureEvalMode::Marker => {
+            ticket.autonomy.allow_shell_commands = vec!["sh".into()];
+        }
+        FixtureEvalMode::CapacityAfterFirstCheck => {
+            ticket.autonomy.allow_shell_commands = vec!["sh".into()];
+        }
+        FixtureEvalMode::Blocking => {
+            ticket.autonomy.allow_shell_commands = vec!["sh".into()];
         }
     }
     let policy = policy();
@@ -4014,6 +4898,21 @@ fn fixture_with_eval_mode(run_id: &str, eval_mode: FixtureEvalMode) -> Fixture {
         }
         FixtureEvalMode::DriftAfterFirstCheck => format!(
             "evals:\n  allow_commands: [sh, true]\n  required:\n    - name: mutate_authority\n      command: {drift_command}\n    - name: must_not_spawn\n      command: true\n"
+        ),
+        FixtureEvalMode::Marker => format!(
+            "evals:\n  allow_commands: [sh]\n  required:\n    - name: marker\n      command: sh eval-marker.sh {}\n",
+            temp.path().join("eval-spawned.marker").display()
+        ),
+        FixtureEvalMode::CapacityAfterFirstCheck => format!(
+            "evals:\n  allow_commands: [sh]\n  required:\n    - name: consume_capacity\n      command: sh eval-capacity-first.sh {} {}\n    - name: must_not_spawn\n      command: sh eval-capacity-second.sh {}\n",
+            temp.path().join("eval-first.marker").display(),
+            runs_root.join(run_id).join("lost-capacity.raw").display(),
+            temp.path().join("eval-second.marker").display(),
+        ),
+        FixtureEvalMode::Blocking => format!(
+            "evals:\n  allow_commands: [sh]\n  required:\n    - name: blocking\n      command: sh eval-blocking.sh {} {}\n      timeout_ms: 10000\n",
+            temp.path().join("eval-blocking.started").display(),
+            temp.path().join("eval-blocking.release").display(),
         ),
     };
     let eval_config = seaf_core::parse_eval_config(&eval_yaml).unwrap();

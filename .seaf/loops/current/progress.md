@@ -40,12 +40,12 @@
 - [x] M1-10: Atomic state and run locking.
 - [ ] M1-11: Minimum artifact protection.
   - [x] M1-11a: Private run artifacts.
-  - [ ] M1-11b: Bounded artifact storage.
+  - [x] M1-11b: Bounded artifact storage.
     - [x] M1-11b1: Serialized artifact limits.
-    - [ ] M1-11b2: Pre-side-effect storage commitments (active).
+    - [x] M1-11b2: Pre-side-effect storage commitments.
       - [x] M1-11b2a: Provider commitments.
-      - [ ] M1-11b2b: Evaluation commitments (active).
-  - [ ] M1-11c: Bounded secret redaction.
+      - [x] M1-11b2b: Evaluation commitments.
+  - [ ] M1-11c: Bounded secret redaction (active).
 - [ ] M1-12: Interruption recovery acceptance.
 
 ## Milestone 2 - Consumable Loop
@@ -178,5 +178,6 @@ before open-only candidate acquisition, preserving candidate-before-run order.
 Git patch-planning indexes are
 isolated in pinned external operation directories, and promotion crash tests now
 synchronize through the repository-to-provider lock order. Provider-side
-M1-11b2a is implemented pending review; evaluation-side M1-11b2b and M1-11c
-bounded secret redaction remain pending.
+M1-11b2a and M1-11b2b are accepted after independent specification, quality,
+and evidence review. M1-11b2 and M1-11b are complete. M1-11c bounded secret
+redaction is active.

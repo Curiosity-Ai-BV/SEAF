@@ -30,7 +30,7 @@ pub(crate) struct StorageCommitment {
 }
 
 impl StorageCommitment {
-    pub(crate) fn after_consuming_provider_slot(&self, relative_path: &str) -> io::Result<Self> {
+    pub(crate) fn after_consuming_slot(&self, relative_path: &str) -> io::Result<Self> {
         let mut remaining = self.clone();
         if let Some(position) = remaining
             .consumable_permanent_paths
@@ -52,6 +52,10 @@ impl StorageCommitment {
             remaining.consumable_transient_path = None;
         }
         Ok(remaining)
+    }
+
+    pub(crate) fn after_consuming_provider_slot(&self, relative_path: &str) -> io::Result<Self> {
+        self.after_consuming_slot(relative_path)
     }
 }
 
@@ -244,6 +248,47 @@ pub(crate) fn validate_replacement_activating_commitment(
     )
 }
 
+pub(crate) fn validate_create_activating_commitment(
+    root: &PinnedPrivateDirectory,
+    relative_path: &str,
+    size: usize,
+    commitment: &StorageCommitment,
+) -> io::Result<()> {
+    validate_artifact_size(relative_path, size)?;
+    let usage = published_run_usage(root)?;
+    let size = u64::try_from(size).map_err(|_| invalid("artifact size is not representable"))?;
+    validate_bytes(
+        usage.bytes,
+        size,
+        0,
+        "commitment activation publication peak",
+    )?;
+    validate_entries(
+        usage.entries,
+        2,
+        0,
+        "commitment activation publication peak",
+    )?;
+    validate_bytes(
+        usage.bytes,
+        size,
+        commitment
+            .permanent_bytes
+            .checked_add(commitment.transient_bytes)
+            .ok_or_else(|| invalid("storage commitment byte accounting overflowed"))?,
+        "commitment activation post-publication commitment",
+    )?;
+    validate_entries(
+        usage.entries,
+        1,
+        commitment
+            .permanent_entries
+            .checked_add(commitment.transient_entries)
+            .ok_or_else(|| invalid("storage commitment entry accounting overflowed"))?,
+        "commitment activation post-publication commitment",
+    )
+}
+
 pub(crate) struct ProviderRequestPrefixProjection<'a> {
     pub(crate) request_path: &'a str,
     pub(crate) request_size: usize,
@@ -395,6 +440,55 @@ pub(crate) fn validate_provider_slot_create_projection(
     )
 }
 
+pub(crate) fn validate_evaluation_log_create_projection(
+    root: &PinnedPrivateDirectory,
+    relative_path: &str,
+    size: usize,
+    commitment: &StorageCommitment,
+) -> io::Result<()> {
+    validate_artifact_size(relative_path, size)?;
+    let Some((_, limit)) = commitment
+        .consumable_permanent_paths
+        .iter()
+        .find(|(path, _)| path == relative_path)
+    else {
+        return Err(invalid(format!(
+            "evaluation log publication does not own an active commitment slot: {relative_path}"
+        )));
+    };
+    let size_u64 =
+        u64::try_from(size).map_err(|_| invalid("artifact size is not representable"))?;
+    let residual = limit
+        .checked_sub(size_u64)
+        .ok_or_else(|| invalid("evaluation log exceeds its normalized commitment"))?;
+    let mut remaining = commitment.after_consuming_slot(relative_path)?;
+    remaining.permanent_bytes = remaining
+        .permanent_bytes
+        .checked_add(residual)
+        .ok_or_else(|| invalid("evaluation log residual commitment overflowed"))?;
+    let usage = published_run_usage(root)?;
+    validate_bytes(usage.bytes, size_u64, 0, "evaluation log publication peak")?;
+    validate_entries(usage.entries, 2, 0, "evaluation log publication peak")?;
+    validate_bytes(
+        usage.bytes,
+        size_u64,
+        remaining
+            .permanent_bytes
+            .checked_add(remaining.transient_bytes)
+            .ok_or_else(|| invalid("storage commitment byte accounting overflowed"))?,
+        "evaluation log post-publication commitment",
+    )?;
+    validate_entries(
+        usage.entries,
+        1,
+        remaining
+            .permanent_entries
+            .checked_add(remaining.transient_entries)
+            .ok_or_else(|| invalid("storage commitment entry accounting overflowed"))?,
+        "evaluation log post-publication commitment",
+    )
+}
+
 pub(crate) fn validate_provider_slot_replacement_projection(
     root: &PinnedPrivateDirectory,
     relative_path: &str,
@@ -437,9 +531,9 @@ pub(crate) fn validate_provider_slot_replacement_projection(
 }
 
 fn active_commitment(root: &PinnedPrivateDirectory) -> io::Result<StorageCommitment> {
-    crate::provider_exchange::derive_active_provider_storage_commitment(root.path())
+    crate::storage_authority::derive_active_storage_commitment(root.path())
         .map(|commitment| commitment.unwrap_or_else(empty_commitment))
-        .map_err(|error| invalid(format!("provider storage commitment is invalid: {error}")))
+        .map_err(|error| invalid(format!("storage commitment is invalid: {error}")))
 }
 
 fn empty_commitment() -> StorageCommitment {
@@ -738,6 +832,123 @@ mod tests {
             .after_consuming_provider_slot("responses/slot.response.json")
             .expect_err("inconsistent commitment entries must fail checked subtraction");
         assert!(error.to_string().contains("underflow"), "{error}");
+    }
+
+    #[test]
+    fn generic_writers_cannot_claim_reserved_paths_or_invade_active_capacity() {
+        let commitment = StorageCommitment {
+            permanent_bytes: 100,
+            transient_bytes: 0,
+            permanent_entries: 1,
+            transient_entries: 0,
+            consumable_permanent_paths: vec![("artifacts/reserved.json".to_string(), 100)],
+            consumable_transient_path: None,
+        };
+        let reserved = private_temp();
+        fill_to(reserved.path(), RUN_TREE_BYTE_CAP - 1);
+        validate_provider_slot_create_projection(
+            &PinnedPrivateDirectory::open(reserved.path()).unwrap(),
+            "artifacts/reserved.json",
+            1,
+            &commitment,
+        )
+        .expect("the typed owner may consume its exact reserved slot");
+        let error = validate_create_with_commitment(
+            published_run_usage(&PinnedPrivateDirectory::open(reserved.path()).unwrap()).unwrap(),
+            "artifacts/reserved.json",
+            1,
+            &commitment,
+        )
+        .expect_err("a generic same-name writer cannot claim a typed reserved slot");
+        assert!(error.to_string().contains("commitment"), "{error}");
+
+        let unrelated = private_temp();
+        fill_to(unrelated.path(), RUN_TREE_BYTE_CAP - 100);
+        let error = validate_create_with_commitment(
+            published_run_usage(&PinnedPrivateDirectory::open(unrelated.path()).unwrap()).unwrap(),
+            "artifacts/unrelated.json",
+            1,
+            &commitment,
+        )
+        .expect_err("an unrelated writer must preserve the complete active commitment");
+        assert!(error.to_string().contains("commitment"), "{error}");
+    }
+
+    #[test]
+    fn commitment_activation_accepts_exact_byte_and_entry_headroom_and_rejects_one_short() {
+        let commitment = StorageCommitment {
+            permanent_bytes: 100,
+            transient_bytes: 100,
+            permanent_entries: 2,
+            transient_entries: 1,
+            consumable_permanent_paths: vec![
+                ("artifacts/future-a.json".to_string(), 50),
+                ("artifacts/future-b.json".to_string(), 50),
+            ],
+            consumable_transient_path: Some("run.json".to_string()),
+        };
+        let exact_bytes = private_temp();
+        fill_to(exact_bytes.path(), RUN_TREE_BYTE_CAP - 50 - 200);
+        validate_create_activating_commitment(
+            &PinnedPrivateDirectory::open(exact_bytes.path()).unwrap(),
+            "artifacts/intent.json",
+            50,
+            &commitment,
+        )
+        .expect("exact fresh commitment byte headroom must be accepted");
+
+        let one_short_bytes = private_temp();
+        fill_to(one_short_bytes.path(), RUN_TREE_BYTE_CAP - 50 - 200 + 1);
+        let error = validate_create_activating_commitment(
+            &PinnedPrivateDirectory::open(one_short_bytes.path()).unwrap(),
+            "artifacts/intent.json",
+            50,
+            &commitment,
+        )
+        .expect_err("one byte less than the fresh commitment must be rejected");
+        assert!(error.to_string().contains("post-publication"), "{error}");
+
+        let exact_entries = private_temp();
+        create_zero_byte_files(exact_entries.path(), RUN_TREE_ENTRY_CAP - 4);
+        validate_create_activating_commitment(
+            &PinnedPrivateDirectory::open(exact_entries.path()).unwrap(),
+            "artifacts/intent.json",
+            0,
+            &commitment,
+        )
+        .expect("exact fresh commitment entry headroom must be accepted");
+
+        let one_short_entry = private_temp();
+        create_zero_byte_files(one_short_entry.path(), RUN_TREE_ENTRY_CAP - 3);
+        let error = validate_create_activating_commitment(
+            &PinnedPrivateDirectory::open(one_short_entry.path()).unwrap(),
+            "artifacts/intent.json",
+            0,
+            &commitment,
+        )
+        .expect_err("one entry less than the fresh commitment must be rejected");
+        assert!(error.to_string().contains("post-publication"), "{error}");
+    }
+
+    #[test]
+    fn commitment_activation_rejects_checked_arithmetic_overflow() {
+        let temp = private_temp();
+        let commitment = StorageCommitment {
+            permanent_bytes: u64::MAX,
+            transient_bytes: 1,
+            permanent_entries: 0,
+            transient_entries: 0,
+            consumable_permanent_paths: Vec::new(),
+            consumable_transient_path: None,
+        };
+        let error = validate_create_activating_commitment(
+            &PinnedPrivateDirectory::open(temp.path()).unwrap(),
+            "artifacts/intent.json",
+            1,
+            &commitment,
+        )
+        .expect_err("fresh commitment overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error}");
     }
 
     #[test]

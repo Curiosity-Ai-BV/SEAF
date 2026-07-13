@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, fs};
+#[cfg(test)]
+use std::fs;
+use std::{collections::BTreeMap, ffi::OsStr, io, path::Path};
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, ArtifactReference, EvalCheck, EvalCommandConfig,
@@ -91,6 +93,15 @@ pub(crate) struct EvaluationInvalidationPrefixPaths {
     pub trailing_stdout: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluationCommitmentPrefix {
+    pub(crate) attempt: u32,
+    pub(crate) intent: String,
+    pub(crate) testing: Option<String>,
+    pub(crate) report: Option<String>,
+    pub(crate) logs: BTreeMap<u32, (Option<String>, Option<String>)>,
+}
+
 impl EvaluationAttemptInventory {
     pub fn load(workspace: &LoopWorkspace) -> Result<Self, String> {
         Self::load_with_mode(workspace, false)
@@ -104,54 +115,109 @@ impl EvaluationAttemptInventory {
         workspace: &LoopWorkspace,
         allow_recovered_attempts_and_crash_prefixes: bool,
     ) -> Result<Self, String> {
+        Self::load_from_run_directory(
+            workspace.run_directory(),
+            allow_recovered_attempts_and_crash_prefixes,
+        )
+    }
+
+    pub(crate) fn load_from_run_directory(
+        run_directory: &Path,
+        allow_recovered_attempts_and_crash_prefixes: bool,
+    ) -> Result<Self, String> {
         let mut attempts: BTreeMap<u32, AttemptInventory> = BTreeMap::new();
-        for entry in fs::read_dir(workspace.run_directory().join("artifacts"))
-            .map_err(|error| error.to_string())?
-        {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let raw = entry.file_name();
-            let lossy = raw.to_string_lossy();
-            let evaluation_name =
-                lossy.starts_with("07-testing") || lossy.starts_with("08-eval-report");
-            if !evaluation_name {
-                continue;
+        let root = crate::artifact_safety::PinnedPrivateDirectory::open(run_directory)
+            .map_err(|error| error.to_string())?;
+        let artifacts = match root.open_child_directory(OsStr::new("artifacts")) {
+            Ok(artifacts) => artifacts,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self { attempts });
             }
-            let name = raw
-                .into_string()
-                .map_err(|_| "evaluation artifact filename is not valid UTF-8".to_string())?;
-            let (attempt, spelling, kind) = parse_name(&name).ok_or_else(|| {
-                format!("evaluation artifact filename is malformed or noncanonical: {name}")
-            })?;
-            if attempt != 1 && !allow_recovered_attempts_and_crash_prefixes {
-                return Err(
-                    "evaluation attempt is unauthorized before M1-09c3 recovery".to_string()
-                );
-            }
-            let file_type = entry.file_type().map_err(|error| error.to_string())?;
-            if file_type.is_symlink() || !file_type.is_file() {
-                return Err(format!(
-                    "evaluation artifact is not a real regular file: {name}"
-                ));
-            }
-            let relative = format!("artifacts/{name}");
-            let slot = attempts.entry(attempt).or_default();
-            if slot.spelling.is_some_and(|current| current != spelling) {
-                return Err(format!(
-                    "mixed fixed and indexed evaluation attempt {attempt} authority"
-                ));
-            }
-            slot.spelling = Some(spelling);
-            let target = match kind {
-                Kind::Intent => &mut slot.intent,
-                Kind::Testing => &mut slot.testing,
-                Kind::Report => &mut slot.report,
-                Kind::Stdout(check) => &mut slot.logs.entry(check).or_default().0,
-                Kind::Stderr(check) => &mut slot.logs.entry(check).or_default().1,
-            };
-            if target.replace(relative).is_some() {
-                return Err(format!("duplicate evaluation artifact slot: {name}"));
-            }
-        }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut entries = 0_usize;
+        artifacts
+            .for_each_entry_name(|raw| {
+                entries = entries.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "evaluation inventory overflowed",
+                    )
+                })?;
+                if entries > crate::artifact_storage::RUN_TREE_ENTRY_CAP {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "evaluation inventory exceeds the run entry cap",
+                    ));
+                }
+                let lossy = raw.to_string_lossy();
+                let evaluation_name =
+                    lossy.starts_with("07-testing") || lossy.starts_with("08-eval-report");
+                if !evaluation_name {
+                    return Ok(());
+                }
+                let name = raw
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "evaluation artifact filename is not valid UTF-8",
+                        )
+                    })?
+                    .to_string();
+                let (attempt, spelling, kind) = parse_name(&name).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "evaluation artifact filename is malformed or noncanonical: {name}"
+                        ),
+                    )
+                })?;
+                if attempt != 1 && !allow_recovered_attempts_and_crash_prefixes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "evaluation attempt is unauthorized before M1-09c3 recovery",
+                    ));
+                }
+                if artifacts.entry_kind(raw)?
+                    != crate::artifact_safety::PinnedEntryKind::RegularFile
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("evaluation artifact is not a real regular file: {name}"),
+                    ));
+                }
+                let relative = format!("artifacts/{name}");
+                let slot = attempts.entry(attempt).or_default();
+                if slot.spelling.is_some_and(|current| current != spelling) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("mixed fixed and indexed evaluation attempt {attempt} authority"),
+                    ));
+                }
+                slot.spelling = Some(spelling);
+                let target = match kind {
+                    Kind::Intent => &mut slot.intent,
+                    Kind::Testing => &mut slot.testing,
+                    Kind::Report => &mut slot.report,
+                    Kind::Stdout(check) => &mut slot.logs.entry(check).or_default().0,
+                    Kind::Stderr(check) => &mut slot.logs.entry(check).or_default().1,
+                };
+                if target.replace(relative).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("duplicate evaluation artifact slot: {name}"),
+                    ));
+                }
+                artifacts.validate_identity()?;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        artifacts
+            .validate_identity()
+            .map_err(|error| error.to_string())?;
+        root.validate_identity()
+            .map_err(|error| error.to_string())?;
         let mut expected = 1_u32;
         for (attempt, inventory) in &attempts {
             if *attempt != expected {
@@ -200,6 +266,14 @@ impl EvaluationAttemptInventory {
         self.attempts.is_empty()
     }
 
+    pub(crate) fn contains_attempt(&self, attempt: u32) -> bool {
+        self.attempts.contains_key(&attempt)
+    }
+
+    pub(crate) fn latest_attempt(&self) -> Option<u32> {
+        self.attempts.keys().next_back().copied()
+    }
+
     pub fn require_selected(
         &self,
         attempt: u32,
@@ -224,6 +298,25 @@ impl EvaluationAttemptInventory {
 
     pub fn intent_path(&self, attempt: u32) -> Option<&str> {
         self.attempts.get(&attempt)?.intent.as_deref()
+    }
+
+    pub(crate) fn latest_commitment_prefix(
+        &self,
+    ) -> Result<Option<EvaluationCommitmentPrefix>, String> {
+        let Some((&attempt, selected)) = self.attempts.iter().next_back() else {
+            return Ok(None);
+        };
+        let intent = selected
+            .intent
+            .clone()
+            .ok_or_else(|| "evaluation commitment prefix lost execution intent".to_string())?;
+        Ok(Some(EvaluationCommitmentPrefix {
+            attempt,
+            intent,
+            testing: selected.testing.clone(),
+            report: selected.report.clone(),
+            logs: selected.logs.clone(),
+        }))
     }
 
     pub(crate) fn recovery_prefix_paths(&self) -> Result<EvaluationRecoveryPrefixPaths, String> {

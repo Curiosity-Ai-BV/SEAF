@@ -44,19 +44,23 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-11b2b - Evaluation-side pre-side-effect storage commitments. Provider-side
-M1-11b2a is accepted. M1-11b2b remains active, so parent M1-11b2 is incomplete.
+M1-11c - Bounded secret redaction. M1-11b, including provider and evaluation
+pre-side-effect commitments, is accepted. M1-11c is the only remaining M1-11
+slice.
 
-An authenticated active evaluation intent reserves every missing normalized
-stdout/stderr maximum, bounded Testing evidence, bounded EvalReport, two bounded
-recovery artifacts, the full future `run.json` replacement bytes at the atomic
-coexistence peak, missing permanent names, and one transient name. The shared
-output-limit normalizer accepts 1 through 1 MiB and defaults to 64 KiB.
+Configured evaluation environment values may remain only in the exact private
+`inputs/eval-config.json`. Provider prompts, requests, responses, evaluation
+logs, Testing evidence, EvalReport, and other derived artifacts must redact both
+configured secret values and obvious credential forms before persistence.
 
-Before publishing a fresh intent or spawning each approved command, prove the
-current physical operation and complete future commitment fit within the 32 MiB
-and 4,096-entry run budgets. Testing/report publication, direct finalization,
-invalidation, and zero-command adoption consume only their authenticated slots
-and reconstruct the remaining commitment after interruption. Release the run
-guard before command latency. Do not add secret redaction, retention/purge,
-format migration, packaging, or release behavior in this slice.
+Accept at most 64 configured secret values, each at most 4 KiB and at most
+64 KiB in aggregate. Oversized redaction input or output fails closed. Preserve
+clean provider results and M1-11b2 typed oversize failures exactly. A
+secret-bearing provider response becomes a small safe non-retryable audited
+failure without raw bytes or a raw digest, while request-only recovery semantics
+remain unchanged.
+
+Mandatory RED/GREEN covers configured values, obvious patterns, overlaps,
+input/output caps, provider responses, request-only crash recovery, and
+no-raw-leak assertions. Do not add retention/purge, format migration, packaging,
+release, or M1-12 interruption-acceptance behavior in this slice.

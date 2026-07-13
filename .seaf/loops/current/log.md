@@ -2169,3 +2169,117 @@ tests. Strict Clippy, formatting, Linux `seaf-loop` target check, TypeScript
 format/lint/typecheck/test/build (8 tests), and diff hygiene pass. M1-11b2a is
 accepted; evaluation-side M1-11b2b is active and parent M1-11b2 remains
 incomplete.
+
+## 2026-07-13 implementation | M1-11b2b evaluation commitments
+
+Implemented evaluation-side byte-and-entry commitments without a reservation
+file. One shared normalizer supplies the execution and storage limits: each
+stdout/stderr stream defaults to 64 KiB and accepts 1 through 1 MiB. Fresh
+intent activation reserves every missing stream, 2 MiB Testing evidence,
+2 MiB EvalReport, 2 MiB recovery source, 2 MiB recovery decision, the full
+2 MiB future `run.json` replacement at its atomic coexistence peak, all missing
+permanent names, and one transient replacement name.
+
+The candidate-to-run lock order is retained. Fresh intent and every pre-spawn
+check reauthenticate run, candidate, source, snapshots, intent, factual prior
+logs, and capacity under the run guard; the guard is released before command
+latency. Typed log, Testing, report, recovery, and final publications consume
+only their authenticated slots. Generic writers retain the entire commitment.
+Testing and report paths release capacity only after exact schema, lineage, log
+digest, report evidence, check, aggregate, and decision validation. Fixed-v1, indexed-v2,
+invalidation-v3, provider-v1 recovery, direct finalization, zero-command
+adoption, and exact retry remain supported.
+
+Present but not yet Testing-authenticated logs retain a non-consumable
+`normalized_limit - physical_size` residual, so physical bytes plus commitment
+still equal the full maximum. Staged adoption reports use the same residual
+rule until a fully verified recovery decision binds their digest. A new run
+guard owner removes only canonical private single-link root replacement temps;
+both final adoption and invalidation reset converge after this reopen cleanup.
+
+Witnessed RED: the shared normalizer symbol was absent on baseline `b80c56c`.
+GREEN now includes a literal mixed-limit prefix table, exact/one-short byte and
+entry activation, checked overflow, fresh evaluation behavioral denial with no
+intent or child marker, deterministic capacity loss after check one with no
+check-two marker or Testing authority, pinned intent-parent substitution,
+generic same-name/unrelated reservation protection, adoption/invalidation crash
+cuts, and real final and invalidation recovery after reclaiming canonical
+orphaned run temps.
+The provider/candidate boundary passed 53/53 before the added capacity tests;
+the new focused behavioral tests pass individually. M1-11b2b remains review
+pending; parent M1-11b2 and M1-11 remain incomplete.
+
+## 2026-07-13 review correction | M1-11b2b evaluation commitments
+
+Independent specification and adversarial review rejected the first pass on
+six concrete gaps. A typed log publication had removed the whole slot instead
+of retaining `limit - actual` residual capacity; source-only v2/v3 recovery and
+v3 supersession did not yet traverse the complete verified authority loaders;
+canonical replacement-temp parsing accepted leading-zero spellings; command
+latency lacked a live run-lock release test; hard-linked logs, malformed or
+substituted Testing, and unbound staged reports needed direct denial evidence;
+and the recovery algebra lacked a literal production-used transition table.
+
+The corrected implementation retains log/report residuals, routes staged
+source and supersession decisions through full lineage and artifact validation,
+rejects noncanonical temp names, verifies an idempotent run save completes while
+an evaluation command is blocked, and rejects every requested same-name and
+typed-evidence forgery before unrelated publication. The transition constructor
+now projects literal remaining paths, bytes, and entries for v2 CreateMissing,
+v2 VerifyExisting, and v3 source/decision/report cuts. Real reauthentication
+also requires adoption final and invalidation reset authority to derive no
+active evaluation commitment; a terminal derivation unit test asserts `None`,
+not a synthetic empty commitment.
+
+Corrected verification is green: evaluation-storage units 4/4, `seaf-loop`
+library 225/225, provider/candidate boundary 63/63, eval engine 7/7, eval report
+3/3, final authority 2/2, provider exchange 22/22, state 38/38, and Testing
+evidence 8/8. The first full-workspace pass exposed lost stable path/collision
+context in the new earlier storage checks; focused RED/GREEN restored
+`eval-config.json`, execution-intent, changed-Approved-authority, and
+different-bytes classifications. The focused CLI matrix then passed 1/1 and
+`cargo test --workspace` passed in full, including CLI 138/138. Strict Clippy,
+Rust formatting, pinned-pnpm format/typecheck/test/build (8 SDK tests), and diff
+hygiene pass. M1-11b2b remains implemented with independent re-review pending.
+
+## 2026-07-13 re-review correction 2 | M1-11b2b latest-prefix authority
+
+The second independent review rejected three remaining evidence/authority
+gaps. Recovery-transition derivation accepted a staged v3 source without tying
+its selected attempt to the active latest prefix; the report residual test
+failed during VerifyExisting source validation instead of traversing the real
+CreateMissing `PresentUnauthenticated` branch; and the live lock-release test
+could panic before releasing and joining its default-long-running command.
+
+Transition derivation now passes the active prefix attempt into staged source
+validation. Both v2 and v3 staged sources must select the factual inventory's
+latest attempt, and an active source must also match the exact commitment
+prefix. A new regression retains a valid attempt-one v3 source, adds a
+contiguous factual attempt-two intent, fills the newer commitment headroom, and
+proves the older source cannot authorize unrelated publication. A second
+regression keeps an authentic CreateMissing source (`eval_report: null`),
+removes its decision and report, fills physical usage plus the exact 6 MiB
+transition commitment, injects a one-byte unbound report, and proves the
+residual prevents an unrelated prompt. The blocking fixture now has a 10-second
+command timeout, and every missing-marker/release assertion path writes the
+release and joins the worker before panicking. Focused corrections pass; the
+corrected `seaf-loop` library passes 225/225, provider/candidate boundary passes
+65/65, and `cargo test --workspace` passes in full, including CLI 138/138. The
+strict Clippy, Rust formatting, pinned-pnpm formatting, and diff-hygiene gates
+also pass. The slice remains rejected until another independent re-review.
+
+## 2026-07-13 accepted | M1-11b2b evaluation commitments
+
+Final independent specification, quality, and evidence re-reviews approve the
+corrected slice. The accepted boundary binds every staged source to the exact
+latest factual attempt, preserves unauthenticated log and CreateMissing report
+residuals, authenticates v2/v3 source and supersession lineage, releases the run
+guard across command latency, and reclaims only canonical private orphan run
+replacement temporaries. The production-used transition table and real crash
+cuts cover normal, adoption, invalidation, final, and reset capacity states.
+
+Final gates pass: `cargo test --workspace` including CLI 138/138, `seaf-loop`
+library 225/225, and provider/candidate boundary 65/65; strict all-target and
+all-feature Clippy; Rust formatting; pinned-pnpm format/typecheck/test/build
+with 8 SDK tests; and diff hygiene. M1-11b2 and M1-11b are complete. M1-11c
+bounded secret redaction is active.

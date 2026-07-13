@@ -1692,8 +1692,8 @@ Commit boundary: private permissions and pinned-directory publication only.
 
 #### M1-11b - Bounded Artifact Storage
 
-Status: active. Split into M1-11b1 serialized artifact limits and M1-11b2
-pre-side-effect storage commitments. M1-11b1 is complete and M1-11b2 is active.
+Status: complete on 2026-07-13. M1-11b1 serialized artifact limits and M1-11b2
+pre-side-effect storage commitments are accepted.
 Dependencies: M1-11a (complete).
 
 Objective: reject oversized run artifacts before partial or misleading
@@ -1803,8 +1803,8 @@ and directly required bounded reads only.
 
 ##### M1-11b2 - Pre-Side-Effect Storage Commitments
 
-Status: active. Split into provider-side M1-11b2a and evaluation-side
-M1-11b2b. M1-11b2a is accepted; M1-11b2b is active.
+Status: complete on 2026-07-13. Provider-side M1-11b2a and evaluation-side
+M1-11b2b are accepted.
 Dependencies: M1-11b1 (complete).
 
 Objective: guarantee logical capacity for the authoritative result before a
@@ -1819,8 +1819,11 @@ Acceptance criteria:
   Insufficient capacity creates no new authoritative request and performs zero
   provider calls.
 - An authenticated active evaluation intent reserves every missing stdout and
-  stderr maximum plus bounded Testing evidence, EvalReport, and final run-state
-  growth. An over-budget plan publishes no intent and spawns zero commands.
+  stderr maximum separately plus bounded Testing evidence, EvalReport, two
+  recovery artifacts, and the full future `run.json` replacement at the atomic
+  coexistence peak. The commitment includes every missing permanent name and
+  one transient replacement name. An over-budget plan publishes no intent and
+  spawns zero commands.
 - Every cooperative publisher accounts physical bytes plus the one derivable
   active provider/evaluation commitment. Canonical prefix publication consumes
   its slot; crash/reopen, staged adoption, invalidation, and exact retry
@@ -1865,17 +1868,85 @@ and raw marker/digest absence.
 
 ###### M1-11b2b - Evaluation-Side Commitments
 
-Status: active. Dependencies: M1-11b2a accepted.
+Status: accepted on 2026-07-13. Dependencies: M1-11b2a accepted. Parent
+M1-11b2 and M1-11b are complete; M1-11 remains active for M1-11c.
 
-Derive active evaluation-intent capacity for missing stdout/stderr maxima,
-Testing evidence, EvalReport, and the full final `run.json` replacement at its
-atomic coexistence peak; refuse an over-budget
-plan before intent or command spawn; preserve it through invalidation and
-zero-command adoption.
+Delivered implementation: one shared output-limit normalizer gives each
+stdout and stderr stream its configured maximum (`64 KiB` by default, valid
+range `1..=1 MiB`). A fresh authenticated intent atomically activates capacity
+for every missing stream, bounded Testing and EvalReport artifacts, both
+2 MiB recovery source and recovery decision fallbacks, the full 2 MiB future
+`run.json` replacement at its atomic coexistence peak, every missing permanent
+name, and one transient replacement name. Physical publication peaks remain
+separate from post-publication steady usage plus the derived commitment.
+
+The exact intent/log/Testing/report prefix reconstructs and consumes only
+authenticated typed slots. Before every command spawn, SEAF acquires the run
+guard after the candidate lock, reauthenticates the durable run, candidate,
+source, inputs, intent, completed log prefix, and remaining capacity, then
+releases the run guard before spawning. Unrelated cooperative publishers retain
+the full evaluation commitment. Existing-winner retries consume no slot;
+different bytes and surplus same-name artifacts fail closed.
+
+Before Testing is durable, a present stdout/stderr name does not create free
+slack: physical bytes plus a non-consumable `normalized_limit - physical_size`
+residual still equal the full stream maximum, while the already-present name
+needs no future entry. Testing validates the exact intent, attempt, selected log
+paths, and log digests before releasing those residuals. A staged adoption
+report likewise retains `2 MiB - physical_size` until a fully verified recovery
+decision binds its exact digest. Wrong same-name and hard-linked artifacts
+therefore cannot finance an unrelated cooperative publication.
+
+Normal intent authority retains the two recovery slots after Testing and
+EvalReport publication. Adoption and invalidation then transition from source
+to decision to optional report to the final run replacement without a durable
+reservation file. Direct final publication consumes the full replacement and
+releases unused recovery fallback. Fixed-v1, indexed-v2, invalidation-v3,
+provider recovery, crash-cut retry, and promotion/final authority behavior are
+preserved. Pinned bounded evaluation inventory replaces raw directory
+enumeration. A new run-guard owner removes only canonical, private,
+single-link root `run.json` replacement temporaries left by a dead prior lock
+owner before commitment validation; lookalike names remain untouched. Real
+adoption/final and invalidation/reset reopen tests prove that the stale physical
+replacement does not double-count the future transient slot.
+
+RED/GREEN covers the shared normalizer, a literal mixed-limit prefix
+table, trailing stdout and exact slot consumption, missing-log rejection,
+exact/one-short byte and entry activation boundaries, checked overflow,
+recovery publication crash cuts, fresh denial with no intent or child marker,
+capacity loss after check one with no second marker or Testing authority,
+pinned intent-parent substitution, wrong same-name residual protection, both
+run-temp reopen transitions, and the complete provider/candidate boundary. The
+first independent review rejected whole-slot log consumption, partial staged
+v2/v3 authentication, permissive temp spelling, missing live lock-release and
+hard-link/Testing/report regressions, and the absence of a literal recovery
+transition table. Those findings are corrected. The production-used table now
+asserts literal paths, bytes, and entries for v2 CreateMissing, v2
+VerifyExisting, and v3 source/decision/report cuts; real adoption and
+invalidation reauthentication require final/reset authority to derive no active
+commitment. Corrected gates pass for evaluation-storage units (4), the full
+`seaf-loop` library (225), provider/candidate boundary (65), eval engine (7),
+eval report (3), final authority (2), provider exchange (22), state (38), and
+Testing evidence (8). The full workspace, strict Clippy, Rust formatting,
+pinned-pnpm format/typecheck/test/build, and diff-hygiene gates pass.
+
+Second re-review correction: staged v2/v3 recovery sources now select both the
+exact active commitment prefix and the factual inventory's latest attempt. A
+contiguous newer attempt makes an older otherwise-valid v3 source fail closed
+without releasing capacity. End-to-end coverage now reaches the authentic
+CreateMissing `PresentUnauthenticated` branch: with source durable, decision and
+report absent, and physical usage plus the 6 MiB transition commitment exactly
+at cap, a one-byte unbound same-name report retains its remaining report cap and
+cannot finance an unrelated prompt. The live command-lock test uses a bounded
+10-second command and releases/joins the worker on every assertion path. The
+Rust owner gates pass: `seaf-loop` library 225/225, provider/candidate boundary
+65/65, and the full workspace including CLI 138/138. Strict Clippy, Rust
+formatting, pinned-pnpm formatting, and diff hygiene also pass. Final
+independent specification, quality, and evidence re-reviews approve the slice.
 
 #### M1-11c - Bounded Secret Redaction
 
-Status: pending. Dependencies: M1-11b.
+Status: active. Dependencies: M1-11b (complete).
 
 Objective: prevent configured and obvious credentials from escaping their one
 private authoritative input snapshot into provider requests or derived run

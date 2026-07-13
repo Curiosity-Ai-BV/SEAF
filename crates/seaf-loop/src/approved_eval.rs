@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
     error::Error,
     fmt,
@@ -22,9 +23,13 @@ use crate::{
     },
     eval_engine::execute_eval_checks_with_pre_spawn,
     evaluation_attempt::{
-        ApprovedEvaluationIntentV2, EvaluationAttemptInventory, EvaluationAttemptPaths,
+        ApprovedEvaluationIntent, ApprovedEvaluationIntentV2, EvaluationAttemptInventory,
+        EvaluationAttemptPaths,
     },
-    immutable_artifact::{publish_create_only, read_verified_regular_file},
+    immutable_artifact::{
+        publish_create_only_consuming_evaluation_slot,
+        publish_create_only_with_guard_after_commitment_projection, read_verified_regular_file,
+    },
     plan_eval_checks, state, LoopWorkspace, TestingEvidence,
 };
 
@@ -217,13 +222,45 @@ fn execute_approved_evaluation_locked(
         planned_checks: eval_config.evals.required.clone(),
     };
     let intent_bytes = canonical_json_bytes(&intent).map_err(ApprovedEvaluationError::wrapped)?;
-    publish_create_only(workspace.run_directory(), &paths.intent, &intent_bytes)
+    let intent_authority = ApprovedEvaluationIntent::V2(Box::new(intent.clone()));
+    let run_guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    let locked = state::load_run(workspace).map_err(ApprovedEvaluationError::wrapped)?;
+    if locked != approved {
+        return Err(ApprovedEvaluationError::invalid(
+            "Approved authority changed before evaluation commitment activation",
+        ));
+    }
+    let commitment = crate::evaluation_storage::derive_fresh_evaluation_storage_commitment(
+        workspace.run_directory(),
+        &locked,
+        &intent_authority,
+        &paths.intent,
+    )
+    .map_err(ApprovedEvaluationError::invalid)?;
+    run_guard
+        .validate_create_activating_commitment(&paths.intent, intent_bytes.len(), &commitment)
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    publish_create_only_with_guard_after_commitment_projection(
+        &run_guard,
+        &paths.intent,
+        &intent_bytes,
+    )
+    .map_err(ApprovedEvaluationError::wrapped)?;
+    run_guard
+        .validate_active_storage_commitment()
+        .map_err(ApprovedEvaluationError::wrapped)?;
+    run_guard
+        .unlock()
         .map_err(ApprovedEvaluationError::wrapped)?;
 
     let started_at = now_timestamp()?;
-    let mut checks = Vec::with_capacity(eval_config.evals.required.len());
+    let checks = RefCell::new(Vec::with_capacity(eval_config.evals.required.len()));
     let executions = execute_eval_checks_with_pre_spawn(&plan, |_| {
         let result = (|| {
+            let run_guard =
+                crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
+                    .map_err(ApprovedEvaluationError::wrapped)?;
             let current = state::load_run(workspace).map_err(ApprovedEvaluationError::wrapped)?;
             if current != approved {
                 return Err(ApprovedEvaluationError::invalid(
@@ -279,6 +316,18 @@ fn execute_approved_evaluation_locked(
                 &intent_bytes,
                 &sha256_bytes(&intent_bytes),
             )?;
+            crate::evaluation_storage::validate_pre_spawn_evaluation_prefix(
+                workspace.run_directory(),
+                attempt,
+                &checks.borrow(),
+            )
+            .map_err(ApprovedEvaluationError::invalid)?;
+            run_guard
+                .validate_active_storage_commitment()
+                .map_err(ApprovedEvaluationError::wrapped)?;
+            run_guard
+                .unlock()
+                .map_err(ApprovedEvaluationError::wrapped)?;
             Ok(())
         })();
         result.map_err(|error| error.to_string())
@@ -291,11 +340,19 @@ fn execute_approved_evaluation_locked(
         let stderr_path = paths.stderr(number);
         let stdout = execution.stdout.as_bytes();
         let stderr = execution.stderr.as_bytes();
-        publish_create_only(workspace.run_directory(), &stdout_path, stdout)
-            .map_err(ApprovedEvaluationError::wrapped)?;
-        publish_create_only(workspace.run_directory(), &stderr_path, stderr)
-            .map_err(ApprovedEvaluationError::wrapped)?;
-        checks.push(EvalCheck {
+        publish_create_only_consuming_evaluation_slot(
+            workspace.run_directory(),
+            &stdout_path,
+            stdout,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+        publish_create_only_consuming_evaluation_slot(
+            workspace.run_directory(),
+            &stderr_path,
+            stderr,
+        )
+        .map_err(ApprovedEvaluationError::wrapped)?;
+        checks.borrow_mut().push(EvalCheck {
             name: execution.name,
             status: execution.status,
             duration_ms: Some(execution.duration_ms),
@@ -306,6 +363,7 @@ fn execute_approved_evaluation_locked(
             summary: Some(execution.summary),
         });
     }
+    let checks = checks.into_inner();
     let completed_at = now_timestamp()?;
 
     // Candidate authority remains locked. Reauthenticate it and every immutable input/output byte.
@@ -389,8 +447,12 @@ fn execute_approved_evaluation_locked(
             .artifact_digest()
             .map_err(ApprovedEvaluationError::wrapped)?,
     };
-    publish_create_only(workspace.run_directory(), &paths.testing, &testing_bytes)
-        .map_err(ApprovedEvaluationError::wrapped)?;
+    publish_create_only_consuming_evaluation_slot(
+        workspace.run_directory(),
+        &paths.testing,
+        &testing_bytes,
+    )
+    .map_err(ApprovedEvaluationError::wrapped)?;
 
     let passed = testing.passed;
     let report = build_integrated_eval_report(&approved, &testing, testing_reference.clone())?;
@@ -399,8 +461,12 @@ fn execute_approved_evaluation_locked(
         path: paths.report.clone(),
         digest: canonical_sha256_digest(&report).map_err(ApprovedEvaluationError::wrapped)?,
     };
-    publish_create_only(workspace.run_directory(), &paths.report, &report_bytes)
-        .map_err(ApprovedEvaluationError::wrapped)?;
+    publish_create_only_consuming_evaluation_slot(
+        workspace.run_directory(),
+        &paths.report,
+        &report_bytes,
+    )
+    .map_err(ApprovedEvaluationError::wrapped)?;
 
     verify_snapshot_bytes(
         workspace,
@@ -625,6 +691,39 @@ pub(crate) fn build_integrated_eval_report(
             testing_evidence: testing_reference.clone(),
         }),
     })
+}
+
+pub(crate) fn validate_integrated_eval_report_binding(
+    approved: &LoopRun,
+    testing: &TestingEvidence,
+    testing_reference: ArtifactReference,
+    report: &EvalReport,
+) -> Result<(), ApprovedEvaluationError> {
+    let errors = seaf_core::validate_eval_report(report);
+    if !errors.is_empty() {
+        return Err(ApprovedEvaluationError::invalid(
+            errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let expected = build_integrated_eval_report(approved, testing, testing_reference)?;
+    if report.eval_report_id != expected.eval_report_id
+        || report.patch_id != expected.patch_id
+        || report.goal_id != expected.goal_id
+        || report.passed != expected.passed
+        || report.checks != expected.checks
+        || report.risk_level != expected.risk_level
+        || report.decision != expected.decision
+        || report.loop_evidence != expected.loop_evidence
+    {
+        return Err(ApprovedEvaluationError::invalid(
+            "EvalReport does not bind exact Testing evidence",
+        ));
+    }
+    Ok(())
 }
 
 fn load_ticket_snapshot(

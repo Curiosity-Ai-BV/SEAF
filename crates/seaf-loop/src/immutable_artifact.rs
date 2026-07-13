@@ -201,12 +201,78 @@ pub(crate) fn publish_create_only_with_guard_consuming_provider_slot(
     publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, |_| Ok(()), true)
 }
 
+pub(crate) fn publish_create_only_consuming_evaluation_slot(
+    run_directory: &Path,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    let guard = RunMutationGuard::acquire(run_directory)?;
+    publish_create_only_with_guard_consuming_evaluation_slot(&guard, relative_path, bytes)
+}
+
+pub(crate) fn publish_create_only_with_guard_consuming_evaluation_slot(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    validate_relative_path(relative_path)?;
+    validate_real_run_parent(guard.run_directory(), Path::new(relative_path))?;
+    let parent = artifact_safety::open_private_descendant_parent(
+        guard.run_directory(),
+        Path::new(relative_path),
+    )?;
+    let file_name = Path::new(relative_path).file_name().ok_or_else(|| {
+        ImmutableArtifactError::Safety("artifact has no flat file name".to_string())
+    })?;
+    match parent.open_existing_file(file_name, true, false) {
+        Ok(_) => publish_create_only_with_guard_and_hook_core(
+            guard,
+            relative_path,
+            bytes,
+            |_| Ok(()),
+            false,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            guard.validate_evaluation_slot_create_projection(relative_path, bytes.len())?;
+            publish_create_only_with_guard_and_hook_core(
+                guard,
+                relative_path,
+                bytes,
+                |_| Ok(()),
+                true,
+            )
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn publish_create_only_with_guard_after_provider_prefix_projection(
     guard: &RunMutationGuard,
     relative_path: &str,
     bytes: &[u8],
 ) -> Result<(), ImmutableArtifactError> {
     publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, |_| Ok(()), true)
+}
+
+pub(crate) fn publish_create_only_with_guard_after_commitment_projection(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, |_| Ok(()), true)
+}
+
+#[cfg(test)]
+fn publish_create_only_with_guard_after_commitment_projection_with_hook<F>(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+    before_link: F,
+) -> Result<(), ImmutableArtifactError>
+where
+    F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
+{
+    publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, before_link, true)
 }
 
 pub(crate) fn publish_create_only_standalone(
@@ -906,6 +972,55 @@ mod tests {
         );
         assert!(!outside.join("escaped.json").exists());
         assert!(!parked.join("escaped.json").exists());
+    }
+
+    #[test]
+    fn commitment_activating_intent_parent_substitution_cannot_publish_externally() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = private_run(&temp);
+        artifact_safety::create_private_directory(&run.join("artifacts")).unwrap();
+        let guard = RunMutationGuard::acquire(&run).unwrap();
+        let commitment = crate::artifact_storage::StorageCommitment {
+            permanent_bytes: 0,
+            transient_bytes: 0,
+            permanent_entries: 0,
+            transient_entries: 0,
+            consumable_permanent_paths: Vec::new(),
+            consumable_transient_path: None,
+        };
+        guard
+            .validate_create_activating_commitment(
+                "artifacts/intent.json",
+                b"intent".len(),
+                &commitment,
+            )
+            .unwrap();
+        let artifacts = run.join("artifacts");
+        let parked = run.join("parked-artifacts");
+        let outside = temp.path().join("outside");
+        artifact_safety::create_private_directory(&outside).unwrap();
+        let error = publish_create_only_with_guard_after_commitment_projection_with_hook(
+            &guard,
+            "artifacts/intent.json",
+            b"intent",
+            |_| {
+                fs::rename(&artifacts, &parked)?;
+                symlink(&outside, &artifacts)?;
+                Ok(())
+            },
+        )
+        .expect_err("commitment activation must retain its pinned artifact parent");
+        assert!(
+            error.to_string().contains("directory") || error.to_string().contains("identity"),
+            "{error}"
+        );
+        assert!(!outside.join("intent.json").exists());
+        assert!(!parked.join("intent.json").exists());
+        assert!(!outside.read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
     }
 
     #[test]

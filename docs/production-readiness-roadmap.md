@@ -262,8 +262,31 @@ permanent scaffold artifact; missing historical locks migrate only after
 authority validation, with the run guard released before open-only candidate
 acquisition to preserve candidate-before-run lock order. External
 repository-operation locks remain outside this policy. M1-11b2 is split:
-provider-side M1-11b2a is accepted, while evaluation-side M1-11b2b is active.
-M1-11c bounded secret redaction remains pending, so
+provider-side M1-11b2a and evaluation-side M1-11b2b are accepted. The
+evaluation implementation
+derives missing per-stream maxima, bounded Testing and EvalReport artifacts,
+two bounded recovery artifacts, every future permanent name, and the full
+future `run.json` replacement plus one transient name at the atomic coexistence
+peak. It activates before intent publication, is reauthenticated under the run
+guard before every command spawn, and transitions through adoption and
+invalidation without a reservation file or holding the run guard across command
+latency. Unauthenticated same-name logs and staged reports retain the unfilled
+remainder of their cap until durable digest authority validates them. Reopening
+the run guard reclaims only canonical private orphan `run.json` replacement
+temporaries before commitment validation, so final and invalidation retry do
+not double-count a dead prior writer's transient slot. Complete staged v2/v3
+source and supersession verification, live command lock-release evidence, and a
+literal production-used v2/v3 transition table were added after the first
+independent review. Corrected focused and boundary gates pass, and final
+independent specification, quality, and evidence re-reviews approve the slice.
+M1-11b2 and M1-11b are complete.
+Second re-review additionally requires every staged v2/v3 source to select the
+active latest factual attempt. That binding and end-to-end authentic
+CreateMissing residual coverage are implemented, and the live command-lock
+test is bounded and cleanup-safe. Corrected Rust owner gates pass, including library
+225/225, provider/candidate boundary 65/65, and full-workspace CLI 138/138;
+strict lint, formatting, and diff-hygiene gates pass as well.
+M1-11c bounded secret redaction is active, so
 M1-11 is not yet complete.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.

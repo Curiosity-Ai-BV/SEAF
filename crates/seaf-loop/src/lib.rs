@@ -10,6 +10,7 @@ pub mod development_evidence;
 pub mod eval_engine;
 pub mod eval_report;
 mod evaluation_attempt;
+mod evaluation_storage;
 pub mod final_evaluation_authority;
 mod immutable_artifact;
 pub mod inspect;
@@ -25,6 +26,7 @@ pub mod role_response;
 mod run_persistence;
 pub mod runner;
 pub mod state;
+mod storage_authority;
 pub mod testing_evidence;
 pub mod workspace;
 
