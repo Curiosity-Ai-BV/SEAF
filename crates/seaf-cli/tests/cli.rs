@@ -82,37 +82,7 @@ fn generic_init_executes_one_stack_neutral_command_contract_before_writing() {
     for (name, rust, node, expected_commands) in cases {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let root = temp_dir.path();
-        fs::write(root.join("README.md"), format!("# {name} fixture\n")).unwrap();
-        if rust {
-            fs::create_dir(root.join("src")).unwrap();
-            fs::write(
-                root.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"init_{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-                    name.replace('-', "_")
-                ),
-            )
-            .unwrap();
-            fs::write(
-                root.join("src/lib.rs"),
-                "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fixture_passes() {}\n}\n",
-            )
-            .unwrap();
-        }
-        if node {
-            fs::write(
-                root.join("package.json"),
-                "{\"scripts\":{\"test\":\"node --test\"},\"type\":\"module\"}\n",
-            )
-            .unwrap();
-            fs::write(
-                root.join("fixture.test.js"),
-                "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('fixture passes', () => assert.equal(1, 1));\n",
-            )
-            .unwrap();
-        }
-        init_empty_git_repo(root);
-        commit_all(root, "Add runnable init fixture");
+        write_generic_stack_fixture(root, name, rust, node, false);
         let mut expected_paths = read_init_tree(root)
             .into_keys()
             .collect::<std::collections::BTreeSet<_>>();
@@ -392,6 +362,838 @@ fn init_rejects_target_and_ancestor_symlinks_including_dangling_links() {
         assert!(!output.status.success(), "{name}: {output:?}");
         assert_eq!(init_repository_snapshot(root), before, "{name}");
         assert_eq!(fs::read(root.join("outside")).unwrap(), b"outside\n");
+    }
+}
+
+#[test]
+fn doctor_ready_fake_report_has_the_exact_ordered_schema() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fixture");
+
+    let output = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("run project doctor");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor JSON report");
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["ready"], true);
+    assert_eq!(
+        report["repository"],
+        repo.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(report["provider"], "fake");
+    assert_eq!(report["model"], "fake-local");
+    assert_eq!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "git_repository",
+            "git_worktree",
+            "project_inputs",
+            "ticket",
+            "candidate_workspace",
+            "eval_config",
+            "eval_executables",
+            "provider",
+        ]
+    );
+    for check in report["checks"].as_array().unwrap() {
+        assert_eq!(check["status"], "passed", "{check}");
+        assert!(check["message"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(check.get("remediation").is_none(), "{check}");
+    }
+}
+
+#[test]
+fn doctor_generated_stack_matrix_plans_native_evals_without_executing_them() {
+    let cases = [
+        ("rust", true, false, vec!["cargo test"]),
+        ("node", false, true, vec!["npm test"]),
+        ("rust-and-node", true, true, vec!["cargo test", "npm test"]),
+        ("git-only", false, false, vec!["git diff --check"]),
+    ];
+
+    for (name, rust, node, expected_commands) in cases {
+        let temp = tempfile::tempdir().expect("doctor stack fixture");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("repository");
+        write_generic_stack_fixture(&repo, name, rust, node, true);
+
+        let init = seaf()
+            .args(["init", "--path", repo.to_str().unwrap(), "--json"])
+            .output()
+            .expect("initialize doctor stack fixture");
+        assert!(init.status.success(), "{name}: {init:?}");
+        let eval_bytes = fs::read(repo.join("seaf.evals.yaml")).expect("generated eval config");
+        let eval = seaf_core::parse_eval_config(std::str::from_utf8(&eval_bytes).unwrap())
+            .expect("valid generated eval config");
+        assert_eq!(
+            eval.evals
+                .required
+                .iter()
+                .map(|check| check.command.as_str())
+                .collect::<Vec<_>>(),
+            expected_commands,
+            "{name}"
+        );
+        commit_all(&repo, "Initialize doctor stack fixture");
+
+        let mut doctor = seaf_in(&repo);
+        doctor.args(["doctor", "--provider", "fake", "--json"]);
+        let source_before = init_repository_snapshot(&repo);
+        let worktrees_before = git_worktree_registration(&repo);
+        let output = doctor.output().expect("run stack project doctor");
+
+        assert!(output.status.success(), "{name}: {output:?}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON report");
+        assert_eq!(report["ready"], true, "{name}: {report}");
+        assert_eq!(report["checks"][5]["status"], "passed", "{name}");
+        assert_eq!(report["checks"][6]["status"], "passed", "{name}");
+        assert_eq!(init_repository_snapshot(&repo), source_before, "{name}");
+        assert_eq!(git_worktree_registration(&repo), worktrees_before, "{name}");
+        assert_eq!(
+            fs::read(repo.join("seaf.evals.yaml")).unwrap(),
+            eval_bytes,
+            "{name}"
+        );
+        assert!(
+            !repo.join("doctor-rust-eval-ran.marker").exists(),
+            "{name}: doctor must not execute cargo test"
+        );
+        assert!(
+            !repo.join("doctor-node-eval-ran.marker").exists(),
+            "{name}: doctor must not execute npm test"
+        );
+        assert!(!repo.join("eval-report.json").exists(), "{name}");
+        assert!(!repo.join(".seaf/loops").exists(), "{name}");
+    }
+}
+
+#[test]
+fn doctor_multi_failure_report_preserves_dependencies_and_actionable_remediation() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fixture");
+    fs::write(repo.join("README.md"), "dirty worktree\n").expect("dirty source");
+    fs::write(repo.join("seaf.config.json"), "{}\n").expect("invalid config");
+    fs::write(repo.join("seaf.ticket.yaml"), "not: a ticket\n").expect("invalid ticket");
+
+    let test_temp = seaf_test_temp_root(&repo);
+    let mut first_command = seaf_in(&repo);
+    assert_command_tmpdir(&first_command, &test_temp);
+    let source_before = init_repository_snapshot(&repo);
+    let common_dir = git_common_dir_path(&repo);
+    let common_before = read_init_tree(&common_dir);
+    let worktrees_before = git_worktree_registration(&repo);
+    let candidate_namespace_before = read_init_tree(&test_temp);
+    first_command.args(["doctor", "--provider", "fake", "--json"]);
+    let first = first_command.output().expect("run project doctor");
+    let second = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("repeat project doctor");
+
+    for output in [&first, &second] {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    assert_eq!(
+        first.stdout, second.stdout,
+        "repeat reports must be equivalent"
+    );
+    assert_eq!(init_repository_snapshot(&repo), source_before);
+    assert_eq!(read_init_tree(&common_dir), common_before);
+    assert_eq!(git_worktree_registration(&repo), worktrees_before);
+    assert_eq!(read_init_tree(&test_temp), candidate_namespace_before);
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("complete doctor JSON report");
+    assert_eq!(report["ready"], false);
+    let checks = report["checks"].as_array().expect("doctor checks");
+    assert_eq!(checks.len(), 8);
+    assert_eq!(checks[0]["status"], "passed");
+    assert_eq!(checks[1]["status"], "failed");
+    assert_eq!(checks[2]["status"], "failed");
+    assert_eq!(checks[3]["status"], "failed");
+    assert_eq!(checks[4]["status"], "blocked");
+    assert_eq!(checks[5]["status"], "blocked");
+    assert_eq!(checks[6]["status"], "blocked");
+    assert_eq!(checks[7]["status"], "passed");
+    for check in checks.iter().filter(|check| check["status"] != "passed") {
+        assert!(
+            check["remediation"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "{check}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fake_and_eval_planning_are_repeatable_and_completely_read_only() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    let trap = repo.join("doctor-eval-trap");
+    let marker = repo.join("doctor-eval-ran.marker");
+    write_executable_script(&trap, &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+    for relative in ["seaf.evals.yaml", "seaf.ticket.yaml"] {
+        let path = repo.join(relative);
+        let contents = fs::read_to_string(&path)
+            .expect("generated input")
+            .replace("git diff --check", "./doctor-eval-trap");
+        fs::write(path, contents).expect("install eval trap authority");
+    }
+    commit_all(&repo, "Initialize read-only doctor fixture");
+    let test_temp = temp.path().join("seaf-test-tmp");
+    fs::create_dir(&test_temp).expect("candidate namespace parent");
+    let source_before = init_repository_snapshot(&repo);
+    let common_dir = git_common_dir_path(&repo);
+    let common_before = read_init_tree(&common_dir);
+    let worktrees_before = git_worktree_registration(&repo);
+    let candidate_namespace_before = read_init_tree(&test_temp);
+
+    for _ in 0..2 {
+        let mut command = seaf_in(&repo);
+        assert_command_tmpdir(&command, &test_temp);
+        let output = command
+            .args(["doctor", "--provider", "fake", "--json"])
+            .output()
+            .expect("run project doctor");
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ready"], true);
+    }
+
+    assert!(
+        !marker.exists(),
+        "doctor must plan but never execute eval checks"
+    );
+    assert_eq!(init_repository_snapshot(&repo), source_before);
+    assert_eq!(read_init_tree(&common_dir), common_before);
+    assert_eq!(git_worktree_registration(&repo), worktrees_before);
+    assert_eq!(read_init_tree(&test_temp), candidate_namespace_before);
+    assert!(!repo.join(".seaf/loops").exists());
+    assert!(!repo.join("eval-report.json").exists());
+}
+
+#[test]
+fn doctor_human_and_json_render_the_same_report_and_usage_errors_exit_two() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fixture");
+
+    let json = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("JSON doctor");
+    let human = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake"])
+        .output()
+        .expect("human doctor");
+    assert_human_doctor_matches_json(&json, &human);
+
+    fs::write(repo.join("README.md"), "dirty\n").unwrap();
+    fs::write(repo.join("seaf.config.json"), "{}\n").unwrap();
+    fs::write(repo.join("seaf.ticket.yaml"), "not: a ticket\n").unwrap();
+    let failed_json = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("failed JSON doctor");
+    let failed_human = seaf_in(&repo)
+        .args(["doctor", "--provider", "fake"])
+        .output()
+        .expect("failed human doctor");
+    assert_human_doctor_matches_json(&failed_json, &failed_human);
+
+    for args in [
+        vec!["doctor", "--provider", "unknown"],
+        vec!["doctor", "--provider", "ollama"],
+        vec!["doctor", "--provider", "fake", "--timeout-ms", "0"],
+        vec!["doctor", "--provider", "fake", "--timeout-ms", "30001"],
+    ] {
+        let output = seaf_in(&repo).args(args).output().expect("usage error");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_explicit_ticket_paths_match_loop_run_caller_relative_behavior() {
+    let temp = tempfile::tempdir().expect("doctor ticket fixture");
+    let repo = temp.path().join("repo");
+    let subdirectory = repo.join("nested");
+    fs::create_dir_all(&subdirectory).expect("nested caller directory");
+    fs::write(repo.join("README.md"), "# Doctor ticket fixture\n").unwrap();
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor ticket fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor ticket fixture");
+
+    let external = temp.path().join("external.ticket.yaml");
+    fs::copy(repo.join("seaf.ticket.yaml"), &external).expect("external ticket");
+    let linked = temp.path().join("linked.ticket.yaml");
+    symlink(&external, &linked).expect("linked external ticket");
+
+    for (case, ticket) in [
+        ("default-root-discovery", None),
+        ("in-repository-relative", Some("../seaf.ticket.yaml")),
+        ("external-relative", Some("../../external.ticket.yaml")),
+        ("symlink-relative", Some("../../linked.ticket.yaml")),
+    ] {
+        let mut command = seaf_in(&subdirectory);
+        command.args(["doctor", "--provider", "fake", "--json"]);
+        if let Some(ticket) = ticket {
+            command.args(["--ticket", ticket]);
+        }
+        let output = command.output().expect("run ticket parity doctor");
+        assert!(output.status.success(), "{case}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ready"], true, "{case}: {report}");
+        assert_eq!(report["checks"][3]["status"], "passed", "{case}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_config_policy_precedence_and_containment_match_loop_run() {
+    let temp = tempfile::tempdir().expect("doctor input fixture");
+    let repo = temp.path().join("repo");
+    let subdirectory = repo.join("nested");
+    fs::create_dir_all(&subdirectory).expect("nested caller directory");
+    fs::write(repo.join("README.md"), "# Doctor input fixture\n").unwrap();
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor input fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor input fixture");
+
+    let valid_config = fs::read(repo.join("seaf.config.json")).unwrap();
+    fs::write(repo.join("seaf.config.json"), "not valid config\n").unwrap();
+    commit_all(&repo, "Make discovered config malformed");
+    let explicit_policy = seaf_in(&subdirectory)
+        .args([
+            "doctor",
+            "--provider",
+            "fake",
+            "--policy",
+            "../seaf.policy.json",
+            "--json",
+        ])
+        .output()
+        .expect("doctor with explicit policy");
+    assert!(explicit_policy.status.success(), "{explicit_policy:?}");
+    let report: serde_json::Value = serde_json::from_slice(&explicit_policy.stdout).unwrap();
+    assert_eq!(report["checks"][2]["status"], "passed", "{report}");
+
+    fs::write(repo.join("seaf.config.json"), &valid_config).unwrap();
+    let external_config = temp.path().join("external.config.json");
+    let external_policy = temp.path().join("external.policy.json");
+    fs::write(&external_config, &valid_config).unwrap();
+    fs::copy(repo.join("seaf.policy.json"), &external_policy).unwrap();
+    symlink(&external_config, repo.join("escape.config.json")).unwrap();
+    symlink(&external_policy, repo.join("escape.policy.json")).unwrap();
+    commit_all(&repo, "Restore config and add escape aliases");
+
+    for (case, flag, path, expected_status, expected_ready) in [
+        (
+            "contained-config-selects-contained-policy",
+            "--config",
+            "../seaf.config.json",
+            "passed",
+            true,
+        ),
+        (
+            "external-config",
+            "--config",
+            "../../external.config.json",
+            "failed",
+            false,
+        ),
+        (
+            "symlink-config-escape",
+            "--config",
+            "../escape.config.json",
+            "failed",
+            false,
+        ),
+        (
+            "external-policy",
+            "--policy",
+            "../../external.policy.json",
+            "failed",
+            false,
+        ),
+        (
+            "symlink-policy-escape",
+            "--policy",
+            "../escape.policy.json",
+            "failed",
+            false,
+        ),
+    ] {
+        let output = seaf_in(&subdirectory)
+            .args(["doctor", "--provider", "fake", flag, path, "--json"])
+            .output()
+            .expect("run project-input doctor");
+        assert_eq!(
+            output.status.success(),
+            expected_ready,
+            "{case}: {output:?}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ready"], expected_ready, "{case}: {report}");
+        assert_eq!(
+            report["checks"][2]["status"], expected_status,
+            "{case}: {report}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fake_rejects_ollama_options_without_network_or_process_contact() {
+    let temp = tempfile::tempdir().expect("doctor fake fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fake fixture\n").unwrap();
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fake fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fake fixture");
+
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let process_marker = temp.path().join("ollama-process-ran.marker");
+    write_executable_script(
+        &bin.join("ollama"),
+        &format!("#!/bin/sh\ntouch {}\n", process_marker.display()),
+    );
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    let ready = seaf_in(&repo)
+        .env("PATH", &path)
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("default fake doctor");
+    assert!(ready.status.success(), "{ready:?}");
+    assert!(
+        !process_marker.exists(),
+        "fake doctor must not spawn Ollama"
+    );
+
+    let rejected_without_listener = seaf_in(&repo)
+        .args([
+            "doctor",
+            "--provider",
+            "fake",
+            "--base-url",
+            "http://127.0.0.1:9/api",
+            "--json",
+        ])
+        .output()
+        .expect("fake doctor with unused Ollama URL");
+    assert_eq!(
+        rejected_without_listener.status.code(),
+        Some(1),
+        "{rejected_without_listener:?}"
+    );
+
+    let (probe, base_url) = provider_call_probe();
+    let rejected = seaf_in(&repo)
+        .env("PATH", &path)
+        .args([
+            "doctor",
+            "--provider",
+            "fake",
+            "--base-url",
+            &base_url,
+            "--json",
+        ])
+        .output()
+        .expect("fake doctor with Ollama URL");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    let report: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(report["checks"][7]["status"], "failed", "{report}");
+    assert_no_provider_call(&probe);
+    assert!(
+        !process_marker.exists(),
+        "fake doctor must not spawn Ollama"
+    );
+}
+
+#[test]
+fn doctor_fake_rejects_even_an_explicit_default_ollama_base_url() {
+    let temp = tempfile::tempdir().expect("doctor fake fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fake fixture\n").unwrap();
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fake fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fake fixture");
+
+    let output = seaf_in(&repo)
+        .args([
+            "doctor",
+            "--provider",
+            "fake",
+            "--base-url",
+            "http://localhost:11434/api",
+            "--json",
+        ])
+        .output()
+        .expect("fake doctor with explicit default Ollama URL");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["checks"][7]["status"], "failed", "{report}");
+}
+
+#[test]
+fn doctor_reports_independent_project_ticket_eval_executable_and_candidate_failures() {
+    for case in ["project", "ticket", "eval", "executable", "candidate"] {
+        let temp = tempfile::tempdir().expect("doctor fixture");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("repository");
+        fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+        init_empty_git_repo(&repo);
+        let init = seaf()
+            .args(["init", "--path", repo.to_str().unwrap()])
+            .output()
+            .expect("initialize doctor fixture");
+        assert!(init.status.success(), "{case}: {init:?}");
+        match case {
+            "project" => fs::write(repo.join("seaf.config.json"), "{}\n").unwrap(),
+            "ticket" => fs::write(repo.join("seaf.ticket.yaml"), "not: a ticket\n").unwrap(),
+            "eval" => {
+                let path = repo.join("seaf.ticket.yaml");
+                let contents = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("seaf.evals.yaml", "missing.evals.yaml");
+                fs::write(path, contents).unwrap();
+            }
+            "executable" => {
+                for relative in ["seaf.evals.yaml", "seaf.ticket.yaml"] {
+                    let path = repo.join(relative);
+                    let contents = fs::read_to_string(&path)
+                        .unwrap()
+                        .replace("git diff --check", "missing-doctor-executable");
+                    fs::write(path, contents).unwrap();
+                }
+            }
+            "candidate" => {}
+            _ => unreachable!(),
+        }
+        commit_all(&repo, "Initialize failing doctor fixture");
+        let mut command = seaf();
+        command
+            .current_dir(&repo)
+            .args(["doctor", "--provider", "fake", "--json"]);
+        if case == "candidate" {
+            command.env("TMPDIR", &repo);
+        } else {
+            let test_temp = temp.path().join("doctor-temp");
+            fs::create_dir(&test_temp).unwrap();
+            command.env("TMPDIR", test_temp);
+        }
+        let output = command.output().expect("run failing doctor");
+        assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let statuses = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| {
+                (
+                    check["id"].as_str().unwrap(),
+                    check["status"].as_str().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = match case {
+            "project" => ("project_inputs", "failed"),
+            "ticket" => ("ticket", "failed"),
+            "eval" => ("eval_config", "failed"),
+            "executable" => ("eval_executables", "failed"),
+            "candidate" => ("candidate_workspace", "failed"),
+            _ => unreachable!(),
+        };
+        assert_eq!(statuses[expected.0], expected.1, "{case}: {report}");
+        assert_eq!(statuses["git_repository"], "passed", "{case}");
+        assert_eq!(statuses["git_worktree"], "passed", "{case}");
+        assert_eq!(statuses["provider"], "passed", "{case}");
+    }
+}
+
+#[test]
+fn doctor_non_repository_still_returns_one_complete_dependency_report() {
+    let temp = tempfile::tempdir().expect("non-repository");
+    let output = seaf_in(temp.path())
+        .args(["doctor", "--provider", "fake", "--json"])
+        .output()
+        .expect("run project doctor");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 8);
+    assert_eq!(checks[0]["id"], "git_repository");
+    assert_eq!(checks[0]["status"], "failed");
+    for check in &checks[1..7] {
+        assert_eq!(check["status"], "blocked", "{check}");
+        assert!(check["remediation"].as_str().is_some());
+    }
+    assert_eq!(checks[7]["status"], "passed");
+}
+
+#[test]
+fn doctor_ollama_offline_is_blocked_without_contact_and_live_requires_ok_true() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fixture");
+
+    let (probe, base_url) = provider_call_probe();
+    let offline = seaf_in(&repo)
+        .args([
+            "doctor",
+            "--provider",
+            "ollama",
+            "--model",
+            "doctor-model",
+            "--base-url",
+            &base_url,
+            "--json",
+        ])
+        .output()
+        .expect("offline Ollama doctor");
+    assert_eq!(offline.status.code(), Some(1), "{offline:?}");
+    let report: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(report["checks"][7]["status"], "blocked");
+    assert_no_provider_call(&probe);
+
+    for (content, expected_status, expected_exit) in [
+        (r#"{"ok":true}"#, "passed", 0),
+        (r#"{"ok":false}"#, "failed", 1),
+    ] {
+        let base_url = start_fake_ollama_server(content);
+        let output = seaf_in(&repo)
+            .args([
+                "doctor",
+                "--provider",
+                "ollama",
+                "--model",
+                "doctor-model",
+                "--base-url",
+                &base_url,
+                "--live-provider",
+                "--json",
+            ])
+            .output()
+            .expect("live Ollama doctor");
+        assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["checks"][7]["status"], expected_status);
+    }
+}
+
+#[test]
+fn doctor_offline_ollama_rejects_invalid_configuration_before_live_authorization() {
+    let temp = tempfile::tempdir().expect("doctor fixture");
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).expect("repository");
+    fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+    init_empty_git_repo(&repo);
+    let init = seaf()
+        .args(["init", "--path", repo.to_str().unwrap()])
+        .output()
+        .expect("initialize doctor fixture");
+    assert!(init.status.success(), "{init:?}");
+    commit_all(&repo, "Initialize doctor fixture");
+
+    for base_url in [
+        "https://127.0.0.1:11434",
+        "not-a-url",
+        "http://ollama.example:11434/api",
+        "http://[::1:11434/api",
+        "http://127.0.0.1:not-a-port/api",
+    ] {
+        let output = seaf_in(&repo)
+            .args([
+                "doctor",
+                "--provider",
+                "ollama",
+                "--model",
+                "doctor-model",
+                "--base-url",
+                base_url,
+                "--json",
+            ])
+            .output()
+            .expect("offline Ollama doctor");
+        assert_eq!(output.status.code(), Some(1), "{base_url}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["checks"][7]["status"], "failed", "{base_url}");
+        assert!(
+            report["checks"][7]["remediation"].as_str().is_some(),
+            "{base_url}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_candidate_namespace_poison_and_collision_fail_without_mutation() {
+    for case in ["symlink", "non-directory", "broad-mode", "target-collision"] {
+        let temp = tempfile::tempdir().expect("doctor fixture");
+        let repo = temp.path().join("repo");
+        let candidate_temp = temp.path().join("candidate-temp");
+        fs::create_dir(&repo).expect("repository");
+        fs::create_dir(&candidate_temp).expect("candidate temp");
+        fs::write(repo.join("README.md"), "# Doctor fixture\n").expect("readme");
+        init_empty_git_repo(&repo);
+        let init = seaf()
+            .args(["init", "--path", repo.to_str().unwrap()])
+            .output()
+            .expect("initialize doctor fixture");
+        assert!(init.status.success(), "{case}: {init:?}");
+        commit_all(&repo, "Initialize doctor fixture");
+        let root = candidate_temp.join("seaf-candidates");
+        match case {
+            "symlink" => {
+                let outside = temp.path().join("outside");
+                fs::create_dir(&outside).unwrap();
+                symlink(outside, &root).unwrap();
+            }
+            "non-directory" => fs::write(&root, "poison\n").unwrap(),
+            "broad-mode" => {
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "target-collision" => {
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                let digest = canonical_sha256_digest(&repository_identity_json(&repo)).unwrap();
+                let repository = root.join(digest);
+                fs::create_dir(&repository).unwrap();
+                fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(repository.join("doctor-readiness"), "collision\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let source_before = init_repository_snapshot(&repo);
+        let namespace_before = read_init_tree(&candidate_temp);
+        let output = seaf()
+            .current_dir(&repo)
+            .env("TMPDIR", &candidate_temp)
+            .args(["doctor", "--provider", "fake", "--json"])
+            .output()
+            .expect("candidate namespace doctor");
+        assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["checks"][4]["status"], "failed", "{case}: {report}");
+        assert_eq!(init_repository_snapshot(&repo), source_before, "{case}");
+        assert_eq!(read_init_tree(&candidate_temp), namespace_before, "{case}");
+    }
+}
+
+#[test]
+fn doctor_ignores_committed_source_entries_named_like_its_diagnostic_id() {
+    for case in ["file", "directory"] {
+        let temp = tempfile::tempdir().expect("doctor diagnostic fixture");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("repository");
+        fs::write(repo.join("README.md"), "# Doctor diagnostic fixture\n").unwrap();
+        init_empty_git_repo(&repo);
+        let init = seaf()
+            .args(["init", "--path", repo.to_str().unwrap()])
+            .output()
+            .expect("initialize doctor diagnostic fixture");
+        assert!(init.status.success(), "{case}: {init:?}");
+        if case == "file" {
+            fs::write(repo.join("doctor-readiness"), "committed source file\n").unwrap();
+        } else {
+            fs::create_dir(repo.join("doctor-readiness")).unwrap();
+            fs::write(
+                repo.join("doctor-readiness/source.txt"),
+                "committed source directory\n",
+            )
+            .unwrap();
+        }
+        commit_all(&repo, "Add diagnostic-name source entry");
+
+        let output = seaf_in(&repo)
+            .args(["doctor", "--provider", "fake", "--json"])
+            .output()
+            .expect("run source-name doctor");
+        assert!(output.status.success(), "{case}: {output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ready"], true, "{case}: {report}");
+        assert_eq!(report["checks"][4]["status"], "passed", "{case}");
     }
 }
 
@@ -754,6 +1556,30 @@ fn model_check_json_reports_invalid_ollama_base_url_without_live_server() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"ok\": false"));
     assert!(stdout.contains("unsupported Ollama base URL"));
+}
+
+#[test]
+fn model_check_preserves_its_existing_transport_success_contract() {
+    let base_url = start_fake_ollama_server(r#"{"ok":false}"#);
+    let output = seaf()
+        .args([
+            "model",
+            "check",
+            "--provider",
+            "ollama",
+            "--model",
+            "local-model",
+            "--base-url",
+            &base_url,
+            "--json",
+        ])
+        .output()
+        .expect("run model check");
+
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["status"], "passed");
 }
 
 #[test]
@@ -10276,18 +11102,72 @@ fn read_init_tree(root: &Path) -> BTreeMap<PathBuf, InitTreeEntry> {
 fn seaf_in(path: &Path) -> Command {
     let mut command = seaf();
     command.current_dir(path);
-    if let Some(repository_root) = path
+    if path
         .ancestors()
-        .find(|candidate| candidate.join(".git").exists())
+        .any(|candidate| candidate.join(".git").exists())
     {
-        let test_temp = repository_root
-            .parent()
-            .expect("test repository parent")
-            .join("seaf-test-tmp");
+        let test_temp = seaf_test_temp_root(path);
         fs::create_dir_all(&test_temp).expect("candidate test temp root");
         command.env("TMPDIR", test_temp);
     }
     command
+}
+
+fn seaf_test_temp_root(path: &Path) -> PathBuf {
+    let repository_root = path
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .expect("test path belongs to a Git repository");
+    repository_root
+        .parent()
+        .expect("test repository parent")
+        .join("seaf-test-tmp")
+}
+
+fn assert_command_tmpdir(command: &Command, expected: &Path) {
+    let actual = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("TMPDIR"))
+        .and_then(|(_, value)| value);
+    assert_eq!(actual, Some(expected.as_os_str()));
+}
+
+fn assert_human_doctor_matches_json(json: &std::process::Output, human: &std::process::Output) {
+    assert_eq!(human.status.code(), json.status.code());
+    assert!(json.stderr.is_empty(), "{json:?}");
+    assert!(human.stderr.is_empty(), "{human:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let mut expected = vec![
+        format!(
+            "project doctor: {}",
+            if report["ready"] == true {
+                "ready"
+            } else {
+                "not ready"
+            }
+        ),
+        format!("repository: {}", report["repository"].as_str().unwrap()),
+        format!("provider: {}", report["provider"].as_str().unwrap()),
+        format!("model: {}", report["model"].as_str().unwrap()),
+    ];
+    for check in report["checks"].as_array().unwrap() {
+        expected.push(format!(
+            "[{}] {}: {}",
+            check["status"].as_str().unwrap(),
+            check["id"].as_str().unwrap(),
+            check["message"].as_str().unwrap()
+        ));
+        if let Some(remediation) = check.get("remediation") {
+            expected.push(format!("  remediation: {}", remediation.as_str().unwrap()));
+        }
+    }
+    assert_eq!(
+        String::from_utf8(human.stdout.clone())
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 fn example_path(file_name: &str) -> PathBuf {
@@ -10901,6 +11781,7 @@ fn source_matches_exact_promoted_candidate(
 fn source_workspace_snapshot(root: &Path) -> SourceWorkspaceSnapshot {
     let git = |args: &[&str]| {
         let output = Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
             .current_dir(root)
             .output()
@@ -10934,6 +11815,7 @@ fn source_workspace_snapshot(root: &Path) -> SourceWorkspaceSnapshot {
 fn git_unstaged_diff_including_untracked(root: &Path) -> Vec<u8> {
     let run = |args: &[&str]| {
         Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
             .current_dir(root)
             .output()
@@ -11032,6 +11914,7 @@ fn source_workspace_entries(root: &Path) -> BTreeMap<PathBuf, SourceWorkspaceEnt
 fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     let run = |args: &[&str]| {
         let output = Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
             .current_dir(root)
             .output()
@@ -11053,6 +11936,7 @@ fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
 
 fn git_worktree_registration(root: &Path) -> Vec<u8> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(root)
         .output()
@@ -11063,6 +11947,29 @@ fn git_worktree_registration(root: &Path) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn git_common_dir_path(root: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(root)
+        .output()
+        .expect("Git common-directory evidence");
+    assert!(
+        output.status.success(),
+        "git common directory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let common = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        root.join(common)
+    };
+    common
+        .canonicalize()
+        .expect("canonical Git common directory")
 }
 
 fn copy_directory(source: &Path, destination: &Path) {
@@ -11111,6 +12018,7 @@ fn repository_identity_json(repository_root: &Path) -> serde_json::Value {
         .canonicalize()
         .expect("canonical worktree root");
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(&worktree_root)
         .output()
@@ -11650,6 +12558,60 @@ fn init_empty_git_repo(path: &Path) {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn write_generic_stack_fixture(
+    root: &Path,
+    name: &str,
+    rust: bool,
+    node: bool,
+    install_eval_markers: bool,
+) {
+    fs::write(root.join("README.md"), format!("# {name} fixture\n")).unwrap();
+    if rust {
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"init_{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                name.replace('-', "_")
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fixture_passes() {}\n}\n",
+        )
+        .unwrap();
+        if install_eval_markers {
+            fs::write(
+                root.join("build.rs"),
+                "fn main() { std::fs::write(\"doctor-rust-eval-ran.marker\", b\"ran\\n\").unwrap(); }\n",
+            )
+            .unwrap();
+        }
+    }
+    if node {
+        fs::write(
+            root.join("package.json"),
+            "{\"scripts\":{\"test\":\"node --test\"},\"type\":\"module\"}\n",
+        )
+        .unwrap();
+        let marker = if install_eval_markers {
+            "import fs from 'node:fs';\nfs.writeFileSync('doctor-node-eval-ran.marker', 'ran\\n');\n"
+        } else {
+            ""
+        };
+        fs::write(
+            root.join("fixture.test.js"),
+            format!(
+                "import test from 'node:test';\nimport assert from 'node:assert/strict';\n{marker}test('fixture passes', () => assert.equal(1, 1));\n"
+            ),
+        )
+        .unwrap();
+    }
+    init_empty_git_repo(root);
+    commit_all(root, "Add runnable init fixture");
 }
 
 fn commit_all(path: &Path, message: &str) {

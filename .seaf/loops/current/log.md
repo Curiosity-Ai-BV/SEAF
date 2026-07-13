@@ -2498,3 +2498,75 @@ hostile same-user ancestor-symlink race between preflight and path-based create,
 and unexpected I/O rollback remains best-effort. Descriptor-relative no-follow
 publication is future defense-in-depth. M2-02 project doctor is active;
 packaging, releases, and external golden-path acceptance remain pending.
+
+## 2026-07-13 implemented; review pending | M2-02 project doctor
+
+Witnessed RED first showed that the top-level `doctor` command did not exist;
+the ready and multi-failure contracts exited as Clap usage errors. Focused RED
+also exposed offline invalid Ollama configuration being treated as merely
+blocked and unsafe existing candidate namespaces being accepted.
+
+The implementation adds a CLI-private schema-v1 report with the exact ordered
+Git, project-input, ticket, candidate, eval, and provider checks. It reuses the
+loop's authoritative input and eval planning seams, and adds only a bounded
+read-only candidate prerequisite helper. Doctor never creates a candidate,
+worktree, run, lock, or eval report and never executes an eval command. Fake
+makes no provider contact; offline Ollama validates configuration and remains
+blocked; explicit `--live-provider` permits one bounded structured request.
+
+The focused doctor suite is GREEN in the controller at 9/9 before the final
+stack-matrix addition. The added ready Rust, Node, hybrid, and Git-only fixtures
+prove init-generated native evals plan successfully while build/test markers,
+repository snapshots, and Git worktree registration remain unchanged. Final
+format, focused doctor, candidate-readiness, compile, and diff gates are being
+rerun for review handoff. M2-02 is implementation-pending-review and remains
+active until independent acceptance. M2-03 has not started.
+
+## 2026-07-13 rejected review; corrections active | M2-02 project doctor
+
+Independent review rejected the first M2-02 implementation. The live Ollama
+request reused the full timeout across blocking phases and addresses and read
+the response without a cap. Candidate diagnosis synthesized an operational run
+path from the source tree, explicit ticket containment contradicted the more-
+tested `loop run` contract, fake accepted an Ollama base URL, human parity and
+combined failure snapshots were incomplete, and the doctor response predicate
+had changed existing `model check` success semantics.
+
+Corrections remain inside M2-02. New RED exposed the incorrect rejection of a
+caller-relative external ticket; focused GREEN proves external and symlinked
+explicit tickets are accepted like `loop run`. Correction coverage also proves
+source entries named `doctor-readiness`, multi-address/trickle/oversize Ollama
+responses, and model-check compatibility. The corrected design uses a diagnostic-only external
+candidate plan, direct explicit-ticket loading with contained config/policy,
+doctor-local `ok=true` validation, fake option rejection, one absolute local-
+address Ollama deadline, and a shared 1 MiB raw-response cap. Ready and combined
+failure coverage now compares richer source, Git common-directory, worktree,
+candidate-namespace, and rendered report authority. M2-02 remains
+implementation-pending-review; M2-03 has not started.
+
+## 2026-07-13 accepted | M2-02 project doctor
+
+Independent specification and quality re-reviews approve the corrected M2-02
+slice with no remaining findings. The accepted contract keeps explicit tickets
+caller-relative like `loop run`, keeps explicit config and policy contained,
+rejects fake-provider Ollama options without contact, preserves existing
+`model check` transport-success semantics, and uses a diagnostic-only candidate
+namespace that creates no operational state.
+
+The local Ollama transport now validates local-only endpoints offline, uses one
+absolute resolution/connect/write/read deadline, and shares the 1 MiB raw-
+response evidence cap with loop execution. Adversarial chunked, truncated,
+multi-address, and trickle coverage is bounded and panic-free. Ready and
+combined-failure tests compare project bytes, Git common-directory bytes,
+worktree registration, and the actual controlled candidate namespace; eval
+traps and fake/offline contact traps remain untouched.
+
+The controller passed 15/15 focused doctor tests, the exact model-check
+compatibility regression, Rust formatting, strict all-target/all-feature
+Clippy, Prettier formatting, and diff hygiene. The complete locked serial Rust
+workspace passed, including CLI 164/164, core 52/52, loop unit 286/286,
+provider/candidate 75/75, state 44/44, and every remaining integration and doc-
+test suite. Pinned-pnpm SDK lint, typecheck, 8/8 tests, and build also passed.
+M2-02 is accepted as one isolated doctor slice. M2-03 package metadata and
+version identity is active; release automation and later acceptance remain
+pending.

@@ -74,7 +74,46 @@ editable project configuration, policy, eval, starter-ticket, and state-ignore
 files. It never writes provider configuration: `--provider fake` or
 `--provider ollama` remains the explicit CLI authority for each new run. Use
 `--template adaptive-notes` only when you intentionally want the specialized
-example files.
+example files. Before starting a loop, run the
+[project doctor](#diagnose-project-readiness).
+
+### Diagnose project readiness
+
+From the initialized project's Git worktree, use the source-workspace CLI to
+plan the same inputs, candidate workspace, and eval commands that a loop would
+use:
+
+```bash
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
+  doctor --provider fake
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
+  doctor --provider fake --json
+```
+
+Doctor reports eight ordered checks for Git, project inputs, the ticket,
+candidate-workspace planning, eval configuration/executables, and the provider.
+It never creates loop or candidate state and plans eval commands without
+executing them. The fake provider is fully local and makes no provider call.
+
+Ollama validation is offline by default and therefore reports provider
+readiness as blocked. Authorize the single bounded live health request
+explicitly:
+
+```bash
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- doctor \
+  --provider ollama --model qwen2.5-coder:7b
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- doctor \
+  --provider ollama --model qwen2.5-coder:7b --live-provider --timeout-ms 5000
+```
+
+By default doctor discovers `seaf.ticket.yaml` at the Git root. `--ticket`,
+when supplied, follows `loop run` and loads its caller-relative path directly,
+including an external or symlinked ticket. `--config` and `--policy` remain
+repository-contained and use the same precedence as `loop run`. Live Ollama
+doctor requests accept only `localhost` or numeric IP addresses,
+share one absolute deadline across connect/write/read work, and cap the raw
+response at 1 MiB. Exit status is 0 only when ready, 1 for a complete non-ready
+report, and 2 for invalid command usage.
 
 ### Adaptive Notes example
 

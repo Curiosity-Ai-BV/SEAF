@@ -43,6 +43,8 @@ use seaf_models::{
 };
 use serde::{Deserialize, Serialize};
 
+mod doctor;
+
 #[derive(Debug, Parser)]
 #[command(name = "seaf")]
 #[command(about = "Self-Evolving Application Framework developer CLI")]
@@ -57,6 +59,8 @@ enum Command {
     Info,
     /// Initialize SEAF config files in a project.
     Init(InitArgs),
+    /// Diagnose whether the current project is ready for a SEAF loop.
+    Doctor(doctor::DoctorArgs),
     /// Work with goal specs.
     Goal {
         #[command(subcommand)]
@@ -642,6 +646,7 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
             Ok(())
         }
         Command::Init(args) => init_project(args),
+        Command::Doctor(args) => doctor::run(args),
         Command::Goal {
             command: GoalCommand::Validate(args),
         } => validate_file(args, "goal", seaf_core::load_goal_file),
@@ -2151,6 +2156,21 @@ struct EffectiveProjectInputs {
     config: ProjectConfig,
 }
 
+enum EffectiveProjectInputFailure {
+    Message(String),
+    Validation(ValidationReport),
+}
+
+impl From<CliFailure> for EffectiveProjectInputFailure {
+    fn from(failure: CliFailure) -> Self {
+        Self::Message(
+            failure
+                .message
+                .unwrap_or_else(|| "project input validation failed".to_string()),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryIdentity {
@@ -2164,12 +2184,23 @@ fn resolve_effective_project_inputs(
     explicit_policy: Option<&Path>,
     as_json: bool,
 ) -> Result<EffectiveProjectInputs, CliFailure> {
+    match resolve_effective_project_inputs_quiet(repository_root, explicit_config, explicit_policy)
+    {
+        Ok(inputs) => Ok(inputs),
+        Err(EffectiveProjectInputFailure::Message(message)) => Err(CliFailure::message(message)),
+        Err(EffectiveProjectInputFailure::Validation(report)) => {
+            Err(CliFailure::validation(report, as_json))
+        }
+    }
+}
+
+fn resolve_effective_project_inputs_quiet(
+    repository_root: &Path,
+    explicit_config: Option<&Path>,
+    explicit_policy: Option<&Path>,
+) -> Result<EffectiveProjectInputs, EffectiveProjectInputFailure> {
     let config_authority = match explicit_config {
-        Some(path) => Some(load_repository_project_config(
-            repository_root,
-            path,
-            as_json,
-        )?),
+        Some(path) => Some(load_repository_project_config(repository_root, path)?),
         None if explicit_policy.is_some() => None,
         None => {
             let discovered = repository_root.join("seaf.config.json");
@@ -2177,7 +2208,6 @@ fn resolve_effective_project_inputs(
                 Some(load_repository_project_config(
                     repository_root,
                     &discovered,
-                    as_json,
                 )?)
             } else {
                 None
@@ -2188,7 +2218,7 @@ fn resolve_effective_project_inputs(
     if let Some(path) = explicit_policy {
         let policy_path = canonical_repository_file(repository_root, path, "policy")?;
         let policy = seaf_core::load_policy_file(&policy_path)
-            .map_err(|report| CliFailure::validation(report, as_json))?;
+            .map_err(EffectiveProjectInputFailure::Validation)?;
         return Ok(EffectiveProjectInputs {
             policy,
             config: ProjectConfig {
@@ -2210,7 +2240,7 @@ fn resolve_effective_project_inputs(
             "policy named by project config",
         )?;
         let policy = seaf_core::load_policy_file(&policy_path)
-            .map_err(|report| CliFailure::validation(report, as_json))?;
+            .map_err(EffectiveProjectInputFailure::Validation)?;
         return Ok(EffectiveProjectInputs { policy, config });
     }
 
@@ -2218,7 +2248,7 @@ fn resolve_effective_project_inputs(
     if authority_path_exists(&root_policy, "root policy")? {
         let policy_path = canonical_repository_file(repository_root, &root_policy, "root policy")?;
         let policy = seaf_core::load_policy_file(&policy_path)
-            .map_err(|report| CliFailure::validation(report, as_json))?;
+            .map_err(EffectiveProjectInputFailure::Validation)?;
         return Ok(EffectiveProjectInputs {
             policy,
             config: ProjectConfig {
@@ -2227,7 +2257,7 @@ fn resolve_effective_project_inputs(
         });
     }
 
-    Err(CliFailure::message(
+    Err(EffectiveProjectInputFailure::Message(
         "no authoritative loop policy found; pass --policy, pass --config, add seaf.config.json at the Git root, or add seaf.policy.json at the Git root"
             .to_string(),
     ))
@@ -2247,11 +2277,10 @@ fn authority_path_exists(path: &Path, kind: &str) -> Result<bool, CliFailure> {
 fn load_repository_project_config(
     repository_root: &Path,
     path: &Path,
-    as_json: bool,
-) -> Result<(ProjectConfig, PathBuf), CliFailure> {
+) -> Result<(ProjectConfig, PathBuf), EffectiveProjectInputFailure> {
     let config_path = canonical_repository_file(repository_root, path, "project config")?;
     let config = seaf_core::load_project_config_file(&config_path)
-        .map_err(|report| CliFailure::validation(report, as_json))?;
+        .map_err(EffectiveProjectInputFailure::Validation)?;
     Ok((config, config_path))
 }
 

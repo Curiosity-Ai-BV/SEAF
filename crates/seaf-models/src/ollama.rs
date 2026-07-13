@@ -1,7 +1,7 @@
 use std::{
     fmt,
     io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,6 +11,7 @@ use serde_json::{json, Map, Value};
 use crate::provider::{ModelError, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse};
 
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
+pub const PROVIDER_RESPONSE_BYTE_CAP: usize = 1024 * 1024;
 
 const DEFAULT_STRUCTURED_TEMPERATURE: f32 = 0.0;
 const STRUCTURED_TEMPERATURE_CEILING: f32 = 0.2;
@@ -203,6 +204,8 @@ pub enum OllamaHttpError {
     ConnectionRefused(String),
     Timeout(String),
     Transport(String),
+    InvalidAddress(String),
+    ResponseTooLarge { limit_bytes: usize },
 }
 
 impl fmt::Display for OllamaHttpError {
@@ -210,18 +213,38 @@ impl fmt::Display for OllamaHttpError {
         match self {
             Self::ConnectionRefused(message)
             | Self::Timeout(message)
-            | Self::Transport(message) => formatter.write_str(message),
+            | Self::Transport(message)
+            | Self::InvalidAddress(message) => formatter.write_str(message),
+            Self::ResponseTooLarge { limit_bytes } => write!(
+                formatter,
+                "Ollama raw HTTP response exceeded the {limit_bytes}-byte limit"
+            ),
         }
     }
 }
 
 struct StdOllamaHttpClient {
     resolver: Arc<dyn OllamaAddressResolver>,
+    connector: Arc<dyn OllamaConnector>,
 }
 
 impl StdOllamaHttpClient {
     fn with_resolver(resolver: Arc<dyn OllamaAddressResolver>) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            connector: Arc::new(StdOllamaConnector),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(
+        resolver: Arc<dyn OllamaAddressResolver>,
+        connector: Arc<dyn OllamaConnector>,
+    ) -> Self {
+        Self {
+            resolver,
+            connector,
+        }
     }
 }
 
@@ -239,22 +262,63 @@ struct StdOllamaAddressResolver;
 
 impl OllamaAddressResolver for StdOllamaAddressResolver {
     fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, OllamaHttpError> {
-        let addresses = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| {
-                OllamaHttpError::Transport(format!(
-                    "could not resolve Ollama host '{host}': {error}"
-                ))
-            })?
-            .collect::<Vec<_>>();
+        local_socket_addresses(host, port)
+    }
+}
 
-        if addresses.is_empty() {
-            return Err(OllamaHttpError::Transport(format!(
-                "could not resolve Ollama host '{host}'"
-            )));
-        }
+fn local_socket_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, OllamaHttpError> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(vec![
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        ]);
+    }
+    host.parse::<IpAddr>()
+        .map(|address| vec![SocketAddr::new(address, port)])
+        .map_err(|_| {
+            OllamaHttpError::InvalidAddress(format!(
+                "Ollama host '{host}' is not allowed; use localhost or a numeric IPv4/IPv6 address so the request deadline does not depend on blocking system DNS"
+            ))
+        })
+}
 
-        Ok(addresses)
+trait OllamaConnector: Send + Sync {
+    fn connect(&self, address: &SocketAddr, timeout: Duration)
+        -> Result<TcpStream, std::io::Error>;
+}
+
+struct StdOllamaConnector;
+
+impl OllamaConnector for StdOllamaConnector {
+    fn connect(
+        &self,
+        address: &SocketAddr,
+        timeout: Duration,
+    ) -> Result<TcpStream, std::io::Error> {
+        TcpStream::connect_timeout(address, timeout)
+    }
+}
+
+struct RequestDeadline {
+    expires_at: Instant,
+}
+
+impl RequestDeadline {
+    fn new(timeout_ms: u64) -> Result<Self, OllamaHttpError> {
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        let expires_at = Instant::now().checked_add(timeout).ok_or_else(|| {
+            OllamaHttpError::Transport("Ollama request timeout is too large".to_string())
+        })?;
+        Ok(Self { expires_at })
+    }
+
+    fn remaining(&self, phase: &str) -> Result<Duration, OllamaHttpError> {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                OllamaHttpError::Timeout(format!("Ollama request deadline expired during {phase}"))
+            })
     }
 }
 
@@ -264,9 +328,11 @@ impl OllamaHttpClient for StdOllamaHttpClient {
         request: OllamaHttpRequest,
         timeout_ms: u64,
     ) -> Result<OllamaHttpResponse, OllamaHttpError> {
-        let url = parse_http_url(request.url())?;
-        let timeout = Duration::from_millis(timeout_ms.max(1));
+        let deadline = RequestDeadline::new(timeout_ms)?;
+        let url = validate_local_ollama_endpoint(request.url())?;
+        deadline.remaining("address resolution")?;
         let socket_addrs = self.resolver.resolve(&url.host, url.port)?;
+        deadline.remaining("address resolution")?;
         let body = serde_json::to_vec(request.body()).map_err(|error| {
             OllamaHttpError::Transport(format!("could not encode JSON: {error}"))
         })?;
@@ -280,7 +346,8 @@ impl OllamaHttpClient for StdOllamaHttpClient {
 
         let mut last_connect_error = None;
         for socket_addr in socket_addrs {
-            let stream = match TcpStream::connect_timeout(&socket_addr, timeout) {
+            let remaining = deadline.remaining("connection")?;
+            let stream = match self.connector.connect(&socket_addr, remaining) {
                 Ok(stream) => stream,
                 Err(error) => {
                     last_connect_error = Some(map_connect_error(error));
@@ -288,14 +355,7 @@ impl OllamaHttpClient for StdOllamaHttpClient {
                 }
             };
 
-            stream
-                .set_read_timeout(Some(timeout))
-                .map_err(|error| map_io_error("could not set read timeout", error))?;
-            stream
-                .set_write_timeout(Some(timeout))
-                .map_err(|error| map_io_error("could not set write timeout", error))?;
-
-            return send_http_request(stream, &wire_request, &body);
+            return send_http_request(stream, &wire_request, &body, &deadline);
         }
 
         Err(last_connect_error.unwrap_or_else(|| {
@@ -308,19 +368,74 @@ fn send_http_request(
     mut stream: TcpStream,
     wire_request: &str,
     body: &[u8],
+    deadline: &RequestDeadline,
 ) -> Result<OllamaHttpResponse, OllamaHttpError> {
-    stream
-        .write_all(wire_request.as_bytes())
-        .map_err(|error| map_io_error("could not write Ollama request", error))?;
-    stream
-        .write_all(body)
-        .map_err(|error| map_io_error("could not write Ollama request body", error))?;
+    write_with_deadline(
+        &mut stream,
+        wire_request.as_bytes(),
+        deadline,
+        "request headers",
+    )?;
+    write_with_deadline(&mut stream, body, deadline, "request body")?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| map_io_error("could not read Ollama response", error))?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let remaining_capacity = PROVIDER_RESPONSE_BYTE_CAP.saturating_sub(response.len());
+        let read_capacity = if remaining_capacity == 0 {
+            1
+        } else {
+            remaining_capacity.min(buffer.len())
+        };
+        stream
+            .set_read_timeout(Some(deadline.remaining("response read")?))
+            .map_err(|error| map_io_error("could not set read timeout", error))?;
+        let read = match stream.read(&mut buffer[..read_capacity]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io_error("could not read Ollama response", error)),
+        };
+        if read == 0 {
+            break;
+        }
+        if response.len() == PROVIDER_RESPONSE_BYTE_CAP {
+            return Err(OllamaHttpError::ResponseTooLarge {
+                limit_bytes: PROVIDER_RESPONSE_BYTE_CAP,
+            });
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
+    deadline.remaining("response parsing")?;
     parse_http_response(&response)
+}
+
+fn write_with_deadline(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: &RequestDeadline,
+    phase: &str,
+) -> Result<(), OllamaHttpError> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(deadline.remaining(phase)?))
+            .map_err(|error| map_io_error("could not set write timeout", error))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(OllamaHttpError::Transport(format!(
+                    "could not write Ollama {phase}: socket wrote zero bytes"
+                )))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(map_io_error(
+                    &format!("could not write Ollama {phase}"),
+                    error,
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_chat_response(
@@ -465,6 +580,22 @@ fn http_error_to_model_error(
             base_url,
             &request.model,
         ),
+        OllamaHttpError::InvalidAddress(message) => ollama_provider_error(
+            format!("Ollama address is invalid: {message}"),
+            false,
+            base_url,
+            &request.model,
+        ),
+        OllamaHttpError::ResponseTooLarge { limit_bytes } => ModelError::provider(
+            format!("Ollama raw HTTP response exceeded the {limit_bytes}-byte limit"),
+            false,
+            json!({
+                "provider": "ollama",
+                "base_url": base_url,
+                "model": request.model,
+                "limit_bytes": limit_bytes,
+            }),
+        ),
     }
 }
 
@@ -483,7 +614,18 @@ fn ollama_chat_url(base_url: &str) -> Result<String, ModelError> {
         ));
     }
 
-    Ok(format!("{trimmed}/chat"))
+    let chat_url = format!("{trimmed}/chat");
+    validate_local_ollama_endpoint(&chat_url).map_err(|error| {
+        ModelError::provider(
+            format!("invalid Ollama endpoint: {error}"),
+            false,
+            json!({
+                "provider": "ollama",
+                "base_url": base_url,
+            }),
+        )
+    })?;
+    Ok(chat_url)
 }
 
 fn ollama_provider_error(
@@ -534,7 +676,7 @@ struct ParsedHttpUrl {
 
 fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, OllamaHttpError> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
-        OllamaHttpError::Transport(format!(
+        OllamaHttpError::InvalidAddress(format!(
             "unsupported Ollama base URL '{url}'; only http:// URLs are supported"
         ))
     })?;
@@ -543,28 +685,69 @@ fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, OllamaHttpError> {
         None => (rest, "/"),
     };
     if authority.is_empty() {
-        return Err(OllamaHttpError::Transport(
+        return Err(OllamaHttpError::InvalidAddress(
             "Ollama URL must include a host".to_string(),
         ));
     }
 
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let parsed_port = port.parse::<u16>().map_err(|error| {
-                OllamaHttpError::Transport(format!("invalid Ollama URL port '{port}': {error}"))
-            })?;
-            (host.to_string(), parsed_port)
+    let (host, port, bracketed) = if let Some(authority) = authority.strip_prefix('[') {
+        let closing = authority.find(']').ok_or_else(|| {
+            OllamaHttpError::InvalidAddress(
+                "invalid Ollama IPv6 URL authority; missing closing ']'".to_string(),
+            )
+        })?;
+        let host = &authority[..closing];
+        let remainder = &authority[closing + 1..];
+        let port = if remainder.is_empty() {
+            80
+        } else {
+            remainder
+                .strip_prefix(':')
+                .ok_or_else(|| {
+                    OllamaHttpError::InvalidAddress(
+                        "invalid Ollama IPv6 URL authority after ']'".to_string(),
+                    )
+                })?
+                .parse::<u16>()
+                .map_err(|error| {
+                    OllamaHttpError::InvalidAddress(format!(
+                        "invalid Ollama URL port in '{remainder}': {error}"
+                    ))
+                })?
+        };
+        (host.to_string(), port, true)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => {
+                let parsed_port = port.parse::<u16>().map_err(|error| {
+                    OllamaHttpError::InvalidAddress(format!(
+                        "invalid Ollama URL port '{port}': {error}"
+                    ))
+                })?;
+                (host.to_string(), parsed_port, false)
+            }
+            Some(_) => {
+                return Err(OllamaHttpError::InvalidAddress(
+                    "numeric IPv6 Ollama URLs must enclose the address in '[' and ']'".to_string(),
+                ))
+            }
+            None => (authority.to_string(), 80, false),
         }
-        None => (authority.to_string(), 80),
     };
     if host.is_empty() {
-        return Err(OllamaHttpError::Transport(
+        return Err(OllamaHttpError::InvalidAddress(
             "Ollama URL must include a host".to_string(),
         ));
     }
 
     Ok(ParsedHttpUrl {
-        host_header: if port == 80 {
+        host_header: if bracketed {
+            if port == 80 {
+                format!("[{host}]")
+            } else {
+                format!("[{host}]:{port}")
+            }
+        } else if port == 80 {
             host.clone()
         } else {
             format!("{host}:{port}")
@@ -573,6 +756,12 @@ fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, OllamaHttpError> {
         port,
         path: path.to_string(),
     })
+}
+
+fn validate_local_ollama_endpoint(url: &str) -> Result<ParsedHttpUrl, OllamaHttpError> {
+    let parsed = parse_http_url(url)?;
+    local_socket_addresses(&parsed.host, parsed.port)?;
+    Ok(parsed)
 }
 
 fn parse_http_response(response: &[u8]) -> Result<OllamaHttpResponse, OllamaHttpError> {
@@ -644,24 +833,42 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, OllamaHttpError> {
         let size = usize::from_str_radix(size_hex, 16).map_err(|error| {
             OllamaHttpError::Transport(format!("Ollama returned an invalid chunk size: {error}"))
         })?;
-        cursor = line_end + 2;
+        cursor = line_end.checked_add(2).ok_or_else(|| {
+            OllamaHttpError::Transport("Ollama chunk cursor overflowed".to_string())
+        })?;
 
         if size == 0 {
+            let suffix_end = cursor.checked_add(2).ok_or_else(|| {
+                OllamaHttpError::Transport("Ollama chunk suffix overflowed".to_string())
+            })?;
+            if body.get(cursor..suffix_end) != Some(b"\r\n") {
+                return Err(OllamaHttpError::Transport(
+                    "Ollama returned an invalid final chunk terminator".to_string(),
+                ));
+            }
             break;
         }
-        if body.len() < cursor + size + 2 {
+        let chunk_end = cursor.checked_add(size).ok_or_else(|| {
+            OllamaHttpError::Transport("Ollama chunk size overflowed".to_string())
+        })?;
+        let suffix_end = chunk_end.checked_add(2).ok_or_else(|| {
+            OllamaHttpError::Transport("Ollama chunk suffix overflowed".to_string())
+        })?;
+        if suffix_end > body.len() {
             return Err(OllamaHttpError::Transport(
                 "Ollama returned a truncated chunked response".to_string(),
             ));
         }
-        decoded.extend_from_slice(&body[cursor..cursor + size]);
-        cursor += size;
-        if body.get(cursor..cursor + 2) != Some(b"\r\n") {
+        let chunk = body.get(cursor..chunk_end).ok_or_else(|| {
+            OllamaHttpError::Transport("Ollama returned an invalid chunk range".to_string())
+        })?;
+        decoded.extend_from_slice(chunk);
+        if body.get(chunk_end..suffix_end) != Some(b"\r\n") {
             return Err(OllamaHttpError::Transport(
                 "Ollama returned an invalid chunk terminator".to_string(),
             ));
         }
-        cursor += 2;
+        cursor = suffix_end;
     }
 
     Ok(decoded)
@@ -701,8 +908,9 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener},
-        sync::Arc,
+        sync::{Arc, Mutex},
         thread,
+        time::{Duration, Instant},
     };
 
     use super::*;
@@ -744,6 +952,166 @@ mod tests {
         server.join().expect("server thread");
     }
 
+    #[test]
+    fn std_http_client_slow_trickle_cannot_extend_the_request_deadline() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind slow response listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            read_http_request(&mut stream);
+            let body = r#"{"message":{"role":"assistant","content":"ok"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            for byte in response.bytes() {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let client = StdOllamaHttpClient::with_resolver(Arc::new(StaticResolver {
+            addresses: vec![address],
+        }));
+        let request = OllamaHttpRequest::new(
+            "POST".to_string(),
+            format!("http://localhost:{}/api/chat", address.port()),
+            json!({ "model": "test", "messages": [], "stream": false }),
+        );
+
+        let started = Instant::now();
+        let error = client
+            .send(request, 75)
+            .expect_err("trickled response must not reset the absolute deadline");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, OllamaHttpError::Timeout(_)));
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "75 ms request deadline took {elapsed:?}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn std_http_client_rejects_response_before_accumulating_past_provider_evidence_limit() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind oversized response listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            read_http_request(&mut stream);
+            let body = format!(
+                r#"{{"message":{{"role":"assistant","content":"{}"}}}}"#,
+                "x".repeat(PROVIDER_RESPONSE_BYTE_CAP)
+            );
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response_headers.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        });
+        let client = StdOllamaHttpClient::with_resolver(Arc::new(StaticResolver {
+            addresses: vec![address],
+        }));
+        let request = OllamaHttpRequest::new(
+            "POST".to_string(),
+            format!("http://localhost:{}/api/chat", address.port()),
+            json!({ "model": "test", "messages": [], "stream": false }),
+        );
+
+        let error = client
+            .send(request, 2_000)
+            .expect_err("oversized response must fail at the transport boundary");
+
+        assert_eq!(
+            error,
+            OllamaHttpError::ResponseTooLarge {
+                limit_bytes: PROVIDER_RESPONSE_BYTE_CAP
+            }
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn std_resolver_accepts_only_localhost_and_numeric_addresses_without_dns() {
+        let resolver = StdOllamaAddressResolver;
+
+        assert_eq!(resolver.resolve("localhost", 11434).unwrap().len(), 2);
+        assert_eq!(
+            resolver.resolve("127.0.0.1", 11434).unwrap(),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11434)]
+        );
+        assert_eq!(
+            resolver.resolve("::1", 11434).unwrap(),
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 11434)]
+        );
+        let error = resolver
+            .resolve("ollama.internal.example", 11434)
+            .unwrap_err();
+        assert!(matches!(error, OllamaHttpError::InvalidAddress(_)));
+        assert!(error.to_string().contains("localhost or a numeric"));
+
+        let parsed = parse_http_url("http://[::1]:11434/api/chat").unwrap();
+        assert_eq!(parsed.host, "::1");
+        assert_eq!(parsed.host_header, "[::1]:11434");
+    }
+
+    #[test]
+    fn chunked_response_with_maximum_or_truncated_size_never_panics_or_allocates() {
+        for chunked_body in [
+            b"ffffffffffffffff\r\n".as_slice(),
+            b"7fffffffffffffff\r\nx\r\n".as_slice(),
+            b"4\r\nab\r\n".as_slice(),
+        ] {
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            response.extend_from_slice(chunked_body);
+
+            let error = parse_http_response(&response).unwrap_err();
+
+            assert!(matches!(error, OllamaHttpError::Transport(_)));
+        }
+    }
+
+    #[test]
+    fn std_http_client_shares_one_connect_deadline_across_all_addresses() {
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
+        let connector = Arc::new(BudgetConnector {
+            timeouts: Arc::clone(&timeouts),
+        });
+        let client = StdOllamaHttpClient::with_transport(
+            Arc::new(StaticResolver {
+                addresses: vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2),
+                ],
+            }),
+            connector,
+        );
+        let request = OllamaHttpRequest::new(
+            "POST".to_string(),
+            "http://localhost:11434/api/chat".to_string(),
+            json!({ "model": "test", "messages": [], "stream": false }),
+        );
+
+        let started = Instant::now();
+        let error = client.send(request, 100).unwrap_err();
+        let elapsed = started.elapsed();
+        let timeouts = timeouts.lock().unwrap();
+
+        assert!(matches!(error, OllamaHttpError::Timeout(_)));
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[1] < timeouts[0], "timeouts were {timeouts:?}");
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "shared 100 ms deadline took {elapsed:?}"
+        );
+    }
+
     fn read_http_request(stream: &mut std::net::TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0; 256];
@@ -783,6 +1151,37 @@ mod tests {
     impl OllamaAddressResolver for StaticResolver {
         fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, OllamaHttpError> {
             Ok(self.addresses.clone())
+        }
+    }
+
+    struct BudgetConnector {
+        timeouts: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl OllamaConnector for BudgetConnector {
+        fn connect(
+            &self,
+            _address: &SocketAddr,
+            timeout: Duration,
+        ) -> Result<TcpStream, std::io::Error> {
+            let attempt = {
+                let mut timeouts = self.timeouts.lock().unwrap();
+                timeouts.push(timeout);
+                timeouts.len()
+            };
+            if attempt == 1 {
+                thread::sleep(Duration::from_millis(60));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "first address refused",
+                ))
+            } else {
+                thread::sleep(timeout);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "second address timed out",
+                ))
+            }
         }
     }
 }

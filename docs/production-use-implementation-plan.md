@@ -2157,7 +2157,7 @@ remaining integration and doc-test suite.
 
 ### M2-02 - Project Doctor
 
-Status: active on 2026-07-13. Dependencies: M2-01 (accepted).
+Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 is active.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2165,13 +2165,46 @@ Objective: diagnose project readiness without mutation.
 
 Acceptance criteria:
 
-- `seaf doctor` checks Git, config, candidate workspace, provider, and eval
-  executables with human and JSON output.
-- Checks are deterministic, actionable, and make no project/runtime changes.
+- `seaf doctor --provider <fake|ollama>` diagnoses the caller's Git repository.
+  It discovers Git-root `seaf.ticket.yaml` by default. Explicit tickets retain
+  `loop run`'s direct caller-relative external/symlink behavior; explicit config
+  and policy retain its repository-containment and precedence. Fake defaults to
+  `fake-local`; Ollama requires `--model`.
+- A versioned typed report contains `ready`, repository/provider/model identity,
+  and exactly eight ordered checks: `git_repository`, `git_worktree`,
+  `project_inputs`, `ticket`, `candidate_workspace`, `eval_config`,
+  `eval_executables`, and `provider`. Status is `passed`, `failed`, or `blocked`;
+  every non-pass has actionable remediation. Human and JSON rendering consume
+  the same report. Ready exits 0, a complete non-ready report exits 1, and Clap
+  usage errors exit 2.
+- Project-input discovery and eval path/executable planning reuse the exact loop
+  seams. Doctor calls `plan_eval_checks` but never executes a check. Candidate
+  readiness proves only committed Git/source authority, worktree support, and a
+  safe external diagnostic path independent of source-tree names; it returns no
+  operational run/candidate authority, never creates a directory, lock, run, or
+  worktree, and does not claim disk/ACL/race readiness.
+- Fake provider readiness is deterministic and makes no process or network
+  call, and fake rejects Ollama-only base URL/live options. Ollama configuration
+  is checked offline, but readiness remains blocked until explicit
+  `--live-provider` authorizes one structured health request. Doctor uses a
+  bounded 5-second default and 30-second maximum. The underlying local Ollama
+  transport uses one absolute resolution/connect/write/read deadline, rejects
+  arbitrary DNS hostnames, and caps raw response accumulation at the shared
+  1 MiB provider-evidence limit. This hardening is a required M2-02 dependency,
+  not packaging work.
+- Checks have deterministic order/aggregation and make no project/runtime
+  changes. Ready and multi-failure tests compare complete repository/Git/
+  worktree/candidate-namespace snapshots, prove eval trap commands never run,
+  and prove fake or offline Ollama diagnosis makes zero provider contacts.
 
-Likely seams: doctor CLI/report models and CLI tests.
+Likely seams: a CLI-private doctor report/orchestrator, non-printing wrappers
+around existing input/eval/provider resolution, one narrow read-only candidate
+prerequisite helper if required, CLI tests, and docs.
 
-RED: doctor success/failure, JSON contract, and no-mutation tests.
+RED: ready generic Rust/Node/Git fixtures; multi-failure and blocked dependency
+reports; JSON/human parity and exit codes; independent Git/input/ticket/eval/
+candidate/provider failures; fake/offline/live-mock provider behavior; and
+complete no-mutation/trap tests.
 
 Verification: CLI tests, full workspace tests, format, Clippy, and diff check.
 
@@ -2179,7 +2212,28 @@ Docs/tracker: doctor guide and M2-02 status.
 
 Commit boundary: doctor only.
 
+Acceptance checkpoint: the CLI-private schema-v1 report and exact eight checks
+are accepted. Input and eval planning reuse loop authorities;
+candidate readiness uses a bounded read-only prerequisite helper. Fake is
+contact-free, offline Ollama remains blocked after configuration validation,
+and `--live-provider` authorizes one structured request. Focused coverage proves
+complete aggregation and exit behavior, independent failures, provider modes,
+candidate namespace refusal, repeatable repository/worktree/namespace
+preservation, eval traps, and ready init-generated Rust, Node, hybrid, and
+Git-only plans without executing native evals. Rejected-review corrections bind
+live Ollama to one real deadline/cap, separate diagnostic candidate planning
+from source names and operational state, restore explicit-ticket and model-check
+compatibility, reject fake base URLs, and strengthen path parity and complete
+no-mutation/human-output proofs. Independent specification and quality re-
+reviews approved the corrected slice without findings. The final controller
+gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
+format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
+provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
+M2-03 is active.
+
 ### M2-03 - Package Metadata And Version Identity
+
+Status: active on 2026-07-13. Dependencies: M2-02 (accepted).
 
 Roadmap: U7. Dependencies: M2-02.
 

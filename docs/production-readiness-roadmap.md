@@ -409,8 +409,8 @@ source-workspace boundary above and runs in Ubuntu CI. Independent specification
 and quality reviews approved the corrected fault coverage. The controller also
 passed workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-Milestone 1 and M2-01 generic project initialization are complete; M2-02
-project doctor is active.
+Milestone 1, M2-01 generic project initialization, and M2-02 project doctor are
+complete. M2-03 package metadata and version identity is active.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -438,8 +438,16 @@ Rust, Node, hybrid, and Git-only fixtures, preserves Adaptive Notes only behind
 explicit opt-in, and refuses target/ancestor conflicts without mutation.
 Provider selection remains explicit CLI authority. Independent specification
 and quality reviews approved the boundary, and the full controller gate passed.
-M2-02 project doctor is active; packaging, releases, and the external golden
-path are not claimed.
+M2-02 project doctor was accepted 2026-07-13 after independent specification
+and quality reviews approved its typed eight-check report, read-only candidate/
+eval planning, fake and explicit-live provider boundaries, complete failure
+aggregation, and ready init-generated Rust, Node, hybrid, and Git-only plans.
+The corrected transport uses one absolute deadline and a 1 MiB raw-response
+cap; diagnostic candidate planning is source-name-independent; explicit ticket,
+config, and policy behavior matches `loop run`; fake-only options fail offline;
+and complete snapshots prove project, Git, worktree, and candidate namespaces
+remain unchanged. The full Rust and SDK controller gates passed. M2-03 packaging
+identity is active; releases and the external golden path are not claimed.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario

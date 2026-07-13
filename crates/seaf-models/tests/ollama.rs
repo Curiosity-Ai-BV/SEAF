@@ -40,6 +40,27 @@ fn ollama_request_builder_preserves_unstructured_and_already_low_temperatures() 
 }
 
 #[test]
+fn ollama_request_builder_rejects_non_local_or_malformed_endpoints_without_retry() {
+    for base_url in [
+        "http://ollama.example:11434/api",
+        "http://[::1:11434/api",
+        "http://127.0.0.1:not-a-port/api",
+    ] {
+        let provider = OllamaProvider::new(OllamaConfig {
+            base_url: base_url.to_string(),
+            ..OllamaConfig::default()
+        });
+
+        let error = provider
+            .build_chat_request(&structured_request(0.0))
+            .unwrap_err();
+
+        assert!(!error.retryable, "{base_url}: {error:?}");
+        assert!(error.message.contains("Ollama"), "{base_url}: {error:?}");
+    }
+}
+
+#[test]
 fn ollama_provider_extracts_non_streaming_chat_message_content() {
     let provider = OllamaProvider::with_http_client(
         OllamaConfig::default(),

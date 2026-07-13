@@ -1645,6 +1645,109 @@ pub fn plan_candidate_workspace(
     })
 }
 
+pub fn plan_candidate_workspace_readiness(
+    source_worktree_root: &Path,
+    repository_identity_digest: &str,
+    diagnostic_id: &str,
+) -> Result<CandidateWorkspaceReadiness, CandidateWorkspaceError> {
+    validate_digest(repository_identity_digest, "repository identity")?;
+    validate_diagnostic_id(diagnostic_id)?;
+    let source = canonical_real_directory(source_worktree_root, "source worktree")?;
+    let starting_head = git_text_readiness(&source, &["rev-parse", "HEAD"])?;
+    let starting_tree = git_text_readiness(&source, &["rev-parse", "HEAD^{tree}"])?;
+    validate_object_id(&starting_head, "starting HEAD")?;
+    validate_object_id(&starting_tree, "starting tree")?;
+    let common_dir = git_common_dir_readiness(&source)?;
+    git_text_readiness(&source, &["worktree", "list", "--porcelain"])?;
+    let temp_root = env::temp_dir().canonicalize()?;
+    let diagnostic_path = temp_root
+        .join(CANDIDATE_ROOT_DIR)
+        .join(repository_identity_digest)
+        .join(diagnostic_id);
+    if diagnostic_path.starts_with(&source) {
+        return Err(CandidateWorkspaceError::Unsafe(
+            "candidate diagnostic path must be outside the source worktree".to_string(),
+        ));
+    }
+    validate_candidate_readiness_namespace(&diagnostic_path)?;
+    Ok(CandidateWorkspaceReadiness {
+        diagnostic_path,
+        source_worktree_root: source,
+        git_common_dir: common_dir,
+        starting_head,
+        starting_tree,
+    })
+}
+
+fn validate_candidate_readiness_namespace(target: &Path) -> Result<(), CandidateWorkspaceError> {
+    let repository = target.parent().ok_or_else(|| {
+        CandidateWorkspaceError::Unsafe(
+            "planned candidate path has no repository namespace".to_string(),
+        )
+    })?;
+    let root = repository.parent().ok_or_else(|| {
+        CandidateWorkspaceError::Unsafe(
+            "planned candidate path has no candidate namespace".to_string(),
+        )
+    })?;
+    if !validate_existing_readiness_directory(root, "candidate namespace")? {
+        return Ok(());
+    }
+    if !validate_existing_readiness_directory(repository, "candidate repository namespace")? {
+        return Ok(());
+    }
+    match fs::symlink_metadata(target) {
+        Ok(_) => Err(CandidateWorkspaceError::Unsafe(
+            "planned diagnostic candidate target already exists".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CandidateWorkspaceError::Io(error)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateWorkspaceReadiness {
+    pub diagnostic_path: PathBuf,
+    pub source_worktree_root: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub starting_head: String,
+    pub starting_tree: String,
+}
+
+fn validate_diagnostic_id(diagnostic_id: &str) -> Result<(), CandidateWorkspaceError> {
+    if !diagnostic_id.is_empty()
+        && diagnostic_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        Ok(())
+    } else {
+        Err(CandidateWorkspaceError::Unsafe(
+            "candidate diagnostic ID must be non-empty ASCII alphanumeric, '-' or '_'".to_string(),
+        ))
+    }
+}
+
+fn validate_existing_readiness_directory(
+    path: &Path,
+    label: &str,
+) -> Result<bool, CandidateWorkspaceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(CandidateWorkspaceError::Unsafe(format!(
+                "{label} is not a real directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => {
+            validate_private_directory(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CandidateWorkspaceError::Io(error)),
+    }
+}
+
 pub fn provision_candidate_workspace(
     workspace: &LoopWorkspace,
 ) -> Result<CandidateWorkspaceState, CandidateWorkspaceError> {
@@ -2736,9 +2839,39 @@ fn git_common_dir(worktree: &Path) -> Result<PathBuf, CandidateWorkspaceError> {
     path.canonicalize().map_err(CandidateWorkspaceError::Io)
 }
 
+fn git_common_dir_readiness(worktree: &Path) -> Result<PathBuf, CandidateWorkspaceError> {
+    let output = git_text_readiness(worktree, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(output);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    };
+    path.canonicalize().map_err(CandidateWorkspaceError::Io)
+}
+
 fn git_text(worktree: &Path, args: &[&str]) -> Result<String, CandidateWorkspaceError> {
     let bytes = git_bytes(worktree, args)?;
     String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| CandidateWorkspaceError::Git(format!("Git output was not UTF-8: {error}")))
+}
+
+fn git_text_readiness(worktree: &Path, args: &[&str]) -> Result<String, CandidateWorkspaceError> {
+    let output = sanitized_git_command()
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .map_err(CandidateWorkspaceError::Io)?;
+    if !output.status.success() {
+        return Err(CandidateWorkspaceError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
         .map(|value| value.trim().to_string())
         .map_err(|error| CandidateWorkspaceError::Git(format!("Git output was not UTF-8: {error}")))
 }

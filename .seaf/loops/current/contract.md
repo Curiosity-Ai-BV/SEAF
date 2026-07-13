@@ -44,23 +44,24 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M2-02 - Project doctor. M2-01 generic project initialization and Milestone 1
-are accepted.
+M2-03 - Package metadata and version identity. Milestone 1, M2-01 generic
+project initialization, and M2-02 project doctor are accepted.
 
-Add a read-only `seaf doctor` command that diagnoses whether an initialized
-project is ready for the supervised loop. It must check Git/repository state,
-authoritative project configuration and policy, candidate-workspace
-prerequisites, configured eval executables, and the explicitly selected model
-provider. Human and JSON output must describe the same typed checks with
-actionable remediation and a deterministic overall result.
+Make the CLI identifiable and Cargo-packagable. Add `seaf --version`, complete
+the publishable Cargo metadata, make every packaged internal dependency
+versioned, add the repository license and changelog, and document the supported
+platform policy. The package and release notes must consume the Rust source-
+compatibility entries already recorded in
+`docs/preview-compatibility-handoff.md`.
 
-Mandatory RED/GREEN covers a ready generic project, each independent failure
-class, stable JSON/human reporting, and a complete before/after filesystem and
-Git snapshot proving the command creates no project, candidate, run, cache, or
-provider evidence. Live-provider checks must remain explicit; deterministic
-fake-provider diagnosis must require no network or model process.
+Mandatory RED/GREEN evidence starts from the current missing version/package
+contract. Cargo package dry-runs must succeed for every publishable crate, and
+an installed-package smoke must invoke the packaged `seaf` binary and prove its
+version identity outside the source workspace. Verification includes the
+focused packaging checks plus the full repository gate matrix.
 
-Keep this slice limited to doctor report contracts, CLI behavior, tests, guide,
-and matching trackers. Do not add package/version metadata, release artifacts,
-installed-binary smoke, or external golden-path execution; those are M2-03 and
-later slices.
+Keep this slice limited to package metadata, version identity, license,
+changelog, supported-platform documentation, packaging tests/scripts, and
+matching trackers. Do not add release artifact automation, checksums, tag or
+publication authority, external golden-path execution, or Ollama acceptance;
+those are M2-04 through M2-07.

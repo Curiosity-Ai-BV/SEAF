@@ -9,7 +9,7 @@ pub(crate) const RUN_TREE_BYTE_CAP: u64 = 32 * 1024 * 1024;
 pub(crate) const RUN_TREE_ENTRY_CAP: usize = 4096;
 pub(crate) const RUN_TREE_DIRECTORY_DEPTH_CAP: usize = 8;
 const DEFAULT_ARTIFACT_BYTE_CAP: u64 = 2 * 1024 * 1024;
-pub(crate) const PROVIDER_RESPONSE_BYTE_CAP: u64 = 1024 * 1024;
+pub(crate) const PROVIDER_RESPONSE_BYTE_CAP: u64 = seaf_models::PROVIDER_RESPONSE_BYTE_CAP as u64;
 pub(crate) const PROVIDER_RECORD_BYTE_CAP: u64 = 64 * 1024;
 const LOG_BYTE_CAP: u64 = 1024 * 1024;
 
