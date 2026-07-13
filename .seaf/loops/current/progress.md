@@ -50,8 +50,8 @@
 
 ## Milestone 2 - Consumable Loop
 
-- [ ] M2-01: Generic project initialization (active).
-- [ ] M2-02: Project doctor.
+- [x] M2-01: Generic project initialization.
+- [ ] M2-02: Project doctor (active).
 - [ ] M2-03: Package metadata and version identity.
 - [ ] M2-04: Release artifact workflow.
 - [ ] M2-05: Human-authorized tagged prerelease.
@@ -70,7 +70,8 @@
 ## Current Gate
 
 Milestone 1, including M1-12 interruption recovery acceptance, is complete.
-M2-01 generic project initialization is active.
+M2-01 generic project initialization is accepted. M2-02 project doctor is
+active.
 Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
@@ -225,8 +226,19 @@ claim. Independent specification and quality re-reviews approve M1-12 with no
 open findings. The controller's final gate passed all 14 exact acceptance
 tests, workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-M2-01 is active. Compatibility handoff is recorded in
+M2-01 is accepted and M2-02 is active. Compatibility handoff is recorded in
 `docs/preview-compatibility-handoff.md` for M2-03 and M3-05.
 The documented complete promotion path requires a clean checkout/worktree. The
 source-workspace gate currently supports macOS/Linux only: CI runs it on Ubuntu
 and current local verification is macOS; Windows is not claimed.
+M2-01 is accepted after independent specification and quality review. Generic
+init plans exactly `seaf.config.json`, `seaf.policy.json`, `seaf.evals.yaml`,
+`seaf.ticket.yaml`, and `.seaf/.gitignore`; validates all public structured bytes
+before mutation; chooses exact Rust, Node, hybrid, or Git fallback checks; and
+keeps provider selection on the CLI. Seven focused tests pass, including
+byte-exact late-conflict/retry and symlink refusal, and all four generated evals
+execute successfully. Core 52/52, CLI 148/148, workspace check, strict owning-
+crate Clippy, formatting, and diff hygiene pass. Doctor, packaging, releases,
+and external golden-path acceptance remain pending. The controller's full gate
+passed workspace check, strict all-target/all-feature Clippy, all pinned-pnpm
+SDK gates, and the complete locked serial Rust workspace suite. M2-02 is active.

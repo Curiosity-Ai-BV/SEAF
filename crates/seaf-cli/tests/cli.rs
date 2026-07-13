@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use seaf_core::{canonical_json_bytes, canonical_sha256_digest, templates, Policy, ProjectConfig};
+use seaf_core::{
+    canonical_json_bytes, canonical_sha256_digest, templates, EvalConfig, Policy, ProjectConfig,
+    TicketSpec,
+};
 use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
@@ -68,26 +71,348 @@ fn invalid_policy_fails_loudly() {
 }
 
 #[test]
-fn init_creates_templates_and_refuses_overwrite() {
+fn generic_init_executes_one_stack_neutral_command_contract_before_writing() {
+    let cases = [
+        ("rust", true, false, vec!["cargo test"]),
+        ("node", false, true, vec!["npm test"]),
+        ("rust-and-node", true, true, vec!["cargo test", "npm test"]),
+        ("unknown", false, false, vec!["git diff --check"]),
+    ];
+
+    for (name, rust, node, expected_commands) in cases {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        fs::write(root.join("README.md"), format!("# {name} fixture\n")).unwrap();
+        if rust {
+            fs::create_dir(root.join("src")).unwrap();
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"init_{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    name.replace('-', "_")
+                ),
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/lib.rs"),
+                "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fixture_passes() {}\n}\n",
+            )
+            .unwrap();
+        }
+        if node {
+            fs::write(
+                root.join("package.json"),
+                "{\"scripts\":{\"test\":\"node --test\"},\"type\":\"module\"}\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("fixture.test.js"),
+                "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('fixture passes', () => assert.equal(1, 1));\n",
+            )
+            .unwrap();
+        }
+        init_empty_git_repo(root);
+        commit_all(root, "Add runnable init fixture");
+        let mut expected_paths = read_init_tree(root)
+            .into_keys()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let output = seaf()
+            .args(["init", "--path", root.to_str().unwrap(), "--json"])
+            .output()
+            .expect("run generic init");
+        assert!(output.status.success(), "{name}: {output:?}");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("init JSON report");
+        assert_eq!(report["template"], "generic", "{name}");
+        assert_eq!(
+            report["created"],
+            serde_json::json!([
+                "seaf.config.json",
+                "seaf.policy.json",
+                "seaf.evals.yaml",
+                "seaf.ticket.yaml",
+                ".seaf/.gitignore"
+            ]),
+            "{name}"
+        );
+
+        for relative in [
+            "seaf.config.json",
+            "seaf.policy.json",
+            "seaf.evals.yaml",
+            "seaf.ticket.yaml",
+            ".seaf/.gitignore",
+        ] {
+            assert!(root.join(relative).is_file(), "{name}: {relative}");
+        }
+        assert!(
+            !root.join(".seaf/loops/current").exists(),
+            "generic init must not create durable loop state for {name}"
+        );
+        expected_paths.extend(
+            [
+                ".seaf",
+                ".seaf/.gitignore",
+                "seaf.config.json",
+                "seaf.evals.yaml",
+                "seaf.policy.json",
+                "seaf.ticket.yaml",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        assert_eq!(
+            read_init_tree(root)
+                .into_keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_paths,
+            "{name}: init must create exactly the documented output set"
+        );
+
+        let config_bytes = fs::read(root.join("seaf.config.json")).unwrap();
+        let policy_bytes = fs::read(root.join("seaf.policy.json")).unwrap();
+        let eval_bytes = fs::read(root.join("seaf.evals.yaml")).unwrap();
+        let ticket_bytes = fs::read(root.join("seaf.ticket.yaml")).unwrap();
+        let config: ProjectConfig = serde_json::from_slice(&config_bytes).unwrap();
+        let policy: Policy = serde_json::from_slice(&policy_bytes).unwrap();
+        let eval: EvalConfig =
+            seaf_core::parse_eval_config(std::str::from_utf8(&eval_bytes).unwrap()).unwrap();
+        let ticket: TicketSpec =
+            seaf_core::load_ticket_file(&root.join("seaf.ticket.yaml")).unwrap();
+        assert!(
+            seaf_core::validate_project_config(&config).is_empty(),
+            "{name}"
+        );
+        assert!(seaf_core::validate_policy(&policy).is_empty(), "{name}");
+        seaf_core::validate_eval_config(&eval).expect("valid generated eval config");
+        assert!(
+            seaf_core::validate_ticket_spec(&ticket).is_empty(),
+            "{name}"
+        );
+
+        let eval_commands = eval
+            .evals
+            .required
+            .iter()
+            .map(|check| check.command.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(eval_commands, expected_commands, "{name}");
+        assert_eq!(eval.evals.allow_commands, expected_commands, "{name}");
+        assert_eq!(
+            ticket.autonomy.allow_shell_commands, expected_commands,
+            "{name}"
+        );
+        assert_eq!(ticket.eval.as_ref().unwrap().config, "seaf.evals.yaml");
+
+        let generated = [config_bytes, policy_bytes, eval_bytes, ticket_bytes].concat();
+        let generated = String::from_utf8(generated).unwrap();
+        for forbidden in [
+            "Adaptive Notes",
+            "adaptive-notes",
+            "crates/",
+            "packages/",
+            "seaf-core",
+            "examples/local-loop",
+            "pnpm",
+        ] {
+            assert!(
+                !generated.contains(forbidden),
+                "{name}: generic output contains forbidden source/example assumption {forbidden}"
+            );
+        }
+
+        let report_path = root.join("eval-report.json");
+        let eval_output = seaf_in(root)
+            .args([
+                "eval",
+                "run",
+                "seaf.evals.yaml",
+                "--output",
+                report_path.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("execute generated native project checks");
+        assert!(eval_output.status.success(), "{name}: {eval_output:?}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&eval_output.stdout).expect("generated eval report");
+        assert_eq!(report["passed"], true, "{name}: {report}");
+    }
+}
+
+#[test]
+fn adaptive_notes_init_is_explicit_and_preserves_the_specialized_file_set() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path();
-
-    let first = seaf()
-        .args(["init", "--path", root.to_str().unwrap(), "--json"])
+    let output = seaf()
+        .args([
+            "init",
+            "--path",
+            root.to_str().unwrap(),
+            "--template",
+            "adaptive-notes",
+            "--json",
+        ])
         .output()
-        .expect("run init");
-    assert!(first.status.success());
-    assert!(root.join("adaptive.yaml").exists());
-    assert!(root.join("seaf.policy.json").exists());
-    assert!(root.join(".seaf/loops/current/contract.md").exists());
+        .expect("run adaptive init");
+    assert!(output.status.success(), "{output:?}");
 
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["created"],
+        serde_json::json!([
+            "adaptive.yaml",
+            "seaf.policy.json",
+            "seaf.evals.yaml",
+            ".seaf/loops/current/contract.md",
+            ".seaf/loops/current/progress.md",
+            ".seaf/loops/current/log.md"
+        ])
+    );
+    for (relative, expected) in [
+        ("adaptive.yaml", templates::ADAPTIVE_GOAL_YAML),
+        ("seaf.policy.json", templates::DEFAULT_POLICY_JSON),
+        ("seaf.evals.yaml", templates::DEFAULT_EVALS_YAML),
+        (".seaf/loops/current/contract.md", templates::LOOP_CONTRACT),
+        (".seaf/loops/current/progress.md", templates::LOOP_PROGRESS),
+        (".seaf/loops/current/log.md", templates::LOOP_LOG),
+    ] {
+        assert_eq!(fs::read(root.join(relative)).unwrap(), expected.as_bytes());
+    }
+    assert!(!root.join("seaf.config.json").exists());
+    assert!(!root.join("seaf.ticket.yaml").exists());
+    assert!(!root.join(".seaf/.gitignore").exists());
+}
+
+#[test]
+fn init_rejects_unsupported_templates_and_removed_force_without_mutation() {
+    for args in [vec!["--template", "unknown"], vec!["--force"]] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        fs::write(root.join("sentinel"), b"unchanged").unwrap();
+        let before = read_init_tree(root);
+
+        let mut command = seaf();
+        command.args(["init", "--path", root.to_str().unwrap()]);
+        command.args(args);
+        let output = command.output().expect("run rejected init");
+
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(read_init_tree(root), before);
+    }
+}
+
+#[test]
+fn init_preflights_every_target_before_a_late_conflict_and_second_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+    init_empty_git_repo(root);
+    commit_all(root, "Add Rust fixture");
+    fs::create_dir(root.join(".seaf")).unwrap();
+    fs::write(root.join(".seaf/.gitignore"), b"late conflict\n").unwrap();
+    let before = init_repository_snapshot(root);
+
+    let conflict = seaf()
+        .args(["init", "--path", root.to_str().unwrap()])
+        .output()
+        .expect("run conflicted init");
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert_eq!(init_repository_snapshot(root), before);
+    assert!(!root.join("seaf.config.json").exists());
+
+    fs::remove_file(root.join(".seaf/.gitignore")).unwrap();
+    fs::remove_dir(root.join(".seaf")).unwrap();
+    let first = seaf()
+        .args(["init", "--path", root.to_str().unwrap()])
+        .output()
+        .expect("run first init");
+    assert!(first.status.success(), "{first:?}");
+    let initialized = init_repository_snapshot(root);
     let second = seaf()
         .args(["init", "--path", root.to_str().unwrap()])
         .output()
-        .expect("run init again");
-    assert!(!second.status.success());
-    let stderr = String::from_utf8(second.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("already exists"));
+        .expect("run second init");
+    assert!(!second.status.success(), "{second:?}");
+    assert_eq!(init_repository_snapshot(root), initialized);
+}
+
+#[test]
+fn init_rejects_target_and_ancestor_file_or_directory_conflicts_without_writes() {
+    for (name, relative, directory) in [
+        ("target-file", "seaf.config.json", false),
+        ("target-directory", "seaf.policy.json", true),
+        ("ancestor-file", ".seaf", false),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        init_empty_git_repo(root);
+        commit_all(root, "Add Node fixture");
+        if directory {
+            fs::create_dir(root.join(relative)).unwrap();
+        } else {
+            fs::write(root.join(relative), format!("{name}\n")).unwrap();
+        }
+        let before = init_repository_snapshot(root);
+
+        let output = seaf()
+            .args(["init", "--path", root.to_str().unwrap()])
+            .output()
+            .expect("run conflicted init");
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert_eq!(init_repository_snapshot(root), before, "{name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_target_and_ancestor_symlinks_including_dangling_links() {
+    for (name, relative, destination) in [
+        ("target-symlink", "seaf.evals.yaml", "outside"),
+        ("target-dangling", "seaf.ticket.yaml", "missing"),
+        ("ancestor-symlink", ".seaf", "outside-directory"),
+    ] {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::write(root.join("outside"), b"outside\n").unwrap();
+        fs::create_dir(root.join("outside-directory")).unwrap();
+        init_empty_git_repo(root);
+        commit_all(root, "Add symlink fixture");
+        symlink(destination, root.join(relative)).unwrap();
+        let before = init_repository_snapshot(root);
+
+        let output = seaf()
+            .args(["init", "--path", root.to_str().unwrap()])
+            .output()
+            .expect("run symlink-conflicted init");
+        assert!(!output.status.success(), "{name}: {output:?}");
+        assert_eq!(init_repository_snapshot(root), before, "{name}");
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"outside\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_a_symlinked_project_root_without_following_it() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let actual_root = temp_dir.path().join("actual");
+    let linked_root = temp_dir.path().join("linked");
+    fs::create_dir(&actual_root).unwrap();
+    fs::write(actual_root.join("sentinel"), b"unchanged\n").unwrap();
+    symlink(&actual_root, &linked_root).unwrap();
+    let before = read_init_tree(&actual_root);
+
+    let output = seaf()
+        .args(["init", "--path", linked_root.to_str().unwrap()])
+        .output()
+        .expect("run symlink-root init");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(read_init_tree(&actual_root), before);
 }
 
 #[test]
@@ -9888,6 +10213,64 @@ fn eval_run_timeout_marks_check_failed_cleanly() {
 
 fn seaf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_seaf"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InitTreeEntry {
+    Directory,
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitRepositorySnapshot {
+    source: SourceWorkspaceSnapshot,
+    tree: BTreeMap<PathBuf, InitTreeEntry>,
+}
+
+fn init_repository_snapshot(root: &Path) -> InitRepositorySnapshot {
+    InitRepositorySnapshot {
+        source: source_workspace_snapshot(root),
+        tree: read_init_tree(root),
+    }
+}
+
+fn read_init_tree(root: &Path) -> BTreeMap<PathBuf, InitTreeEntry> {
+    fn visit(root: &Path, directory: &Path, entries: &mut BTreeMap<PathBuf, InitTreeEntry>) {
+        let mut children = fs::read_dir(directory)
+            .expect("init tree directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("init tree entries");
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            if child.file_name() == ".git" {
+                continue;
+            }
+            let path = child.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).expect("init tree metadata");
+            if metadata.file_type().is_symlink() {
+                entries.insert(
+                    relative,
+                    InitTreeEntry::Symlink(fs::read_link(&path).expect("init symlink target")),
+                );
+            } else if metadata.is_dir() {
+                entries.insert(relative, InitTreeEntry::Directory);
+                visit(root, &path, entries);
+            } else if metadata.is_file() {
+                entries.insert(
+                    relative,
+                    InitTreeEntry::RegularFile(fs::read(&path).expect("init file bytes")),
+                );
+            } else {
+                panic!("unsupported init tree entry: {}", path.display());
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
 }
 
 fn seaf_in(path: &Path) -> Command {

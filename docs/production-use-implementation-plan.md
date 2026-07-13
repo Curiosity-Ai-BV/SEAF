@@ -2008,8 +2008,8 @@ and diff hygiene.
 
 ### M1-12 - Interruption Recovery Acceptance
 
-Status: accepted on 2026-07-13. Dependencies: M1-11 (complete). Milestone 1 is
-complete and M2-01 is active.
+Status: accepted on 2026-07-13. Dependencies: M1-11 (complete). Milestone 1 and
+M2-01 are complete; M2-02 is active.
 
 Roadmap: U5 and Milestone 1 exit gate. Dependencies: M1-11.
 
@@ -2095,7 +2095,8 @@ provider exchange 22/22, and every remaining integration and doc-test suite.
 
 ### M2-01 - Generic Project Initialization
 
-Status: active on 2026-07-13. Dependencies: M1-12 (accepted).
+Status: accepted on 2026-07-13. M2-02 is active. Dependencies: M1-12
+(accepted).
 
 Roadmap: U6. Dependencies: M1-12.
 
@@ -2103,13 +2104,27 @@ Objective: bootstrap a stack-neutral external project.
 
 Acceptance criteria:
 
-- Default init generates editable policy, eval, ticket, provider/config, and
-  ignore templates without SEAF-repo-specific commands.
-- Named examples remain opt-in and existing-file refusal is atomic.
+- Default init generates exactly `seaf.config.json`, `seaf.policy.json`,
+  `seaf.evals.yaml`, `seaf.ticket.yaml`, and `.seaf/.gitignore`. Project stack
+  detection selects `cargo test`, `npm test`, both in that order, or
+  `git diff --check`; eval and ticket allowlists agree.
+- Project config, policy, eval config, and ticket bytes parse and pass production
+  validation before filesystem mutation. Generic bytes contain no Adaptive
+  Notes or SEAF-source-workspace assumptions.
+- `--template adaptive-notes` remains explicit opt-in with its specialized file
+  set and content. Unsupported templates, removed `--force`, any target
+  conflict, and any traversed ancestor conflict or symlink fail before writes.
+  A late conflict and second run preserve a byte-exact repository/Git snapshot.
+- Initialization does not create a provider config. The quickstart documents
+  explicit `--provider fake`/`--provider ollama` CLI authority.
+- Generic mode omits `.seaf/loops/current`. Doctor, packaging, release, and
+  external golden-path work remain later slices.
 
 Likely seams: templates/core, init CLI, fixtures, and CLI tests.
 
-RED: generic init in Rust and Node fixture repos plus atomic conflict tests.
+RED: the exact six-test init selection passed only explicit Adaptive Notes
+compatibility. Five tests failed because default init still selected Adaptive
+Notes, ignored generic late/target/ancestor conflicts, and accepted `--force`.
 
 Verification: CLI/core tests, template validation, full Rust tests, format,
 Clippy, TS checks, and diff check.
@@ -2118,7 +2133,31 @@ Docs/tracker: bootstrap quickstart and M2-01 status.
 
 Commit boundary: generic initialization only.
 
+Implemented evidence: the default path plans exactly the five documented
+outputs, detects Rust/Node markers read-only, renders all bytes, parses and
+production-validates project config, policy, eval config, and ticket, preflights
+every target and traversed ancestor, and only then creates missing directories
+and files with create-new semantics. On an I/O error it attempts cleanup of
+files and directories created by the invocation; no temporary file is used. The
+removed `--force` and unsupported templates fail before init dispatch.
+
+Witnessed RED ran six exact init tests: explicit Adaptive Notes compatibility
+passed, while the five generic/atomic tests exposed the old default, late-write,
+conflict, and `--force` behavior. GREEN runs seven focused tests, including
+root/target/ancestor symlink cases. The stack matrix builds committed runnable
+Rust, built-in Node, hybrid, and Git-only fixtures; every generated eval runs
+successfully and publishes a passing report. The full locked serial CLI suite
+passes 148/148, core passes 52/52, workspace check and strict owning-crate
+Clippy pass, and formatting/diff gates pass. Independent specification and
+quality reviews approve with no blocking findings. The controller's final gate
+passed workspace check, strict all-target/all-feature Clippy, every pinned-pnpm
+lint/type/test/build check, and the complete locked serial Rust workspace suite,
+including loop unit 286/286, provider/candidate 75/75, state 44/44, and every
+remaining integration and doc-test suite.
+
 ### M2-02 - Project Doctor
+
+Status: active on 2026-07-13. Dependencies: M2-01 (accepted).
 
 Roadmap: U6. Dependencies: M2-01.
 

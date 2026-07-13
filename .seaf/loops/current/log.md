@@ -2446,3 +2446,55 @@ documentation; it does not change production Rust behavior or the public API.
 Milestone 1 is complete. M2-01 generic project initialization is active with a
 stack-neutral, conflict-atomic scope; `doctor`, packaging, releases, and
 external packaged acceptance remain later slices.
+
+## 2026-07-13 implemented; review pending | M2-01 generic project initialization
+
+Witnessed RED ran six exact init tests against the old Adaptive Notes default.
+Only explicit Adaptive Notes compatibility passed. The five failures showed
+that default init selected the specialized template, ignored generic late,
+target, ancestor, and dangling-link conflicts, and still accepted `--force`.
+
+The implementation plans the complete output set in memory. Generic stack
+detection is read-only; rendered project config, policy, eval, and ticket bytes
+parse and pass production validation before the filesystem changes. Preflight
+rejects every existing target type and non-directory or symlinked traversed
+ancestor. Files use create-new writes, and an I/O failure triggers best-effort
+cleanup of only files and directories created by that invocation. Generic mode creates exactly
+`seaf.config.json`, `seaf.policy.json`, `seaf.evals.yaml`, `seaf.ticket.yaml`,
+and `.seaf/.gitignore`; it does not create loop state or provider config.
+
+The corrected seven-test selection is GREEN. It proves exact output and command
+contracts, byte-identical explicit Adaptive Notes output, unsupported-template
+and removed-`--force` rejection, complete Git/filesystem preservation on late
+conflict and second run, every target/ancestor conflict shape, and root/ancestor/
+target symlink refusal. Minimal committed Rust, built-in Node, hybrid, and Git-
+only fixtures execute their generated evals successfully with no package install.
+Core passes 52/52; the full locked serial CLI suite passes 148/148 in 644.53s;
+workspace check, strict owning-crate Clippy, Rust/Prettier formatting, and diff
+hygiene pass. The README uses explicit `--provider fake` and explains that
+provider choice remains CLI authority. M2-01 remains active with independent
+review pending; no doctor, packaging, release, or external golden-path result is
+claimed.
+
+## 2026-07-13 accepted | M2-01 generic project initialization
+
+Independent specification and quality reviews approve the complete M2-01 diff
+with no blocking findings. Controller review required the stack fixtures to do
+more than inspect generated YAML: the corrected seven-test gate creates valid
+committed Rust, built-in Node, hybrid, and Git-only repositories and executes
+each generated eval successfully. Exact generic output, production validation,
+Adaptive Notes opt-in compatibility, removed-`--force` behavior, and byte-exact
+target/ancestor/root conflict and symlink refusal remain GREEN.
+
+The controller passed workspace check, strict all-target/all-feature Clippy,
+Rust and Prettier formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK
+tests, and diff hygiene. The definitive locked serial Rust workspace suite
+passed: CLI 148/148, core 52/52, loop unit 286/286, provider/candidate 75/75,
+state 44/44, provider exchange 22/22, and every remaining integration and
+doc-test suite. M2-01 is accepted as one initialization slice.
+
+The accepted cooperative conflict contract does not claim protection from a
+hostile same-user ancestor-symlink race between preflight and path-based create,
+and unexpected I/O rollback remains best-effort. Descriptor-relative no-follow
+publication is future defense-in-depth. M2-02 project doctor is active;
+packaging, releases, and external golden-path acceptance remain pending.

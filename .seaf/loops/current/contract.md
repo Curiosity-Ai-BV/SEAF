@@ -44,24 +44,23 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M2-01 - Generic project initialization. Milestone 1 and M1-12 interruption
-recovery acceptance are complete.
+M2-02 - Project doctor. M2-01 generic project initialization and Milestone 1
+are accepted.
 
-Make the default `seaf init` output stack-neutral and immediately editable in a
-clean external repository. It must plan the complete output set before writing,
-then refuse any existing-file conflict atomically without changing any target.
-The default output set includes policy, eval, starter ticket, provider/project
-configuration, and ignore entries. No default path, command, label, or content
-may assume the SEAF workspace or the Adaptive Notes example.
+Add a read-only `seaf doctor` command that diagnoses whether an initialized
+project is ready for the supervised loop. It must check Git/repository state,
+authoritative project configuration and policy, candidate-workspace
+prerequisites, configured eval executables, and the explicitly selected model
+provider. Human and JSON output must describe the same typed checks with
+actionable remediation and a deterministic overall result.
 
-Named examples remain explicit opt-in modes and preserve their documented
-specialized behavior. Mandatory RED/GREEN uses representative empty Rust and
-Node fixture repositories plus an existing-file conflict fixture. Tests must
-parse and validate every generated public file, prove the generic commands are
-appropriate to each fixture, prove the default contains no SEAF/Adaptive Notes
-assumptions, and prove conflict refusal leaves a byte-exact repository snapshot.
+Mandatory RED/GREEN covers a ready generic project, each independent failure
+class, stable JSON/human reporting, and a complete before/after filesystem and
+Git snapshot proving the command creates no project, candidate, run, cache, or
+provider evidence. Live-provider checks must remain explicit; deterministic
+fake-provider diagnosis must require no network or model process.
 
-Keep this slice limited to initialization templates, the init CLI, fixtures,
-tests, the bootstrap quickstart, and matching trackers. Do not add `doctor`,
-package/version metadata, release automation, or packaged-binary acceptance;
-those are M2-02 and later slices.
+Keep this slice limited to doctor report contracts, CLI behavior, tests, guide,
+and matching trackers. Do not add package/version metadata, release artifacts,
+installed-binary smoke, or external golden-path execution; those are M2-03 and
+later slices.

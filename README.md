@@ -48,8 +48,38 @@ pnpm typecheck
 
 ## CLI MVP
 
+### Bootstrap an existing project
+
+Until packaged installation lands in M2-03, run the CLI from this source
+workspace while keeping the initialized project as the process working
+directory:
+
 ```bash
-cargo run -p seaf-cli -- init --path /tmp/seaf-demo
+SEAF_MANIFEST="$PWD/Cargo.toml"
+mkdir -p /tmp/seaf-demo
+git -C /tmp/seaf-demo init
+cd /tmp/seaf-demo
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- init
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
+  ticket validate seaf.ticket.yaml
+git add seaf.config.json seaf.policy.json seaf.evals.yaml seaf.ticket.yaml .seaf/.gitignore
+git -c user.name="SEAF Demo" -c user.email="demo@seaf.invalid" \
+  commit -m "Initialize SEAF"
+cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- loop run \
+  --ticket seaf.ticket.yaml --provider fake --run-id first-seaf-run --json
+```
+
+The generic initializer detects `Cargo.toml` and `package.json` and writes only
+editable project configuration, policy, eval, starter-ticket, and state-ignore
+files. It never writes provider configuration: `--provider fake` or
+`--provider ollama` remains the explicit CLI authority for each new run. Use
+`--template adaptive-notes` only when you intentionally want the specialized
+example files.
+
+### Adaptive Notes example
+
+```bash
+cargo run -p seaf-cli -- init --path /tmp/seaf-demo --template adaptive-notes
 cargo run -p seaf-cli -- goal validate examples/adaptive-notes/adaptive.yaml
 cargo run -p seaf-cli -- policy validate examples/adaptive-notes/seaf.policy.json
 cargo run -p seaf-cli -- task brief \
@@ -170,9 +200,10 @@ checkout, and leaves it unstaged and uncommitted for review. Crash retry adopts
 only that exact patch; it does not delete the frozen candidate or contact a
 model provider.
 
-Milestone 1 verifies this flow only when SEAF runs from this Cargo source
-workspace. Packaged installation, generic project initialization, and adoption
-in an external repository remain Milestone 2 acceptance work. The current
-source-workspace acceptance gate supports macOS and Linux only: CI executes it
-on Ubuntu, and current local verification is on macOS. Windows and generic
-platform support are not claimed.
+Milestone 1 verifies the complete loop only when SEAF runs from this Cargo
+source workspace. Generic project initialization is now covered for Rust,
+Node, hybrid, and Git-only repositories, but project doctor, packaged
+installation, and the packaged external golden path remain Milestone 2 work.
+The current complete-loop acceptance gate supports macOS and Linux only: CI
+executes it on Ubuntu, and current local verification is on macOS. Windows and
+generic platform support are not claimed.

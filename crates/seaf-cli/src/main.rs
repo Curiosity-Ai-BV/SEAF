@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode},
     time::{SystemTime, UNIX_EPOCH},
@@ -104,12 +104,9 @@ struct InitArgs {
     /// Directory to initialize.
     #[arg(long, default_value = ".")]
     path: PathBuf,
-    /// Starter template to use.
-    #[arg(long, default_value = "adaptive-notes")]
-    template: String,
-    /// Overwrite existing template files.
+    /// Optional named example template to use instead of the generic project template.
     #[arg(long)]
-    force: bool,
+    template: Option<String>,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -706,50 +703,21 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
 }
 
 fn init_project(args: InitArgs) -> Result<(), CliFailure> {
-    if args.template != "adaptive-notes" {
-        return Err(CliFailure::message(format!(
-            "unsupported template '{}'; supported templates: adaptive-notes",
-            args.template
-        )));
-    }
-
     let root = args.path;
-    let targets = [
-        ("adaptive.yaml", templates::ADAPTIVE_GOAL_YAML),
-        ("seaf.policy.json", templates::DEFAULT_POLICY_JSON),
-        ("seaf.evals.yaml", templates::DEFAULT_EVALS_YAML),
-        (".seaf/loops/current/contract.md", templates::LOOP_CONTRACT),
-        (".seaf/loops/current/progress.md", templates::LOOP_PROGRESS),
-        (".seaf/loops/current/log.md", templates::LOOP_LOG),
-    ];
-
-    for (relative_path, _) in targets {
-        let target = root.join(relative_path);
-        if target.exists() && !args.force {
+    let plan = match args.template.as_deref() {
+        None => generic_init_plan(&root)?,
+        Some("adaptive-notes") => adaptive_notes_init_plan()?,
+        Some(template) => {
             return Err(CliFailure::message(format!(
-                "{} already exists; rerun with --force to overwrite template files",
-                target.display()
-            )));
+                "unsupported template '{template}'; supported named templates: adaptive-notes"
+            )))
         }
-    }
-
-    let mut created = Vec::new();
-    for (relative_path, contents) in targets {
-        let target = root.join(relative_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                CliFailure::message(format!("could not create {}: {err}", parent.display()))
-            })?;
-        }
-        fs::write(&target, contents).map_err(|err| {
-            CliFailure::message(format!("could not write {}: {err}", target.display()))
-        })?;
-        created.push(relative_path.to_string());
-    }
+    };
+    let created = write_init_plan(&root, &plan)?;
 
     let report = InitReport {
         path: root.display().to_string(),
-        template: args.template,
+        template: plan.template.to_string(),
         created,
     };
 
@@ -763,6 +731,293 @@ fn init_project(args: InitArgs) -> Result<(), CliFailure> {
     }
 
     Ok(())
+}
+
+struct InitPlan {
+    template: &'static str,
+    files: Vec<PlannedInitFile>,
+}
+
+struct PlannedInitFile {
+    relative_path: &'static str,
+    contents: Vec<u8>,
+}
+
+fn generic_init_plan(root: &Path) -> Result<InitPlan, CliFailure> {
+    let (has_rust, has_node) = detect_generic_project_stack(root)?;
+    let evals = templates::generic_evals_yaml(has_rust, has_node);
+    let ticket = templates::generic_ticket_yaml(has_rust, has_node);
+
+    let config: ProjectConfig = serde_json::from_str(templates::GENERIC_PROJECT_CONFIG_JSON)
+        .map_err(|error| {
+            CliFailure::message(format!("generated project config is invalid JSON: {error}"))
+        })?;
+    ensure_generated_fields_valid(
+        "project config",
+        seaf_core::validate_project_config(&config),
+    )?;
+
+    let policy: Policy = serde_json::from_str(templates::GENERIC_POLICY_JSON).map_err(|error| {
+        CliFailure::message(format!("generated policy is invalid JSON: {error}"))
+    })?;
+    ensure_generated_fields_valid("policy", seaf_core::validate_policy(&policy))?;
+
+    seaf_core::parse_eval_config(&evals).map_err(|error| {
+        CliFailure::message(format!("generated eval config is invalid: {error}"))
+    })?;
+    let ticket_spec = seaf_core::parse_ticket_spec(&ticket).map_err(|report| {
+        CliFailure::message(format!(
+            "generated ticket is invalid: {}",
+            serde_json::to_string(&report).unwrap_or_else(|_| "validation failed".to_string())
+        ))
+    })?;
+    ensure_generated_fields_valid("ticket", seaf_core::validate_ticket_spec(&ticket_spec))?;
+
+    Ok(InitPlan {
+        template: "generic",
+        files: vec![
+            PlannedInitFile {
+                relative_path: "seaf.config.json",
+                contents: templates::GENERIC_PROJECT_CONFIG_JSON.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: "seaf.policy.json",
+                contents: templates::GENERIC_POLICY_JSON.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: "seaf.evals.yaml",
+                contents: evals.into_bytes(),
+            },
+            PlannedInitFile {
+                relative_path: "seaf.ticket.yaml",
+                contents: ticket.into_bytes(),
+            },
+            PlannedInitFile {
+                relative_path: ".seaf/.gitignore",
+                contents: templates::GENERIC_STATE_GITIGNORE.as_bytes().to_vec(),
+            },
+        ],
+    })
+}
+
+fn adaptive_notes_init_plan() -> Result<InitPlan, CliFailure> {
+    let policy: Policy = serde_json::from_str(templates::DEFAULT_POLICY_JSON).map_err(|error| {
+        CliFailure::message(format!("adaptive-notes policy is invalid JSON: {error}"))
+    })?;
+    ensure_generated_fields_valid("adaptive-notes policy", seaf_core::validate_policy(&policy))?;
+    seaf_core::parse_eval_config(templates::DEFAULT_EVALS_YAML).map_err(|error| {
+        CliFailure::message(format!("adaptive-notes eval config is invalid: {error}"))
+    })?;
+
+    Ok(InitPlan {
+        template: "adaptive-notes",
+        files: vec![
+            PlannedInitFile {
+                relative_path: "adaptive.yaml",
+                contents: templates::ADAPTIVE_GOAL_YAML.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: "seaf.policy.json",
+                contents: templates::DEFAULT_POLICY_JSON.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: "seaf.evals.yaml",
+                contents: templates::DEFAULT_EVALS_YAML.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: ".seaf/loops/current/contract.md",
+                contents: templates::LOOP_CONTRACT.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: ".seaf/loops/current/progress.md",
+                contents: templates::LOOP_PROGRESS.as_bytes().to_vec(),
+            },
+            PlannedInitFile {
+                relative_path: ".seaf/loops/current/log.md",
+                contents: templates::LOOP_LOG.as_bytes().to_vec(),
+            },
+        ],
+    })
+}
+
+fn detect_generic_project_stack(root: &Path) -> Result<(bool, bool), CliFailure> {
+    let rust = stack_marker_exists(&root.join("Cargo.toml"))?;
+    let node = stack_marker_exists(&root.join("package.json"))?;
+    Ok((rust, node))
+}
+
+fn stack_marker_exists(path: &Path) -> Result<bool, CliFailure> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliFailure::message(format!(
+            "could not inspect stack marker {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn ensure_generated_fields_valid(kind: &str, errors: Vec<FieldError>) -> Result<(), CliFailure> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let details = errors
+        .iter()
+        .map(|error| format!("{}: {}", error.field, error.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliFailure::message(format!(
+        "generated {kind} failed validation: {details}"
+    )))
+}
+
+fn write_init_plan(root: &Path, plan: &InitPlan) -> Result<Vec<String>, CliFailure> {
+    let missing_directories = preflight_init_plan(root, plan)?;
+    let mut created_directories = Vec::new();
+    for directory in missing_directories {
+        if let Err(error) = fs::create_dir(&directory) {
+            rollback_init_writes(&[], &created_directories);
+            return Err(CliFailure::message(format!(
+                "could not create {}: {error}",
+                directory.display()
+            )));
+        }
+        created_directories.push(directory);
+    }
+
+    if let Err(error) = preflight_init_plan(root, plan) {
+        rollback_init_writes(&[], &created_directories);
+        return Err(error);
+    }
+
+    let mut created_files = Vec::new();
+    for planned in &plan.files {
+        let target = root.join(planned.relative_path);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                rollback_init_writes(&created_files, &created_directories);
+                return Err(CliFailure::message(format!(
+                    "could not write {}: {error}",
+                    target.display()
+                )));
+            }
+        };
+        created_files.push(target.clone());
+        if let Err(error) = file
+            .write_all(&planned.contents)
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            rollback_init_writes(&created_files, &created_directories);
+            return Err(CliFailure::message(format!(
+                "could not write {}: {error}",
+                target.display()
+            )));
+        }
+    }
+
+    Ok(plan
+        .files
+        .iter()
+        .map(|file| file.relative_path.to_string())
+        .collect())
+}
+
+fn preflight_init_plan(root: &Path, plan: &InitPlan) -> Result<Vec<PathBuf>, CliFailure> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| {
+        CliFailure::message(format!(
+            "could not inspect initialization directory {}: {error}",
+            root.display()
+        ))
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(CliFailure::message(format!(
+            "initialization path {} must be an existing non-symlink directory",
+            root.display()
+        )));
+    }
+
+    let mut missing_directories = BTreeSet::new();
+    for planned in &plan.files {
+        let relative = Path::new(planned.relative_path);
+        let mut ancestor = PathBuf::new();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                let Component::Normal(component) = component else {
+                    return Err(CliFailure::message(format!(
+                        "generated init path {} is not repository-relative",
+                        relative.display()
+                    )));
+                };
+                ancestor.push(component);
+                let absolute = root.join(&ancestor);
+                match fs::symlink_metadata(&absolute) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(CliFailure::message(format!(
+                            "initialization ancestor {} must not be a symlink",
+                            absolute.display()
+                        )))
+                    }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(CliFailure::message(format!(
+                            "initialization ancestor {} is not a directory",
+                            absolute.display()
+                        )))
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        missing_directories.insert(absolute);
+                    }
+                    Err(error) => {
+                        return Err(CliFailure::message(format!(
+                            "could not inspect initialization ancestor {}: {error}",
+                            absolute.display()
+                        )))
+                    }
+                }
+            }
+        }
+
+        let target = root.join(relative);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                return Err(CliFailure::message(format!(
+                    "{} already exists; initialization does not overwrite files",
+                    target.display()
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliFailure::message(format!(
+                    "could not inspect initialization target {}: {error}",
+                    target.display()
+                )))
+            }
+        }
+    }
+
+    let mut missing_directories = missing_directories.into_iter().collect::<Vec<_>>();
+    missing_directories.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(missing_directories)
+}
+
+fn rollback_init_writes(created_files: &[PathBuf], created_directories: &[PathBuf]) {
+    for path in created_files.iter().rev() {
+        let _ = fs::remove_file(path);
+    }
+    for path in created_directories.iter().rev() {
+        let _ = fs::remove_dir(path);
+    }
 }
 
 fn validate_file<T, F>(args: ValidateArgs, kind: &'static str, loader: F) -> Result<(), CliFailure>

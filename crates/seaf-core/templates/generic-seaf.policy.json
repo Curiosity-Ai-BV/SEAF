@@ -1,0 +1,27 @@
+{
+  "policy_id": "default-local-project-policy",
+  "default_autonomy_level": 1,
+  "forbidden_paths": [
+    ".git/**",
+    ".seaf/loops/**",
+    ".env",
+    ".env.*",
+    "secrets/**"
+  ],
+  "requires_human_review": [
+    "dependency_changes",
+    "database_migrations",
+    "auth_code",
+    "payment_code",
+    "privacy_sensitive_code",
+    "network_permission_changes",
+    "ci_changes",
+    "eval_changes",
+    "policy_changes"
+  ],
+  "allowed_without_review": [
+    "tests",
+    "documentation",
+    "non_sensitive_copy_changes"
+  ]
+}

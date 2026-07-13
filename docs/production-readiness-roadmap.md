@@ -320,7 +320,8 @@ This scenario is the release gate for the roadmap. A developer must be able to:
 
 1. Install a versioned `seaf` binary without cloning this repository.
 2. Initialize a generic, clean external Git repository and obtain editable
-   policy, eval, ticket, provider, and ignore templates.
+   policy, eval, ticket, project configuration, documented CLI provider
+   selection, and an ignore template.
 3. Run a small test-covered ticket with Ollama in an isolated candidate
    worktree. The original checkout must not be mutated.
 4. Inspect evidence showing that each role received the ticket and preceding
@@ -408,7 +409,8 @@ source-workspace boundary above and runs in Ubuntu CI. Independent specification
 and quality reviews approved the corrected fault coverage. The controller also
 passed workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-Milestone 1 is complete; M2-01 generic project initialization is active.
+Milestone 1 and M2-01 generic project initialization are complete; M2-02
+project doctor is active.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -416,9 +418,10 @@ Goal: a developer can adopt SEAF without understanding this monorepo.
 
 - **U6 - Ship a generic project bootstrap.** Replace the Adaptive Notes-only
   default with stack-neutral initialization plus explicit optional examples.
-  Generate a starter ticket, project policy, eval config, provider config, and
-  `.gitignore` entries. Add `seaf doctor` for Git, model, configuration,
-  candidate-workspace, and eval-command readiness.
+  Generate a starter ticket, project policy, eval config, project config, and
+  `.gitignore` entries; keep provider selection as documented CLI authority.
+  Add `seaf doctor` for Git, model, configuration, candidate-workspace, and
+  eval-command readiness.
 - **U7 - Distribute a versioned CLI.** Add `seaf --version`, complete Cargo
   package metadata and versioned internal dependencies, a license and changelog,
   and tagged macOS/Linux binary releases with checksums. Test the packaged
@@ -428,6 +431,15 @@ Goal: a developer can adopt SEAF without understanding this monorepo.
   fixture, run a real candidate patch through the fake provider, execute its
   native tests, exercise interrupt/resume and rejection, and validate every
   referenced artifact. Rewrite the README and loop docs from that tested flow.
+
+M2-01 accepted 2026-07-13: generic init emits the
+five documented project files, executes the generated native checks in minimal
+Rust, Node, hybrid, and Git-only fixtures, preserves Adaptive Notes only behind
+explicit opt-in, and refuses target/ancestor conflicts without mutation.
+Provider selection remains explicit CLI authority. Independent specification
+and quality reviews approved the boundary, and the full controller gate passed.
+M2-02 project doctor is active; packaging, releases, and the external golden
+path are not claimed.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario

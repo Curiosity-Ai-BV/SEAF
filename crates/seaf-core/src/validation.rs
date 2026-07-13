@@ -115,11 +115,26 @@ pub fn load_eval_report_file(path: &Path) -> ValidationResult<EvalReport> {
 
 pub fn load_ticket_file(path: &Path) -> ValidationResult<TicketSpec> {
     let ticket = load_struct::<TicketSpec>("ticket", path)?;
+    validate_parsed_ticket(ticket, Some(path))
+}
+
+pub fn parse_ticket_spec(text: &str) -> ValidationResult<TicketSpec> {
+    let ticket = serde_yaml::from_str(text).map_err(|error| {
+        ValidationReport::invalid(
+            "ticket",
+            None,
+            vec![FieldError::new("document", error.to_string())],
+        )
+    })?;
+    validate_parsed_ticket(ticket, None)
+}
+
+fn validate_parsed_ticket(ticket: TicketSpec, path: Option<&Path>) -> ValidationResult<TicketSpec> {
     let errors = validate_ticket_spec(&ticket);
     if errors.is_empty() {
         Ok(ticket)
     } else {
-        Err(ValidationReport::invalid("ticket", Some(path), errors))
+        Err(ValidationReport::invalid("ticket", path, errors))
     }
 }
 
