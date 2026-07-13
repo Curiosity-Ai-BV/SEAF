@@ -43,6 +43,8 @@
   - [ ] M1-11b: Bounded artifact storage.
     - [x] M1-11b1: Serialized artifact limits.
     - [ ] M1-11b2: Pre-side-effect storage commitments (active).
+      - [x] M1-11b2a: Provider commitments.
+      - [ ] M1-11b2b: Evaluation commitments (active).
   - [ ] M1-11c: Bounded secret redaction.
 - [ ] M1-12: Interruption recovery acceptance.
 
@@ -175,6 +177,6 @@ scaffold artifact; authenticated missing-lock migration releases the run guard
 before open-only candidate acquisition, preserving candidate-before-run order.
 Git patch-planning indexes are
 isolated in pinned external operation directories, and promotion crash tests now
-synchronize through the repository-to-provider lock order. M1-11b2
-pre-side-effect storage commitments is active; M1-11c bounded secret redaction
-is pending.
+synchronize through the repository-to-provider lock order. Provider-side
+M1-11b2a is implemented pending review; evaluation-side M1-11b2b and M1-11c
+bounded secret redaction remain pending.

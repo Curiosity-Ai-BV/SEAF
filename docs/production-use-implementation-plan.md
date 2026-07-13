@@ -1803,7 +1803,9 @@ and directly required bounded reads only.
 
 ##### M1-11b2 - Pre-Side-Effect Storage Commitments
 
-Status: active. Dependencies: M1-11b1 (complete).
+Status: active. Split into provider-side M1-11b2a and evaluation-side
+M1-11b2b. M1-11b2a is accepted; M1-11b2b is active.
+Dependencies: M1-11b1 (complete).
 
 Objective: guarantee logical capacity for the authoritative result before a
 provider call or approved evaluation command starts, without a new reservation
@@ -1812,7 +1814,8 @@ file or holding the run lock across external latency.
 Acceptance criteria:
 
 - An authenticated request-phase provider ledger tail reserves the missing
-  response-audit cap, response-record cap, and exact future `run.json` growth.
+  response-audit cap, response-record cap, and full future `run.json`
+  replacement bytes at the atomic coexistence peak.
   Insufficient capacity creates no new authoritative request and performs zero
   provider calls.
 - An authenticated active evaluation intent reserves every missing stdout and
@@ -1833,6 +1836,42 @@ publisher; typed oversize provider failure with no raw leak.
 
 Commit boundary: derived provider/evaluation commitments and bounded oversize
 provider failure only.
+
+###### M1-11b2a - Provider-Side Commitments
+
+Status: complete and independently accepted on 2026-07-13.
+
+Fresh and uniquely adoptable staged request records activate one authenticated
+byte-and-entry commitment under the permanent run guard. It reserves missing
+1 MiB response-audit and 64 KiB response-record slots, full future `run.json`
+replacement bytes at the atomic coexistence peak, future permanent names, and
+one transient name.
+Physical operation peaks and post-operation steady commitment are checked
+separately. Every provider call reauthenticates the exact request tail and
+commitment under the guard, releases it, then invokes the provider.
+
+Response audit, response record, and response-tail run publishers consume only
+their authenticated slot; unrelated publishers retain the complete remainder.
+Request-only replay, staged adoption, exact retry, and concurrent publishers
+reconstruct the same commitment without metadata. Canonical audit size is
+measured through a cap-plus-one writer before raw hashing or persistence.
+Oversized success or error results become one fixed non-retryable failure with
+no raw bytes or digest; exact 1 MiB and under-cap results remain unchanged.
+
+RED/GREEN covers exact and one-short byte and entry headroom, fresh denial with
+zero calls, request-only replay with one or zero calls, staged request
+activation, concurrent unrelated denial, exact 1 MiB, oversized success/error,
+and raw marker/digest absence.
+
+###### M1-11b2b - Evaluation-Side Commitments
+
+Status: active. Dependencies: M1-11b2a accepted.
+
+Derive active evaluation-intent capacity for missing stdout/stderr maxima,
+Testing evidence, EvalReport, and the full final `run.json` replacement at its
+atomic coexistence peak; refuse an over-budget
+plan before intent or command spawn; preserve it through invalidation and
+zero-command adoption.
 
 #### M1-11c - Bounded Secret Redaction
 

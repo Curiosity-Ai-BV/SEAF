@@ -126,16 +126,154 @@ impl RunMutationGuard {
         self.validate()
     }
 
-    pub(crate) fn validate_atomic_replacement_projection(
+    pub(crate) fn validate_atomic_replacement_projection_with_old(
+        &self,
+        relative_path: &str,
+        size: usize,
+        old_size: u64,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_atomic_replacement_projection_with_old(
+            &self.directory,
+            relative_path,
+            size,
+            old_size,
+        )?;
+        self.validate()
+    }
+
+    fn validate_atomic_replacement_projection_for_bytes(
+        &self,
+        relative_path: &str,
+        bytes: &[u8],
+        old_size: u64,
+    ) -> Result<(), RunPersistenceError> {
+        if relative_path != crate::workspace::RUN_FILE
+            || serde_json::from_slice::<seaf_core::LoopRun>(bytes).is_err()
+        {
+            return self.validate_atomic_replacement_projection_with_old(
+                relative_path,
+                bytes.len(),
+                old_size,
+            );
+        }
+        self.validate()?;
+        let commitment =
+            crate::provider_exchange::derive_provider_storage_commitment_for_run_bytes(
+                self.run_directory(),
+                bytes,
+            )
+            .map_err(|error| RunPersistenceError::Invalid(error.to_string()))?
+            .unwrap_or_else(|| crate::artifact_storage::StorageCommitment {
+                permanent_bytes: 0,
+                transient_bytes: 0,
+                permanent_entries: 0,
+                transient_entries: 0,
+                consumable_permanent_paths: Vec::new(),
+                consumable_transient_path: None,
+            });
+        crate::artifact_storage::validate_atomic_replacement_projection_with_commitment(
+            &self.directory,
+            relative_path,
+            bytes.len(),
+            old_size,
+            &commitment,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_active_provider_commitment(&self) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        let commitment = crate::provider_exchange::derive_active_provider_storage_commitment(
+            self.run_directory(),
+        )
+        .map_err(|error| RunPersistenceError::Invalid(error.to_string()))?
+        .ok_or_else(|| {
+            RunPersistenceError::Invalid(
+                "authoritative provider request tail has no active storage commitment".to_string(),
+            )
+        })?;
+        crate::artifact_storage::validate_usage_with_commitment(&self.directory, &commitment)?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_replacement_activating_provider_commitment(
+        &self,
+        relative_path: &str,
+        size: usize,
+        old_size: u64,
+        commitment: &crate::artifact_storage::StorageCommitment,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_replacement_activating_commitment(
+            &self.directory,
+            relative_path,
+            size,
+            old_size,
+            commitment,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_provider_slot_create_projection(
         &self,
         relative_path: &str,
         size: usize,
     ) -> Result<(), RunPersistenceError> {
         self.validate()?;
-        crate::artifact_storage::validate_atomic_replacement_projection(
+        let commitment = crate::provider_exchange::derive_active_provider_storage_commitment(
+            self.run_directory(),
+        )
+        .map_err(|error| RunPersistenceError::Invalid(error.to_string()))?
+        .ok_or_else(|| {
+            RunPersistenceError::Invalid(
+                "provider slot publication requires an active request-tail commitment".to_string(),
+            )
+        })?;
+        crate::artifact_storage::validate_provider_slot_create_projection(
             &self.directory,
             relative_path,
             size,
+            &commitment,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_provider_request_prefix_projection(
+        &self,
+        projection: &crate::artifact_storage::ProviderRequestPrefixProjection<'_>,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        crate::artifact_storage::validate_provider_request_prefix_projection(
+            &self.directory,
+            projection,
+        )?;
+        self.validate()
+    }
+
+    pub(crate) fn validate_staged_provider_request_projection(
+        &self,
+        record_path: &str,
+        record_size: usize,
+        adoption_run_size: usize,
+        commitment: &crate::artifact_storage::StorageCommitment,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate()?;
+        let run_file = self.directory.open_existing_file(
+            OsStr::new(crate::workspace::RUN_FILE),
+            true,
+            false,
+        )?;
+        let run_identity = run_file.metadata()?;
+        self.directory
+            .validate_single_link_file(OsStr::new(crate::workspace::RUN_FILE), &run_identity)?;
+        crate::artifact_storage::validate_staged_provider_request_projection(
+            &self.directory,
+            record_path,
+            record_size,
+            adoption_run_size,
+            run_identity.len(),
+            commitment,
         )?;
         self.validate()
     }
@@ -201,6 +339,38 @@ pub(crate) fn publish_replacement(
     publish_replacement_with_hooks(guard, target, bytes, || Ok(()), || Ok(()))
 }
 
+pub(crate) fn publish_replacement_consuming_provider_slot(
+    guard: &RunMutationGuard,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), RunPersistenceError> {
+    let commitment =
+        crate::provider_exchange::derive_active_provider_storage_commitment(guard.run_directory())
+            .map_err(|error| RunPersistenceError::Invalid(error.to_string()))?
+            .ok_or_else(|| {
+                RunPersistenceError::Invalid(
+                    "provider replacement requires an active request-tail commitment".to_string(),
+                )
+            })?;
+    let file_name = guard_target_name(guard, target)?;
+    let current = guard.directory.open_existing_file(file_name, true, false)?;
+    let current_identity = current.metadata()?;
+    guard
+        .directory
+        .validate_single_link_file(file_name, &current_identity)?;
+    let relative = file_name.to_str().ok_or_else(|| {
+        RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
+    })?;
+    crate::artifact_storage::validate_provider_slot_replacement_projection(
+        &guard.directory,
+        relative,
+        bytes.len(),
+        current_identity.len(),
+        &commitment,
+    )?;
+    publish_replacement_core(guard, target, bytes, None, |_| Ok(()), true)
+}
+
 pub(crate) fn publish_replacement_with_hooks<BeforeRename, AfterRename>(
     guard: &RunMutationGuard,
     target: &Path,
@@ -214,14 +384,23 @@ where
 {
     let mut before_rename = Some(before_rename);
     let mut after_rename = Some(after_rename);
-    publish_replacement_core(guard, target, bytes, None, |phase| match phase {
-        PublishPhase::BeforeRename => before_rename
-            .take()
-            .expect("before-rename hook is called once")(),
-        PublishPhase::AfterRename => after_rename
-            .take()
-            .expect("after-rename hook is called once")(),
-    })
+    publish_replacement_core(
+        guard,
+        target,
+        bytes,
+        None,
+        |phase| match phase {
+            PublishPhase::BeforeRename => before_rename
+                .take()
+                .expect("before-rename hook is called once")(
+            ),
+            PublishPhase::AfterRename => after_rename
+                .take()
+                .expect("after-rename hook is called once")(
+            ),
+        },
+        false,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +415,7 @@ fn publish_replacement_core<F>(
     bytes: &[u8],
     fault: Option<InjectedPublicationFault>,
     mut hook: F,
+    projection_prevalidated: bool,
 ) -> Result<(), RunPersistenceError>
 where
     F: FnMut(PublishPhase) -> Result<(), RunPersistenceError>,
@@ -243,10 +423,19 @@ where
     let file_name = guard_target_name(guard, target)?;
     let current_target = guard.directory.open_existing_file(file_name, true, false)?;
     let current_identity = current_target.metadata()?;
+    guard
+        .directory
+        .validate_single_link_file(file_name, &current_identity)?;
     let relative = file_name.to_str().ok_or_else(|| {
         RunPersistenceError::Invalid("run artifact name is not valid UTF-8".to_string())
     })?;
-    guard.validate_atomic_replacement_projection(relative, bytes.len())?;
+    if !projection_prevalidated {
+        guard.validate_atomic_replacement_projection_for_bytes(
+            relative,
+            bytes,
+            current_identity.len(),
+        )?;
+    }
     let (temp_name, _temp_path, mut temp) = create_temp(&guard.directory, file_name)?;
     let temp_identity = temp.metadata()?;
     let result = (|| {
@@ -264,7 +453,7 @@ where
         guard.validate()?;
         guard
             .directory
-            .validate_file(file_name, &current_identity)?;
+            .validate_single_link_file(file_name, &current_identity)?;
         if fault == Some(InjectedPublicationFault::Publish) {
             return Err(injected_fault(InjectedPublicationFault::Publish));
         }
@@ -381,7 +570,7 @@ fn publish_replacement_with_fault(
     bytes: &[u8],
     fault: InjectedPublicationFault,
 ) -> Result<(), RunPersistenceError> {
-    publish_replacement_core(guard, target, bytes, Some(fault), |_| Ok(()))
+    publish_replacement_core(guard, target, bytes, Some(fault), |_| Ok(()), false)
 }
 
 #[cfg(test)]
@@ -433,7 +622,10 @@ pub(crate) fn read_regular_file(path: &Path) -> Result<Vec<u8>, RunPersistenceEr
     crate::artifact_storage::validate_artifact_size(relative, bytes.len())?;
     directory.validate_identity()?;
     directory.validate_file(name, &identity)?;
-    if file.metadata()?.len() != bytes.len() as u64 {
+    let read_size = u64::try_from(bytes.len()).map_err(|_| {
+        RunPersistenceError::Invalid("run artifact read size is not representable".to_string())
+    })?;
+    if file.metadata()?.len() != read_size {
         return Err(RunPersistenceError::Invalid(
             "run artifact changed while being read".to_string(),
         ));
@@ -554,7 +746,7 @@ mod tests {
 
     fn initialized_target() -> (tempfile::TempDir, PathBuf, Vec<u8>) {
         let temp = private_temp();
-        let target = temp.path().join("run.json");
+        let target = temp.path().join("state.json");
         let old = b"old-valid-run\n".to_vec();
         fs::write(&target, &old).unwrap();
         #[cfg(unix)]
@@ -879,7 +1071,7 @@ mod tests {
             InjectedPublicationFault::ParentSync,
         ] {
             let temp = private_temp();
-            let target = temp.path().join("run.json");
+            let target = temp.path().join("state.json");
             let guard = RunMutationGuard::acquire(temp.path()).unwrap();
             let error = publish_create_only_with_fault(&guard, &target, intended, fault)
                 .expect_err("injected create-only cut");
@@ -1009,13 +1201,20 @@ mod tests {
         let (temp, target, old) = initialized_target();
         let guard = RunMutationGuard::acquire(temp.path()).unwrap();
         let lock_path = temp.path().join(RUN_MUTATION_LOCK_FILE);
-        let error = publish_replacement_core(&guard, &target, b"replacement\n", None, |phase| {
-            if phase == PublishPhase::BeforeRename {
-                fs::remove_file(&lock_path)?;
-                fs::write(&lock_path, b"replacement lock")?;
-            }
-            Ok(())
-        })
+        let error = publish_replacement_core(
+            &guard,
+            &target,
+            b"replacement\n",
+            None,
+            |phase| {
+                if phase == PublishPhase::BeforeRename {
+                    fs::remove_file(&lock_path)?;
+                    fs::write(&lock_path, b"replacement lock")?;
+                }
+                Ok(())
+            },
+            false,
+        )
         .unwrap_err();
         assert!(
             error.to_string().contains("lock path changed")
@@ -1028,13 +1227,20 @@ mod tests {
         let outside = temp.path().join("outside-run");
         crate::artifact_safety::write_private_fixture(&outside, b"outside-unchanged\n").unwrap();
         let guard = RunMutationGuard::acquire(temp.path()).unwrap();
-        let error = publish_replacement_core(&guard, &target, b"replacement\n", None, |phase| {
-            if phase == PublishPhase::BeforeRename {
-                fs::remove_file(&target)?;
-                symlink(&outside, &target)?;
-            }
-            Ok(())
-        })
+        let error = publish_replacement_core(
+            &guard,
+            &target,
+            b"replacement\n",
+            None,
+            |phase| {
+                if phase == PublishPhase::BeforeRename {
+                    fs::remove_file(&target)?;
+                    symlink(&outside, &target)?;
+                }
+                Ok(())
+            },
+            false,
+        )
         .unwrap_err();
         assert!(error.to_string().contains("regular file"), "{error}");
         assert_eq!(fs::read(outside).unwrap(), b"outside-unchanged\n");
@@ -1050,9 +1256,13 @@ mod tests {
         let parked = original_root.with_extension("parked-replacement");
         let outside = original_root.with_extension("outside-replacement");
         artifact_safety::create_private_directory(&outside).unwrap();
-        fs::write(outside.join("run.json"), b"outside unchanged\n").unwrap();
+        fs::write(outside.join("state.json"), b"outside unchanged\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(outside.join("run.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            outside.join("state.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let guard = RunMutationGuard::acquire(&original_root).unwrap();
         let error = publish_replacement_with_hooks(
             &guard,
@@ -1067,9 +1277,9 @@ mod tests {
         )
         .expect_err("replacement must reject substituted run directory");
         assert!(error.to_string().contains("directory"), "{error}");
-        assert_eq!(fs::read(parked.join("run.json")).unwrap(), old);
+        assert_eq!(fs::read(parked.join("state.json")).unwrap(), old);
         assert_eq!(
-            fs::read(outside.join("run.json")).unwrap(),
+            fs::read(outside.join("state.json")).unwrap(),
             b"outside unchanged\n"
         );
 

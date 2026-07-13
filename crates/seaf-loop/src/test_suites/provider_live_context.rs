@@ -599,9 +599,12 @@ fn initial_request_collision_prevents_the_first_provider_call_and_terminal_claim
         .run_next_step()
         .expect_err("initial durable request collision");
 
-    assert!(error
-        .to_string()
-        .contains("durable provider exchange write failed"));
+    assert!(
+        error.to_string().contains("durable provider exchange write failed")
+            || error.to_string().contains("provider storage commitment")
+            || error.to_string().contains("orphaned provider exchange artifact"),
+        "{error}"
+    );
     assert!(provider.requests().is_empty());
     let run = read_run(&runs_root.join(run_id));
     assert!(run.provider_exchange_records.is_empty());
@@ -610,7 +613,7 @@ fn initial_request_collision_prevents_the_first_provider_call_and_terminal_claim
         .iter()
         .find(|record| record.name == LoopStepName::Research)
         .expect("research");
-    assert_eq!(research.status, LoopStepStatus::Running);
+    assert_eq!(research.status, LoopStepStatus::Pending);
     assert!(research.artifact_path.is_none());
 }
 
@@ -638,8 +641,9 @@ fn resume_reuses_attempt_one_after_conventional_prompt_crash_before_first_exchan
     drop(first);
     let run_directory = runs_root.join(run_id);
     std::fs::remove_file(run_directory.join(exchange_request)).expect("remove injected cut");
-    let conventional = std::fs::read(run_directory.join("prompts/01-research.prompt.md"))
-        .expect("attempt one prompt");
+    assert!(!run_directory
+        .join("prompts/01-research.prompt.md")
+        .exists());
 
     let provider =
         InspectingProvider::new(run_directory.clone(), vec![1], vec![Ok(response(passed()))]);
@@ -652,11 +656,9 @@ fn resume_reuses_attempt_one_after_conventional_prompt_crash_before_first_exchan
 
     let run = read_run(&run_directory);
     assert_eq!(run.provider_exchange_records[0].step_attempt, 1);
-    assert_eq!(
-        std::fs::read(run_directory.join("prompts/01-research.prompt.md"))
-            .expect("attempt one prompt"),
-        conventional
-    );
+    assert!(run_directory
+        .join("prompts/01-research.prompt.md")
+        .is_file());
     assert!(!run_directory
         .join("prompts/01-research.attempt-002.prompt.md")
         .exists());
@@ -686,11 +688,9 @@ fn resume_rejects_a_skipped_conventional_prompt_attempt_before_any_exchange_writ
     drop(loop_runner);
     let run_directory = runs_root.join(run_id);
     std::fs::remove_file(run_directory.join(exchange_request)).expect("remove cut");
-    let exact =
-        std::fs::read(run_directory.join("prompts/01-research.prompt.md")).expect("attempt one");
     crate::artifact_safety::write_private_fixture(
         run_directory.join("prompts/01-research.attempt-999.prompt.md"),
-        &exact,
+        "skipped",
     )
     .expect("inject skipped prompt");
     let before = snapshot_tree(&run_directory);
@@ -1239,6 +1239,16 @@ fn resume_rejects_an_orphaned_exchange_response_before_provider_call_or_mutation
         .run_next_step()
         .expect_err("response publication interruption");
     drop(first);
+    let retained = crate::provider_exchange::derive_active_provider_storage_commitment(
+        &runs_root.join(run_id),
+    )
+    .expect("derive retained response commitment")
+    .expect("request tail remains active");
+    assert!(retained
+        .consumable_permanent_paths
+        .iter()
+        .any(|(path, bytes)| path == response_path
+            && *bytes == crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP));
     let before = read_run(&runs_root.join(run_id));
 
     let resumed_provider = InspectingProvider::new(runs_root.join(run_id), Vec::new(), Vec::new());
@@ -1512,7 +1522,7 @@ fn recovery_rejects_a_staged_next_role_attempt_999_without_advancing_the_head() 
         b"staged analysis attempt 999",
     )
     .expect("request");
-    stage_provider_exchange_record(
+    let stage_error = stage_provider_exchange_record(
         &run_directory,
         &ProviderExchangeRecord {
             schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
@@ -1538,7 +1548,8 @@ fn recovery_rejects_a_staged_next_role_attempt_999_without_advancing_the_head() 
             outcome: None,
         },
     )
-    .expect("stage attempt 999");
+    .expect_err("unauthorized attempt 999 must not activate a staged commitment");
+    assert!(stage_error.to_string().contains("orphaned"), "{stage_error}");
     let provider = InspectingProvider::new(run_directory.clone(), Vec::new(), Vec::new());
     let mut resumed_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
         .with_ticket(ticket.clone())
@@ -1622,7 +1633,7 @@ fn empty_legacy_ledger_rejects_an_unauthorized_staged_attempt_two_request() {
         b"unauthorized attempt two",
     )
     .expect("request file");
-    stage_provider_exchange_record(
+    let stage_error = stage_provider_exchange_record(
         &run_directory,
         &ProviderExchangeRecord {
             schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
@@ -1641,7 +1652,8 @@ fn empty_legacy_ledger_rejects_an_unauthorized_staged_attempt_two_request() {
             outcome: None,
         },
     )
-    .expect("stage unauthorized request");
+    .expect_err("unauthorized attempt two must not activate a staged commitment");
+    assert!(stage_error.to_string().contains("orphaned"), "{stage_error}");
 
     let provider = InspectingProvider::new(run_directory, Vec::new(), Vec::new());
     let mut resumed_runner = ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)

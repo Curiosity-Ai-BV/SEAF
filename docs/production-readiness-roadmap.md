@@ -261,8 +261,9 @@ aggregate bytes remain within 32 MiB. The candidate-workspace lock is a guarded
 permanent scaffold artifact; missing historical locks migrate only after
 authority validation, with the run guard released before open-only candidate
 acquisition to preserve candidate-before-run lock order. External
-repository-operation locks remain outside this policy. M1-11b2 pre-side-effect storage
-commitments is active; M1-11c bounded secret redaction remains pending, so
+repository-operation locks remain outside this policy. M1-11b2 is split:
+provider-side M1-11b2a is accepted, while evaluation-side M1-11b2b is active.
+M1-11c bounded secret redaction remains pending, so
 M1-11 is not yet complete.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.

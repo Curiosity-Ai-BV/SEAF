@@ -98,7 +98,10 @@ where
     validate_parent_identity(parent, parent_identity, label)?;
     validate_opened_file_identity(path, &opened, label)?;
     let after = file.metadata()?;
-    if !metadata_identity_matches(&opened, &after) || after.len() != bytes.len() as u64 {
+    let read_size = u64::try_from(bytes.len()).map_err(|_| {
+        ImmutableArtifactError::Safety(format!("{label} read size is not representable"))
+    })?;
+    if !metadata_identity_matches(&opened, &after) || after.len() != read_size {
         return Err(ImmutableArtifactError::Safety(format!(
             "{label} opened file identity changed while reading"
         )));
@@ -189,6 +192,23 @@ pub(crate) fn publish_create_only_with_guard(
     publish_create_only_with_guard_and_hook(guard, relative_path, bytes, |_| Ok(()))
 }
 
+pub(crate) fn publish_create_only_with_guard_consuming_provider_slot(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    guard.validate_provider_slot_create_projection(relative_path, bytes.len())?;
+    publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, |_| Ok(()), true)
+}
+
+pub(crate) fn publish_create_only_with_guard_after_provider_prefix_projection(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<(), ImmutableArtifactError> {
+    publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, |_| Ok(()), true)
+}
+
 pub(crate) fn publish_create_only_standalone(
     run_directory: &Path,
     relative_path: &str,
@@ -251,8 +271,12 @@ fn publish_mutable_with_guard_core(
             }
         }
     }
-    if current.is_some() {
-        guard.validate_atomic_replacement_projection(relative_path, bytes.len())?;
+    if let Some(current) = current.as_ref() {
+        guard.validate_atomic_replacement_projection_with_old(
+            relative_path,
+            bytes.len(),
+            current.len(),
+        )?;
     } else {
         guard.validate_create_projection(relative_path, bytes.len())?;
     }
@@ -315,6 +339,19 @@ fn publish_create_only_with_guard_and_hook<F>(
 where
     F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
 {
+    publish_create_only_with_guard_and_hook_core(guard, relative_path, bytes, before_link, false)
+}
+
+fn publish_create_only_with_guard_and_hook_core<F>(
+    guard: &RunMutationGuard,
+    relative_path: &str,
+    bytes: &[u8],
+    before_link: F,
+    projection_prevalidated: bool,
+) -> Result<(), ImmutableArtifactError>
+where
+    F: FnOnce(&Path) -> Result<(), ImmutableArtifactError>,
+{
     let run_directory = guard.run_directory();
     validate_relative_path(relative_path)?;
     validate_real_run_parent(run_directory, Path::new(relative_path))?;
@@ -334,7 +371,9 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    guard.validate_create_projection(relative_path, bytes.len())?;
+    if !projection_prevalidated {
+        guard.validate_create_projection(relative_path, bytes.len())?;
+    }
     publish_create_only_standalone_with_open_parent(&parent, file_name, bytes, before_link, || {
         guard.validate().map_err(Into::into)
     })
@@ -468,7 +507,10 @@ where
     let mut file = parent.open_existing_file(file_name, true, false)?;
     let opened = file.metadata()?;
     parent.validate_file(file_name, &opened)?;
-    if opened.len() != bytes.len() as u64 {
+    let intended_size = u64::try_from(bytes.len()).map_err(|_| {
+        ImmutableArtifactError::Collision("intended artifact size is not representable".to_string())
+    })?;
+    if opened.len() != intended_size {
         return Err(ImmutableArtifactError::Collision(
             "existing artifact has different bytes".to_string(),
         ));
@@ -476,11 +518,16 @@ where
     after_open()?;
     let mut current = Vec::new();
     (&mut file)
-        .take(bytes.len() as u64 + 1)
+        .take(intended_size.checked_add(1).ok_or_else(|| {
+            ImmutableArtifactError::Collision("intended artifact read limit overflowed".to_string())
+        })?)
         .read_to_end(&mut current)?;
     parent.validate_identity()?;
     parent.validate_file(file_name, &opened)?;
-    if file.metadata()?.len() != current.len() as u64 {
+    let current_size = u64::try_from(current.len()).map_err(|_| {
+        ImmutableArtifactError::Collision("existing artifact size is not representable".to_string())
+    })?;
+    if file.metadata()?.len() != current_size {
         return Err(ImmutableArtifactError::Collision(
             "existing artifact changed while being verified".to_string(),
         ));

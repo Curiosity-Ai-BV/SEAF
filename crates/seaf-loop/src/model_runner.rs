@@ -13,13 +13,19 @@ use crate::provider_exchange::authorize_provider_exchange_rerun;
 use crate::provider_exchange::{
     classify_provider_exchange_response, load_provider_exchange_record,
     load_provider_exchange_request, load_provider_exchange_response_audit,
-    persist_provider_exchange_record_reference,
-    persist_provider_exchange_record_reference_with_validator,
-    preflight_provider_exchange_reconciliation, reconcile_provider_exchange_state_with_validator,
-    stage_provider_exchange_record, stage_provider_exchange_response_record,
-    validate_recovered_conventional_attempt, write_provider_exchange_request,
-    write_provider_exchange_response, ProviderExchangeCoordinates, ProviderExchangeResponseAudit,
-    ProviderExchangeResponseClassification, PROVIDER_EXCHANGE_SCHEMA_VERSION,
+    persist_provider_exchange_record_reference, preflight_provider_exchange_reconciliation,
+    publish_provider_exchange_request_tail_with_validator,
+    reconcile_provider_exchange_state_with_validator,
+    stage_provider_exchange_response_record_consuming_commitment,
+    validate_provider_call_response_slots_absent, validate_recovered_conventional_attempt,
+    write_provider_exchange_response_consuming_commitment, ProviderExchangeCoordinates,
+    ProviderExchangeResponseAudit, ProviderExchangeResponseClassification,
+    PROVIDER_EXCHANGE_SCHEMA_VERSION,
+};
+#[cfg(test)]
+use crate::provider_exchange::{
+    persist_provider_exchange_record_reference_with_validator, stage_provider_exchange_record,
+    write_provider_exchange_request,
 };
 use crate::role_response::{parse_role_response, repair_prompt, RoleResponseError};
 use crate::{
@@ -47,6 +53,10 @@ use crate::{
 #[cfg(test)]
 type AfterResponsePersistObserver<'a> =
     dyn Fn(&LoopWorkspace, &LoopRun, &ProviderExchangeCoordinates) + 'a;
+
+#[cfg(test)]
+type BeforeProviderReauthenticationObserver<'a> =
+    dyn Fn(&LoopWorkspace, &LoopRun, &ProviderExchangeCoordinates, &ArtifactReference) + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +139,8 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     legacy_unit_test_harness: bool,
     #[cfg(test)]
     after_response_persist: Option<&'a AfterResponsePersistObserver<'a>>,
+    #[cfg(test)]
+    before_provider_reauthentication: Option<&'a BeforeProviderReauthenticationObserver<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +219,8 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             legacy_unit_test_harness: false,
             #[cfg(test)]
             after_response_persist: None,
+            #[cfg(test)]
+            before_provider_reauthentication: None,
         }
     }
 
@@ -251,6 +265,15 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
         observer: &'a AfterResponsePersistObserver<'a>,
     ) -> Self {
         self.after_response_persist = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_before_provider_reauthentication_observer(
+        mut self,
+        observer: &'a BeforeProviderReauthenticationObserver<'a>,
+    ) -> Self {
+        self.before_provider_reauthentication = Some(observer);
         self
     }
 
@@ -929,15 +952,23 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
                 if kind == ProviderExchangeKind::Initial {
                     initial_request_reference = Some(request_reference.clone());
                 }
-                let provider_result = self.provider.complete(model_request.clone());
-                let audit = match &provider_result {
-                    Ok(response) => ProviderExchangeResponseAudit::ModelResponse {
-                        response: response.clone(),
-                    },
-                    Err(error) => ProviderExchangeResponseAudit::ProviderFailure {
-                        error: error.clone(),
-                    },
-                };
+                #[cfg(test)]
+                if let Some(observer) = self.before_provider_reauthentication {
+                    let workspace = self.exchange_workspace.as_ref().ok_or_else(|| {
+                        RunnerError::Step(
+                            "provider call is missing its exchange workspace".to_string(),
+                        )
+                    })?;
+                    let run = self.run.as_ref().ok_or_else(|| {
+                        RunnerError::Step(
+                            "provider call is missing authoritative run state".to_string(),
+                        )
+                    })?;
+                    observer(workspace, run, &coordinates, &request_reference);
+                }
+                self.reauthenticate_provider_call_commitment(&coordinates, &request_reference)?;
+                let (provider_result, audit) =
+                    bounded_provider_result_audit(self.provider.complete(model_request.clone()))?;
                 let classification = self.append_exchange_response(
                     &coordinates,
                     request_reference,
@@ -1156,31 +1187,40 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         let workspace = self.exchange_workspace.clone().ok_or_else(|| {
             RunnerError::Step("audited provider exchange is missing its workspace".to_string())
         })?;
-        let request =
-            write_provider_exchange_request(workspace.run_directory(), coordinates, bytes)
-                .map_err(exchange_write_error)?;
-        let previous_record_digest = self
-            .run
-            .as_ref()
-            .and_then(|run| run.provider_exchange_records.last())
-            .map(|record| record.digest.clone());
-        let record = ProviderExchangeRecord {
-            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
-            run_id: coordinates.run_id.clone(),
-            step: coordinates.step,
-            role: coordinates.role,
-            step_attempt: coordinates.step_attempt,
-            exchange_index: coordinates.exchange_index,
-            kind: coordinates.kind,
-            context_round: coordinates.context_round,
-            phase: ProviderExchangePhase::Request,
-            previous_record_digest,
-            request: request.clone(),
-            response: None,
+        let current = self.run.as_ref().cloned().ok_or_else(|| {
+            RunnerError::Step("provider request lost authoritative run".to_string())
+        })?;
+        let is_output_review_initial = coordinates.step == LoopStepName::OutputReview
+            && coordinates.role == ProviderRole::OutputReviewer
+            && coordinates.kind == ProviderExchangeKind::Initial;
+        let expected_output_review =
+            if is_output_review_initial && !self.legacy_unit_test_harness_enabled() {
+                Some(self.output_review_subject(Role::OutputReviewer)?)
+            } else {
+                None
+            };
+        let (run, request) = publish_provider_exchange_request_tail_with_validator(
+            &workspace,
+            &current,
+            coordinates,
+            bytes,
             expansion,
-            outcome: None,
-        };
-        self.stage_and_persist_record(&workspace, &record)?;
+            |_prospective| {
+                if let Some(expected) = expected_output_review.as_ref() {
+                    validate_all_output_review_initial_subjects(
+                        &workspace,
+                        &current,
+                        Some(expected),
+                        &current.model,
+                    )
+                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(exchange_write_error)?;
+        self.run = Some(run.clone());
+        self.durable_provider_exchange_records = Some(run.provider_exchange_records);
         Ok(request)
     }
 
@@ -1194,9 +1234,12 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         let workspace = self.exchange_workspace.clone().ok_or_else(|| {
             RunnerError::Step("audited provider exchange is missing its workspace".to_string())
         })?;
-        let response =
-            write_provider_exchange_response(workspace.run_directory(), coordinates, audit)
-                .map_err(exchange_write_error)?;
+        let response = write_provider_exchange_response_consuming_commitment(
+            workspace.run_directory(),
+            coordinates,
+            audit,
+        )
+        .map_err(exchange_write_error)?;
         let previous_record_digest = self
             .run
             .as_ref()
@@ -1219,8 +1262,11 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             outcome: None,
         };
         let (reference, classification) =
-            stage_provider_exchange_response_record(workspace.run_directory(), record)
-                .map_err(exchange_write_error)?;
+            stage_provider_exchange_response_record_consuming_commitment(
+                workspace.run_directory(),
+                record,
+            )
+            .map_err(exchange_write_error)?;
         let run = persist_provider_exchange_record_reference(&workspace, reference)
             .map_err(exchange_write_error)?;
         self.run = Some(run.clone());
@@ -1232,59 +1278,62 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         Ok(classification)
     }
 
-    fn stage_and_persist_record(
-        &mut self,
-        workspace: &LoopWorkspace,
-        record: &ProviderExchangeRecord,
+    fn reauthenticate_provider_call_commitment(
+        &self,
+        coordinates: &ProviderExchangeCoordinates,
+        request: &ArtifactReference,
     ) -> Result<(), RunnerError> {
-        let is_output_review_initial = record.step == LoopStepName::OutputReview
-            && record.role == ProviderRole::OutputReviewer
-            && record.phase == ProviderExchangePhase::Request
-            && record.kind == ProviderExchangeKind::Initial;
-        let expected_output_review =
-            if is_output_review_initial && !self.legacy_unit_test_harness_enabled() {
-                Some(self.output_review_subject(Role::OutputReviewer)?)
-            } else {
-                None
-            };
-        let reference = stage_provider_exchange_record(workspace.run_directory(), record)
+        let workspace = self.exchange_workspace.as_ref().ok_or_else(|| {
+            RunnerError::Step("provider call is missing its exchange workspace".to_string())
+        })?;
+        let expected = self.run.as_ref().ok_or_else(|| {
+            RunnerError::Step("provider call is missing authoritative run state".to_string())
+        })?;
+        let guard = crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
             .map_err(exchange_write_error)?;
-        let run = if let Some(expected) = expected_output_review.as_ref() {
-            persist_provider_exchange_record_reference_with_validator(
-                workspace,
-                reference,
-                |prospective| {
-                    validate_all_output_review_initial_subjects(
-                        workspace,
-                        prospective,
-                        Some(expected),
-                        &prospective.model,
-                    )
-                    .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))
-                },
-            )
-        } else {
-            #[cfg(test)]
-            {
-                if is_output_review_initial && self.legacy_unit_test_harness_enabled() {
-                    persist_provider_exchange_record_reference_with_validator(
-                        workspace,
-                        reference,
-                        |_| Ok(()),
-                    )
-                } else {
-                    persist_provider_exchange_record_reference(workspace, reference)
-                }
-            }
-            #[cfg(not(test))]
-            {
-                persist_provider_exchange_record_reference(workspace, reference)
-            }
+        let current = crate::state::load_run(workspace)
+            .map_err(|error| exchange_write_error(error.to_string()))?;
+        if current.run_id != expected.run_id
+            || current.ticket_id != expected.ticket_id
+            || current.goal_id != expected.goal_id
+            || current.provider != expected.provider
+            || current.model != expected.model
+            || current.input_digests != expected.input_digests
+            || current.execution_mode != expected.execution_mode
+            || current.provider_exchange_records != expected.provider_exchange_records
+            || current.candidate_workspace != expected.candidate_workspace
+            || current.latest_recovery != expected.latest_recovery
+        {
+            return Err(RunnerError::Step(
+                "loop state changed before provider call commitment reauthentication".to_string(),
+            ));
         }
-        .map_err(exchange_write_error)?;
-        self.run = Some(run.clone());
-        self.durable_provider_exchange_records = Some(run.provider_exchange_records);
-        Ok(())
+        let head = current.provider_exchange_records.last().ok_or_else(|| {
+            RunnerError::Step("provider call has no authoritative request tail".to_string())
+        })?;
+        let record = load_provider_exchange_record(workspace.run_directory(), head)
+            .map_err(exchange_recovery_error)?;
+        if head.phase != ProviderExchangePhase::Request
+            || record.request != *request
+            || record.run_id != coordinates.run_id
+            || record.step != coordinates.step
+            || record.step_attempt != coordinates.step_attempt
+            || record.exchange_index != coordinates.exchange_index
+            || record.kind != coordinates.kind
+            || record.context_round != coordinates.context_round
+        {
+            return Err(RunnerError::Step(
+                "provider call request does not match the authenticated committed ledger tail"
+                    .to_string(),
+            ));
+        }
+        guard
+            .validate_active_provider_commitment()
+            .map_err(exchange_write_error)?;
+        validate_provider_call_response_slots_absent(workspace.run_directory(), coordinates)
+            .map_err(exchange_recovery_error)?;
+        guard.validate().map_err(exchange_write_error)?;
+        guard.unlock().map_err(exchange_write_error)
     }
 
     fn context_cap_reached(&self, step: LoopStepName) -> bool {
@@ -1588,6 +1637,91 @@ fn context_request_for_response(response: &RoleResponse) -> Option<ContextReques
 
 fn exchange_write_error(error: impl std::fmt::Display) -> RunnerError {
     RunnerError::Step(format!("durable provider exchange write failed: {error}"))
+}
+
+const OVERSIZED_PROVIDER_AUDIT_MESSAGE: &str =
+    "provider response audit exceeded the 1048576-byte durable limit";
+
+fn bounded_provider_result_audit(
+    provider_result: Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+) -> Result<
+    (
+        Result<seaf_models::ModelResponse, seaf_models::ModelError>,
+        ProviderExchangeResponseAudit,
+    ),
+    RunnerError,
+> {
+    let audit = match provider_result {
+        Ok(response) => ProviderExchangeResponseAudit::ModelResponse { response },
+        Err(error) => ProviderExchangeResponseAudit::ProviderFailure { error },
+    };
+    let audit_cap = usize::try_from(crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP)
+        .map_err(|_| RunnerError::Step("provider response cap is not representable".to_string()))?;
+    let mut counter = CappedJsonCounter::new(audit_cap);
+    let measurement = serde_json::to_writer_pretty(&mut counter, &audit);
+    if !counter.exceeded {
+        measurement.map_err(|error| {
+            RunnerError::Step(format!(
+                "failed to measure provider response audit: {error}"
+            ))
+        })?;
+        let bounded_result = match &audit {
+            ProviderExchangeResponseAudit::ModelResponse { response } => Ok(response.clone()),
+            ProviderExchangeResponseAudit::ProviderFailure { error } => Err(error.clone()),
+        };
+        return Ok((bounded_result, audit));
+    }
+    drop(measurement);
+    drop(audit);
+    let error = seaf_models::ModelError::provider(
+        OVERSIZED_PROVIDER_AUDIT_MESSAGE,
+        false,
+        serde_json::json!({
+            "code": "provider_response_audit_too_large",
+            "limit_bytes": crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP,
+        }),
+    );
+    Ok((
+        Err(error.clone()),
+        ProviderExchangeResponseAudit::ProviderFailure { error },
+    ))
+}
+
+struct CappedJsonCounter {
+    count: usize,
+    cap: usize,
+    exceeded: bool,
+}
+
+impl CappedJsonCounter {
+    fn new(cap: usize) -> Self {
+        Self {
+            count: 0,
+            cap,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for CappedJsonCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.count.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("provider audit length overflowed"));
+        };
+        if next > self.cap {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "provider audit exceeds its durable byte cap",
+            ));
+        }
+        self.count = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn exchange_recovery_error(error: impl std::fmt::Display) -> RunnerError {
@@ -2636,6 +2770,63 @@ mod live_context_cap_tests {
         TicketPriority, TicketStatus,
     };
 
+    fn response_with_canonical_audit_size(size: usize) -> seaf_models::ModelResponse {
+        let empty = seaf_models::ModelResponse {
+            content: String::new(),
+            latency_ms: 0,
+            raw_provider_metadata: serde_json::Value::Null,
+        };
+        let overhead =
+            canonical_json_bytes(&ProviderExchangeResponseAudit::ModelResponse { response: empty })
+                .unwrap()
+                .len();
+        let response = seaf_models::ModelResponse {
+            content: "x".repeat(size.checked_sub(overhead).expect("size covers envelope")),
+            latency_ms: 0,
+            raw_provider_metadata: serde_json::Value::Null,
+        };
+        assert_eq!(
+            canonical_json_bytes(&ProviderExchangeResponseAudit::ModelResponse {
+                response: response.clone(),
+            })
+            .unwrap()
+            .len(),
+            size
+        );
+        response
+    }
+
+    #[test]
+    fn provider_audit_exact_cap_is_preserved_and_cap_plus_one_is_safely_replaced() {
+        let cap = crate::artifact_storage::PROVIDER_RESPONSE_BYTE_CAP as usize;
+        let exact = response_with_canonical_audit_size(cap);
+        let (result, audit) = bounded_provider_result_audit(Ok(exact.clone())).unwrap();
+        assert_eq!(result, Ok(exact));
+        assert_eq!(canonical_json_bytes(&audit).unwrap().len(), cap);
+
+        let oversized = response_with_canonical_audit_size(cap + 1);
+        let (result, audit) = bounded_provider_result_audit(Ok(oversized)).unwrap();
+        let error = result.expect_err("cap plus one must become typed failure");
+        assert!(!error.retryable);
+        assert_eq!(error.message, OVERSIZED_PROVIDER_AUDIT_MESSAGE);
+        assert!(canonical_json_bytes(&audit).unwrap().len() < cap);
+    }
+
+    #[test]
+    fn oversized_provider_error_is_safely_replaced_without_raw_marker_or_digest() {
+        let marker = format!("RAW_ERROR_MARKER_{}", "z".repeat(1024 * 1024 + 128));
+        let digest = sha256_bytes(marker.as_bytes());
+        let raw =
+            seaf_models::ModelError::provider(marker, true, serde_json::json!({"raw": "metadata"}));
+        let (result, audit) = bounded_provider_result_audit(Err(raw)).unwrap();
+        let error = result.expect_err("oversized error remains a safe provider failure");
+        assert!(!error.retryable);
+        let bytes = canonical_json_bytes(&audit).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(!rendered.contains("RAW_ERROR_MARKER_"));
+        assert!(!rendered.contains(&digest));
+    }
+
     #[test]
     fn caps_count_context_requests_across_attempts_but_not_initial_or_repairs() {
         let records = vec![
@@ -2719,7 +2910,7 @@ mod live_context_cap_tests {
         std::fs::create_dir(&repository).expect("repository");
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), "output-first").expect("workspace");
-        let run = crate::state::create_run(crate::state::NewLoopRun {
+        let mut run = crate::state::create_run(crate::state::NewLoopRun {
             run_id: "output-first".to_string(),
             ticket_id: "T-1".to_string(),
             goal_id: "G-1".to_string(),
@@ -2733,9 +2924,19 @@ mod live_context_cap_tests {
                 eval_config: None,
             },
         });
+        run.current_step = LoopStepName::OutputReview;
+        run.steps
+            .iter_mut()
+            .find(|step| step.name == LoopStepName::OutputReview)
+            .expect("output-review step")
+            .status = LoopStepStatus::Running;
         crate::state::save_run(&workspace, &run).expect("save");
         authorize_provider_exchange_rerun(&workspace, &run, LoopStepName::OutputReview, 2)
             .expect("authorize context-free output review rerun");
+        drop(
+            crate::run_persistence::RunMutationGuard::acquire(workspace.run_directory())
+                .expect("initialize the permanent run lock before staging a crash prefix"),
+        );
         let coordinates = ProviderExchangeCoordinates {
             run_id: run.run_id.clone(),
             step: LoopStepName::OutputReview,

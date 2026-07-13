@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fmt, fs,
+    fmt,
     path::Path,
 };
 
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    artifact_storage::{StorageCommitment, PROVIDER_RECORD_BYTE_CAP, PROVIDER_RESPONSE_BYTE_CAP},
     immutable_artifact::{publish_create_only, read_verified_regular_file, ImmutableArtifactError},
     role_response::{
         parse_role_response, AgentStatus, DeveloperStatus, ReviewDecision, Role, RoleResponse,
@@ -27,6 +28,379 @@ use crate::{
 
 pub const PROVIDER_EXCHANGE_SCHEMA_VERSION: u32 = 1;
 const PROVIDER_RERUN_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+
+pub(crate) fn derive_active_provider_storage_commitment(
+    run_directory: &Path,
+) -> Result<Option<StorageCommitment>, ProviderExchangeError> {
+    let root = crate::artifact_safety::PinnedPrivateDirectory::open(run_directory)?;
+    match root.entry_kind(std::ffi::OsStr::new(crate::workspace::RUN_FILE)) {
+        Ok(crate::artifact_safety::PinnedEntryKind::RegularFile) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => {
+            return Err(ProviderExchangeError::Invalid(
+                "run.json is not a real regular file".to_string(),
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if !has_provider_artifact_namespace(&root)? {
+        let bytes = read_verified_regular_file(
+            run_directory,
+            crate::workspace::RUN_FILE,
+            "bare run-state commitment probe",
+        )?;
+        if let Ok(run) = serde_json::from_slice::<LoopRun>(&bytes) {
+            if !run.provider_exchange_records.is_empty() {
+                return Err(ProviderExchangeError::Invalid(
+                    "provider run state has no provider artifact namespace".to_string(),
+                ));
+            }
+        }
+        return Ok(None);
+    }
+    let parent = run_directory
+        .parent()
+        .ok_or_else(|| ProviderExchangeError::Invalid("run directory has no parent".to_string()))?;
+    let run_id = run_directory
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            ProviderExchangeError::Invalid("run directory name is not valid UTF-8".to_string())
+        })?;
+    let workspace = LoopWorkspace::open_minimal(parent, run_id)
+        .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+    let run = state::load_run(&workspace)?;
+    let current_run = root.open_existing_file(
+        std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+        true,
+        false,
+    )?;
+    let current_identity = current_run.metadata()?;
+    root.validate_single_link_file(
+        std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+        &current_identity,
+    )?;
+    derive_provider_or_staged_storage_commitment(&workspace, &run, current_identity.len())
+}
+
+fn has_provider_artifact_namespace(
+    root: &crate::artifact_safety::PinnedPrivateDirectory,
+) -> Result<bool, ProviderExchangeError> {
+    for name in [
+        crate::workspace::PROMPTS_DIR,
+        crate::workspace::RESPONSES_DIR,
+        crate::workspace::ARTIFACTS_DIR,
+    ] {
+        match root.entry_kind(std::ffi::OsStr::new(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_provider_call_response_slots_absent(
+    run_directory: &Path,
+    coordinates: &ProviderExchangeCoordinates,
+) -> Result<(), ProviderExchangeError> {
+    let response = response_path(coordinates);
+    let response_record = record_path(coordinates, ProviderExchangePhase::Response);
+    if run_artifact_exists(run_directory, &response)?
+        || run_artifact_exists(run_directory, &response_record)?
+    {
+        return Err(ProviderExchangeError::Invalid(
+            "provider call response slot appeared before invocation; reconcile without recalling the provider"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn derive_provider_or_staged_storage_commitment(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    base_run_size: u64,
+) -> Result<Option<StorageCommitment>, ProviderExchangeError> {
+    if let Some(commitment) = derive_provider_storage_commitment_for_run(workspace, run)? {
+        return Ok(Some(commitment));
+    }
+    let prospective = preflight_provider_exchange_reconciliation_mode(workspace, run, false)?;
+    if prospective.provider_exchange_records == run.provider_exchange_records {
+        return Ok(None);
+    }
+    let mut adoption_run_bytes = serde_json::to_vec_pretty(&prospective)?;
+    adoption_run_bytes.push(b'\n');
+    crate::artifact_storage::validate_artifact_size("run.json", adoption_run_bytes.len())?;
+    if let Some(commitment) = derive_provider_storage_commitment_for_run(workspace, &prospective)? {
+        let adoption_run_size = u64::try_from(adoption_run_bytes.len()).map_err(|_| {
+            ProviderExchangeError::Invalid(
+                "provider adoption run size is not representable".to_string(),
+            )
+        })?;
+        let post_adoption = adoption_run_size
+            .checked_add(commitment.permanent_bytes)
+            .and_then(|bytes| bytes.checked_add(commitment.transient_bytes))
+            .ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "staged provider commitment byte accounting overflowed".to_string(),
+                )
+            })?
+            .saturating_sub(base_run_size);
+        return Ok(Some(StorageCommitment {
+            permanent_bytes: 0,
+            transient_bytes: adoption_run_size.max(post_adoption),
+            permanent_entries: 0,
+            transient_entries: 3,
+            consumable_permanent_paths: Vec::new(),
+            consumable_transient_path: None,
+        }));
+    }
+    Ok(Some(StorageCommitment {
+        permanent_bytes: 0,
+        transient_bytes: u64::try_from(adoption_run_bytes.len()).map_err(|_| {
+            ProviderExchangeError::Invalid(
+                "provider adoption run size is not representable".to_string(),
+            )
+        })?,
+        permanent_entries: 0,
+        transient_entries: 1,
+        consumable_permanent_paths: Vec::new(),
+        consumable_transient_path: Some("run.json".to_string()),
+    }))
+}
+
+pub(crate) fn derive_provider_storage_commitment_for_run_bytes(
+    run_directory: &Path,
+    bytes: &[u8],
+) -> Result<Option<StorageCommitment>, ProviderExchangeError> {
+    let run: LoopRun = serde_json::from_slice(bytes)?;
+    let mut canonical = serde_json::to_vec_pretty(&run)?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err(ProviderExchangeError::Invalid(
+            "intended run-state replacement is not canonical JSON".to_string(),
+        ));
+    }
+    let errors = seaf_core::validate_loop_run(&run);
+    if !errors.is_empty() {
+        return Err(ProviderExchangeError::Invalid(
+            errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let root = crate::artifact_safety::PinnedPrivateDirectory::open(run_directory)?;
+    if run.provider_exchange_records.is_empty() && !has_provider_artifact_namespace(&root)? {
+        return Ok(None);
+    }
+    let parent = run_directory
+        .parent()
+        .ok_or_else(|| ProviderExchangeError::Invalid("run directory has no parent".to_string()))?;
+    let run_id = run_directory
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            ProviderExchangeError::Invalid("run directory name is not valid UTF-8".to_string())
+        })?;
+    let workspace = LoopWorkspace::open_minimal(parent, run_id)
+        .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+    derive_provider_or_staged_storage_commitment(
+        &workspace,
+        &run,
+        u64::try_from(bytes.len()).map_err(|_| {
+            ProviderExchangeError::Invalid(
+                "intended run-state size is not representable".to_string(),
+            )
+        })?,
+    )
+}
+
+pub(crate) fn derive_provider_storage_commitment_for_run(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<Option<StorageCommitment>, ProviderExchangeError> {
+    if run.provider_exchange_records.is_empty() {
+        return Ok(None);
+    }
+    validate_authoritative_provider_exchange_records(workspace, run)?;
+    let Some(head) = run.provider_exchange_records.last() else {
+        return Ok(None);
+    };
+    if head.phase != ProviderExchangePhase::Request {
+        return Ok(None);
+    }
+    let request_record = load_provider_exchange_record(workspace.run_directory(), head)?;
+    if request_record.phase != ProviderExchangePhase::Request {
+        return Err(ProviderExchangeError::Invalid(
+            "authoritative request reference does not bind a request record".to_string(),
+        ));
+    }
+    let coordinates = coordinates_from_record(&request_record);
+    let response_relative = response_path(&coordinates);
+    let response_record_relative = record_path(&coordinates, ProviderExchangePhase::Response);
+
+    let response_reference = if run_artifact_exists(workspace.run_directory(), &response_relative)?
+    {
+        let bytes = read_verified_regular_file(
+            workspace.run_directory(),
+            &response_relative,
+            "provider response commitment prefix",
+        )?;
+        match serde_json::from_slice::<ProviderExchangeResponseAudit>(&bytes) {
+            Ok(audit) if canonical_json_bytes(&audit)? == bytes => Some(ArtifactReference {
+                path: response_relative.clone(),
+                digest: digest_bytes(&bytes),
+            }),
+            Ok(_) | Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let staged_response = if run_artifact_exists(
+        workspace.run_directory(),
+        &response_record_relative,
+    )? {
+        let response = response_reference.as_ref().ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "staged provider response record has no canonical response audit".to_string(),
+            )
+        })?;
+        let bytes = read_verified_regular_file(
+            workspace.run_directory(),
+            &response_record_relative,
+            "provider response commitment record",
+        )?;
+        let record: ProviderExchangeRecord = serde_json::from_slice(&bytes)?;
+        if canonical_json_bytes(&record)? != bytes || record.response.as_ref() != Some(response) {
+            return Err(ProviderExchangeError::Invalid(
+                "staged provider response commitment record is not canonical or substitutes its response"
+                    .to_string(),
+            ));
+        }
+        let reference = record_reference(&record, digest_bytes(&bytes));
+        if reference.path != response_record_relative {
+            return Err(ProviderExchangeError::Invalid(
+                "staged provider response commitment record path does not match its identity"
+                    .to_string(),
+            ));
+        }
+        load_provider_exchange_record(workspace.run_directory(), &reference)?;
+        validate_append_link(workspace, run, &record, true)?;
+        Some(reference)
+    } else {
+        None
+    };
+
+    let response_record_exists = staged_response.is_some();
+    Ok(Some(provider_request_tail_commitment(
+        run,
+        &request_record,
+        response_reference.is_some(),
+        response_record_exists,
+        staged_response,
+    )?))
+}
+
+fn provider_request_tail_commitment(
+    run: &LoopRun,
+    request_record: &ProviderExchangeRecord,
+    response_exists: bool,
+    response_record_exists: bool,
+    staged_response: Option<ProviderExchangeRecordReference>,
+) -> Result<StorageCommitment, ProviderExchangeError> {
+    let coordinates = coordinates_from_record(request_record);
+    let response_relative = response_path(&coordinates);
+    let response_record_relative = record_path(&coordinates, ProviderExchangePhase::Response);
+    let predicted_response_reference =
+        staged_response.unwrap_or_else(|| ProviderExchangeRecordReference {
+            run_id: request_record.run_id.clone(),
+            step: request_record.step,
+            role: request_record.role,
+            step_attempt: request_record.step_attempt,
+            exchange_index: request_record.exchange_index,
+            kind: request_record.kind,
+            context_round: request_record.context_round,
+            phase: ProviderExchangePhase::Response,
+            path: response_record_relative.clone(),
+            digest: "0".repeat(64),
+        });
+    let mut future = run.clone();
+    future
+        .provider_exchange_records
+        .push(predicted_response_reference);
+    let mut future_run_bytes = serde_json::to_vec_pretty(&future)?;
+    future_run_bytes.push(b'\n');
+    crate::artifact_storage::validate_artifact_size("run.json", future_run_bytes.len())?;
+
+    let mut permanent_bytes = 0_u64;
+    let mut permanent_entries = 0_usize;
+    let mut consumable_permanent_paths = Vec::new();
+    if !response_exists {
+        permanent_bytes = permanent_bytes
+            .checked_add(PROVIDER_RESPONSE_BYTE_CAP)
+            .ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "provider commitment byte accounting overflowed".to_string(),
+                )
+            })?;
+        permanent_entries = permanent_entries.checked_add(1).ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "provider commitment entry accounting overflowed".to_string(),
+            )
+        })?;
+        consumable_permanent_paths.push((response_relative, PROVIDER_RESPONSE_BYTE_CAP));
+    }
+    if !response_record_exists {
+        permanent_bytes = permanent_bytes
+            .checked_add(PROVIDER_RECORD_BYTE_CAP)
+            .ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "provider commitment byte accounting overflowed".to_string(),
+                )
+            })?;
+        permanent_entries = permanent_entries.checked_add(1).ok_or_else(|| {
+            ProviderExchangeError::Invalid(
+                "provider commitment entry accounting overflowed".to_string(),
+            )
+        })?;
+        consumable_permanent_paths.push((response_record_relative, PROVIDER_RECORD_BYTE_CAP));
+    }
+    Ok(StorageCommitment {
+        permanent_bytes,
+        transient_bytes: u64::try_from(future_run_bytes.len()).map_err(|_| {
+            ProviderExchangeError::Invalid(
+                "provider future run size is not representable".to_string(),
+            )
+        })?,
+        permanent_entries,
+        transient_entries: 1,
+        consumable_permanent_paths,
+        consumable_transient_path: Some("run.json".to_string()),
+    })
+}
+
+fn run_artifact_exists(
+    run_directory: &Path,
+    relative_path: &str,
+) -> Result<bool, ProviderExchangeError> {
+    let relative = Path::new(relative_path);
+    let parent = crate::artifact_safety::open_private_descendant_parent(run_directory, relative)?;
+    let name = relative.file_name().ok_or_else(|| {
+        ProviderExchangeError::Invalid("provider commitment path has no file name".to_string())
+    })?;
+    match parent.entry_kind(name) {
+        Ok(crate::artifact_safety::PinnedEntryKind::RegularFile) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Err(ProviderExchangeError::Invalid(format!(
+            "provider commitment artifact is not a real regular file: {relative_path}"
+        ))),
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderExchangeCoordinates {
@@ -205,6 +579,149 @@ pub fn write_provider_exchange_request(
     write_exchange_bytes(run_directory, request_path(coordinates), bytes)
 }
 
+pub(crate) fn publish_provider_exchange_request_tail_with_validator<F>(
+    workspace: &LoopWorkspace,
+    expected: &LoopRun,
+    coordinates: &ProviderExchangeCoordinates,
+    request_bytes: &[u8],
+    expansion: Option<ArtifactReference>,
+    validate_prospective: F,
+) -> Result<(LoopRun, ArtifactReference), ProviderExchangeError>
+where
+    F: Fn(&LoopRun) -> Result<(), ProviderExchangeError>,
+{
+    validate_coordinates(coordinates)?;
+    crate::artifact_storage::validate_artifact_size(
+        &request_path(coordinates),
+        request_bytes.len(),
+    )?;
+    let lock = RunMutationGuard::acquire(workspace.run_directory())?;
+    let result = (|| {
+        let current = state::load_run(workspace)?;
+        if current.run_id != expected.run_id
+            || current.ticket_id != expected.ticket_id
+            || current.goal_id != expected.goal_id
+            || current.provider != expected.provider
+            || current.model != expected.model
+            || current.input_digests != expected.input_digests
+            || current.execution_mode != expected.execution_mode
+            || current.provider_exchange_records != expected.provider_exchange_records
+            || current.candidate_workspace != expected.candidate_workspace
+            || current.latest_recovery != expected.latest_recovery
+        {
+            return Err(ProviderExchangeError::Invalid(
+                "loop state changed before provider request-tail activation".to_string(),
+            ));
+        }
+        if state::is_frozen_review_or_evaluation_authority(&current) {
+            return Err(ProviderExchangeError::Invalid(
+                "provider request-tail activation cannot mutate frozen review or evaluation authority"
+                    .to_string(),
+            ));
+        }
+        let request_path = request_path(coordinates);
+        let request_record_path = record_path(coordinates, ProviderExchangePhase::Request);
+        if run_artifact_exists(workspace.run_directory(), &request_path)?
+            || run_artifact_exists(workspace.run_directory(), &request_record_path)?
+        {
+            return Err(ProviderExchangeError::Invalid(
+                "fresh provider request prefix collides with staged exchange artifacts; reconcile before retry"
+                    .to_string(),
+            ));
+        }
+        let request = ArtifactReference {
+            path: request_path.clone(),
+            digest: digest_bytes(request_bytes),
+        };
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: coordinates.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: coordinates.context_round,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: current
+                .provider_exchange_records
+                .last()
+                .map(|record| record.digest.clone()),
+            request: request.clone(),
+            response: None,
+            expansion,
+            outcome: None,
+        };
+        validate_record(&record)?;
+        validate_authoritative_provider_exchange_records(workspace, &current)?;
+        validate_append_link(workspace, &current, &record, true)?;
+        let record_bytes = canonical_json_bytes(&record)?;
+        let reference = record_reference(&record, digest_bytes(&record_bytes));
+        let mut prospective = current.clone();
+        prospective
+            .provider_exchange_records
+            .push(reference.clone());
+        let errors = seaf_core::validate_loop_run(&prospective);
+        if !errors.is_empty() {
+            return Err(ProviderExchangeError::Invalid(
+                errors
+                    .into_iter()
+                    .map(|error| format!("{}: {}", error.field, error.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        validate_prospective(&prospective)?;
+        let commitment =
+            provider_request_tail_commitment(&prospective, &record, false, false, None)?;
+        let mut run_bytes = serde_json::to_vec_pretty(&prospective)?;
+        run_bytes.push(b'\n');
+        let root = crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
+        let run_file = root.open_existing_file(
+            std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+            true,
+            false,
+        )?;
+        let run_identity = run_file.metadata()?;
+        root.validate_single_link_file(
+            std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+            &run_identity,
+        )?;
+        lock.validate_provider_request_prefix_projection(
+            &crate::artifact_storage::ProviderRequestPrefixProjection {
+                request_path: &request_path,
+                request_size: request_bytes.len(),
+                record_path: &request_record_path,
+                record_size: record_bytes.len(),
+                old_run_size: run_identity.len(),
+                new_run_size: run_bytes.len(),
+                commitment: &commitment,
+            },
+        )?;
+        crate::immutable_artifact::publish_create_only_with_guard_after_provider_prefix_projection(
+            &lock,
+            &request_path,
+            request_bytes,
+        )?;
+        crate::immutable_artifact::publish_create_only_with_guard_after_provider_prefix_projection(
+            &lock,
+            &request_record_path,
+            &record_bytes,
+        )?;
+        load_provider_exchange_record(workspace.run_directory(), &reference)?;
+        validate_append_link(workspace, &current, &record, true)?;
+        run_persistence::publish_replacement(&lock, &workspace.run_file(), &run_bytes)?;
+        lock.validate_active_provider_commitment()?;
+        Ok((prospective, request))
+    })();
+    let unlock = lock.unlock();
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), _) => Err(error),
+    }
+}
+
 pub fn write_provider_exchange_response(
     run_directory: &Path,
     coordinates: &ProviderExchangeCoordinates,
@@ -213,6 +730,28 @@ pub fn write_provider_exchange_response(
     validate_coordinates(coordinates)?;
     let bytes = canonical_json_bytes(audit)?;
     write_exchange_bytes(run_directory, response_path(coordinates), &bytes)
+}
+
+pub(crate) fn write_provider_exchange_response_consuming_commitment(
+    run_directory: &Path,
+    coordinates: &ProviderExchangeCoordinates,
+    audit: &ProviderExchangeResponseAudit,
+) -> Result<ArtifactReference, ProviderExchangeError> {
+    validate_coordinates(coordinates)?;
+    let path = response_path(coordinates);
+    let bytes = canonical_json_bytes(audit)?;
+    let guard = RunMutationGuard::acquire(run_directory)?;
+    if run_artifact_exists(run_directory, &path)? {
+        crate::immutable_artifact::publish_create_only_with_guard(&guard, &path, &bytes)?;
+    } else {
+        crate::immutable_artifact::publish_create_only_with_guard_consuming_provider_slot(
+            &guard, &path, &bytes,
+        )?;
+    }
+    Ok(ArtifactReference {
+        path,
+        digest: digest_bytes(&bytes),
+    })
 }
 
 pub fn load_provider_exchange_request(
@@ -262,10 +801,76 @@ pub fn stage_provider_exchange_record(
     validate_derived_response_outcome(run_directory, record)?;
     let reference = record_reference(record, canonical_sha256_digest(record)?);
     let bytes = canonical_json_bytes(record)?;
-    publish_create_only(run_directory, &reference.path, &bytes)?;
+    if record.phase == ProviderExchangePhase::Request {
+        let guard = RunMutationGuard::acquire(run_directory)?;
+        if run_artifact_exists(run_directory, &reference.path)? {
+            crate::immutable_artifact::publish_create_only_with_guard(
+                &guard,
+                &reference.path,
+                &bytes,
+            )?;
+        } else {
+            let parent = run_directory.parent().ok_or_else(|| {
+                ProviderExchangeError::Invalid("run directory has no parent".to_string())
+            })?;
+            let run_id = run_directory
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "run directory name is not valid UTF-8".to_string(),
+                    )
+                })?;
+            let workspace = LoopWorkspace::open_minimal(parent, run_id)
+                .map_err(|error| ProviderExchangeError::Invalid(error.to_string()))?;
+            let current = state::load_run(&workspace)?;
+            validate_authoritative_provider_exchange_records(&workspace, &current)?;
+            if validate_append_link(&workspace, &current, record, true).is_err() {
+                crate::immutable_artifact::publish_create_only_with_guard(
+                    &guard,
+                    &reference.path,
+                    &bytes,
+                )?;
+                return Ok(reference);
+            }
+            let mut prospective = current.clone();
+            prospective
+                .provider_exchange_records
+                .push(reference.clone());
+            let errors = seaf_core::validate_loop_run(&prospective);
+            if !errors.is_empty() {
+                return Err(ProviderExchangeError::Invalid(
+                    errors
+                        .into_iter()
+                        .map(|error| format!("{}: {}", error.field, error.message))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
+            let commitment =
+                provider_request_tail_commitment(&prospective, record, false, false, None)?;
+            let mut adoption = serde_json::to_vec_pretty(&prospective)?;
+            adoption.push(b'\n');
+            guard.validate_staged_provider_request_projection(
+                &reference.path,
+                bytes.len(),
+                adoption.len(),
+                &commitment,
+            )?;
+            crate::immutable_artifact::publish_create_only_with_guard_after_provider_prefix_projection(
+                &guard,
+                &reference.path,
+                &bytes,
+            )?;
+            guard.validate_active_provider_commitment()?;
+        }
+    } else {
+        publish_create_only(run_directory, &reference.path, &bytes)?;
+    }
     Ok(reference)
 }
 
+#[cfg(test)]
 pub(crate) fn stage_provider_exchange_response_record(
     run_directory: &Path,
     mut record: ProviderExchangeRecord,
@@ -297,6 +902,49 @@ pub(crate) fn stage_provider_exchange_response_record(
     let reference = record_reference(&record, canonical_sha256_digest(&record)?);
     let bytes = canonical_json_bytes(&record)?;
     publish_create_only(run_directory, &reference.path, &bytes)?;
+    Ok((reference, classification))
+}
+
+pub(crate) fn stage_provider_exchange_response_record_consuming_commitment(
+    run_directory: &Path,
+    mut record: ProviderExchangeRecord,
+) -> Result<
+    (
+        ProviderExchangeRecordReference,
+        ProviderExchangeResponseClassification,
+    ),
+    ProviderExchangeError,
+> {
+    if record.phase != ProviderExchangePhase::Response || record.outcome.is_some() {
+        return Err(ProviderExchangeError::Invalid(
+            "derived response staging requires a response record without a caller outcome"
+                .to_string(),
+        ));
+    }
+    verify_bound_artifact(run_directory, &record.request, "provider request")?;
+    let response = record.response.as_ref().ok_or_else(|| {
+        ProviderExchangeError::Invalid("response record has no response audit".to_string())
+    })?;
+    verify_bound_artifact(run_directory, response, "provider response")?;
+    if let Some(expansion) = &record.expansion {
+        verify_bound_artifact(run_directory, expansion, "context expansion")?;
+    }
+    let classification =
+        classify_bound_provider_exchange_response(run_directory, record.role, response)?;
+    record.outcome = Some(classification.outcome);
+    validate_record(&record)?;
+    let reference = record_reference(&record, canonical_sha256_digest(&record)?);
+    let bytes = canonical_json_bytes(&record)?;
+    let guard = RunMutationGuard::acquire(run_directory)?;
+    if run_artifact_exists(run_directory, &reference.path)? {
+        crate::immutable_artifact::publish_create_only_with_guard(&guard, &reference.path, &bytes)?;
+    } else {
+        crate::immutable_artifact::publish_create_only_with_guard_consuming_provider_slot(
+            &guard,
+            &reference.path,
+            &bytes,
+        )?;
+    }
     Ok((reference, classification))
 }
 
@@ -413,13 +1061,47 @@ where
                 "provider exchange record is already referenced".to_string(),
             ));
         }
+        let phase = reference.phase;
         validate_provider_exchange_record_append(workspace, &run, &reference)?;
         run.provider_exchange_records.push(reference);
         validate_prospective(&run)?;
         validate_run_for_atomic_publication(workspace, &run)?;
         let mut bytes = serde_json::to_vec_pretty(&run)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
+        if phase == ProviderExchangePhase::Request {
+            let commitment = derive_provider_storage_commitment_for_run(workspace, &run)?
+                .ok_or_else(|| {
+                    ProviderExchangeError::Invalid(
+                        "request record did not activate a provider storage commitment".to_string(),
+                    )
+                })?;
+            let root =
+                crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
+            let current_run = root.open_existing_file(
+                std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+                true,
+                false,
+            )?;
+            let current_identity = current_run.metadata()?;
+            root.validate_single_link_file(
+                std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+                &current_identity,
+            )?;
+            lock.validate_replacement_activating_provider_commitment(
+                "run.json",
+                bytes.len(),
+                current_identity.len(),
+                &commitment,
+            )?;
+            replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
+            lock.validate_active_provider_commitment()?;
+        } else {
+            run_persistence::publish_replacement_consuming_provider_slot(
+                &lock,
+                &workspace.run_file(),
+                &bytes,
+            )?;
+        }
         Ok(run)
     })();
     let unlock = lock.unlock();
@@ -725,7 +1407,50 @@ where
         validate_run_for_atomic_publication(workspace, &prospective)?;
         let mut bytes = serde_json::to_vec_pretty(&prospective)?;
         bytes.push(b'\n');
-        replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
+        let current_phase = authoritative
+            .provider_exchange_records
+            .last()
+            .map(|reference| reference.phase);
+        let prospective_phase = prospective
+            .provider_exchange_records
+            .last()
+            .map(|reference| reference.phase);
+        if prospective_phase == Some(ProviderExchangePhase::Request) {
+            let commitment = derive_provider_storage_commitment_for_run(workspace, &prospective)?
+                .ok_or_else(|| {
+                ProviderExchangeError::Invalid(
+                    "reconciled request tail did not activate a storage commitment".to_string(),
+                )
+            })?;
+            let root =
+                crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
+            let current_run = root.open_existing_file(
+                std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+                true,
+                false,
+            )?;
+            let current_identity = current_run.metadata()?;
+            root.validate_single_link_file(
+                std::ffi::OsStr::new(crate::workspace::RUN_FILE),
+                &current_identity,
+            )?;
+            lock.validate_replacement_activating_provider_commitment(
+                "run.json",
+                bytes.len(),
+                current_identity.len(),
+                &commitment,
+            )?;
+            replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
+            lock.validate_active_provider_commitment()?;
+        } else if current_phase == Some(ProviderExchangePhase::Request) {
+            run_persistence::publish_replacement_consuming_provider_slot(
+                &lock,
+                &workspace.run_file(),
+                &bytes,
+            )?;
+        } else {
+            replace_run_file_atomically_with_hook(&lock, &workspace.run_file(), &bytes, || Ok(()))?;
+        }
         Ok(prospective)
     })();
     let unlock = lock.unlock();
@@ -740,6 +1465,14 @@ pub(crate) fn preflight_provider_exchange_reconciliation(
     workspace: &LoopWorkspace,
     run: &LoopRun,
 ) -> Result<LoopRun, ProviderExchangeError> {
+    preflight_provider_exchange_reconciliation_mode(workspace, run, true)
+}
+
+fn preflight_provider_exchange_reconciliation_mode(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    verify_conventional_prompts: bool,
+) -> Result<LoopRun, ProviderExchangeError> {
     let mut prospective = run.clone();
     let mut staged = BTreeMap::new();
     let authoritative_paths = run
@@ -747,7 +1480,7 @@ pub(crate) fn preflight_provider_exchange_reconciliation(
         .iter()
         .map(|reference| reference.path.as_str())
         .collect::<BTreeSet<_>>();
-    for relative in exchange_family_files(workspace)? {
+    for relative in exchange_family_files(workspace, run.provider_exchange_records.is_empty())? {
         if !is_exchange_record_path(&relative) || authoritative_paths.contains(relative.as_str()) {
             continue;
         }
@@ -792,7 +1525,8 @@ pub(crate) fn preflight_provider_exchange_reconciliation(
     validate_authoritative_provider_exchange_records(workspace, &prospective)?;
     for reference in &prospective.provider_exchange_records {
         let record = load_provider_exchange_record(workspace.run_directory(), reference)?;
-        if record.phase == ProviderExchangePhase::Request
+        if verify_conventional_prompts
+            && record.phase == ProviderExchangePhase::Request
             && record.kind == ProviderExchangeKind::Initial
         {
             verify_conventional_initial_prompt(workspace, &record)?;
@@ -810,7 +1544,9 @@ pub(crate) fn preflight_provider_exchange_reconciliation(
             bound.insert(expansion.path);
         }
     }
-    for relative in exchange_family_files(workspace)? {
+    for relative in
+        exchange_family_files(workspace, prospective.provider_exchange_records.is_empty())?
+    {
         if bound.contains(&relative) {
             continue;
         }
@@ -847,25 +1583,63 @@ fn verify_conventional_initial_prompt(
     Ok(())
 }
 
-fn exchange_family_files(workspace: &LoopWorkspace) -> Result<Vec<String>, ProviderExchangeError> {
+fn exchange_family_files(
+    workspace: &LoopWorkspace,
+    allow_missing_directories: bool,
+) -> Result<Vec<String>, ProviderExchangeError> {
     let mut files = Vec::new();
+    let root = crate::artifact_safety::PinnedPrivateDirectory::open(workspace.run_directory())?;
+    let mut entries = 0_usize;
     for directory in ["prompts", "responses", "artifacts"] {
-        for entry in fs::read_dir(workspace.run_directory().join(directory))? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+        let child = match root.open_child_directory(std::ffi::OsStr::new(directory)) {
+            Ok(child) => child,
+            Err(error)
+                if allow_missing_directories && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        child.for_each_entry_name(|name| {
+            entries = entries.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "provider exchange enumeration overflowed",
+                )
+            })?;
+            if entries > crate::artifact_storage::RUN_TREE_ENTRY_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "provider exchange enumeration exceeds the run entry cap",
+                ));
+            }
+            let name = name.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "provider exchange artifact name is not valid UTF-8",
+                )
+            })?;
             let exchange = name.contains(".attempt-")
                 && (name.contains(".exchange-") || name.contains(".context-round-"));
             if exchange {
-                let metadata = fs::symlink_metadata(entry.path())?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(ProviderExchangeError::Invalid(format!(
+                if child.entry_kind(name.as_ref())?
+                    != crate::artifact_safety::PinnedEntryKind::RegularFile
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
                         "provider exchange artifact is not a real regular file: {directory}/{name}"
-                    )));
+                        ),
+                    ));
                 }
                 files.push(format!("{directory}/{name}"));
             }
-        }
+            child.validate_identity()?;
+            Ok(())
+        })?;
+        child.validate_identity()?;
     }
+    root.validate_identity()?;
     files.sort();
     Ok(files)
 }
@@ -2142,6 +2916,662 @@ mod tests {
         LoopStepStatus, PromotionEvidence, RiskLevel,
     };
 
+    fn exact_future_response_run_size(
+        request_run: &LoopRun,
+        coordinates: &ProviderExchangeCoordinates,
+        response_reference: Option<&ProviderExchangeRecordReference>,
+    ) -> u64 {
+        let response_reference =
+            response_reference
+                .cloned()
+                .unwrap_or_else(|| ProviderExchangeRecordReference {
+                    run_id: coordinates.run_id.clone(),
+                    step: coordinates.step,
+                    role: coordinates.role,
+                    step_attempt: coordinates.step_attempt,
+                    exchange_index: coordinates.exchange_index,
+                    kind: coordinates.kind,
+                    context_round: coordinates.context_round,
+                    phase: ProviderExchangePhase::Response,
+                    path: record_path(coordinates, ProviderExchangePhase::Response),
+                    digest: "0".repeat(64),
+                });
+        let mut future = request_run.clone();
+        future.provider_exchange_records.push(response_reference);
+        let mut bytes = serde_json::to_vec_pretty(&future).unwrap();
+        bytes.push(b'\n');
+        u64::try_from(bytes.len()).unwrap()
+    }
+
+    #[test]
+    fn staged_request_adoption_succeeds_with_sufficient_committed_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "staged-request-success").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "staged-request-success".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = write_provider_exchange_request(
+            workspace.run_directory(),
+            &coordinates,
+            br#"{"request":"staged"}"#,
+        )
+        .unwrap();
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference = stage_provider_exchange_record(workspace.run_directory(), &record).unwrap();
+        let adopted = persist_provider_exchange_record_reference(&workspace, reference.clone())
+            .expect("sufficient staged request commitment permits adoption");
+        assert_eq!(adopted.provider_exchange_records, vec![reference]);
+        let commitment = derive_active_provider_storage_commitment(workspace.run_directory())
+            .unwrap()
+            .expect("request tail reserves the full response suffix");
+        assert_eq!(
+            commitment.permanent_bytes,
+            PROVIDER_RESPONSE_BYTE_CAP + PROVIDER_RECORD_BYTE_CAP
+        );
+        assert_eq!(commitment.permanent_entries, 2);
+        assert_eq!(commitment.transient_entries, 1);
+        assert_eq!(
+            commitment.transient_bytes,
+            exact_future_response_run_size(&adopted, &coordinates, None)
+        );
+        assert_eq!(
+            commitment.consumable_permanent_paths,
+            vec![
+                (response_path(&coordinates), PROVIDER_RESPONSE_BYTE_CAP),
+                (
+                    record_path(&coordinates, ProviderExchangePhase::Response),
+                    PROVIDER_RECORD_BYTE_CAP,
+                ),
+            ]
+        );
+        assert_eq!(
+            commitment.consumable_transient_path.as_deref(),
+            Some("run.json")
+        );
+    }
+
+    #[test]
+    fn response_suffix_consumes_audit_record_and_run_slots_one_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "response-slot-consumption").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "response-slot-consumption".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let (request_run, request) = publish_provider_exchange_request_tail_with_validator(
+            &workspace,
+            &run,
+            &coordinates,
+            br#"{"request":"slots"}"#,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let audit = ProviderExchangeResponseAudit::ModelResponse {
+            response: ModelResponse {
+                content: serde_json::json!({
+                    "role": "researcher",
+                    "status": "passed",
+                    "summary": "Passed.",
+                    "findings": [],
+                    "risks": [],
+                    "next_step_recommendation": "Continue."
+                })
+                .to_string(),
+                latency_ms: 1,
+                raw_provider_metadata: serde_json::Value::Null,
+            },
+        };
+        let response = write_provider_exchange_response_consuming_commitment(
+            workspace.run_directory(),
+            &coordinates,
+            &audit,
+        )
+        .unwrap();
+        let after_audit = derive_active_provider_storage_commitment(workspace.run_directory())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_audit.permanent_bytes, PROVIDER_RECORD_BYTE_CAP);
+        assert_eq!(after_audit.permanent_entries, 1);
+        assert_eq!(
+            after_audit.transient_bytes,
+            exact_future_response_run_size(&request_run, &coordinates, None)
+        );
+        assert_eq!(
+            after_audit.consumable_permanent_paths,
+            vec![(
+                record_path(&coordinates, ProviderExchangePhase::Response),
+                PROVIDER_RECORD_BYTE_CAP,
+            )]
+        );
+
+        let request_head = request_run
+            .provider_exchange_records
+            .last()
+            .expect("request head");
+        let response_record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id,
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Response,
+            previous_record_digest: Some(request_head.digest.clone()),
+            request,
+            response: Some(response),
+            expansion: None,
+            outcome: None,
+        };
+        let response_record_path = record_path(&coordinates, ProviderExchangePhase::Response);
+        let injected = b"wrong reserved response-record bytes";
+        crate::artifact_safety::write_private_fixture(
+            workspace.run_directory().join(&response_record_path),
+            injected,
+        )
+        .unwrap();
+        let collision = stage_provider_exchange_response_record_consuming_commitment(
+            workspace.run_directory(),
+            response_record.clone(),
+        )
+        .expect_err("wrong bytes in a reserved response-record slot must fail closed");
+        assert!(
+            collision.to_string().contains("JSON")
+                || collision.to_string().contains("collision")
+                || collision.to_string().contains("canonical"),
+            "{collision}"
+        );
+        assert_eq!(
+            std::fs::read(workspace.run_directory().join(&response_record_path)).unwrap(),
+            injected
+        );
+        std::fs::remove_file(workspace.run_directory().join(&response_record_path)).unwrap();
+        let (response_reference, _) = stage_provider_exchange_response_record_consuming_commitment(
+            workspace.run_directory(),
+            response_record,
+        )
+        .unwrap();
+        let after_record = derive_active_provider_storage_commitment(workspace.run_directory())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_record.permanent_bytes, 0);
+        assert_eq!(after_record.permanent_entries, 0);
+        assert_eq!(after_record.transient_entries, 1);
+        assert_eq!(
+            after_record.transient_bytes,
+            exact_future_response_run_size(&request_run, &coordinates, Some(&response_reference),)
+        );
+        assert_eq!(
+            after_record.consumable_transient_path.as_deref(),
+            Some("run.json")
+        );
+
+        persist_provider_exchange_record_reference(&workspace, response_reference).unwrap();
+        assert_eq!(
+            derive_active_provider_storage_commitment(workspace.run_directory()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn active_request_tail_without_provider_namespace_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "missing-provider-namespace").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "missing-provider-namespace".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        publish_provider_exchange_request_tail_with_validator(
+            &workspace,
+            &run,
+            &coordinates,
+            br#"{"request":"namespace"}"#,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        for directory in [
+            crate::workspace::PROMPTS_DIR,
+            crate::workspace::RESPONSES_DIR,
+            crate::workspace::ARTIFACTS_DIR,
+        ] {
+            std::fs::remove_dir_all(workspace.run_directory().join(directory)).unwrap();
+        }
+
+        let error = derive_active_provider_storage_commitment(workspace.run_directory())
+            .expect_err(
+            "authoritative request tail cannot become uncommitted when its namespace disappears",
+        );
+        assert!(
+            error.to_string().contains("no provider artifact namespace"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn empty_provider_ledger_treats_missing_family_directories_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "partial-empty-namespace").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "partial-empty-namespace".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        std::fs::remove_dir(
+            workspace
+                .run_directory()
+                .join(crate::workspace::RESPONSES_DIR),
+        )
+        .unwrap();
+        std::fs::remove_dir(
+            workspace
+                .run_directory()
+                .join(crate::workspace::ARTIFACTS_DIR),
+        )
+        .unwrap();
+
+        state::save_run(&workspace, &run)
+            .expect("empty provider authority may persist through a partial scaffold");
+        assert_eq!(
+            derive_active_provider_storage_commitment(workspace.run_directory()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn active_request_tail_with_partial_provider_namespace_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "partial-active-namespace").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "partial-active-namespace".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        publish_provider_exchange_request_tail_with_validator(
+            &workspace,
+            &run,
+            &coordinates,
+            br#"{"request":"partial-namespace"}"#,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        std::fs::remove_dir(
+            workspace
+                .run_directory()
+                .join(crate::workspace::RESPONSES_DIR),
+        )
+        .unwrap();
+
+        let error = derive_active_provider_storage_commitment(workspace.run_directory())
+            .expect_err("active provider authority requires every family directory");
+        assert!(error.to_string().contains("No such file"), "{error}");
+    }
+    use std::fs;
+
+    #[cfg(unix)]
+    fn fill_run_tree_to_bytes(run_directory: &Path, target: u64, prefix: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = crate::artifact_storage::published_run_bytes(run_directory).unwrap();
+        let mut remaining = target
+            .checked_sub(current)
+            .expect("target has byte headroom");
+        let mut index = 0;
+        while remaining > 0 {
+            let size = remaining.min(2 * 1024 * 1024);
+            let path = run_directory
+                .join("artifacts")
+                .join(format!("{prefix}-{index:02}.bin"));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            file.set_len(size).unwrap();
+            remaining -= size;
+            index += 1;
+        }
+    }
+
+    #[cfg(unix)]
+    fn staged_request_boundary_fixture(
+        root: &Path,
+        run_id: &str,
+    ) -> (
+        LoopWorkspace,
+        ProviderExchangeRecord,
+        ProviderExchangeRecordReference,
+        u64,
+    ) {
+        let workspace = LoopWorkspace::create(root, run_id).unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: run_id.to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = write_provider_exchange_request(
+            workspace.run_directory(),
+            &coordinates,
+            br#"{"request":"staged-boundary"}"#,
+        )
+        .unwrap();
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let record_bytes = canonical_json_bytes(&record).unwrap();
+        let reference = record_reference(&record, digest_bytes(&record_bytes));
+        let mut prospective = run;
+        prospective
+            .provider_exchange_records
+            .push(reference.clone());
+        let tail =
+            provider_request_tail_commitment(&prospective, &record, false, false, None).unwrap();
+        let mut adoption = serde_json::to_vec_pretty(&prospective).unwrap();
+        adoption.push(b'\n');
+        let adoption_size = u64::try_from(adoption.len()).unwrap();
+        let old_run_size = std::fs::metadata(workspace.run_file()).unwrap().len();
+        let post_adoption = adoption_size
+            .checked_add(tail.permanent_bytes)
+            .and_then(|bytes| bytes.checked_add(tail.transient_bytes))
+            .unwrap()
+            .saturating_sub(old_run_size);
+        let required = u64::try_from(record_bytes.len())
+            .unwrap()
+            .checked_add(adoption_size.max(post_adoption))
+            .unwrap();
+        (workspace, record, reference, required)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_request_record_requires_exact_full_adoption_and_response_tail_headroom() {
+        let exact = tempfile::tempdir().unwrap();
+        let (workspace, record, reference, required) =
+            staged_request_boundary_fixture(exact.path(), "staged-boundary-exact");
+        fill_run_tree_to_bytes(
+            workspace.run_directory(),
+            crate::artifact_storage::RUN_TREE_BYTE_CAP - required,
+            "staged-boundary-exact",
+        );
+        let staged = stage_provider_exchange_record(workspace.run_directory(), &record)
+            .expect("exact staged-request headroom must permit record publication");
+        assert_eq!(staged, reference);
+
+        let short = tempfile::tempdir().unwrap();
+        let (workspace, record, reference, required) =
+            staged_request_boundary_fixture(short.path(), "staged-boundary-short");
+        fill_run_tree_to_bytes(
+            workspace.run_directory(),
+            crate::artifact_storage::RUN_TREE_BYTE_CAP - required + 1,
+            "staged-boundary-short",
+        );
+        let error = stage_provider_exchange_record(workspace.run_directory(), &record)
+            .expect_err("one byte short must fail before staged record publication");
+        assert!(error.to_string().contains("aggregate cap"), "{error}");
+        assert!(!workspace.run_directory().join(reference.path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_request_adoption_requires_full_commitment_and_preserves_authoritative_head_on_denial()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = LoopWorkspace::create(temp.path(), "staged-request-capacity").unwrap();
+        let run = state::create_run(state::NewLoopRun {
+            run_id: "staged-request-capacity".to_string(),
+            ticket_id: "T-1".to_string(),
+            goal_id: "G-1".to_string(),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            input_digests: LoopInputDigests {
+                ticket: "a".repeat(64),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        });
+        state::save_run(&workspace, &run).unwrap();
+        let coordinates = ProviderExchangeCoordinates {
+            run_id: run.run_id.clone(),
+            step: LoopStepName::Research,
+            role: ProviderRole::Researcher,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: ProviderExchangeKind::Initial,
+            context_round: None,
+        };
+        let request = write_provider_exchange_request(
+            workspace.run_directory(),
+            &coordinates,
+            br#"{"request":"staged"}"#,
+        )
+        .unwrap();
+        let record = ProviderExchangeRecord {
+            schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: run.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: 1,
+            exchange_index: 1,
+            kind: coordinates.kind,
+            context_round: None,
+            phase: ProviderExchangePhase::Request,
+            previous_record_digest: None,
+            request,
+            response: None,
+            expansion: None,
+            outcome: None,
+        };
+        let reference = stage_provider_exchange_record(workspace.run_directory(), &record).unwrap();
+        let staged_commitment =
+            derive_active_provider_storage_commitment(workspace.run_directory())
+                .unwrap()
+                .expect("staged request commitment");
+        let mut prospective = run.clone();
+        prospective
+            .provider_exchange_records
+            .push(reference.clone());
+        let response_commitment =
+            derive_provider_storage_commitment_for_run(&workspace, &prospective)
+                .unwrap()
+                .expect("prospective response commitment");
+        let current_run_size = std::fs::metadata(workspace.run_file()).unwrap().len();
+        let mut request_tail_bytes = serde_json::to_vec_pretty(&prospective).unwrap();
+        request_tail_bytes.push(b'\n');
+        let expected = (request_tail_bytes.len() as u64).max(
+            (request_tail_bytes.len() as u64)
+                + response_commitment.permanent_bytes
+                + response_commitment.transient_bytes
+                - current_run_size,
+        );
+        assert_eq!(staged_commitment.permanent_bytes, 0);
+        assert_eq!(staged_commitment.transient_bytes, expected);
+        assert_eq!(staged_commitment.transient_entries, 3);
+        let current =
+            crate::artifact_storage::published_run_bytes(workspace.run_directory()).unwrap();
+        let target = crate::artifact_storage::RUN_TREE_BYTE_CAP - 32 * 1024;
+        let mut remaining = target.checked_sub(current).unwrap();
+        let mut index = 0;
+        while remaining > 0 {
+            let size = remaining.min(2 * 1024 * 1024);
+            let path = workspace
+                .run_directory()
+                .join("artifacts")
+                .join(format!("adoption-filler-{index:02}.bin"));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            file.set_len(size).unwrap();
+            remaining -= size;
+            index += 1;
+        }
+
+        let unrelated = crate::immutable_artifact::publish_create_only(
+            workspace.run_directory(),
+            "artifacts/unrelated-after-staged-request.json",
+            b"x",
+        )
+        .expect_err("an unrelated cooperative writer cannot invade a staged request commitment");
+        assert!(unrelated.to_string().contains("commitment"), "{unrelated}");
+
+        let error = persist_provider_exchange_record_reference(&workspace, reference)
+            .expect_err("staged request adoption must prove the full response tail");
+        assert!(error.to_string().contains("commitment"), "{error}");
+        assert!(state::load_run(&workspace)
+            .unwrap()
+            .provider_exchange_records
+            .is_empty());
+    }
+
     fn awaiting_human_review_run(workspace: &LoopWorkspace) -> LoopRun {
         let mut run = state::create_run(state::NewLoopRun {
             run_id: workspace
@@ -2716,9 +4146,10 @@ mod tests {
             kind: ProviderExchangeKind::Initial,
             context_round: None,
         };
-        let request =
-            write_provider_exchange_request(workspace.run_directory(), &coordinates, b"late")
-                .unwrap();
+        let request = ArtifactReference {
+            path: request_path(&coordinates),
+            digest: digest_bytes(b"late"),
+        };
         let record = ProviderExchangeRecord {
             schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
             run_id: run.run_id.clone(),
@@ -2735,7 +4166,7 @@ mod tests {
             expansion: None,
             outcome: None,
         };
-        let reference = stage_provider_exchange_record(workspace.run_directory(), &record).unwrap();
+        let reference = record_reference(&record, canonical_sha256_digest(&record).unwrap());
         let error = persist_provider_exchange_record_reference(&workspace, reference.clone())
             .expect_err("late provider suffix must remain unreferenced");
         assert!(error.to_string().contains("frozen"), "{error}");
@@ -3103,12 +4534,10 @@ mod tests {
             kind: ProviderExchangeKind::Initial,
             context_round: None,
         };
-        let request = write_provider_exchange_request(
-            workspace.run_directory(),
-            &coordinates,
-            b"unauthenticated output review",
-        )
-        .expect("request audit");
+        let request = ArtifactReference {
+            path: request_path(&coordinates),
+            digest: digest_bytes(b"unauthenticated output review"),
+        };
         let record = ProviderExchangeRecord {
             schema_version: PROVIDER_EXCHANGE_SCHEMA_VERSION,
             run_id: run.run_id.clone(),
@@ -3125,8 +4554,7 @@ mod tests {
             expansion: None,
             outcome: None,
         };
-        let reference =
-            stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage");
+        let reference = record_reference(&record, canonical_sha256_digest(&record).unwrap());
         let before = fs::read(workspace.run_file()).expect("run bytes");
 
         let error = persist_provider_exchange_record_reference(&workspace, reference.clone())
@@ -3141,10 +4569,7 @@ mod tests {
         assert_eq!(fs::read(workspace.run_file()).unwrap(), before);
         let current = state::load_run(&workspace).expect("current run");
         assert!(current.provider_exchange_records.is_empty());
-        assert_eq!(
-            classify_provider_exchange_record(&workspace, &current, &reference).unwrap(),
-            ProviderExchangeRecordState::Staged
-        );
+        assert!(!workspace.run_directory().join(&reference.path).exists());
     }
 
     #[test]

@@ -204,24 +204,9 @@ fn exchange_artifacts_and_records_are_create_only_and_canonical() {
 
     let request =
         write_provider_exchange_request(&run_dir, &coordinates, b"request").expect("request");
-    let response = write_provider_exchange_response(
-        &run_dir,
-        &coordinates,
-        &response_audit(ProviderExchangeOutcome::NeedsContext),
-    )
-    .expect("response");
     assert!(request
         .path
         .contains("attempt-001.exchange-001.initial.request"));
-    assert!(response
-        .path
-        .contains("attempt-001.exchange-001.initial.response"));
-    assert_eq!(
-        write_provider_exchange_request(&run_dir, &coordinates, b"request").expect("replay"),
-        request
-    );
-    assert!(write_provider_exchange_request(&run_dir, &coordinates, b"different").is_err());
-
     let record = request_record(1, None, request.clone(), None);
     let staged = stage_provider_exchange_record(&run_dir, &record).expect("stage record");
     let canonical = canonical_json_bytes(&record).expect("canonical");
@@ -241,6 +226,24 @@ fn exchange_artifacts_and_records_are_create_only_and_canonical() {
         load_provider_exchange_record(&run_dir, &staged).expect("verified record"),
         record
     );
+
+    let workspace = seaf_loop::LoopWorkspace::open(temp.path(), "run").expect("workspace");
+    persist_provider_exchange_record_reference(&workspace, staged.clone())
+        .expect("activate request record");
+    assert_eq!(
+        write_provider_exchange_request(&run_dir, &coordinates, b"request").expect("replay"),
+        request
+    );
+    assert!(write_provider_exchange_request(&run_dir, &coordinates, b"different").is_err());
+    let response = write_provider_exchange_response(
+        &run_dir,
+        &coordinates,
+        &response_audit(ProviderExchangeOutcome::NeedsContext),
+    )
+    .expect("response");
+    assert!(response
+        .path
+        .contains("attempt-001.exchange-001.initial.response"));
 
     let response_record = response_record(staged.digest.clone(), request, response);
     stage_provider_exchange_record(&run_dir, &response_record).expect("response record");
@@ -421,9 +424,14 @@ fn append_transitions_follow_the_prior_parsed_outcome() {
         expansion: None,
         outcome: None,
     };
-    let wrong_reference =
-        stage_provider_exchange_record(workspace.run_directory(), &wrong_record).expect("stage");
-    assert!(persist_provider_exchange_record_reference(&workspace, wrong_reference).is_err());
+    let wrong_reference = write_staged_record_fixture(workspace.run_directory(), &wrong_record);
+    assert!(
+        persist_provider_exchange_record_reference(&workspace, wrong_reference.clone()).is_err()
+    );
+    fs::remove_file(workspace.run_directory().join(wrong_reference.path))
+        .expect("remove rejected staged record fixture");
+    fs::remove_file(workspace.run_directory().join(wrong_record.request.path))
+        .expect("remove rejected request fixture");
 
     let retry = coordinates(2);
     let retry_request =
@@ -668,8 +676,7 @@ fn invalid_response_allows_only_json_repair_and_terminal_outcomes_allow_no_next_
         None,
     );
     let second_reference =
-        stage_provider_exchange_record(invalid_workspace.run_directory(), &second_record)
-            .expect("stage second repair");
+        write_staged_record_fixture(invalid_workspace.run_directory(), &second_record);
     assert!(
         persist_provider_exchange_record_reference(&invalid_workspace, second_reference).is_err(),
         "an invalid repair response must not permit another repair"
@@ -702,8 +709,7 @@ fn invalid_response_allows_only_json_repair_and_terminal_outcomes_allow_no_next_
         outcome: None,
     };
     let next_reference =
-        stage_provider_exchange_record(terminal_workspace.run_directory(), &next_record)
-            .expect("stage next");
+        write_staged_record_fixture(terminal_workspace.run_directory(), &next_record);
     assert!(
         persist_provider_exchange_record_reference(&terminal_workspace, next_reference).is_err()
     );
@@ -768,8 +774,7 @@ fn only_malformed_json_is_eligible_for_json_repair() {
         )
         .expect("repair request");
         let record = repair_request_record(repair, head.digest, request, None);
-        let reference = stage_provider_exchange_record(workspace.run_directory(), &record)
-            .expect("stage repair candidate");
+        let reference = write_staged_record_fixture(workspace.run_directory(), &record);
 
         assert!(
             persist_provider_exchange_record_reference(&workspace, reference).is_err(),
@@ -799,8 +804,7 @@ fn repair_after_context_retry_must_inherit_the_exact_round_and_expansion_authori
             .expect("repair request");
     let missing_record = repair_request_record(missing, missing_head.digest, missing_request, None);
     let missing_reference =
-        stage_provider_exchange_record(missing_workspace.run_directory(), &missing_record)
-            .expect("JSON repair may structurally have no context authority");
+        write_staged_record_fixture(missing_workspace.run_directory(), &missing_record);
     assert!(
         persist_provider_exchange_record_reference(&missing_workspace, missing_reference).is_err(),
         "repair after a context retry must not drop its context authority"
@@ -833,8 +837,7 @@ fn repair_after_context_retry_must_inherit_the_exact_round_and_expansion_authori
         Some(substitute_expansion),
     );
     let substituted_reference =
-        stage_provider_exchange_record(substituted_workspace.run_directory(), &substituted_record)
-            .expect("structurally paired repair context");
+        write_staged_record_fixture(substituted_workspace.run_directory(), &substituted_record);
     assert!(
         persist_provider_exchange_record_reference(&substituted_workspace, substituted_reference)
             .is_err(),
@@ -961,11 +964,8 @@ fn response_outcome_is_derived_from_the_canonical_audit_not_the_record_claim() {
             expansion: None,
             outcome: None,
         };
-        let request_reference =
-            stage_provider_exchange_record(&run_dir, &request_record).expect("request record");
-        let response =
-            write_provider_exchange_response(&run_dir, &coordinates, &response_audit(actual))
-                .expect("response audit");
+        let request_reference = write_staged_record_fixture(&run_dir, &request_record);
+        let response = write_response_audit_fixture(&run_dir, &request, &response_audit(actual));
         let response_record = ProviderExchangeRecord {
             schema_version: 1,
             run_id: coordinates.run_id,
@@ -1001,6 +1001,9 @@ fn loading_response_record_rejects_a_tampered_canonical_response_audit() {
     let request_record = request_record(1, None, request.clone(), None);
     let request_reference =
         stage_provider_exchange_record(&run_dir, &request_record).expect("request record");
+    let workspace = seaf_loop::LoopWorkspace::open(temp.path(), "run").expect("workspace");
+    persist_provider_exchange_record_reference(&workspace, request_reference.clone())
+        .expect("activate request record");
     let response = write_provider_exchange_response(
         &run_dir,
         &coordinates,
@@ -1248,9 +1251,7 @@ fn assert_wrong_reviewer_decision_is_terminal(
         expansion: None,
         outcome: None,
     };
-    let request_reference =
-        stage_provider_exchange_record(workspace.run_directory(), &request_record)
-            .expect("stage request");
+    let request_reference = write_staged_record_fixture(workspace.run_directory(), &request_record);
     persist_provider_exchange_record_reference(&workspace, request_reference.clone())
         .expect("append request");
     let audit = ProviderExchangeResponseAudit::ModelResponse {
@@ -1306,9 +1307,7 @@ fn assert_wrong_reviewer_decision_is_terminal(
             .expect("repair request");
     let repair_record =
         repair_request_record(repair, response_reference.digest, repair_request, None);
-    let repair_reference =
-        stage_provider_exchange_record(workspace.run_directory(), &repair_record)
-            .expect("stage repair candidate");
+    let repair_reference = write_staged_record_fixture(workspace.run_directory(), &repair_record);
     assert!(
         persist_provider_exchange_record_reference(&workspace, repair_reference).is_err(),
         "wrong reviewer decision is terminal and not repairable"
@@ -1520,22 +1519,81 @@ fn staged_request_for_group(
         expansion: None,
         outcome: None,
     };
-    stage_provider_exchange_record(workspace.run_directory(), &record).expect("stage new group")
+    write_staged_record_fixture(workspace.run_directory(), &record)
+}
+
+fn write_staged_record_fixture(
+    run_directory: &Path,
+    record: &ProviderExchangeRecord,
+) -> ProviderExchangeRecordReference {
+    assert_eq!(record.phase, ProviderExchangePhase::Request);
+    let request_name = record
+        .request
+        .path
+        .strip_prefix("prompts/")
+        .and_then(|path| path.strip_suffix(".request.md"))
+        .expect("canonical staged request path");
+    let reference = ProviderExchangeRecordReference {
+        run_id: record.run_id.clone(),
+        step: record.step,
+        role: record.role,
+        step_attempt: record.step_attempt,
+        exchange_index: record.exchange_index,
+        kind: record.kind,
+        context_round: record.context_round,
+        phase: record.phase,
+        path: format!("artifacts/{request_name}.request.record.json"),
+        digest: canonical_sha256_digest(record).expect("record digest"),
+    };
+    write_private_fixture_file(
+        run_directory.join(&reference.path),
+        &canonical_json_bytes(record).expect("canonical record"),
+    );
+    reference
+}
+
+fn write_response_audit_fixture(
+    run_directory: &Path,
+    request: &ArtifactReference,
+    audit: &ProviderExchangeResponseAudit,
+) -> ArtifactReference {
+    let request_name = request
+        .path
+        .strip_prefix("prompts/")
+        .and_then(|path| path.strip_suffix(".request.md"))
+        .expect("canonical request path");
+    let bytes = canonical_json_bytes(audit).expect("canonical response audit");
+    let reference = ArtifactReference {
+        path: format!("responses/{request_name}.response.json"),
+        digest: hex::encode(sha2::Sha256::digest(&bytes)),
+    };
+    write_private_fixture_file(run_directory.join(&reference.path), &bytes);
+    reference
 }
 
 #[cfg(unix)]
 fn create_private_run_layout(run_dir: &Path) {
-    use std::os::unix::fs::DirBuilderExt;
-
-    for path in [
-        run_dir.to_path_buf(),
-        run_dir.join("prompts"),
-        run_dir.join("responses"),
-        run_dir.join("artifacts"),
-    ] {
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700).create(path).unwrap();
-    }
+    let parent = run_dir.parent().expect("run parent");
+    let run_id = run_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("run id");
+    let workspace = seaf_loop::LoopWorkspace::create(parent, run_id).expect("workspace");
+    let run = seaf_loop::state::create_run(seaf_loop::state::NewLoopRun {
+        run_id: "exchange-run".to_string(),
+        ticket_id: "T-1".to_string(),
+        goal_id: "G-1".to_string(),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        input_digests: LoopInputDigests {
+            ticket: digest('a'),
+            policy: digest('b'),
+            config: digest('c'),
+            repository: digest('d'),
+            eval_config: None,
+        },
+    });
+    seaf_loop::state::save_run(&workspace, &run).expect("save run");
 }
 
 #[cfg(not(unix))]

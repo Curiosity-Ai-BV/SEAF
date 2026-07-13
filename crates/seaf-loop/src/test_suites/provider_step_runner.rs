@@ -2,7 +2,8 @@ use std::path::Path;
 
 use seaf_core::{
     canonical_json_bytes, canonical_sha256_digest, LoopInputDigests, LoopRun, LoopStatus,
-    LoopStepName, LoopStepStatus, Policy, TicketContext, TicketSpec, TicketStatus,
+    LoopStepName, LoopStepStatus, Policy, ProviderExchangeOutcome, ProviderExchangePhase,
+    ProviderExchangeRecord, TicketContext, TicketSpec, TicketStatus,
 };
 use seaf_loop::{
     CommandOutput, ContextLimits, ContextManifest, ContextPackRequest, LoopRunner,
@@ -10,7 +11,7 @@ use seaf_loop::{
     PolicyDecision, ProviderPatchGateConfig, ProviderStepRunner, Role, StepRunner,
     UNTRUSTED_CONTEXT_MARKER,
 };
-use seaf_models::{FakeProvider, ModelError, ModelResponse};
+use seaf_models::{FakeProvider, ModelError, ModelProvider, ModelRequest, ModelResponse};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -1190,6 +1191,472 @@ fn provider_step_runner_persists_timeout_response_artifact_when_loop_step_fails(
     assert_file_contains(&response_path, "provider request failed for Research");
     assert_file_contains(&response_path, "\"kind\": \"timeout\"");
     assert_file_contains(&response_path, "research model timed out");
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_request_capacity_denial_happens_before_exchange_activation_or_provider_call() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let ticket = ticket();
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "provider-capacity-denial",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+    let run_directory = runs_root.join("provider-capacity-denial");
+    let current = crate::artifact_storage::published_run_bytes(&run_directory).unwrap();
+    let target = crate::artifact_storage::RUN_TREE_BYTE_CAP - 32 * 1024;
+    let mut remaining = target.checked_sub(current).expect("room for filler");
+    let mut index = 0;
+    while remaining > 0 {
+        let size = remaining.min(2 * 1024 * 1024);
+        let path = run_directory
+            .join("artifacts")
+            .join(format!("capacity-filler-{index:02}.bin"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create filler");
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .expect("private filler");
+        file.set_len(size).expect("size filler");
+        remaining -= size;
+        index += 1;
+    }
+
+    let error = loop_runner
+        .run_next_step()
+        .expect_err("insufficient committed capacity must refuse the provider step");
+    assert!(error.to_string().contains("capacity") || error.to_string().contains("cap"), "{error}");
+    assert!(provider.requests().expect("provider requests").is_empty());
+    let persisted = read_run(&run_directory);
+    assert_eq!(persisted.status, LoopStatus::Running);
+    assert_eq!(
+        persisted
+            .steps
+            .iter()
+            .find(|step| step.name == LoopStepName::Research)
+            .expect("research step")
+            .status,
+        LoopStepStatus::Running
+    );
+    assert!(persisted.provider_exchange_records.is_empty());
+    assert!(!run_directory
+        .join("prompts/01-research.attempt-001.exchange-001.initial.request.md")
+        .exists());
+    assert!(!run_directory
+        .join("artifacts/01-research.attempt-001.exchange-001.initial.request.record.json")
+        .exists());
+}
+
+#[test]
+fn response_audit_appearing_before_call_reauthentication_prevents_provider_side_effects() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let observer = |workspace: &seaf_loop::LoopWorkspace,
+                    _run: &LoopRun,
+                    coordinates: &seaf_loop::ProviderExchangeCoordinates,
+                    _request: &seaf_core::ArtifactReference| {
+        seaf_loop::write_provider_exchange_response(
+            workspace.run_directory(),
+            coordinates,
+            &seaf_loop::ProviderExchangeResponseAudit::ModelResponse {
+                response: model_response(fixture("research.valid.json")),
+            },
+        )
+        .expect("inject canonical response audit before reauthentication");
+    };
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone())
+            .with_before_provider_reauthentication_observer(&observer);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "response-audit-pre-call-race",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    let error = loop_runner
+        .run_next_step()
+        .expect_err("a raced response audit must stop before provider invocation");
+    assert!(error.to_string().contains("provider call"), "{error}");
+    assert!(provider.requests().expect("provider requests").is_empty());
+    let persisted = read_run(&runs_root.join("response-audit-pre-call-race"));
+    assert_eq!(persisted.provider_exchange_records.len(), 1);
+    assert_eq!(
+        persisted.provider_exchange_records[0].phase,
+        ProviderExchangePhase::Request
+    );
+    assert_ne!(persisted.status, LoopStatus::Completed);
+    assert_ne!(persisted.status, LoopStatus::Failed);
+}
+
+#[test]
+fn staged_response_record_appearing_before_call_reauthentication_prevents_provider_side_effects() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let provider = FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let observer = |workspace: &seaf_loop::LoopWorkspace,
+                    _run: &LoopRun,
+                    coordinates: &seaf_loop::ProviderExchangeCoordinates,
+                    request: &seaf_core::ArtifactReference| {
+        let response = seaf_loop::write_provider_exchange_response(
+            workspace.run_directory(),
+            coordinates,
+            &seaf_loop::ProviderExchangeResponseAudit::ModelResponse {
+                response: model_response(fixture("research.valid.json")),
+            },
+        )
+        .expect("inject canonical response audit before reauthentication");
+        let record = ProviderExchangeRecord {
+            schema_version: seaf_loop::PROVIDER_EXCHANGE_SCHEMA_VERSION,
+            run_id: coordinates.run_id.clone(),
+            step: coordinates.step,
+            role: coordinates.role,
+            step_attempt: coordinates.step_attempt,
+            exchange_index: coordinates.exchange_index,
+            kind: coordinates.kind,
+            context_round: coordinates.context_round,
+            phase: ProviderExchangePhase::Response,
+            previous_record_digest: None,
+            request: request.clone(),
+            response: Some(response),
+            expansion: None,
+            outcome: Some(ProviderExchangeOutcome::Passed),
+        };
+        let request_head = read_run(workspace.run_directory())
+            .provider_exchange_records
+            .last()
+            .expect("request head")
+            .digest
+            .clone();
+        let mut record = record;
+        record.previous_record_digest = Some(request_head);
+        seaf_loop::stage_provider_exchange_record(workspace.run_directory(), &record)
+            .expect("inject linked staged response record before reauthentication");
+    };
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone())
+            .with_before_provider_reauthentication_observer(&observer);
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "response-record-pre-call-race",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    let error = loop_runner
+        .run_next_step()
+        .expect_err("a raced staged response must stop before provider invocation");
+    assert!(error.to_string().contains("provider call"), "{error}");
+    assert!(provider.requests().expect("provider requests").is_empty());
+    let persisted = read_run(&runs_root.join("response-record-pre-call-race"));
+    assert_eq!(persisted.provider_exchange_records.len(), 1);
+    assert_eq!(
+        persisted.provider_exchange_records[0].phase,
+        ProviderExchangePhase::Request
+    );
+    assert_ne!(persisted.status, LoopStatus::Completed);
+    assert_ne!(persisted.status, LoopStatus::Failed);
+}
+
+struct PanicAfterRequestProvider;
+
+impl ModelProvider for PanicAfterRequestProvider {
+    fn complete(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        panic!("injected crash after durable request tail")
+    }
+}
+
+struct RunLockCheckingProvider {
+    run_directory: std::path::PathBuf,
+    calls: std::sync::Mutex<usize>,
+}
+
+impl ModelProvider for RunLockCheckingProvider {
+    fn complete(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let guard = crate::run_persistence::RunMutationGuard::acquire(&self.run_directory)
+            .expect("provider callback must run after the run mutation lock is released");
+        guard.unlock().expect("release callback proof lock");
+        *self.calls.lock().expect("calls lock") += 1;
+        Ok(model_response(fixture("research.valid.json")))
+    }
+}
+
+#[test]
+fn provider_invocation_does_not_hold_the_run_mutation_lock() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "provider-call-lock-release";
+    let ticket = ticket();
+    let provider = RunLockCheckingProvider {
+        run_directory: runs_root.join(run_id),
+        calls: std::sync::Mutex::new(0),
+    };
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            run_id,
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    loop_runner
+        .run_next_step()
+        .expect("provider executes after the run lock is released");
+    assert_eq!(*provider.calls.lock().expect("calls lock"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn request_only_crash_replays_exact_request_once_when_commitment_remains_sufficient() {
+    use std::{os::unix::fs::PermissionsExt, sync::{Arc, Barrier}, thread};
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let crash_provider = PanicAfterRequestProvider;
+    let mut crash_step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&crash_provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "request-only-replay",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut crash_step_runner,
+    )
+    .expect("start loop");
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = loop_runner.run_next_step();
+    }));
+    assert!(crashed.is_err());
+    drop(loop_runner);
+    drop(crash_step_runner);
+    let run_directory = runs_root.join("request-only-replay");
+    assert_eq!(
+        read_run(&run_directory)
+            .provider_exchange_records
+            .last()
+            .expect("request tail")
+            .phase,
+        seaf_core::ProviderExchangePhase::Request
+    );
+    let commitment = crate::provider_exchange::derive_active_provider_storage_commitment(
+        &run_directory,
+    )
+    .unwrap()
+    .expect("request-tail commitment");
+    let current = crate::artifact_storage::published_run_bytes(&run_directory).unwrap();
+    let reserved = commitment.permanent_bytes + commitment.transient_bytes;
+    let resume_log_slack = 4 * 1024;
+    let mut remaining =
+        (crate::artifact_storage::RUN_TREE_BYTE_CAP - reserved - resume_log_slack) - current;
+    let mut index = 0;
+    while remaining > 0 {
+        let size = remaining.min(2 * 1024 * 1024);
+        let path = run_directory
+            .join("artifacts")
+            .join(format!("exact-replay-filler-{index:02}.bin"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        file.set_len(size).unwrap();
+        remaining -= size;
+        index += 1;
+    }
+    let barrier = Arc::new(Barrier::new(3));
+    let mut writers = Vec::new();
+    for name in ["concurrent-unrelated-a", "concurrent-unrelated-b"] {
+        let barrier = Arc::clone(&barrier);
+        let run_directory = run_directory.clone();
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            crate::immutable_artifact::publish_create_only(
+                &run_directory,
+                &format!("artifacts/{name}.json"),
+                &vec![b'x'; resume_log_slack as usize + 1],
+            )
+        }));
+    }
+    barrier.wait();
+    assert!(writers
+        .into_iter()
+        .all(|writer| writer.join().unwrap().is_err()));
+
+    let resume_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut resume_step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
+            .with_ticket(ticket);
+    let mut resumed = LoopRunner::resume(
+        &runs_root,
+        "request-only-replay",
+        &mut resume_step_runner,
+    )
+    .expect("resume request-only prefix");
+    resumed.run_next_step().expect("replay exact request once");
+    assert_eq!(resume_provider.requests().expect("provider requests").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn request_only_replay_with_lost_headroom_makes_zero_provider_calls() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let ticket = ticket();
+    let crash_provider = PanicAfterRequestProvider;
+    let mut crash_step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&crash_provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "request-only-insufficient-replay",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut crash_step_runner,
+    )
+    .unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = loop_runner.run_next_step();
+    }));
+    drop(loop_runner);
+    drop(crash_step_runner);
+    let run_directory = runs_root.join("request-only-insufficient-replay");
+    let current = crate::artifact_storage::published_run_bytes(&run_directory).unwrap();
+    let mut remaining = (crate::artifact_storage::RUN_TREE_BYTE_CAP - 32 * 1024) - current;
+    let mut index = 0;
+    while remaining > 0 {
+        let size = remaining.min(2 * 1024 * 1024);
+        let path = run_directory
+            .join("artifacts")
+            .join(format!("replay-filler-{index:02}.bin"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        file.set_len(size).unwrap();
+        remaining -= size;
+        index += 1;
+    }
+
+    let resume_provider =
+        FakeProvider::new(vec![Ok(model_response(fixture("research.valid.json")))]);
+    let mut resume_step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&resume_provider, "fake-model", 30_000)
+            .with_ticket(ticket);
+    let error = match LoopRunner::resume(
+        &runs_root,
+        "request-only-insufficient-replay",
+        &mut resume_step_runner,
+    ) {
+        Ok(mut resumed) => resumed
+            .run_next_step()
+            .expect_err("lost commitment headroom must block replay"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cap") || error.to_string().contains("commitment"), "{error}");
+    assert!(resume_provider.requests().expect("provider requests").is_empty());
+}
+
+#[test]
+fn oversized_provider_success_becomes_fixed_audited_failure_without_raw_bytes_or_digest() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let sentinel = format!("RAW_PROVIDER_SENTINEL_{}", "x".repeat(1024 * 1024 + 128));
+    let raw_digest = sha256(sentinel.as_bytes());
+    let provider = FakeProvider::new(vec![Ok(model_response(&sentinel))]);
+    let ticket = ticket();
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(ticket.clone());
+    let mut loop_runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &runs_root,
+            "oversized-provider-success",
+            &ticket,
+            "fake-provider",
+            "fake-model",
+            test_input_digests_for(&ticket),
+        ),
+        &mut step_runner,
+    )
+    .expect("start loop");
+
+    assert!(loop_runner
+        .run_next_step()
+        .expect("oversize conversion is a durable terminal provider failure"));
+    assert_eq!(provider.requests().expect("provider requests").len(), 1);
+    let run_directory = runs_root.join("oversized-provider-success");
+    let persisted = read_run(&run_directory);
+    assert_eq!(persisted.status, LoopStatus::Failed);
+    let response_audit = std::fs::read_to_string(
+        run_directory
+            .join("responses/01-research.attempt-001.exchange-001.initial.response.json"),
+    )
+    .expect("fixed response audit");
+    assert!(response_audit.contains("provider_response_audit_too_large"));
+    for (_, bytes) in read_tree_bytes(&run_directory) {
+        let rendered = String::from_utf8_lossy(&bytes);
+        assert!(!rendered.contains("RAW_PROVIDER_SENTINEL_"));
+        assert!(!rendered.contains(&raw_digest));
+    }
 }
 
 #[test]

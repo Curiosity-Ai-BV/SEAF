@@ -2123,3 +2123,49 @@ policy 13, provider-candidate 53, provider-exchange 22, isolation 1, staged
 authority 2, role response 13, state 38, Testing evidence 8, models 7, Ollama 8,
 and all doc tests. M1-11b1 is accepted; M1-11b2 remains active and M1-11c
 remains pending.
+
+## 2026-07-13 implementation | M1-11b2a provider commitments
+
+Split M1-11b2 into provider-side M1-11b2a and evaluation-side M1-11b2b. The
+provider slice now derives a byte-and-entry commitment from an authenticated
+request ledger tail or uniquely adoptable staged request record. Fresh request
+audit, request record, and ledger activation share one run guard and collective
+preflight. Physical temporary peaks are checked separately from post-operation
+steady usage plus missing response audit, response record, full future
+`run.json` replacement bytes at the atomic coexistence peak, permanent names,
+and one transient name.
+
+Every provider invocation reauthenticates that commitment under the run guard,
+releases it, and only then calls the provider. Response audit, response record,
+and response-tail run publication consume their typed slots; unrelated and
+concurrent publishers retain the remainder. Request-only replay, staged
+request/response adoption, the full intended `run.json` replacement at its
+atomic coexistence peak, exact retry, malformed
+prefixes, and hard-linked mutable authority fail closed or preserve the same
+derivable commitment without a reservation file.
+
+Canonical provider audits are measured with a bounded cap-plus-one writer
+before raw hashing or publication. Exact 1 MiB remains unchanged. Oversized
+success and error results become one fixed non-retryable provider failure; raw
+markers and their SHA-256 digests do not enter the run tree.
+
+Witnessed RED against detached baseline `ac188e8`: insufficient fresh capacity
+continued the provider step, and a 1,048,881-byte audit failed as an unsafe
+durable write. Review then exposed staged-request underreservation, a pre-call
+response race, partial-scaffold namespace incompatibility, and integration
+fixtures that routed invalid evidence through production staging. The accepted
+implementation rejects exact/one-short capacity before publication, refuses
+raced audit/record prefixes with zero provider calls, preserves empty-ledger
+scaffolding while active authority fails closed, and keeps invalid fixtures out
+of production staging.
+
+Final independent specification, quality, and test-evidence reviews approve the
+slice with no findings. The controller workspace gate passes with CLI 138, core
+51, local runtime 5, loop library 215, bench 4, candidate 40, context 22, eval
+engine 7, eval report 3, final authority 2, patch 7, policy 13,
+provider-candidate 53, provider-exchange 22, isolation 1, staged authority 2,
+role response 13, state 38, Testing evidence 8, models 7, Ollama 8, and all doc
+tests. Strict Clippy, formatting, Linux `seaf-loop` target check, TypeScript
+format/lint/typecheck/test/build (8 tests), and diff hygiene pass. M1-11b2a is
+accepted; evaluation-side M1-11b2b is active and parent M1-11b2 remains
+incomplete.
