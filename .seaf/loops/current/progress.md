@@ -52,8 +52,8 @@
 
 - [x] M2-01: Generic project initialization.
 - [x] M2-02: Project doctor.
-- [ ] M2-03: Package metadata and version identity (active).
-- [ ] M2-04: Release artifact workflow.
+- [x] M2-03: Package metadata and version identity.
+- [ ] M2-04: Release artifact workflow (active).
 - [ ] M2-05: Human-authorized tagged prerelease.
 - [ ] M2-06: Packaged external golden path.
 - [ ] M2-07: Executed Ollama acceptance.
@@ -70,11 +70,16 @@
 ## Current Gate
 
 Milestone 1, including M1-12 interruption recovery acceptance, is complete.
-M2-01 generic project initialization and M2-02 project doctor are accepted.
-M2-03 package metadata and version identity is active. The accepted doctor
-slice covers the absolute/capped local Ollama transport, diagnostic-only
-candidate planning, loop-compatible ticket/config/policy authority, fake-option
-and model-check compatibility, and complete report/no-mutation proof.
+M2-01 generic project initialization, M2-02 project doctor, and M2-03 package
+identity are accepted. M2-04 release artifact workflow is active. The accepted
+package gate proves exact version/private metadata, four pristine local package
+archives, warning-free MIT notices, external extracted-CLI install, and exact
+version/info/init/commit/fake-doctor smoke. Its tracked-input, archive inventory,
+size/type, Git, Cargo-config, and wrapper boundaries pass their negative guards.
+The accepted doctor slice covers the absolute/capped local Ollama transport,
+diagnostic-only candidate planning, loop-compatible ticket/config/policy
+authority, fake-option and model-check compatibility, and complete report/no-
+mutation proof.
 Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
@@ -229,7 +234,8 @@ claim. Independent specification and quality re-reviews approve M1-12 with no
 open findings. The controller's final gate passed all 14 exact acceptance
 tests, workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-M2-01 and M2-02 are accepted; M2-03 is active. Compatibility handoff is recorded in
+M2-01 through M2-03 are accepted; M2-04 is active.
+Compatibility handoff is recorded in
 `docs/preview-compatibility-handoff.md` for M2-03 and M3-05.
 The documented complete promotion path requires a clean checkout/worktree. The
 source-workspace gate currently supports macOS/Linux only: CI runs it on Ubuntu
@@ -241,9 +247,11 @@ before mutation; chooses exact Rust, Node, hybrid, or Git fallback checks; and
 keeps provider selection on the CLI. Seven focused tests pass, including
 byte-exact late-conflict/retry and symlink refusal, and all four generated evals
 execute successfully. Core 52/52, CLI 148/148, workspace check, strict owning-
-crate Clippy, formatting, and diff hygiene pass. Doctor, packaging, releases,
-and external golden-path acceptance remain pending. The controller's full gate
+crate Clippy, formatting, and diff hygiene pass. Release artifacts and external
+golden-path acceptance remain pending. The controller's full gate
 passed workspace check, strict all-target/all-feature Clippy, all pinned-pnpm
 SDK gates, and the complete locked serial Rust workspace suite. M2-02 then
 passed independent specification and quality review plus its complete focused
-and full controller gates. M2-03 is active.
+and full controller gates. M2-03 passed its package-readiness gate, independent
+specification and quality reviews, and the complete controller matrix. M2-04 is
+active.

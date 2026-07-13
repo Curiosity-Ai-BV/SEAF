@@ -409,8 +409,11 @@ source-workspace boundary above and runs in Ubuntu CI. Independent specification
 and quality reviews approved the corrected fault coverage. The controller also
 passed workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-Milestone 1, M2-01 generic project initialization, and M2-02 project doctor are
-complete. M2-03 package metadata and version identity is active.
+Milestone 1 and M2-01 through M2-03 are complete. Package identity is private,
+exact, warning-free, and proven through pristine archives plus an external
+installed-CLI smoke. Independent specification and quality reviews approved the
+corrected package boundary, and the full controller gate passed. M2-04 release
+artifact workflow is active.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -446,8 +449,11 @@ The corrected transport uses one absolute deadline and a 1 MiB raw-response
 cap; diagnostic candidate planning is source-name-independent; explicit ticket,
 config, and policy behavior matches `loop run`; fake-only options fail offline;
 and complete snapshots prove project, Git, worktree, and candidate namespaces
-remain unchanged. The full Rust and SDK controller gates passed. M2-03 packaging
-identity is active; releases and the external golden path are not claimed.
+remain unchanged. The full Rust and SDK controller gates passed. M2-03 package
+identity is accepted after exact archive/install smoke, adversarial boundary
+guards, independent reviews, and the full controller matrix. M2-04 release
+artifact workflow is active; tagged publication and the external golden path are
+not claimed.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario

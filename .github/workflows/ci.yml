@@ -45,6 +45,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Milestone 1 source-workspace acceptance
         run: ./scripts/test-milestone-one-acceptance.sh
+      - name: Package readiness
+        run: ./scripts/test-package-readiness.sh
       - name: Cargo tests
         run: cargo test --locked --workspace
       - name: P2-012 schema fixture checks

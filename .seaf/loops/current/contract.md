@@ -44,24 +44,54 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M2-03 - Package metadata and version identity. Milestone 1, M2-01 generic
-project initialization, and M2-02 project doctor are accepted.
+M2-04 - Release artifact workflow. Milestone 1 and M2-01 through M2-03 are
+accepted. Status: active on 2026-07-13.
 
-Make the CLI identifiable and Cargo-packagable. Add `seaf --version`, complete
-the publishable Cargo metadata, make every packaged internal dependency
-versioned, add the repository license and changelog, and document the supported
-platform policy. The package and release notes must consume the Rust source-
-compatibility entries already recorded in
-`docs/preview-compatibility-handoff.md`.
+Build checksummed native CLI artifacts without creating a tag or publishing a
+GitHub Release. The binding prebuilt matrix is intentionally limited to
+`ubuntu-22.04` / `x86_64-unknown-linux-gnu` and `macos-15` /
+`aarch64-apple-darwin`; broader Linux, Intel macOS, Windows, musl, and cross-
+compiled targets remain unsupported until they have their own native evidence.
+The Cargo workspace version is authoritative, so version `0.1.0` requires the
+exact future tag `v0.1.0` and exact binary output `seaf 0.1.0`.
 
-Mandatory RED/GREEN evidence starts from the current missing version/package
-contract. Cargo package dry-runs must succeed for every publishable crate, and
-an installed-package smoke must invoke the packaged `seaf` binary and prove its
-version identity outside the source workspace. Verification includes the
-focused packaging checks plus the full repository gate matrix.
+Each native build produces exactly
+`seaf-v0.1.0-<target>.tar.gz`. The archive has one matching root directory and
+exactly four regular entries in stable order: `CHANGELOG.md`, `LICENSE`,
+`README.md`, and executable `seaf`. Normalize modes, owners, timestamps, USTAR
+metadata, and the gzip header so identical input bytes produce identical
+archives. Bound every input and output, reject unsafe archive entries before
+extraction, keep build/output/install roots outside the repository, and prove
+the repository status is unchanged.
 
-Keep this slice limited to package metadata, version identity, license,
-changelog, supported-platform documentation, packaging tests/scripts, and
-matching trackers. Do not add release artifact automation, checksums, tag or
-publication authority, external golden-path execution, or Ollama acceptance;
-those are M2-04 through M2-07.
+The aggregate release-assets directory contains exactly the two native archives
+and a newline-terminated `SHA256SUMS`. Its two lowercase SHA-256 lines use two
+spaces, basenames only, and lexical filename order. Assembly and verification
+must reject missing, extra, duplicate, renamed, path-bearing, malformed, or
+tampered inputs. A local native smoke extracts only after validation, installs
+the archive binary into a fresh external `bin`, and proves exact `--version` and
+`info` without resolving the source or Cargo target binary.
+
+Add a tag-push-only GitHub Actions workflow that hard-codes the two native
+runners, checks exact tag/version/ref/host authority, builds with locked Cargo,
+packages and smokes each artifact, assembles the exact checksum bundle, and
+uploads only short-lived immutable workflow artifacts. Use top-level
+`contents: read`, no secrets or deployment environment, checkout without
+persisted credentials, full-SHA action pins, and context values passed through
+environment variables. Do not grant write/OIDC/attestation permissions or add
+`workflow_dispatch`, `pull_request_target`, release API calls, tag creation, or
+publication. Ordinary CI runs the same native artifact contract locally but
+never takes tag or publication authority.
+
+Mandatory RED first proves the artifact scripts, workflow, documentation, and
+CI seam are absent. Focused GREEN proves deterministic packaging, exact
+inventory/modes/metadata, target/version refusal, aggregate checksum shape and
+tamper rejection, installed artifact identity, workflow formatting, and status
+preservation. Full repository gates remain required.
+
+Keep this slice limited to deterministic artifact construction, checksum
+assembly, tag-gated read-only workflow artifacts, native smoke coverage,
+release-artifact documentation, and matching trackers. Do not create or push a
+tag, create a GitHub Release, publish a registry package, sign/notarize, modify
+release-capsule domain commands, run the external golden path, or execute Ollama
+acceptance. Those authorities remain M2-05 through M2-07.

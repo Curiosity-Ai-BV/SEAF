@@ -41,6 +41,7 @@ docs/                  Architecture, threat model, agent loop, and roadmap.
 ```bash
 cargo test
 ./scripts/test-milestone-one-acceptance.sh
+./scripts/test-package-readiness.sh
 pnpm install
 pnpm build
 pnpm typecheck
@@ -48,24 +49,40 @@ pnpm typecheck
 
 ## CLI MVP
 
-### Bootstrap an existing project
+### Install the private CLI from a checkout
 
-Until packaged installation lands in M2-03, run the CLI from this source
-workspace while keeping the initialized project as the process working
-directory:
+SEAF requires the latest stable Rust toolchain. From a SEAF checkout, install
+the private CLI package and verify its exact identity:
 
 ```bash
-SEAF_MANIFEST="$PWD/Cargo.toml"
+rustup update stable
+cargo install --locked --path crates/seaf-cli
+seaf --version
+# seaf 0.1.0
+```
+
+Do **not** run `cargo install seaf-cli`: the package with that name on crates.io
+is an unrelated project. All SEAF workspace packages have registry publication
+disabled. Tagged SEAF binaries are planned but are not available yet.
+
+Current support is limited to macOS and Linux; see the
+[supported-platform policy](https://github.com/Curiosity-Ai-BV/SEAF/blob/main/docs/supported-platforms.md).
+
+### Bootstrap an existing project
+
+Run the installed CLI from the project you want SEAF to initialize:
+
+```bash
 mkdir -p /tmp/seaf-demo
 git -C /tmp/seaf-demo init
 cd /tmp/seaf-demo
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- init
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
-  ticket validate seaf.ticket.yaml
+seaf init
+seaf ticket validate seaf.ticket.yaml
 git add seaf.config.json seaf.policy.json seaf.evals.yaml seaf.ticket.yaml .seaf/.gitignore
 git -c user.name="SEAF Demo" -c user.email="demo@seaf.invalid" \
   commit -m "Initialize SEAF"
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- loop run \
+seaf doctor --provider fake
+seaf loop run \
   --ticket seaf.ticket.yaml --provider fake --run-id first-seaf-run --json
 ```
 
@@ -79,15 +96,12 @@ example files. Before starting a loop, run the
 
 ### Diagnose project readiness
 
-From the initialized project's Git worktree, use the source-workspace CLI to
-plan the same inputs, candidate workspace, and eval commands that a loop would
-use:
+From the initialized project's Git worktree, use the installed CLI to plan the
+same inputs, candidate workspace, and eval commands that a loop would use:
 
 ```bash
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
-  doctor --provider fake
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- \
-  doctor --provider fake --json
+seaf doctor --provider fake
+seaf doctor --provider fake --json
 ```
 
 Doctor reports eight ordered checks for Git, project inputs, the ticket,
@@ -100,9 +114,9 @@ readiness as blocked. Authorize the single bounded live health request
 explicitly:
 
 ```bash
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- doctor \
+seaf doctor \
   --provider ollama --model qwen2.5-coder:7b
-cargo run --manifest-path "$SEAF_MANIFEST" -p seaf-cli -- doctor \
+seaf doctor \
   --provider ollama --model qwen2.5-coder:7b --live-provider --timeout-ms 5000
 ```
 
@@ -118,24 +132,24 @@ report, and 2 for invalid command usage.
 ### Adaptive Notes example
 
 ```bash
-cargo run -p seaf-cli -- init --path /tmp/seaf-demo --template adaptive-notes
-cargo run -p seaf-cli -- goal validate examples/adaptive-notes/adaptive.yaml
-cargo run -p seaf-cli -- policy validate examples/adaptive-notes/seaf.policy.json
-cargo run -p seaf-cli -- task brief \
+seaf init --path /tmp/seaf-demo --template adaptive-notes
+seaf goal validate examples/adaptive-notes/adaptive.yaml
+seaf policy validate examples/adaptive-notes/seaf.policy.json
+seaf task brief \
   --goal examples/adaptive-notes/adaptive.yaml \
   --policy examples/adaptive-notes/seaf.policy.json
-cargo run -p seaf-cli -- eval run examples/adaptive-notes/seaf.evals.yaml \
+seaf eval run examples/adaptive-notes/seaf.evals.yaml \
   --goal-id reduce_time_to_first_note \
   --patch-id patch_local \
   --json
-cargo run -p seaf-cli -- release prepare \
+seaf release prepare \
   --app-id dev.seaf.adaptive-notes \
   --version 0.1.0 \
   --source-commit abc123 \
   --artifact examples/adaptive-notes/events/note-created.json \
   --eval-report .seaf/evals/eval-report.json \
   --rollback-plan rollback/0.0.9
-cargo run -p seaf-cli -- release verify examples/adaptive-notes/release-capsule.json
+seaf release verify examples/adaptive-notes/release-capsule.json
 ```
 
 ## SDK MVP
@@ -239,10 +253,10 @@ checkout, and leaves it unstaged and uncommitted for review. Crash retry adopts
 only that exact patch; it does not delete the frozen candidate or contact a
 model provider.
 
-Milestone 1 verifies the complete loop only when SEAF runs from this Cargo
-source workspace. Generic project initialization is now covered for Rust,
-Node, hybrid, and Git-only repositories, but project doctor, packaged
-installation, and the packaged external golden path remain Milestone 2 work.
-The current complete-loop acceptance gate supports macOS and Linux only: CI
-executes it on Ubuntu, and current local verification is on macOS. Windows and
-generic platform support are not claimed.
+Milestone 1 verifies the complete loop when SEAF runs from this Cargo source
+workspace. The package-readiness gate separately verifies an extracted CLI
+package outside the source tree through version, information, initialization,
+and fake-provider doctor checks. The packaged external golden path remains
+Milestone 2 work. The supported loop platforms are macOS and Linux: CI executes
+on Ubuntu, and current local verification is on macOS. Windows and untested
+architectures are not claimed.

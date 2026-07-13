@@ -48,7 +48,7 @@ slice rather than being silently waived.
 | Rust workspace | Shared contracts, state, loop runner, CLI, specs, or fixtures             | `cargo test --locked --workspace` plus Rust focused gate                                                                                                                                                                                                                                      |
 | TypeScript     | `packages/**`, root JS package metadata, or lockfile                      | `corepack pnpm format:check`; `corepack pnpm lint:packages`; `corepack pnpm typecheck`; `corepack pnpm test`; `corepack pnpm build`; `git diff --check`                                                                                                                                       |
 | Full repo      | Milestone exits, CI/release changes, external acceptance, or final review | `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --all-features -- -D warnings`; `cargo test --locked --workspace`; `corepack pnpm format:check`; `corepack pnpm lint:packages`; `corepack pnpm typecheck`; `corepack pnpm test`; `corepack pnpm build`; `git diff --check` |
-| Packaging      | Distribution or release slices                                            | `cargo package -p seaf-core --allow-dirty`; `cargo package -p seaf-models --allow-dirty`; `cargo package -p seaf-loop --allow-dirty`; `cargo package -p seaf-cli --allow-dirty`; packaged binary `--version`, `info`, and `doctor` smoke; Full repo gate                                      |
+| Packaging      | Distribution or release slices                                            | `./scripts/test-package-readiness.sh`; Full repo gate                                                                                                                                                                                                                                         |
 
 Release workflow slices additionally run their deterministic archive/checksum
 contract tests and Prettier over the workflow. External tag, GitHub release,
@@ -2157,7 +2157,8 @@ remaining integration and doc-test suite.
 
 ### M2-02 - Project Doctor
 
-Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 is active.
+Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 is
+accepted; M2-04 is active.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2229,11 +2230,12 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 is active.
+M2-03 is accepted; M2-04 is active.
 
 ### M2-03 - Package Metadata And Version Identity
 
-Status: active on 2026-07-13. Dependencies: M2-02 (accepted).
+Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 is
+active.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2241,16 +2243,29 @@ Objective: make the CLI identifiable and Cargo-packagable.
 
 Acceptance criteria:
 
-- `seaf --version`, complete Cargo metadata, versioned internal dependencies,
-  license, changelog, and supported-platform policy exist.
-- Cargo package dry-runs and an installed-package smoke pass.
+- Exact `seaf --version` reports version `0.1.0`. All five workspace crates
+  carry shared version/license/README/repository metadata, precise descriptions,
+  explicit `publish = false`, and version-plus-path requirements for internal
+  dependencies. Registry publication is disabled because crates.io already
+  owns an unrelated `seaf-cli`; renaming is outside this slice.
+- The distribution package set is `seaf-core`, `seaf-models`, `seaf-loop`, then
+  `seaf-cli`. `seaf-local-runtime` remains explicitly private and outside that
+  binding matrix. Verified Cargo package dry-runs and an installed-package smoke
+  use only the exact extracted local archives and run outside the source tree;
+  `--no-verify`, registry packages, and source-workspace path dependencies cannot
+  satisfy the gate.
+- The repository has an MIT license, changelog, and supported-platform policy.
+  Support is limited to macOS/Linux with latest stable Rust; no MSRV, Windows,
+  or untested architecture is claimed.
 - Package/release notes consume the Rust source-compatibility entries in
   `docs/preview-compatibility-handoff.md`.
 
 Likely seams: Cargo manifests, CLI metadata, license/changelog, and package
 smoke tests.
 
-RED/evidence: version and installed-package smoke fail before metadata changes.
+RED/evidence: top-level version exits 2, package metadata lacks descriptions and
+README, and CLI packaging exits 101 because internal path dependencies have no
+version requirement.
 
 Verification: Packaging and Full repo gates from the matrix.
 
@@ -2258,7 +2273,25 @@ Docs/tracker: install/version docs and M2-03 status.
 
 Commit boundary: packaging metadata and identity only.
 
+Acceptance checkpoint: exact CLI identity, private workspace metadata, precise
+descriptions, exact internal dependency requirements, MIT notices, changelog,
+and supported-platform policy are accepted. The deterministic package gate
+materializes only bounded known inputs, verifies exact regular-file archive
+inventories before extraction, keeps Git and Cargo configuration/wrappers out
+of the trusted path, preserves pristine Cargo verification, and installs the
+exact extracted CLI outside the source tree for version/info/init/commit/fake-
+doctor smoke. Negative guards cover untracked, symlink, oversized, traversal,
+repository-local temporary, ambient Git, Cargo-config, and wrapper cases.
+Independent specification and quality re-reviews approved the final corrected
+slice. The controller passed both package modes, exact version and metadata,
+latest-stable Rust format/strict Clippy, all SDK lint/typecheck/8 tests/build
+gates, and the complete locked serial Rust workspace: CLI 165/165, core 52/52,
+loop 286/286, provider/candidate 75/75, state 44/44, every remaining integration
+suite, and doc tests.
+
 ### M2-04 - Release Artifact Workflow
+
+Status: active on 2026-07-13. Dependencies: M2-03 (accepted).
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2270,6 +2303,20 @@ Acceptance criteria:
   checksums without publishing on ordinary CI.
 - Deterministic scripts/tests validate archive naming, contents, and checksums.
 - CI installs and smokes locally built release artifacts.
+- The native matrix is exactly Ubuntu 22.04 x86_64 GNU/Linux and macOS 15 Apple
+  Silicon. Version `0.1.0` requires exact future tag `v0.1.0`; the workspace
+  version, checked-out SHA, runner host, and binary identity must agree.
+- Each archive is exactly `seaf-v0.1.0-<target>.tar.gz` and contains only a
+  matching root with ordered regular `CHANGELOG.md`, `LICENSE`, `README.md`, and
+  executable `seaf`. Identical inputs produce byte-identical normalized
+  archives.
+- The aggregate directory contains only both archives and lexically sorted
+  `SHA256SUMS`. Verification rejects missing, extra, duplicate, renamed,
+  path-bearing, malformed, or tampered inputs.
+- The workflow has read-only contents permission, no secrets or write/OIDC/
+  attestation authority, non-persisted checkout credentials, full-SHA action
+  pins, and uploads only short-lived workflow artifacts. It cannot create a tag
+  or GitHub Release; that external authority remains M2-05.
 
 Likely seams: release workflow/scripts, package smoke tests, and release docs.
 

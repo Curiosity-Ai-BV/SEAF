@@ -20,6 +20,18 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[test]
+fn top_level_version_identifies_the_exact_cli_package() {
+    let output = seaf()
+        .arg("--version")
+        .output()
+        .expect("run seaf --version");
+
+    assert!(output.status.success(), "version failed: {output:?}");
+    assert_eq!(output.stdout, b"seaf 0.1.0\n");
+    assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
+}
+
+#[test]
 fn validates_goal_json_output() {
     let output = seaf()
         .args([

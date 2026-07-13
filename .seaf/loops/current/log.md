@@ -2570,3 +2570,147 @@ test suite. Pinned-pnpm SDK lint, typecheck, 8/8 tests, and build also passed.
 M2-02 is accepted as one isolated doctor slice. M2-03 package metadata and
 version identity is active; release automation and later acceptance remain
 pending.
+
+## 2026-07-13 implemented; review pending | M2-03 package identity
+
+Witnessed RED first proved that top-level `seaf --version` exited 2 as an
+unknown argument and that `cargo package -p seaf-cli` exited 101 because its
+internal path dependencies had no version requirements. The focused version
+test then passed with exact stdout `seaf 0.1.0` after enabling Clap's
+package-derived version.
+
+All five workspace packages now inherit version `0.1.0`, MIT license and notice,
+README, repository, and private publication metadata, with precise package
+descriptions. Internal dependencies retain local development paths with exact
+`=0.1.0` requirements. `seaf-local-runtime` remains private and outside the
+binding distribution set.
+
+The deterministic package-readiness gate copies the exact working tree to a
+temporary workspace, fetches the locked dependency set once into an isolated
+Cargo home, then works offline. It packages core, models, loop, and CLI in
+dependency order without `--no-verify`; downstream pristine builds consume the
+exact extracted dependency archives through temporary crates.io patches. Each
+archive is checked for normalized private/versioned metadata, license, README,
+lock, manifests, source assets, and unsafe workspace/runtime/credential-shaped
+files. The extracted CLI installs outside the source tree and passes exact
+version and info checks plus init, commit, and fake-provider doctor readiness in
+a fresh temporary Git repository. Repository status is compared before and
+after the gate.
+
+The package gate is GREEN locally. CI invokes the same script. The README warns
+that crates.io's `seaf-cli` is unrelated; the changelog carries both required
+Rust compatibility facts; and the platform policy claims only macOS/Linux with
+latest stable Rust and no MSRV, Windows, or architecture claim. M2-03 remains
+implementation-pending-review until independent specification and quality
+review plus the controller's full repository gate. No release artifact,
+checksum, tag, publication, external golden-path, or Ollama work is claimed.
+
+## 2026-07-13 rejected quality review; correction pending re-review | M2-03 package boundary
+
+Quality review rejected the first package gate because its narrow archive-name
+denylist could certify benign-named untracked files, symlinks, non-regular
+entries, and unbounded payloads. Follow-up inspection also found that a
+repository-local `TMPDIR`, whole-repository copying, and ambient Git templates,
+hooks, or filesystem monitors could affect the supposedly isolated gate.
+
+The corrected gate enumerates each binding crate directly, including ignored
+files, and accepts only Git-tracked regular non-symlink inputs under a 2 MiB
+per-file cap. It materializes the disposable workspace from only regular root
+`Cargo.toml`, `Cargo.lock`, README, and LICENSE inputs plus Git-tracked regular
+files for all five workspace members; unrelated root and crate payloads are not
+copied. The canonical temporary root must be outside the repository.
+
+Each distribution archive has an 8 MiB compressed cap, a 24 MiB tar-stream cap,
+a 16 MiB unpacked cap, and contributes to a 32 MiB aggregate unpacked cap.
+Before extraction, the gate rejects non-regular tar entries, absolute or
+traversal-shaped names, duplicate names, and any inventory differing from the
+exact tracked crate files plus Cargo's normalized manifest/original manifest,
+lockfile, README, and LICENSE. Extracted files are rechecked as regular bounded
+files. All Git commands ignore system/global config, disable hooks and
+filesystem monitors, and use an empty init template.
+
+Focused negative fixtures prove rejection of an ordinary untracked filename, a
+tracked symlink, a sparse over-budget file, a repository-local temporary root,
+an untracked oversized root payload, and malicious global Git template, hook,
+and fsmonitor configuration. The corrected full package gate remains GREEN with
+the prior offline pristine archive patches, extracted CLI install, exact
+version/info checks, and external init/commit/doctor smoke intact. M2-03 is
+implementation-pending-re-review; no later milestone work is claimed.
+
+## 2026-07-13 correction checkpoint | M2-03 warning-free license packaging
+
+Focused Cargo verification exposed that inheriting both the SPDX expression
+`license = "MIT"` and `license-file` produced a warning for every workspace
+package. The correction keeps machine-readable MIT identity, removes
+`license-file` metadata, and adds byte-identical tracked regular LICENSE
+notices to the four binding distribution crates. The package gate now rejects
+any normalized `license-file`, compares every crate notice byte-for-byte with
+the repository license, and derives each archive's LICENSE entry from its exact
+tracked crate inventory.
+
+The negative guards and full package-readiness gate pass. All four archives
+retain LICENSE while pristine package verification, extracted-package install,
+exact version/info output, and external init/commit/doctor smoke remain GREEN.
+`cargo metadata --locked --no-deps` and focused strict Clippy emit no license
+warning; shell syntax, Prettier formatting, and diff hygiene pass. M2-03 remains
+implementation-pending-re-review; no M2-04 work is claimed.
+
+## 2026-07-13 rejected quality review; Cargo configuration boundary corrected
+
+Quality re-review found that the package helper set isolated Cargo home and
+target directories but still launched Cargo from the SEAF checkout. Cargo
+discovers configuration from its process working directory rather than the
+`--manifest-path` location, so a source or ancestor `.cargo/config.toml`
+could inject a source replacement or rustc wrapper.
+
+Witnessed RED set a caller-controlled `RUSTC_WRAPPER` on the real package
+gate. The gate exited 101, the malicious marker was present, and Cargo reported
+the wrapper's deliberate exit 97. Every fetch, lock generation, package
+verification, and extracted install now passes through one helper that changes
+to a dedicated directory inside the canonical external temporary root. Before
+Cargo executes, the helper rejects `.cargo/config` or `.cargo/config.toml`
+from that directory through the filesystem root, rejects configuration in the
+isolated Cargo home, validates the target inside the temporary root, and clears
+both direct and Cargo-build rustc wrapper variables.
+
+Focused negative coverage places a rustc-wrapper config above an unsafe Cargo
+working directory and proves rejection before its marker appears. A companion
+GREEN runs Cargo from the safe external directory while the manifest remains
+under that malicious config ancestor and caller wrapper variables are set;
+Cargo succeeds and no marker appears. The complete package gate also exits 0
+under all four wrapper variables with no marker, while prior inventory, type,
+size, license, Git-isolation, pristine-package, extracted-install, exact
+version/info, and external init/doctor checks remain GREEN.
+
+The helper intentionally retains broader target, linker, and toolchain
+environment variables for supported-platform toolchains; the code states that
+this is configuration- and wrapper-isolation, not a fully hermetic compiler
+environment. M2-03 remains implementation-pending-re-review; no M2-04 work is
+claimed.
+
+## 2026-07-13 accepted | M2-03 package identity
+
+Independent specification and quality re-reviews approve the final corrected
+package boundary with no remaining findings. The exact private `0.1.0` metadata,
+four-crate distribution order, warning-free MIT notices, compatibility notes,
+platform policy, and crates.io collision warning match the binding contract.
+The final Cargo correction keeps every Cargo operation in a validated external,
+config-free working directory and clears all four rustc wrapper variables at
+the command boundary. The controller's guards and complete package gate pass
+even when each wrapper variable points to `/usr/bin/false`.
+
+The controller also passed exact version identity, warning-free metadata, Rust
+format, latest-stable all-target/all-feature strict Clippy, Prettier, diff
+hygiene, and all pinned-pnpm SDK gates including 8/8 tests. The complete locked
+serial Rust workspace passed: CLI 165/165, core 52/52, local runtime 5/5, loop
+unit 286/286, candidate 40/40, provider/candidate 75/75, provider exchange
+22/22, state 44/44, models 12/12, Ollama 9/9, every remaining integration
+suite, and all doc tests. M2-03 is accepted as one package identity slice.
+
+M2-04 release artifact workflow is active. Its reviewed contract is the native
+Ubuntu 22.04 x86_64 GNU/Linux and macOS 15 Apple Silicon matrix, deterministic
+four-file `seaf-v0.1.0-<target>.tar.gz` archives, an exact two-archive
+`SHA256SUMS` bundle, local installed-artifact smoke, and a read-only tag-push
+workflow that uploads only short-lived Actions artifacts. M2-04 does not create
+or push a tag or publish a GitHub Release; that external authority remains
+M2-05.

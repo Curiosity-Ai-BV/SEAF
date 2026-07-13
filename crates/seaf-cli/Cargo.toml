@@ -1,9 +1,12 @@
 [package]
 name = "seaf-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+description = "Developer CLI for the Self-Evolving Application Framework"
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "seaf"
@@ -11,9 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-seaf-core = { path = "../seaf-core" }
-seaf-loop = { path = "../seaf-loop" }
-seaf-models = { path = "../seaf-models" }
+seaf-core.workspace = true
+seaf-loop.workspace = true
+seaf-models.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

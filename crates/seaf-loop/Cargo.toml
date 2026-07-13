@@ -1,16 +1,19 @@
 [package]
 name = "seaf-loop"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+description = "Supervised local coding-loop orchestration and policy gates for SEAF"
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 aho-corasick.workspace = true
 hex.workspace = true
 libc.workspace = true
-seaf-core = { path = "../seaf-core" }
-seaf-models = { path = "../seaf-models" }
+seaf-core.workspace = true
+seaf-models.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

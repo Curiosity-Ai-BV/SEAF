@@ -48,6 +48,7 @@ mod doctor;
 #[derive(Debug, Parser)]
 #[command(name = "seaf")]
 #[command(about = "Self-Evolving Application Framework developer CLI")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
