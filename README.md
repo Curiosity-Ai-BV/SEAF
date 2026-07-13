@@ -40,6 +40,7 @@ docs/                  Architecture, threat model, agent loop, and roadmap.
 
 ```bash
 cargo test
+./scripts/test-milestone-one-acceptance.sh
 pnpm install
 pnpm build
 pnpm typecheck
@@ -140,9 +141,25 @@ Approved resume uses the persisted canonical ticket and eval snapshots, not
 live files, and makes no model-provider call. Before any check it publishes a
 create-only execution intent; it then records indexed redacted logs, canonical
 Testing evidence, and a bound EvalReport. A passing run becomes `eval_passed`;
-a failed check becomes an approval-bound reported failure. An interrupted
-evaluation attempt will not replay commands until M1-09c adds audited adoption
-and invalidation.
+a failed check becomes an approval-bound reported failure. A complete
+interrupted evaluation prefix is adopted without provider or command calls:
+
+```bash
+cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+  --from-step testing --eval-recovery adopt \
+  --actor <operator> --reason <reason> --json
+```
+
+An incomplete prefix is never replayed in place. Invalidate it, then run the
+new recovery-bound indexed attempt:
+
+```bash
+cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+  --from-step testing --eval-recovery invalidate \
+  --actor <operator> --reason <reason> --json
+cargo run -p seaf-cli -- loop rerun --run-id <run-id> \
+  --recovery <recovery-id> --json
+```
 
 Human approval authorizes local command execution under the developer account.
 SEAF detects lasting source/candidate drift but is not an OS sandbox against
@@ -152,3 +169,10 @@ durably records intent, applies the exact evaluated patch to the original
 checkout, and leaves it unstaged and uncommitted for review. Crash retry adopts
 only that exact patch; it does not delete the frozen candidate or contact a
 model provider.
+
+Milestone 1 verifies this flow only when SEAF runs from this Cargo source
+workspace. Packaged installation, generic project initialization, and adoption
+in an external repository remain Milestone 2 acceptance work. The current
+source-workspace acceptance gate supports macOS and Linux only: CI executes it
+on Ubuntu, and current local verification is on macOS. Windows and generic
+platform support are not claimed.

@@ -294,8 +294,13 @@ versioned intent keeps configured values out of derived evidence, clean v1/v2
 history remains readable, and unsafe legacy history fails closed. Fresh
 isolated provisioning requires authoritative input snapshots and screens its
 exact state and scaffold before creating the run leaf, candidate, or lock.
-Full workspace, strict lint, formatting, SDK, and diff gates pass. M1-11 is
-complete and M1-12 interruption-recovery acceptance is active.
+Full workspace, strict lint, formatting, SDK, and diff gates pass. M1-11 and
+M1-12 interruption-recovery acceptance are complete. The corrected 14-test
+focused gate separately proves complete input
+snapshots, early and Development role dataflow, complete-prefix zero-command
+adoption, crash-cut convergence, complete source/candidate snapshots at every
+selected recovery cut, immutable Testing attempt history, and exact approved-
+patch promotion.
 Authoritative input changes still require a new run;
 EvalPassed/Promoted and M1-08 promotion intent remain frozen.
 Human approval authorizes local execution under the developer account: SEAF
@@ -343,8 +348,8 @@ Detailed slice contracts and review gates are maintained in
 | Milestone | Slices         | Status   |
 | --------- | -------------- | -------- |
 | Contract  | S0             | complete |
-| 1         | M1-01a - M1-12 | active   |
-| 2         | M2-01 - M2-07  | pending  |
+| 1         | M1-01a - M1-12 | complete |
+| 2         | M2-01 - M2-07  | active   |
 | 3         | M3-01 - M3-06  | pending  |
 
 ### Milestone 1 - Make One Loop Coherent And Safe
@@ -380,15 +385,30 @@ Goal: one command produces a reviewable candidate and trustworthy evidence.
 - **U5 - Make recovery real.** Add audited CLI operations to inspect, revise,
   and rerun from a named step. Preserve attempt history, bind the candidate and
   config snapshots, use atomic state replacement and a per-run lock, and cover
-  interruption at patch, review, testing, and report boundaries. Before live
-  Ollama use, enforce private run-directory permissions, provider-response and
-  storage caps, and prompt/response redaction.
+  interruption at patch, review, Testing, EvalReport, and promotion boundaries.
+  Complete evaluation prefixes adopt without provider or command calls;
+  incomplete evaluation is never replayed in place and requires a new
+  recovery-bound indexed attempt. Retries must not duplicate durable provider
+  records, evidence, recovery entries, or unauthorized source changes; this is
+  not an external-call exactly-once guarantee. Before live Ollama use, enforce
+  private run-directory permissions, provider-response and storage caps, and
+  prompt/response redaction.
 
 Exit gate: focused tests prove authoritative inputs, role-to-role data flow,
 candidate isolation, human approval, controlled evals, bound reports, promotion
 integrity, and recovery. A failed run leaves the source checkout byte-for-byte
-unchanged. This gate may still run SEAF from its source workspace; packaging and
-external initialization belong to Milestone 2.
+unchanged. Patch/review/evaluation interruption also leaves the worktree and
+index exact. An interrupted authorized promotion may leave only the approved
+patch unstaged and uncommitted; retry adopts it without further source
+mutation. This gate runs SEAF from its Cargo source workspace only; packaging,
+generic initialization, and external-project adoption belong to Milestone 2.
+
+Accepted 2026-07-13: the named 14-test Milestone 1 gate proves the complete
+source-workspace boundary above and runs in Ubuntu CI. Independent specification
+and quality reviews approved the corrected fault coverage. The controller also
+passed workspace check, strict Clippy, Rust and Prettier formatting, every
+locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
+Milestone 1 is complete; M2-01 generic project initialization is active.
 
 ### Milestone 2 - Make The Loop Consumable
 

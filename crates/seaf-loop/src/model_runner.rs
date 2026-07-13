@@ -3322,6 +3322,11 @@ mod provider_secret_recovery_tests {
     include!("test_suites/provider_secret_recovery.rs");
 }
 
+#[cfg(test)]
+mod output_review_response_recovery_tests {
+    include!("test_suites/output_review_response_recovery.rs");
+}
+
 fn status_for_response(response: &RoleResponse) -> LoopStepStatus {
     match response {
         RoleResponse::Agent(response) => match response.status {

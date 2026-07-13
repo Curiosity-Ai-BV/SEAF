@@ -44,25 +44,24 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M1-12 - Interruption recovery acceptance. M1-11 minimum artifact protection,
-including bounded secret propagation across exact provider, evaluation,
-operator, recovery, context, scaffold, log, and run-state envelopes, is accepted.
+M2-01 - Generic project initialization. Milestone 1 and M1-12 interruption
+recovery acceptance are complete.
 
-Add one focused Milestone 1 acceptance harness that interrupts patch, review,
-testing, report, and promotion boundaries and proves restart without duplicate
-effects or source mutation. The suite must also exercise authoritative input
-snapshots, validated role dataflow, candidate isolation, exact human approval,
-controlled evaluation, bound reports, promotion integrity, and recovery through
-the verified source-workspace path.
+Make the default `seaf init` output stack-neutral and immediately editable in a
+clean external repository. It must plan the complete output set before writing,
+then refuse any existing-file conflict atomically without changing any target.
+The default output set includes policy, eval, starter ticket, provider/project
+configuration, and ignore entries. No default path, command, label, or content
+may assume the SEAF workspace or the Adaptive Notes example.
 
-Carry two pre-preview Rust compatibility notes into the handoff: M1-09c1 added
-public v2 `TestingEvidence` fields, and M1-11c made
-`InitializedLoopRun::create_isolated` require `AuthoritativeRunInputSnapshots`.
-Persisted clean v1 Testing JSON remains readable. Do not claim packaged or
-external-project acceptance in this slice; those belong to Milestone 2.
+Named examples remain explicit opt-in modes and preserve their documented
+specialized behavior. Mandatory RED/GREEN uses representative empty Rust and
+Node fixture repositories plus an existing-file conflict fixture. Tests must
+parse and validate every generated public file, prove the generic commands are
+appropriate to each fixture, prove the default contains no SEAF/Adaptive Notes
+assumptions, and prove conflict refusal leaves a byte-exact repository snapshot.
 
-Mandatory RED/GREEN covers every lifecycle interruption boundary, exact resume
-or adoption, absence of duplicate publication/process effects, and byte-exact
-source-checkout preservation. Commit only the integration/fault harness, any
-minimal boundary wiring it proves necessary, the focused CI gate, and matching
-Milestone 1 evidence/docs.
+Keep this slice limited to initialization templates, the init CLI, fixtures,
+tests, the bootstrap quickstart, and matching trackers. Do not add `doctor`,
+package/version metadata, release automation, or packaged-binary acceptance;
+those are M2-02 and later slices.

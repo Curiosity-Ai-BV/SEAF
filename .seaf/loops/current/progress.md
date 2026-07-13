@@ -46,11 +46,11 @@
       - [x] M1-11b2a: Provider commitments.
       - [x] M1-11b2b: Evaluation commitments.
   - [x] M1-11c: Bounded secret redaction.
-- [ ] M1-12: Interruption recovery acceptance (active).
+- [x] M1-12: Interruption recovery acceptance.
 
 ## Milestone 2 - Consumable Loop
 
-- [ ] M2-01: Generic project initialization.
+- [ ] M2-01: Generic project initialization (active).
 - [ ] M2-02: Project doctor.
 - [ ] M2-03: Package metadata and version identity.
 - [ ] M2-04: Release artifact workflow.
@@ -69,7 +69,9 @@
 
 ## Current Gate
 
-M1-06 through M1-11 are complete; M1-12 is active. Public run/status output supplies
+Milestone 1, including M1-12 interruption recovery acceptance, is complete.
+M2-01 generic project initialization is active.
+Public run/status output supplies
 the exact staged-diff digest and target HEAD required by `seaf loop approve`.
 Approval publishes versioned inline evidence only after candidate-to-provider
 locked revalidation of physical candidate/source state, policy, approving role
@@ -190,5 +192,41 @@ screens its exact state/scaffold before the run leaf, candidate, or lock exists.
 The full workspace passes, including CLI 142/142, provider/candidate boundary
 75/75, state 44/44, and provider exchange 22/22; strict Clippy, workspace check,
 Rust/Prettier formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK tests,
-and diff hygiene pass. M1-11 is complete. M1-12 now owns the integrated
+and diff hygiene pass. M1-11 is complete. M1-12 implements the integrated
 fault-injection acceptance harness and both pre-preview Rust compatibility notes.
+M1-12 now has one stable source-workspace gate at
+`scripts/test-milestone-one-acceptance.sh`. It rejects Cargo's zero-test success
+and runs 14 exact locked tests serially; the final-tree implementation run passed
+in 2m14s. Separate selections prove the complete canonical input snapshot set,
+full provider run, early-role chain, Development's exact approved-spec input,
+zero-command complete-prefix adoption, and crash-cut convergence.
+The new natural OutputReview fault cut interrupts after the response and response
+record are durable but before the step artifact/final state, then resumes through
+isolated authority with retained snapshots. Recovery makes zero provider calls,
+keeps one request/response pair and one review artifact, preserves every prior
+artifact and the exact candidate subject, reruns no patch operation, and reaches
+`awaiting_human_review` with exact source/candidate Git and filesystem snapshots.
+The interrupted state is asserted immediately before any resume entrypoint as
+well as after recovery. Promotion crash injection waits for two consecutive
+identical complete authorized source snapshots while final publication is
+blocked, avoiding a torn or partially applied cut.
+CLI failure/promotion coverage now snapshots regular bytes and symlink targets
+outside `.git` plus HEAD, status, staged binary diff, and unstaged binary diff.
+Candidate Applying/Applied cuts compare complete source and candidate snapshots
+before and after every cut and resume. Testing invalidation/rerun preserves the
+source plus every attempt-1/history byte, adding only the recovery pair and
+recovery-bound attempt 2. Failed evaluation and pre-promotion cuts are exact;
+promotion interruption and success require the source's canonical binary
+worktree patch and complete entries to equal the approved candidate, and retry
+is source-byte inert. Complete evaluation prefixes adopt with zero provider or
+command calls; incomplete prefixes require a new recovery-bound indexed attempt
+and are never replayed in place. This is not an external-call exactly-once
+claim. Independent specification and quality re-reviews approve M1-12 with no
+open findings. The controller's final gate passed all 14 exact acceptance
+tests, workspace check, strict Clippy, Rust and Prettier formatting, every
+locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
+M2-01 is active. Compatibility handoff is recorded in
+`docs/preview-compatibility-handoff.md` for M2-03 and M3-05.
+The documented complete promotion path requires a clean checkout/worktree. The
+source-workspace gate currently supports macOS/Linux only: CI runs it on Ubuntu
+and current local verification is macOS; Windows is not claimed.

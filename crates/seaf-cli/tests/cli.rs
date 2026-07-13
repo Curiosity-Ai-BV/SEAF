@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::TcpListener,
@@ -1404,7 +1405,18 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
         canonical_sha256_digest(&evaluated).unwrap()
     );
 
-    let source_before = git_evidence(&repo);
+    let source_before = source_workspace_snapshot(&repo);
+    let candidate_before_promotion = source_workspace_snapshot(&candidate_path);
+    let expected_diff = fs::read(
+        run_dir.join(
+            status["candidate_diff_path"]
+                .as_str()
+                .expect("approved candidate diff path"),
+        ),
+    )
+    .expect("approved candidate diff bytes");
+    assert_eq!(candidate_before_promotion.staged_diff, expected_diff);
+    assert!(candidate_before_promotion.unstaged_diff.is_empty());
     let run_before_secret_rejection = read_tree_bytes(&run_dir);
     for secret_reviewer in [promotion_secret, "sk-0123456789abcdef"] {
         let rejected = seaf_in(&repo)
@@ -1430,7 +1442,7 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
         let stderr = String::from_utf8(rejected.stderr).unwrap();
         assert!(!stderr.contains(secret_reviewer), "{stderr}");
         assert_eq!(read_tree_bytes(&run_dir), run_before_secret_rejection);
-        assert_eq!(git_evidence(&repo), source_before);
+        assert_eq!(source_workspace_snapshot(&repo), source_before);
     }
     let unsafe_intent_path = run_dir.join("artifacts/09-promotion.intent.json");
     fs::write(
@@ -1462,7 +1474,7 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     let stderr = String::from_utf8(unsafe_intent_retry.stderr).unwrap();
     assert!(!stderr.contains(promotion_secret), "{stderr}");
     assert_eq!(read_tree_bytes(&run_dir), unsafe_intent_before);
-    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(source_workspace_snapshot(&repo), source_before);
     fs::remove_file(&unsafe_intent_path).unwrap();
     for (flag, value, expected) in [
         (
@@ -1520,7 +1532,7 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
             "{flag}: {}",
             String::from_utf8_lossy(&rejected.stderr)
         );
-        assert_eq!(git_evidence(&repo), source_before, "{flag}");
+        assert_eq!(source_workspace_snapshot(&repo), source_before, "{flag}");
         assert_eq!(read_run_json(&run_dir)["status"], "eval_passed", "{flag}");
     }
 
@@ -1562,14 +1574,17 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     let promoted_run = read_run_json(&run_dir);
     assert_eq!(promoted_run["status"], "promoted");
     assert_eq!(promoted_run["provider_exchange_records"], provider_records);
-    let _expected_diff = fs::read(
-        run_dir.join(
-            promoted_run["promotion"]["candidate_diff"]["path"]
-                .as_str()
-                .unwrap(),
-        ),
-    )
-    .expect("approved diff bytes");
+    assert_eq!(
+        fs::read(
+            run_dir.join(
+                promoted_run["promotion"]["candidate_diff"]["path"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        )
+        .expect("promoted approved diff bytes"),
+        expected_diff
+    );
     assert_eq!(
         fs::read(repo.join("examples/local-loop/evals/fake-provider-smoke.txt")).unwrap(),
         fs::read(candidate_path.join("examples/local-loop/evals/fake-provider-smoke.txt")).unwrap(),
@@ -1580,7 +1595,13 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
     );
 
     let run_bytes = read_tree_bytes(&run_dir);
-    let source_after = git_evidence(&repo);
+    let source_after = source_workspace_snapshot(&repo);
+    assert_source_is_exact_promoted_candidate(
+        &source_before,
+        &source_after,
+        &candidate_before_promotion,
+        &expected_diff,
+    );
     let cleanup = seaf_in(&repo)
         .args([
             "loop",
@@ -1633,7 +1654,7 @@ fn loop_promote_applies_only_the_frozen_eval_passed_patch_and_exact_retry_is_ine
         .expect("retry exact promotion");
     assert!(retry.status.success(), "{retry:?}");
     assert_eq!(read_tree_bytes(&run_dir), run_bytes);
-    assert_eq!(git_evidence(&repo), source_after);
+    assert_eq!(source_workspace_snapshot(&repo), source_after);
 }
 
 #[test]
@@ -2024,6 +2045,23 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
     let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
     let evaluated = run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
     let run_dir = runs_root.join(run_id);
+    let source_before_promotion = source_workspace_snapshot(&repo);
+    let candidate_path = PathBuf::from(
+        evaluated["candidate_workspace"]["path"]
+            .as_str()
+            .expect("candidate path"),
+    );
+    let candidate_before_promotion = source_workspace_snapshot(&candidate_path);
+    let expected_diff = fs::read(
+        run_dir.join(
+            evaluated["human_approval"]["candidate_diff"]["path"]
+                .as_str()
+                .expect("approved candidate diff path"),
+        ),
+    )
+    .expect("approved candidate diff bytes");
+    assert_eq!(candidate_before_promotion.staged_diff, expected_diff);
+    assert!(candidate_before_promotion.unstaged_diff.is_empty());
     let diff = evaluated["human_approval"]["candidate_diff"]["digest"]
         .as_str()
         .unwrap();
@@ -2081,25 +2119,60 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
         thread::sleep(Duration::from_millis(10));
     }
     assert!(intent.is_file(), "promotion did not durably publish intent");
+    assert_eq!(
+        source_workspace_snapshot(&repo),
+        source_before_promotion,
+        "durable promotion intent must precede every source byte or index change"
+    );
     provider_lock.lock().expect("hold final publication lock");
     repository_lock
         .unlock()
         .expect("release repository operation lock");
     let applied = repo.join("examples/local-loop/evals/fake-provider-smoke.txt");
+    let mut complete_applied_snapshot = None;
+    let mut early_exit = None;
     for _ in 0..500 {
-        if applied.is_file() {
+        let observed = source_workspace_snapshot(&repo);
+        if source_matches_exact_promoted_candidate(
+            &source_before_promotion,
+            &observed,
+            &candidate_before_promotion,
+            &expected_diff,
+        ) {
+            let confirmed = source_workspace_snapshot(&repo);
+            if confirmed == observed
+                && source_matches_exact_promoted_candidate(
+                    &source_before_promotion,
+                    &confirmed,
+                    &candidate_before_promotion,
+                    &expected_diff,
+                )
+            {
+                complete_applied_snapshot = Some(confirmed);
+                break;
+            }
+        }
+        if let Some(status) = child.try_wait().expect("poll promotion child") {
+            early_exit = Some(status);
             break;
         }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "promotion exited before apply"
-        );
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        applied.is_file(),
-        "promotion did not reach the source apply boundary"
-    );
+    let interrupted_source = match complete_applied_snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            if early_exit.is_none() {
+                let _ = child.kill();
+                child.wait().expect("reap timed-out promotion");
+            }
+            provider_lock
+                .unlock()
+                .expect("release provider lock after failed apply wait");
+            panic!(
+                "promotion did not reach the complete exact source snapshot before timeout; early exit: {early_exit:?}"
+            );
+        }
+    };
     assert!(
         intent.is_file(),
         "durable intent must precede source mutation"
@@ -2112,6 +2185,17 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
         .expect("release final publication lock");
 
     let interrupted_bytes = fs::read(&applied).unwrap();
+    let killed_source = source_workspace_snapshot(&repo);
+    assert_eq!(
+        killed_source, interrupted_source,
+        "killing the process after the stable complete apply boundary must preserve the exact source snapshot"
+    );
+    assert_source_is_exact_promoted_candidate(
+        &source_before_promotion,
+        &killed_source,
+        &candidate_before_promotion,
+        &expected_diff,
+    );
     let retry = seaf_in(&repo)
         .args([
             "loop",
@@ -2138,6 +2222,11 @@ fn loop_promote_persists_intent_before_apply_and_adopts_exact_patch_after_proces
         String::from_utf8_lossy(&retry.stderr)
     );
     assert_eq!(fs::read(&applied).unwrap(), interrupted_bytes);
+    assert_eq!(
+        source_workspace_snapshot(&repo),
+        killed_source,
+        "promotion retry must adopt the exact already-applied patch without further mutation"
+    );
     assert_eq!(read_run_json(&run_dir)["status"], "promoted");
 }
 
@@ -2912,6 +3001,9 @@ fn approved_eval_failed_command_publishes_rejecting_bound_terminal_report() {
         "evals:\n  allow_commands: [false]\n  required:\n    - name: required_failure\n      command: false\n",
     )
     .expect("failing eval config");
+    #[cfg(unix)]
+    symlink("seaf.evals.yaml", repo.join("eval-config-link.yaml"))
+        .expect("source snapshot symlink fixture");
     commit_all(&repo, "Configure failing eval");
     let runs_root = temp_dir.path().join("runs");
     let run_id = "approved-failed-check";
@@ -2921,7 +3013,7 @@ fn approved_eval_failed_command_publishes_rejecting_bound_terminal_report() {
         .replace("    - printf", "    - false");
     fs::write(&ticket_path, ticket).expect("ticket allowlist");
     let approved = run_and_approve_provider_loop(&repo, &ticket_path, &runs_root, run_id);
-    let source_before = git_evidence(&repo);
+    let source_before = source_workspace_snapshot(&repo);
     let provider_records = approved["provider_exchange_records"].clone();
 
     let resume = seaf_in(&repo)
@@ -2949,7 +3041,7 @@ fn approved_eval_failed_command_publishes_rejecting_bound_terminal_report() {
     assert_eq!(report["passed"], false);
     assert_eq!(report["decision"], "reject");
     assert_eq!(report["checks"][0]["status"], "failed");
-    assert_eq!(git_evidence(&repo), source_before);
+    assert_eq!(source_workspace_snapshot(&repo), source_before);
 }
 
 #[test]
@@ -6267,6 +6359,7 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
     run_and_approve_provider_loop(&repo, &ticket, &runs_root, run_id);
     let run_dir = runs_root.join(run_id);
     let approved_bytes = fs::read(run_dir.join("run.json")).unwrap();
+    let source_before_recovery = source_workspace_snapshot(&repo);
 
     let evaluation = seaf_in(&repo)
         .args([
@@ -6281,6 +6374,7 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
         .output()
         .unwrap();
     assert!(evaluation.status.success(), "{evaluation:?}");
+    assert_eq!(source_workspace_snapshot(&repo), source_before_recovery);
     fs::write(run_dir.join("run.json"), approved_bytes).unwrap();
     for path in [
         "artifacts/07-testing.attempt-001.check-001.stderr.log",
@@ -6289,6 +6383,8 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
     ] {
         fs::remove_file(run_dir.join(path)).unwrap();
     }
+    assert_eq!(source_workspace_snapshot(&repo), source_before_recovery);
+    let interrupted_history = immutable_run_history(&run_dir);
 
     let invalidated = seaf_in(&repo)
         .args([
@@ -6315,6 +6411,18 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
         serde_json::from_slice(&invalidated.stdout).unwrap();
     assert_eq!(invalidated_output["invalidated_attempt"], 1);
     assert_eq!(invalidated_output["next_evaluation_attempt"], 2);
+    assert_eq!(source_workspace_snapshot(&repo), source_before_recovery);
+    let invalidated_history = immutable_run_history(&run_dir);
+    assert_history_preserved(&interrupted_history, &invalidated_history);
+    assert_eq!(
+        new_history_paths(&interrupted_history, &invalidated_history),
+        [
+            PathBuf::from("artifacts/recovery-001.json"),
+            PathBuf::from("artifacts/recovery-001.source-run.json"),
+        ]
+        .into_iter()
+        .collect()
+    );
 
     let rerun = seaf_in(&repo)
         .args([
@@ -6331,6 +6439,21 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
         .output()
         .unwrap();
     assert!(rerun.status.success(), "{rerun:?}");
+    assert_eq!(source_workspace_snapshot(&repo), source_before_recovery);
+    let rerun_history = immutable_run_history(&run_dir);
+    assert_history_preserved(&invalidated_history, &rerun_history);
+    assert_eq!(
+        new_history_paths(&invalidated_history, &rerun_history),
+        [
+            PathBuf::from("artifacts/07-testing.attempt-002.check-001.stderr.log"),
+            PathBuf::from("artifacts/07-testing.attempt-002.check-001.stdout.log"),
+            PathBuf::from("artifacts/07-testing.attempt-002.execution-intent.json"),
+            PathBuf::from("artifacts/07-testing.attempt-002.json"),
+            PathBuf::from("artifacts/08-eval-report.attempt-002.json"),
+        ]
+        .into_iter()
+        .collect()
+    );
     let final_run = read_run_json(&run_dir);
     assert_eq!(final_run["status"], "eval_passed");
     assert_eq!(
@@ -10302,6 +10425,33 @@ fn read_tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     files
 }
 
+fn immutable_run_history(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    read_tree_bytes(root)
+        .into_iter()
+        .filter(|(path, _)| path != Path::new("run.json") && path != Path::new("log.md"))
+        .collect()
+}
+
+fn assert_history_preserved(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+) {
+    for (path, bytes) in before {
+        assert_eq!(after.get(path), Some(bytes), "{}", path.display());
+    }
+}
+
+fn new_history_paths(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+) -> std::collections::BTreeSet<PathBuf> {
+    after
+        .keys()
+        .filter(|path| !before.contains_key(*path))
+        .cloned()
+        .collect()
+}
+
 fn find_named_file(root: &Path, name: &str) -> PathBuf {
     let mut matches = Vec::new();
     fn visit(root: &Path, name: &str, matches: &mut Vec<PathBuf>) {
@@ -10318,6 +10468,182 @@ fn find_named_file(root: &Path, name: &str) -> PathBuf {
     visit(root, name, &mut matches);
     assert_eq!(matches.len(), 1, "expected one {name}: {matches:?}");
     matches.pop().unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceWorkspaceEntry {
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceWorkspaceSnapshot {
+    head: Vec<u8>,
+    status: Vec<u8>,
+    staged_diff: Vec<u8>,
+    unstaged_diff: Vec<u8>,
+    entries: BTreeMap<PathBuf, SourceWorkspaceEntry>,
+}
+
+fn assert_source_is_exact_promoted_candidate(
+    source_before: &SourceWorkspaceSnapshot,
+    source_after: &SourceWorkspaceSnapshot,
+    approved_candidate: &SourceWorkspaceSnapshot,
+    approved_diff: &[u8],
+) {
+    assert_eq!(source_after.head, source_before.head);
+    assert!(source_after.staged_diff.is_empty());
+    assert_eq!(source_after.unstaged_diff, approved_diff);
+    assert_eq!(source_after.entries, approved_candidate.entries);
+    assert_eq!(approved_candidate.head, source_before.head);
+    assert_eq!(approved_candidate.staged_diff, approved_diff);
+    assert!(approved_candidate.unstaged_diff.is_empty());
+}
+
+fn source_matches_exact_promoted_candidate(
+    source_before: &SourceWorkspaceSnapshot,
+    source_after: &SourceWorkspaceSnapshot,
+    approved_candidate: &SourceWorkspaceSnapshot,
+    approved_diff: &[u8],
+) -> bool {
+    source_after.head == source_before.head
+        && source_after.staged_diff.is_empty()
+        && source_after.unstaged_diff == approved_diff
+        && source_after.entries == approved_candidate.entries
+        && approved_candidate.head == source_before.head
+        && approved_candidate.staged_diff == approved_diff
+        && approved_candidate.unstaged_diff.is_empty()
+}
+
+fn source_workspace_snapshot(root: &Path) -> SourceWorkspaceSnapshot {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("source workspace Git evidence");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    SourceWorkspaceSnapshot {
+        head: git(&["rev-parse", "HEAD"]),
+        status: git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+        staged_diff: git(&[
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ]),
+        unstaged_diff: git_unstaged_diff_including_untracked(root),
+        entries: source_workspace_entries(root),
+    }
+}
+
+fn git_unstaged_diff_including_untracked(root: &Path) -> Vec<u8> {
+    let run = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("unstaged source workspace Git evidence")
+    };
+    let tracked = run(&[
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--",
+    ]);
+    assert!(
+        tracked.status.success(),
+        "tracked unstaged diff: {}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    let mut diff = tracked.stdout;
+    let untracked = run(&["ls-files", "--others", "--exclude-standard", "-z"]);
+    assert!(
+        untracked.status.success(),
+        "untracked paths: {}",
+        String::from_utf8_lossy(&untracked.stderr)
+    );
+    let mut untracked_paths = untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    untracked_paths.sort();
+    for path in untracked_paths {
+        let path = std::str::from_utf8(&path).expect("UTF-8 test repository path");
+        let output = run(&[
+            "diff",
+            "--no-index",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+            "/dev/null",
+            path,
+        ]);
+        assert_eq!(output.status.code(), Some(1), "untracked diff for {path}");
+        diff.extend(output.stdout);
+    }
+    diff
+}
+
+fn source_workspace_entries(root: &Path) -> BTreeMap<PathBuf, SourceWorkspaceEntry> {
+    fn visit(root: &Path, directory: &Path, entries: &mut BTreeMap<PathBuf, SourceWorkspaceEntry>) {
+        let mut children = fs::read_dir(directory)
+            .expect("source workspace directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("source workspace entries");
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            if child.file_name() == ".git" {
+                continue;
+            }
+            let path = child.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("source-relative path")
+                .to_path_buf();
+            let metadata = fs::symlink_metadata(&path).expect("source entry metadata");
+            if metadata.file_type().is_symlink() {
+                entries.insert(
+                    relative,
+                    SourceWorkspaceEntry::Symlink(
+                        fs::read_link(&path).expect("source symlink target"),
+                    ),
+                );
+            } else if metadata.is_dir() {
+                visit(root, &path, entries);
+            } else if metadata.is_file() {
+                entries.insert(
+                    relative,
+                    SourceWorkspaceEntry::RegularFile(
+                        fs::read(&path).expect("source regular-file bytes"),
+                    ),
+                );
+            } else {
+                panic!("unsupported source entry type: {}", path.display());
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
 }
 
 fn git_evidence(root: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {

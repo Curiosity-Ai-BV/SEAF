@@ -2343,3 +2343,106 @@ Workspace check, strict all-target/all-feature Clippy, Rust and Prettier
 formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK tests, and diff
 hygiene pass. M1-11 is complete and M1-12 interruption recovery acceptance is
 active.
+
+## 2026-07-13 implemented; review pending | M1-12 interruption recovery acceptance
+
+RED created the stable `scripts/test-milestone-one-acceptance.sh` gate before
+the new OutputReview recovery regression existed. U1, U2, and candidate
+Applying/Applied cuts each passed exactly one selected test; Cargo then reported
+`running 0 tests` and `0 passed` for
+`output_review_response_cut_adopts_without_provider_replay_or_source_mutation`,
+and the script failed loudly instead of accepting Cargo's zero-test exit.
+
+The new regression uses the existing test-only post-response-persistence
+observer at the natural production boundary. It interrupts isolated
+OutputReview after the exact response and response record are durable but
+before the step artifact/final state. Resume goes through
+`InitializedLoopRun::resume_isolated_with_inputs` with retained authoritative
+snapshots and an empty provider. It adopts the exact response with zero provider
+calls, publishes exactly one request/response pair and one OutputReview
+artifact, preserves the applied candidate subject and all earlier artifacts,
+reruns no patch operation, retains exact source/candidate Git and filesystem
+snapshots, and reaches `awaiting_human_review`. No production API changed.
+
+The selected CLI failure and promotion tests now use a deterministic source
+snapshot containing every relative regular-file byte and symlink target outside
+`.git`, plus HEAD, NUL-delimited status, staged binary diff, and unstaged binary
+diff. Failed evaluation and pre-promotion cuts remain byte-exact. Authorized
+promotion crash may leave the exact approved patch unstaged and uncommitted;
+retry adopts it without another mutation. This does not claim exactly-once
+external provider calls. Complete evaluation prefixes adopt with zero provider
+and command calls, while incomplete prefixes require a new recovery-bound
+indexed attempt and never replay in place.
+
+GREEN `./scripts/test-milestone-one-acceptance.sh` ran 11 exact locked tests
+with one thread and passed in 1m17s. It covers authoritative inputs, exact early
+role dataflow, candidate publication cuts, durable OutputReview response
+recovery, exact approval, incomplete Testing invalidation/indexed rerun,
+complete report-prefix zero-command adoption, rejecting failed evaluation,
+promotion crash adoption, full promotion inert retry, and persisted clean v1
+Testing JSON. CI runs this named step after Clippy and before full workspace
+tests. Public source-workspace docs now describe provider and evaluation
+recovery, manual unstaged promotion, and the Milestone 1 boundary. The named
+compatibility handoff carries both Rust source changes into M2-03 and M3-05.
+M1-12 remains unchecked with review pending; M2-01 remains pending.
+
+SPEC REVIEW CORRECTION: the first 11-test selection above was rejected because
+it combined report crash convergence with the zero-command claim and used
+partial repository evidence at several cuts. The corrected gate now runs 14
+exact locked tests with one thread and passed on the final tree in 2m05s. It adds the complete
+canonical-input snapshot test, Development approved-spec dataflow test, and the
+separate eight-variant complete-prefix adoption test while retaining the crash-
+cut convergence test. Candidate Applying/Applied cuts now compare complete
+source/candidate snapshots before and after each cut and resume. Testing
+invalidation/rerun preserves the exact source and immutable attempt-1/history
+prefix, adding only the recovery pair and recovery-bound attempt 2. Evaluation
+adoption compares complete source/candidate snapshots around source, recovery,
+report, CAS, and retry cuts. Promotion interruption and completion now require
+the source's complete entries and canonical binary worktree patch to equal the
+approved candidate exactly; sorted untracked paths use `git diff --no-index`
+with the same binary/full-index normalization. The focused correction tests and
+the full 14-test script are GREEN. Status remains implemented/review pending;
+M2-01 remains pending.
+
+QUALITY REVIEW CORRECTION: OutputReview now asserts complete source and candidate
+snapshots immediately after the durable response cut and before invoking any
+resume path, while retaining the final recovered assertions. Promotion crash
+injection no longer treats one added file as proof of complete apply: with final
+publication blocked, it polls the full source authority and requires two
+consecutive identical snapshots whose HEAD, index, canonical tracked-plus-
+sorted-untracked binary diff, and all filesystem entries equal the approved
+candidate. Timeout and early-exit paths terminate/reap the child and release the
+held provider lock before failing. The stronger test initially caught a torn
+snapshot that mixed pre-apply status with post-apply bytes; consecutive snapshot
+confirmation closed that race. The complete documented promotion demo now
+requires a clean checkout/worktree and omits `--allow-dirty`; dirty runs are
+limited to status/inspect demonstrations and cannot promote. README and loop
+docs explicitly limit the current gate to macOS/Linux, with Ubuntu CI and macOS
+local verification, and make no Windows claim. Both corrected exact tests and
+the final 14-test gate are GREEN; the exact final-tree gate ran in 2m14s. M1-12
+remains implemented/review pending and M2-01 remains pending.
+
+## 2026-07-13 accepted | M1-12 interruption recovery and Milestone 1
+
+Final independent specification and quality re-reviews approve the corrected
+M1-12 boundary with no open findings. The stable acceptance script runs 14
+exact locked tests and rejects Cargo's zero-test success. It directly proves
+authoritative inputs, complete role dataflow, candidate publication cuts,
+durable OutputReview response adoption without provider replay, exact approval,
+incomplete-evaluation invalidation and indexed rerun, complete-prefix
+zero-command adoption, report crash convergence, source-preserving evaluation
+failure, promotion crash adoption, inert promotion retry, and persisted v1
+Testing compatibility.
+
+The controller reran the final tree. `scripts/test-milestone-one-acceptance.sh`
+passed 14/14. Workspace check, strict all-target/all-feature Clippy, Rust and
+Prettier formatting, pinned-pnpm lint/typecheck/test/build with 8 SDK tests,
+shell syntax, and diff hygiene passed. The definitive locked serial Rust
+workspace suite passed, including CLI 142/142, loop unit 286/286,
+provider/candidate 75/75, state 44/44, provider exchange 22/22, and every
+remaining integration and doc-test suite. M1-12 adds fault coverage, CI, and
+documentation; it does not change production Rust behavior or the public API.
+
+Milestone 1 is complete. M2-01 generic project initialization is active with a
+stack-neutral, conflict-atomic scope; `doctor`, packaging, releases, and
+external packaged acceptance remain later slices.

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -2888,12 +2888,16 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     let final_shape = publish_indexed_final_eval_artifacts(&fixture.workspace, &approved, true);
     let report_path = final_shape.eval_report_path.unwrap();
     fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    let source_snapshot = complete_repository_snapshot(&fixture.source);
+    let candidate_snapshot = complete_repository_snapshot(&fixture.candidate);
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     let first = adopt_approved_evaluation(
         &fixture.workspace,
         "operator@example.invalid",
         "resume every adoption crash cut",
     )
     .unwrap();
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     assert_eq!(
         first.recovery.report_disposition,
         EvaluationRecoveryReportDisposition::CreateMissing
@@ -2908,12 +2912,14 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     write_raw_run(&fixture.workspace, &approved);
     fs::remove_file(fixture.workspace.run_directory().join(&recovery_path)).unwrap();
     fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     let after_source = adopt_approved_evaluation(
         &fixture.workspace,
         "operator@example.invalid",
         "resume every adoption crash cut",
     )
     .unwrap();
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     assert_eq!(after_source.recovery.created_at, first.recovery.created_at);
     assert_eq!(
         after_source.recovery.report_disposition,
@@ -2935,6 +2941,7 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     // Recovery published, then interrupted before missing report.
     write_raw_run(&fixture.workspace, &approved);
     fs::remove_file(fixture.workspace.run_directory().join(&report_path)).unwrap();
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     let after_recovery = adopt_approved_evaluation(
         &fixture.workspace,
         "operator@example.invalid",
@@ -2942,9 +2949,11 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     )
     .unwrap();
     assert_eq!(after_recovery, first);
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
 
     // Report published, then interrupted before CAS.
     write_raw_run(&fixture.workspace, &approved);
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     let after_report = adopt_approved_evaluation(
         &fixture.workspace,
         "operator@example.invalid",
@@ -2952,8 +2961,10 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     )
     .unwrap();
     assert_eq!(after_report, first);
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
 
     // Successful CAS, then caller interruption.
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     let after_cas = adopt_approved_evaluation(
         &fixture.workspace,
         "operator@example.invalid",
@@ -2961,6 +2972,7 @@ fn evaluation_adoption_resumes_source_recovery_and_report_crash_cuts_exactly() {
     )
     .unwrap();
     assert_eq!(after_cas, first);
+    assert_complete_repository_snapshots(&fixture, &source_snapshot, &candidate_snapshot);
     fixture.cleanup();
 }
 
@@ -5770,6 +5782,120 @@ fn source_evidence(root: &Path) -> (String, String, Vec<u8>) {
         git(root, &["status", "--porcelain=v1"]),
         fs::read(root.join("src/lib.rs")).unwrap(),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompleteRepositoryEntry {
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompleteRepositorySnapshot {
+    head: Vec<u8>,
+    status: Vec<u8>,
+    staged_diff: Vec<u8>,
+    unstaged_diff: Vec<u8>,
+    entries: BTreeMap<PathBuf, CompleteRepositoryEntry>,
+}
+
+fn complete_repository_snapshot(root: &Path) -> CompleteRepositorySnapshot {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("complete repository Git evidence");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    CompleteRepositorySnapshot {
+        head: git(&["rev-parse", "HEAD"]),
+        status: git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+        staged_diff: git(&[
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ]),
+        unstaged_diff: git(&[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ]),
+        entries: complete_repository_entries(root),
+    }
+}
+
+fn complete_repository_entries(root: &Path) -> BTreeMap<PathBuf, CompleteRepositoryEntry> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        entries: &mut BTreeMap<PathBuf, CompleteRepositoryEntry>,
+    ) {
+        let mut children = fs::read_dir(directory)
+            .expect("complete repository directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("complete repository entries");
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            if child.file_name() == ".git" {
+                continue;
+            }
+            let path = child.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).expect("complete repository metadata");
+            if metadata.file_type().is_symlink() {
+                entries.insert(
+                    relative,
+                    CompleteRepositoryEntry::Symlink(
+                        fs::read_link(&path).expect("complete repository symlink target"),
+                    ),
+                );
+            } else if metadata.is_dir() {
+                visit(root, &path, entries);
+            } else if metadata.is_file() {
+                entries.insert(
+                    relative,
+                    CompleteRepositoryEntry::RegularFile(
+                        fs::read(&path).expect("complete repository regular-file bytes"),
+                    ),
+                );
+            } else {
+                panic!("unsupported complete repository entry: {}", path.display());
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn assert_complete_repository_snapshots(
+    fixture: &AwaitingApprovalFixture,
+    expected_source: &CompleteRepositorySnapshot,
+    expected_candidate: &CompleteRepositorySnapshot,
+) {
+    assert_eq!(
+        complete_repository_snapshot(&fixture.source),
+        *expected_source
+    );
+    assert_eq!(
+        complete_repository_snapshot(&fixture.candidate),
+        *expected_candidate
+    );
 }
 
 #[cfg(unix)]

@@ -1,9 +1,9 @@
 # Local Agent Loop
 
-Current slice context: Phase 2 complete on branch
-`codex/seaf-foundation-agent-loop`. This page documents the Phase 2 local loop
-as implemented. CI uses fake-provider paths for repeatable automation; Ollama
-commands are local live smoke checks.
+This page documents the current Milestone 1 loop implementation as exercised
+from the SEAF Cargo source workspace. CI uses fake-provider paths for repeatable
+automation; Ollama commands are local live smoke checks. Packaged installation,
+generic initialization, and external-project adoption remain Milestone 2 gates.
 
 The local loop is disk-backed and review-first. Model output is untrusted
 working material. Schema validation, the deterministic policy gate, configured
@@ -20,44 +20,57 @@ tests, eval reports, and human review remain authoritative.
 - CI-safe commands use `--provider fake` and do not require Ollama, network
   access, or installed local models.
 
-No local-loop command commits, merges, signs a release, applies an update, or
-turns model output into trusted evidence by itself.
+No local-loop command commits, merges, signs a release, or deploys. Only an
+explicit `loop promote` after exact human approval and passing bound evaluation
+may modify the source checkout; it applies the authorized patch unstaged and
+uncommitted for manual review.
 
 ## Demo Path
 
-Run the commands from the repository root:
+Use a clean checkout or dedicated clean worktree and run the commands from its
+repository root. Confirm `git status --short` has no output before starting the
+complete approve/evaluate/promote path:
 
 ```bash
-git switch codex/seaf-foundation-agent-loop
 cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
-cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id p2-011-demo --allow-dirty --json
-cargo run -p seaf-cli -- loop status --run-id p2-011-demo --json
-cargo run -p seaf-cli -- loop inspect --run-id p2-011-demo --json
+cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id milestone-one-demo --json
+cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
+cargo run -p seaf-cli -- loop inspect --run-id milestone-one-demo --json
+cargo run -p seaf-cli -- loop approve --run-id milestone-one-demo \
+  --reviewer reviewer@example.invalid \
+  --confirm-candidate-diff <digest-from-status> \
+  --confirm-target-head <head-from-status> --json
+cargo run -p seaf-cli -- loop resume --run-id milestone-one-demo --json
+cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
+cargo run -p seaf-cli -- loop promote --run-id milestone-one-demo \
+  --reviewer reviewer@example.invalid \
+  --confirm-candidate-diff <digest-from-status> \
+  --confirm-eval-report <eval-report-digest-from-status> \
+  --confirm-target-head <head-from-status> --json
 cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
-cargo run -p seaf-cli -- eval run examples/local-loop/seaf.evals.yaml --loop-run .seaf/loops/runs/p2-011-demo/run.json --ticket examples/local-loop/tickets/add-health-command.yaml --output .seaf/evals/p2-011-demo-eval-report.json --json
 ```
 
-The demo uses `--allow-dirty` because documentation slices and agent worktrees
-often already contain reviewable changes. For normal implementation work,
-prefer a clean working tree and omit `--allow-dirty`; `loop run` refuses dirty
-trees by default. If the fixed `p2-011-demo` run ID already exists, choose a
-new run ID or inspect/resume the existing run instead of overwriting it.
+The complete path intentionally omits `--allow-dirty`: `loop run` refuses a
+dirty tree by default, and promotion requires the exact clean target authority.
+If you deliberately use `--allow-dirty` for a non-promotion demonstration,
+limit that run to `loop status` and `loop inspect`; promotion will reject it. If
+the fixed `milestone-one-demo` run ID already exists, choose a new run ID or
+inspect/resume the existing run instead of overwriting it.
 
 After the commands finish, review:
 
-- `.seaf/loops/runs/p2-011-demo/run.json`
-- `.seaf/loops/runs/p2-011-demo/inputs/`
-- `.seaf/loops/runs/p2-011-demo/context-manifest.json`
-- `.seaf/loops/runs/p2-011-demo/log.md`
-- `.seaf/loops/runs/p2-011-demo/prompts/`
-- `.seaf/loops/runs/p2-011-demo/responses/`
-- `.seaf/loops/runs/p2-011-demo/artifacts/`
-- `.seaf/evals/p2-011-demo-eval-report.json`
-- `.seaf/evals/logs/`
+- `.seaf/loops/runs/milestone-one-demo/run.json`
+- `.seaf/loops/runs/milestone-one-demo/inputs/`
+- `.seaf/loops/runs/milestone-one-demo/context-manifest.json`
+- `.seaf/loops/runs/milestone-one-demo/log.md`
+- `.seaf/loops/runs/milestone-one-demo/prompts/`
+- `.seaf/loops/runs/milestone-one-demo/responses/`
+- `.seaf/loops/runs/milestone-one-demo/artifacts/`
 
-The eval command validates the loop run and ticket before command checks run.
-Policy-gate evidence is evaluated when the final loop EvalReport is built;
-missing, malformed, mismatched, or rejected policy evidence fails closed.
+Approved resume validates the loop, exact human approval, candidate, and
+persisted ticket/eval authority before command checks run. Policy-gate evidence
+is evaluated when the final Loop EvalReport is built; missing, malformed,
+mismatched, or rejected evidence fails closed.
 
 ## Project Policy Authority
 
@@ -74,30 +87,24 @@ canonicalized and must remain inside the Git root, including through symlinks.
 An explicit config is always loaded and validated even when `--policy`
 overrides its policy choice.
 
-Before the first provider request, the run writes canonical effective
-`ticket.json`, `policy.json`, `config.json`, and `repository.json` snapshots
-under `inputs/`. The four SHA-256 values in `run.json` digest those exact typed
-inputs. The repository identity digest and snapshot bind the canonical worktree
-root and Git common directory. The effective config snapshot records the
-winning policy path for explicit-policy and root-policy fallback runs as well
-as config-backed runs.
+Before the first provider request, the run writes canonical effective ticket,
+policy, config, repository, eval-config, and provider-ticket snapshots. Their
+bound digests and repository identity bind the canonical source worktree, Git
+common directory, candidate, policy, and controlled checks.
 
-M1-03 validated role dataflow is complete. Development consumes the exact
-approved spec and persists policy-gated DevelopmentEvidence; OutputReview
-consumes only that verified evidence and approved-spec identities. M1-04
-bounded additional context is the next dependency-ready slice.
-
-Provider-backed Development is proposal-only. A ticket may record
-`apply_requested: true`, but the provider gate performs at most an applicability
-check and always records `applied: false`; it does not modify the source
-checkout before the isolated candidate-workspace milestone.
+Development consumes the exact approved spec, publishes policy-gated evidence,
+and applies only to the isolated candidate. OutputReview receives the exact
+verified Applied candidate subject. Testing cannot start until a human approves
+the candidate digest and target HEAD. Evaluation uses the persisted ticket/eval
+snapshots in the candidate, and promotion requires another fresh confirmation
+before the exact evaluated patch can reach the source checkout.
 
 ## Failed-Run Recovery
 
 First inspect persisted state:
 
 ```bash
-cargo run -p seaf-cli -- loop status --run-id p2-011-demo --json
+cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
 ```
 
 Use the reported `run_directory` and `next_action` fields to decide what to
@@ -110,9 +117,9 @@ only after the blocker is understood. This records the operator and reason and
 performs no provider call:
 
 ```bash
-cargo run -p seaf-cli -- loop revise --run-id p2-011-demo \
+cargo run -p seaf-cli -- loop revise --run-id milestone-one-demo \
   --from-step <provider-step> --actor <operator> --reason <reason> --json
-cargo run -p seaf-cli -- loop rerun --run-id p2-011-demo \
+cargo run -p seaf-cli -- loop rerun --run-id milestone-one-demo \
   --recovery <recovery-id> \
   --ticket examples/local-loop/tickets/add-health-command.yaml \
   --policy examples/adaptive-notes/seaf.policy.json --json
@@ -122,7 +129,10 @@ Only `loop rerun --recovery <id>` may consume a pending revision before its
 first durable provider request. After that request exists, ordinary `loop
 resume` continues the exact attempt. The former `loop resume --rerun-from`
 path is retired. Recovery currently covers provider steps through OutputReview;
-interrupted Approved evaluation is owned by M1-09c.
+complete evaluation prefixes use
+`loop revise --from-step testing --eval-recovery adopt` and make zero provider
+or command calls. Incomplete prefixes must use `--eval-recovery invalidate`
+followed by `loop rerun --recovery <id>`; they are never replayed in place.
 
 Recovery validates the persisted `run.json` before scaffolding or mutating a
 workspace. Invalid JSON, missing run files, invalid run IDs, mismatched run IDs,
@@ -132,11 +142,12 @@ authority used by `loop run`. Pass matching `--config` or `--policy` arguments
 when the run used explicit authority; discovered Git-root authority needs no
 extra flag.
 
-Recovery canonically verifies all four input snapshots, the four `LoopRun`
-digests, and repository identity before appending the run log, contacting a
-provider, rebuilding context, or applying a patch. Missing, noncanonical,
-tampered, changed, unsafe, or cross-repository inputs are rejected with
-guidance to supply the matching inputs or start a new run.
+Recovery canonically verifies ticket, policy, config, repository, eval-config,
+and provider-ticket snapshots plus their bound `LoopRun` digests and repository
+identity before appending the run log, contacting a provider, rebuilding
+context, or applying a patch. Missing, noncanonical, tampered, changed, unsafe,
+or cross-repository inputs are rejected with guidance to supply the matching
+inputs or start a new run.
 
 ## Local Model Smoke
 
@@ -170,9 +181,16 @@ The model check passed through the local Ollama API, and the AgentBench-lite
 Ollama smoke returned `schema_valid_rate = 1.0`, `eval_pass_rate = 1.0`,
 `forbidden_violation_count = 0`, and `eval_weakening_accepted_count = 0`.
 
-## Pending Work
+## Acceptance Boundary
 
-M1-03 validated role dataflow is complete: incomplete provider resumes verify
-the exact approved spec, DevelopmentEvidence, policy decision, and downstream
-role envelopes before provider or state mutation. M1-04 bounded additional
-context is the next production-use slice.
+Run `./scripts/test-milestone-one-acceptance.sh` for the focused source-workspace
+gate. Its 14 exact tests cover the complete authoritative input snapshot set,
+early and Development role dataflow, candidate Applying/Applied recovery,
+OutputReview durable-response adoption, approval, separate zero-command
+evaluation adoption and crash-cut convergence, invalidation with immutable
+attempt history, rejecting reports, exact approved-patch promotion crash
+adoption, and persisted clean v1 Testing compatibility. It does not establish
+packaged or external-project readiness. This source-workspace gate is currently
+supported on macOS and Linux only: the workflow executes it on Ubuntu, while
+the current local verification evidence is from macOS. Windows and generic
+platform support are not claimed.

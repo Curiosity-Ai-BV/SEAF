@@ -3529,7 +3529,10 @@ impl From<std::io::Error> for CandidateWorkspaceError {
 mod tests {
     use super::*;
     use seaf_core::LoopInputDigests;
-    use std::{process::Command, sync::mpsc, thread, time::Duration};
+    use std::{collections::BTreeMap, process::Command, sync::mpsc, thread, time::Duration};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn candidate_lock_acquisition_requires_a_preexisting_scaffolded_file() {
@@ -4657,6 +4660,9 @@ mod tests {
     #[test]
     fn candidate_application_recovers_from_each_real_publication_cut() {
         let before_index = application_fixture("application-before-index");
+        let before_index_source = test_repository_snapshot(&before_index.source);
+        let before_index_candidate =
+            test_repository_snapshot(Path::new(&before_index.candidate.path));
         let error = apply_candidate_development_evidence_with_hook(
             &before_index.workspace,
             &before_index.source,
@@ -4672,6 +4678,22 @@ mod tests {
         .expect_err("inject before index mutation");
         assert!(error.to_string().contains("injected"), "{error}");
         assert_applying_without_future_evidence(&before_index, false);
+        assert_eq!(
+            test_repository_snapshot(&before_index.source),
+            before_index_source
+        );
+        assert_eq!(
+            test_repository_snapshot(Path::new(&before_index.candidate.path)),
+            before_index_candidate,
+            "Applying publication before index mutation must leave every candidate byte and Git surface pristine"
+        );
+        let before_index_expected_diff = fs::read(
+            before_index
+                .workspace
+                .run_directory()
+                .join(PATCH_EXPECTED_DIFF_PATH),
+        )
+        .expect("planned exact candidate diff");
         let recovered =
             apply_candidate_development_evidence(&before_index.workspace, &before_index.source)
                 .expect("recover pristine Applying");
@@ -4679,9 +4701,21 @@ mod tests {
             recovered.patch_transaction.as_ref().unwrap().phase,
             CandidatePatchPhase::Applied
         );
+        assert_eq!(
+            test_repository_snapshot(&before_index.source),
+            before_index_source
+        );
+        assert_exact_applied_candidate_snapshot(
+            &before_index_candidate,
+            &test_repository_snapshot(Path::new(&before_index.candidate.path)),
+            &before_index_expected_diff,
+        );
         before_index.cleanup();
 
         let after_materialize = application_fixture("application-after-materialize");
+        let after_materialize_source = test_repository_snapshot(&after_materialize.source);
+        let after_materialize_candidate_before =
+            test_repository_snapshot(Path::new(&after_materialize.candidate.path));
         let error = apply_candidate_development_evidence_with_hook(
             &after_materialize.workspace,
             &after_materialize.source,
@@ -4697,14 +4731,44 @@ mod tests {
         .expect_err("inject after materialization");
         assert!(error.to_string().contains("injected"), "{error}");
         assert_applying_without_future_evidence(&after_materialize, true);
+        assert_eq!(
+            test_repository_snapshot(&after_materialize.source),
+            after_materialize_source
+        );
+        let after_materialize_expected_diff = fs::read(
+            after_materialize
+                .workspace
+                .run_directory()
+                .join(PATCH_EXPECTED_DIFF_PATH),
+        )
+        .expect("planned exact candidate diff");
+        let after_materialize_cut =
+            test_repository_snapshot(Path::new(&after_materialize.candidate.path));
+        assert_exact_applied_candidate_snapshot(
+            &after_materialize_candidate_before,
+            &after_materialize_cut,
+            &after_materialize_expected_diff,
+        );
         apply_candidate_development_evidence(
             &after_materialize.workspace,
             &after_materialize.source,
         )
         .expect("recover exact materialized Applying");
+        assert_eq!(
+            test_repository_snapshot(&after_materialize.source),
+            after_materialize_source
+        );
+        assert_eq!(
+            test_repository_snapshot(Path::new(&after_materialize.candidate.path)),
+            after_materialize_cut,
+            "materialized Applying recovery must publish evidence without mutating the exact candidate snapshot"
+        );
         after_materialize.cleanup();
 
         let after_applied = application_fixture("application-after-applied");
+        let after_applied_source = test_repository_snapshot(&after_applied.source);
+        let after_applied_candidate_before =
+            test_repository_snapshot(Path::new(&after_applied.candidate.path));
         let error = apply_candidate_development_evidence_with_hook(
             &after_applied.workspace,
             &after_applied.source,
@@ -4731,6 +4795,23 @@ mod tests {
                 .phase,
             CandidatePatchPhase::Applied
         );
+        assert_eq!(
+            test_repository_snapshot(&after_applied.source),
+            after_applied_source
+        );
+        let after_applied_expected_diff = fs::read(
+            after_applied
+                .workspace
+                .run_directory()
+                .join(PATCH_EXPECTED_DIFF_PATH),
+        )
+        .expect("planned exact candidate diff");
+        let after_applied_cut = test_repository_snapshot(Path::new(&after_applied.candidate.path));
+        assert_exact_applied_candidate_snapshot(
+            &after_applied_candidate_before,
+            &after_applied_cut,
+            &after_applied_expected_diff,
+        );
         assert!(after_applied
             .workspace
             .run_directory()
@@ -4738,6 +4819,15 @@ mod tests {
             .is_file());
         apply_candidate_development_evidence(&after_applied.workspace, &after_applied.source)
             .expect("replay exact Applied publication");
+        assert_eq!(
+            test_repository_snapshot(&after_applied.source),
+            after_applied_source
+        );
+        assert_eq!(
+            test_repository_snapshot(Path::new(&after_applied.candidate.path)),
+            after_applied_cut,
+            "Applied retry must be byte-inert across the complete candidate repository snapshot"
+        );
         after_applied.cleanup();
     }
 
@@ -4893,7 +4983,9 @@ mod tests {
             test_git(&source, &args);
         }
         fs::write(source.join("tracked.txt"), "source\n").expect("tracked");
-        test_git(&source, &["add", "tracked.txt"]);
+        #[cfg(unix)]
+        symlink("tracked.txt", source.join("tracked-link")).expect("tracked symlink");
+        test_git(&source, &["add", "."]);
         test_git(&source, &["commit", "-qm", "initial"]);
         let workspace =
             LoopWorkspace::create(&temp.path().join("runs"), run_id).expect("workspace");
@@ -5253,6 +5345,122 @@ mod tests {
             .run_directory()
             .join(PATCH_APPLIED_EVIDENCE_PATH)
             .exists());
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestRepositoryEntry {
+        RegularFile(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestRepositorySnapshot {
+        head: Vec<u8>,
+        status: Vec<u8>,
+        staged_diff: Vec<u8>,
+        unstaged_diff: Vec<u8>,
+        entries: BTreeMap<PathBuf, TestRepositoryEntry>,
+    }
+
+    fn test_repository_snapshot(root: &Path) -> TestRepositorySnapshot {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("repository snapshot Git evidence");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        TestRepositorySnapshot {
+            head: git(&["rev-parse", "HEAD"]),
+            status: git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+            staged_diff: git(&[
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+            ]),
+            unstaged_diff: git(&[
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ]),
+            entries: test_repository_entries(root),
+        }
+    }
+
+    fn test_repository_entries(root: &Path) -> BTreeMap<PathBuf, TestRepositoryEntry> {
+        fn visit(
+            root: &Path,
+            directory: &Path,
+            entries: &mut BTreeMap<PathBuf, TestRepositoryEntry>,
+        ) {
+            let mut children = fs::read_dir(directory)
+                .expect("repository snapshot directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("repository snapshot entries");
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                if child.file_name() == ".git" {
+                    continue;
+                }
+                let path = child.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let metadata = fs::symlink_metadata(&path).expect("repository entry metadata");
+                if metadata.file_type().is_symlink() {
+                    entries.insert(
+                        relative,
+                        TestRepositoryEntry::Symlink(
+                            fs::read_link(&path).expect("repository symlink target"),
+                        ),
+                    );
+                } else if metadata.is_dir() {
+                    visit(root, &path, entries);
+                } else if metadata.is_file() {
+                    entries.insert(
+                        relative,
+                        TestRepositoryEntry::RegularFile(
+                            fs::read(&path).expect("repository regular-file bytes"),
+                        ),
+                    );
+                } else {
+                    panic!("unsupported repository entry type: {}", path.display());
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    fn assert_exact_applied_candidate_snapshot(
+        before: &TestRepositorySnapshot,
+        after: &TestRepositorySnapshot,
+        expected_diff: &[u8],
+    ) {
+        assert_eq!(after.head, before.head);
+        assert_eq!(after.status, b"M  tracked.txt\0");
+        assert_eq!(after.staged_diff, expected_diff);
+        assert!(after.unstaged_diff.is_empty());
+        let mut expected_entries = before.entries.clone();
+        expected_entries.insert(
+            PathBuf::from("tracked.txt"),
+            TestRepositoryEntry::RegularFile(b"candidate\n".to_vec()),
+        );
+        assert_eq!(after.entries, expected_entries);
     }
 
     fn test_git(path: &Path, args: &[&str]) {

@@ -1946,7 +1946,7 @@ independent specification, quality, and evidence re-reviews approve the slice.
 #### M1-11c - Bounded Secret Redaction
 
 Status: accepted on 2026-07-13. Dependencies: M1-11b (complete). M1-11 is
-complete; M1-12 is active.
+complete; M1-12 is accepted.
 
 Objective: prevent configured and obvious credentials from escaping their one
 private authoritative input snapshot into provider requests or derived run
@@ -2008,7 +2008,8 @@ and diff hygiene.
 
 ### M1-12 - Interruption Recovery Acceptance
 
-Status: active on 2026-07-13. Dependencies: M1-11 (complete).
+Status: accepted on 2026-07-13. Dependencies: M1-11 (complete). Milestone 1 is
+complete and M2-01 is active.
 
 Roadmap: U5 and Milestone 1 exit gate. Dependencies: M1-11.
 
@@ -2016,8 +2017,17 @@ Objective: prove safe restart across the complete reviewed lifecycle.
 
 Acceptance criteria:
 
-- Fault-injection tests interrupt patch, review, testing, report, and promotion
-  boundaries and resume without duplication or source mutation.
+- Retries do not duplicate durable provider records, role/evaluation evidence,
+  recovery entries, or unauthorized source changes. Provider calls are not
+  claimed to be exactly once: request-only recovery may repeat an external
+  call when the durable contract permits it.
+- A complete evaluation prefix is adopted with zero provider or command calls.
+  An incomplete evaluation prefix is never replayed in place; it can continue
+  only through a new recovery-bound indexed attempt.
+- Patch, review, Testing, and EvalReport interruption leaves the source
+  worktree and index byte-exact. Authorized promotion interruption may leave
+  only the exact approved patch unstaged and uncommitted; retry adopts those
+  bytes without another source mutation.
 - The focused Milestone 1 acceptance suite proves authoritative inputs, role
   dataflow, candidate isolation, approval, eval, promotion, and recovery.
 - The preview handoff records that M1-09c1 added public v2 `TestingEvidence`
@@ -2025,21 +2035,67 @@ Acceptance criteria:
   JSON remains readable. It also records that M1-11c made
   `InitializedLoopRun::create_isolated` require
   `AuthoritativeRunInputSnapshots`. Both notes are carried into preview release
-  notes.
+  notes through `docs/preview-compatibility-handoff.md`.
 - Roadmap/docs claim only the verified source-workspace path.
 
 Likely seams: integration test harness, CLI tests, docs, and CI focused step.
 
-RED: the new acceptance harness fails before boundary wiring/fixtures exist.
+RED: `scripts/test-milestone-one-acceptance.sh` passed the first three exact
+tests, then selected the absent OutputReview response-cut regression and failed
+loudly after Cargo reported `running 0 tests` / `0 passed`.
 
 Verification: Milestone 1 acceptance suite, all Rust/TS gates, format, and diff
 check.
 
-Docs/tracker: Milestone 1 evidence and completion.
+Docs/tracker: accepted Milestone 1 evidence and M2-01 activation.
 
 Commit boundary: integration/fault coverage and matching docs only.
 
+Implemented evidence: the stable script uses `cargo test --locked`, exact test
+selection, and `--test-threads=1`; it rejects zero-test Cargo success and ran 14
+exact tests in 2m14s on the final tree. Separate exact selections prove the complete
+canonical input snapshot set and full provider run, the Research-through-
+SpecReview chain and Development's approved-spec/repository-context boundary,
+complete-prefix zero-command adoption, and crash-cut convergence. A test-only
+post-response-persistence observer
+interrupts OutputReview after its exact response and response record are
+durable but before its step artifact/final state. Isolated resume reuses retained
+authoritative snapshots, makes zero provider calls, publishes one request and
+response pair plus one OutputReview artifact, preserves the reviewed candidate
+subject and every earlier artifact, reruns no patch operation, leaves source and
+candidate Git/filesystem snapshots exact, and stops at `awaiting_human_review`.
+The cut snapshots are asserted before entering resume and again after recovery.
+The promotion crash test blocks final publication and requires two consecutive
+identical complete authorized source snapshots before killing the process, so it
+cannot select a torn or partially applied state. No production API changed.
+
+Selected CLI failure and promotion tests now snapshot every regular file byte
+and symlink target outside `.git`, plus HEAD, NUL-delimited status, staged
+binary diff, and unstaged binary diff. Candidate Applying/Applied tests compare
+that complete evidence before and after every publication cut and resume.
+Testing invalidation/rerun preserves the source and every existing attempt-1
+history byte, adding only its recovery pair and recovery-bound attempt 2. Failed
+evaluation and every pre-promotion cut remain byte-exact. Promotion source bytes,
+filesystem entries, and canonical binary worktree patch must equal the approved
+candidate exactly; a killed promotion may leave only that authorized unstaged
+patch, and its retry is source-byte inert.
+
+The complete documented approve/evaluate/promote path requires a clean checkout
+or worktree and omits `--allow-dirty`. Current source-workspace acceptance is
+limited to macOS/Linux: the workflow runs on Ubuntu and local evidence is from
+macOS; Windows or generic platform support is not claimed.
+
+Independent specification and quality re-reviews approve the corrected
+boundary with no remaining findings. The controller's final gate passed all 14
+exact acceptance tests; workspace check; strict all-target/all-feature Clippy;
+Rust and Prettier formatting; pinned-pnpm lint, typecheck, 8-test SDK suite, and
+build; diff hygiene; and the complete locked serial Rust workspace suite,
+including CLI 142/142, loop unit 286/286, provider/candidate 75/75, state 44/44,
+provider exchange 22/22, and every remaining integration and doc-test suite.
+
 ### M2-01 - Generic Project Initialization
+
+Status: active on 2026-07-13. Dependencies: M1-12 (accepted).
 
 Roadmap: U6. Dependencies: M1-12.
 
@@ -2095,6 +2151,8 @@ Acceptance criteria:
 - `seaf --version`, complete Cargo metadata, versioned internal dependencies,
   license, changelog, and supported-platform policy exist.
 - Cargo package dry-runs and an installed-package smoke pass.
+- Package/release notes consume the Rust source-compatibility entries in
+  `docs/preview-compatibility-handoff.md`.
 
 Likely seams: Cargo manifests, CLI metadata, license/changelog, and package
 smoke tests.
@@ -2326,6 +2384,9 @@ Acceptance criteria:
 
 - Compatibility notes, security reporting, support boundary, release procedure,
   and honest experimental-surface labels are complete.
+- The preview notes carry every entry from
+  `docs/preview-compatibility-handoff.md`, including both pre-preview Rust
+  source-compatibility changes.
 - A release-candidate build passes both pilot scenarios, packaged golden path,
   the Full repo gate, and clean-tree verification.
 - A final independent cross-milestone review finds no open safety, data-loss,
