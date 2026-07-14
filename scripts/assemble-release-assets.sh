@@ -151,10 +151,8 @@ validate_assets_inventory() {
 expected_checksums() {
   local directory="$1"
 
-  {
-    printf '%s  %s\n' "$(sha256_file "$directory/$linux_archive")" "$linux_archive"
-    printf '%s  %s\n' "$(sha256_file "$directory/$macos_archive")" "$macos_archive"
-  } | LC_ALL=C sort
+  printf '%s  %s\n' "$(sha256_file "$directory/$macos_archive")" "$macos_archive"
+  printf '%s  %s\n' "$(sha256_file "$directory/$linux_archive")" "$linux_archive"
 }
 
 validate_checksum_shape() {

@@ -540,6 +540,8 @@ run_review_regressions() {
   local assembly_tools="$review_root/assembly-tools"
   local assembly_counter="$review_root/install-count"
   local real_install="$(command -v install)"
+  local checksum_tools="$review_root/checksum-tools"
+  local checksum_output checksum_result expected_checksum_order
   local mutation mutation_directory mutation_archive
 
   mkdir -p "$review_root"
@@ -720,6 +722,38 @@ run_review_regressions() {
   [[ -f "$review_root/assembly-parent-sentinel" ]] ||
     record_review_failure "assembly cleanup removed a sibling sentinel"
   rm -rf "$output"
+
+  echo "==> Review regression: order SHA256SUMS by archive name, not digest"
+  mkdir "$checksum_tools"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'case "$(basename "${1:?}")" in' \
+    "  seaf-v${VERSION}-${LINUX_TARGET}.tar.gz) digest=0000000000000000000000000000000000000000000000000000000000000000 ;;" \
+    "  seaf-v${VERSION}-${MACOS_TARGET}.tar.gz) digest=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff ;;" \
+    '  *) printf "unexpected checksum input: %s\\n" "$1" >&2; exit 2 ;;' \
+    'esac' \
+    'printf "%s  %s\\n" "$digest" "$1"' >"$checksum_tools/sha256sum"
+  chmod 0755 "$checksum_tools/sha256sum"
+  checksum_output="$review_root/checksum-name-order-output"
+  if ! checksum_result="$(
+    env PATH="$checksum_tools:$PATH" \
+      "$assemble_script" assemble "$input_directory" "$checksum_output" 2>&1
+  )"; then
+    record_review_failure \
+      "checksum assembly depends on digest order; output: $checksum_result"
+  else
+    expected_checksum_order="$(
+      printf '%s  %s\n' \
+        ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+        "seaf-v${VERSION}-${MACOS_TARGET}.tar.gz"
+      printf '%s  %s\n' \
+        0000000000000000000000000000000000000000000000000000000000000000 \
+        "seaf-v${VERSION}-${LINUX_TARGET}.tar.gz"
+    )"
+    [[ "$(cat "$checksum_output/SHA256SUMS")" == "$expected_checksum_order" ]] ||
+      record_review_failure "SHA256SUMS is not ordered lexically by archive name"
+  fi
 
   echo "==> Review regressions: reject noncanonical gzip and USTAR bytes"
   output="$review_root/metadata-source"
@@ -934,10 +968,9 @@ expected_listing="$(printf '%s\n' \
 linux_archive="seaf-v${VERSION}-${LINUX_TARGET}.tar.gz"
 macos_archive="seaf-v${VERSION}-${MACOS_TARGET}.tar.gz"
 expected_sums="$(
-  printf '%s  %s\n' "$(sha256_file "$assets/$linux_archive")" "$linux_archive"
   printf '%s  %s\n' "$(sha256_file "$assets/$macos_archive")" "$macos_archive"
+  printf '%s  %s\n' "$(sha256_file "$assets/$linux_archive")" "$linux_archive"
   )"
-expected_sums="$(printf '%s\n' "$expected_sums" | LC_ALL=C sort)"
 [[ "$(cat "$assets/SHA256SUMS")" == "$expected_sums" ]] ||
   fail "SHA256SUMS content is not exact"
 [[ "$(tail -c 1 "$assets/SHA256SUMS" | od -An -t x1 | tr -d ' \n')" == "0a" ]] ||
