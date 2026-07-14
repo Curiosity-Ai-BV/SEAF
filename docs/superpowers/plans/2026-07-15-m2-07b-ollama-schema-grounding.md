@@ -5,8 +5,7 @@
 Two fresh packaged `gemma4:latest` attempts failed safely with no published
 evidence: the first reached Development after the required reviewer recovery,
 then returned `invalid_response`; the bounded retry returned
-`invalid_response` at Research. Ollama remained reachable and returned HTTP
-200. Its local server log reported incomplete JSON-schema conversion because
+`invalid_response` at Research. Ollama remained reachable and returned HTTP 200. Its local server log reported incomplete JSON-schema conversion because
 SEAF role schemas contain unsupported regex syntax.
 
 Ollama's structured-output guidance recommends both passing the JSON schema in
@@ -34,4 +33,3 @@ repair schema-invalid role output, or change non-Ollama providers.
 - Modify `crates/seaf-models/src/ollama.rs` only after the focused test is RED.
 - Do not modify the M2-07 evidence or roadmap during remediation.
 - Commit the defect separately as `Ground Ollama structured responses`.
-
