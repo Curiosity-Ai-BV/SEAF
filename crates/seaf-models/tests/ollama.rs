@@ -45,6 +45,30 @@ fn ollama_structured_request_keeps_exact_schema_and_grounds_the_system_message()
 }
 
 #[test]
+fn ollama_structured_request_without_system_text_starts_with_the_schema_instruction() {
+    let provider = OllamaProvider::default();
+
+    for system in ["", " \t\n"] {
+        let mut request = structured_request(0.0);
+        request.system = system.to_string();
+        let schema = request.response_schema.clone().expect("response schema");
+
+        let chat_request = provider
+            .build_chat_request(&request)
+            .expect("build structured request");
+
+        assert_eq!(
+            chat_request.body()["messages"][0]["content"],
+            format!(
+                "Respond with JSON matching this exact schema:\n{}",
+                serde_json::to_string(&schema).expect("compact response schema")
+            ),
+            "system input {system:?}"
+        );
+    }
+}
+
+#[test]
 fn ollama_unstructured_request_preserves_the_trusted_system_message() {
     let provider = OllamaProvider::default();
 

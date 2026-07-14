@@ -61,10 +61,15 @@ impl OllamaProvider {
         let temperature = self.effective_temperature(request)?;
         let mut messages = Vec::new();
         let system = match &request.response_schema {
-            Some(schema) => format!(
-                "{}\n\nRespond with JSON matching this exact schema:\n{schema}",
-                request.system
-            ),
+            Some(schema) => {
+                let schema_instruction =
+                    format!("Respond with JSON matching this exact schema:\n{schema}");
+                if request.system.trim().is_empty() {
+                    schema_instruction
+                } else {
+                    format!("{}\n\n{schema_instruction}", request.system)
+                }
+            }
             None => request.system.clone(),
         };
 
