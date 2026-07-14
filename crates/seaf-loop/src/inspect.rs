@@ -674,7 +674,7 @@ fn inspect_steps(
             workspace,
             MAX_ARTIFACT_HISTORY_PER_STEP,
             &priority,
-            |path| role_artifact_identity(&stem, path).is_some(),
+            |path| step_role_artifact_identity(record.name, &stem, path).is_some(),
         )?;
         total_history += total;
         let index = step_index(record.name);
@@ -695,8 +695,8 @@ fn inspect_steps(
         };
         let mut history = Vec::new();
         for path in &artifacts {
-            let (attempt, extension) =
-                role_artifact_identity(&stem, path).expect("filtered role artifact identity");
+            let (attempt, extension) = step_role_artifact_identity(record.name, &stem, path)
+                .expect("filtered role artifact identity");
             let mut classification = if record.artifact_path.as_deref() == Some(path) {
                 match record.artifact_digest.as_deref() {
                     Some(digest) => classify_digest(workspace, path, digest)?,
@@ -755,7 +755,7 @@ fn inspect_steps(
                     path,
                     record.artifact_digest.as_deref().unwrap_or_default(),
                 )?;
-                let identity = role_artifact_identity(&stem, path);
+                let identity = step_role_artifact_identity(record.name, &stem, path);
                 let (selected_attempt, extension, mut classification) =
                     match (identity, verification) {
                         (Some((attempt, extension)), EvidenceClassification::Verified) => {
@@ -803,7 +803,7 @@ fn inspect_steps(
                         record.name
                     ));
                 }
-                if role_artifact_identity(&stem, path).is_none()
+                if step_role_artifact_identity(record.name, &stem, path).is_none()
                     || classification == EvidenceClassification::Missing
                 {
                     total_history += 1;
@@ -1074,6 +1074,21 @@ fn role_artifact_identity(stem: &str, path: &str) -> Option<(u32, String)> {
     .then(|| (parsed_attempt, extension.to_string()))
 }
 
+fn step_role_artifact_identity(
+    step: LoopStepName,
+    stem: &str,
+    path: &str,
+) -> Option<(u32, String)> {
+    role_artifact_identity(stem, path).or_else(|| {
+        if !matches!(step, LoopStepName::Testing | LoopStepName::EvalReport) {
+            return None;
+        }
+        let name = path.strip_prefix("artifacts/")?;
+        let extension = name.strip_prefix(stem)?.strip_prefix(".attempt-001.")?;
+        (!extension.contains('.') && valid_extension(extension)).then(|| (1, extension.to_string()))
+    })
+}
+
 fn valid_extension(extension: &str) -> bool {
     !extension.is_empty()
         && extension
@@ -1271,6 +1286,15 @@ mod tests {
     #[test]
     fn role_artifact_attempt_name_uses_canonical_minimum_width_without_a_three_digit_cap() {
         assert_eq!(
+            step_role_artifact_identity(
+                LoopStepName::Research,
+                "01-research",
+                "artifacts/01-research.attempt-001.json",
+            ),
+            None,
+            "provider roles must preserve fixed-name attempt-1 authority"
+        );
+        assert_eq!(
             role_artifact_identity("01-research", "artifacts/01-research.attempt-1000.yaml"),
             Some((1000, "yaml".to_string()))
         );
@@ -1343,6 +1367,75 @@ mod tests {
             "once an indexed artifact is selected, persisted authority cannot prove the fixed file was reused"
         );
         assert!(!ambiguities.is_empty());
+    }
+
+    #[test]
+    fn verified_evaluation_attempt_one_accepts_its_canonical_indexed_role_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace =
+            LoopWorkspace::create(&temp.path().join("runs"), "indexed-evaluation").unwrap();
+        let testing_bytes = b"indexed testing evidence";
+        let report_bytes = b"indexed evaluation report";
+        for (path, bytes) in [
+            (
+                "artifacts/07-testing.attempt-001.json",
+                testing_bytes.as_slice(),
+            ),
+            (
+                "artifacts/08-eval-report.attempt-001.json",
+                report_bytes.as_slice(),
+            ),
+        ] {
+            crate::artifact_safety::write_private_fixture(
+                workspace.run_directory().join(path),
+                bytes,
+            )
+            .unwrap();
+        }
+        let mut run = run("indexed-evaluation");
+        for (step, path, bytes) in [
+            (
+                LoopStepName::Testing,
+                "artifacts/07-testing.attempt-001.json",
+                testing_bytes.as_slice(),
+            ),
+            (
+                LoopStepName::EvalReport,
+                "artifacts/08-eval-report.attempt-001.json",
+                report_bytes.as_slice(),
+            ),
+        ] {
+            let record = run
+                .steps
+                .iter_mut()
+                .find(|record| record.name == step)
+                .unwrap();
+            record.artifact_path = Some(path.to_string());
+            record.artifact_digest = Some(digest_bytes(bytes));
+        }
+        let mut messages = Vec::new();
+        let mut ambiguities = Vec::new();
+
+        let (steps, _) = inspect_steps(
+            &workspace,
+            &run,
+            &[None; 8],
+            &[None; 8],
+            FinalEvaluationAuthority::Verified { attempt: 1 },
+            &mut messages,
+            &mut ambiguities,
+        )
+        .unwrap();
+
+        for step in steps.iter().skip(6) {
+            assert_eq!(step.artifact_history.len(), 1);
+            assert_eq!(
+                step.artifact_history[0].classification,
+                EvidenceClassification::Current
+            );
+        }
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(ambiguities.is_empty(), "{ambiguities:?}");
     }
 
     #[test]
