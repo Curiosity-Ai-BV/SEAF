@@ -1,0 +1,37 @@
+ticket_id: packaged-ollama-golden-path
+goal_id: packaged-ollama-adoption
+title: Make the one permitted Ollama acceptance edit
+status: ready
+priority: p1
+problem: >-
+  Change only top-level ollama-acceptance.txt from the exact bytes PENDING plus
+  one trailing newline to the exact bytes SEAF packaged Ollama acceptance
+  passed. plus one trailing newline. Do not create, delete, rename, or modify
+  any other path.
+research_questions:
+  - Can the exact one-file, one-line, trailing-newline change be made without any other repository change?
+context:
+  relevant_files:
+    - ollama-acceptance.txt
+  forbidden_files:
+    - .git/**
+    - .seaf/**
+    - fixtures/**
+    - SEAF/**
+    - ollama-native-check.sh
+    - seaf.config.json
+    - seaf.policy.json
+    - seaf.evals.yaml
+    - seaf.ticket.yaml
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - ./ollama-native-check.sh
+acceptance_criteria:
+  - Only top-level ollama-acceptance.txt is changed.
+  - Before the change its exact bytes are PENDING followed by one newline.
+  - After the change its exact bytes are SEAF packaged Ollama acceptance passed. followed by one newline.
+  - No other path is created, deleted, renamed, or modified.
+eval:
+  config: seaf.evals.yaml

@@ -1,0 +1,11 @@
+evals:
+  allow_commands:
+    - ./ollama-native-check.sh
+  required:
+    - name: packaged_ollama_native_check
+      command: ./ollama-native-check.sh
+      timeout_ms: 120000
+      max_output_bytes: 4096
+      env:
+        SEAF_GOLDEN_PATH_MODE: "@SEAF_GOLDEN_PATH_MODE@"
+        SEAF_GOLDEN_PATH_CONTROL_DIR: "@SEAF_GOLDEN_PATH_CONTROL_DIR@"

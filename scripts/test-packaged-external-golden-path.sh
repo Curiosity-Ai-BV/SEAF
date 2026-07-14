@@ -6,27 +6,81 @@ export LC_ALL=C
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 fixture_relative_path="fixtures/packaged-external-golden-path/project.txt"
 fixture_root="$repo_root/fixtures/packaged-external-golden-path"
+ollama_fixture_root="$fixture_root/ollama"
 build_release_script="$repo_root/scripts/build-release-artifact.sh"
 readonly version="0.1.0"
 readonly reviewer="golden-path-reviewer@example.invalid"
 readonly operator="golden-path-operator"
 readonly passing_run_id="packaged-external-passing"
 readonly rejection_run_id="packaged-external-rejection"
+readonly ollama_passing_run_id="packaged-ollama-passing"
+readonly ollama_rejection_run_id="packaged-ollama-rejection"
+readonly ollama_host="http://localhost:11434"
+readonly ollama_base_url="http://localhost:11434/api"
+readonly role_timeout_ms="120000"
 
 temp_root=""
 source_before_snapshot=""
 active_resume_pid=""
 active_eval_pid=""
-
-if [[ ! -f "$repo_root/$fixture_relative_path" ]]; then
-  echo "Packaged external golden path failed: required fixture file is missing: $fixture_relative_path" >&2
-  exit 1
-fi
+evidence_temp=""
+acceptance_mode="fake"
+model=""
+evidence_out=""
+ollama_command=""
+ollama_server_version=""
+ollama_client_version=""
 
 fail() {
   echo "Packaged external golden path failed: $*" >&2
   exit 1
 }
+
+while (($# > 0)); do
+  case "$1" in
+    --local-live-ollama)
+      [[ "$acceptance_mode" == "fake" ]] || fail "--local-live-ollama may be passed only once"
+      acceptance_mode="ollama"
+      shift
+      ;;
+    --model)
+      [[ -z "$model" ]] || fail "--model may be passed only once"
+      (($# >= 2)) || fail "--model requires a value"
+      [[ -n "$2" && "$2" != --* ]] || fail "--model requires a value"
+      model="$2"
+      shift 2
+      ;;
+    --evidence-out)
+      [[ -z "$evidence_out" ]] || fail "--evidence-out may be passed only once"
+      (($# >= 2)) || fail "--evidence-out requires a value"
+      [[ -n "$2" && "$2" != --* ]] || fail "--evidence-out requires a value"
+      evidence_out="$2"
+      shift 2
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+if [[ "$acceptance_mode" == "fake" ]]; then
+  [[ -z "$model" ]] || fail "--model requires --local-live-ollama"
+  [[ -z "$evidence_out" ]] || fail "--evidence-out requires --local-live-ollama"
+else
+  [[ -n "$model" ]] || fail "--local-live-ollama requires --model"
+  [[ -n "$evidence_out" ]] || fail "--local-live-ollama requires --evidence-out"
+  case "${CI:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes)
+      fail "local Ollama acceptance refuses truthy CI"
+      ;;
+  esac
+  [[ "$evidence_out" == /* ]] || fail "--evidence-out must be an absolute external path"
+  [[ ! -e "$evidence_out" && ! -L "$evidence_out" ]] || fail "--evidence-out must not already exist"
+  [[ -t 0 ]] || fail "local Ollama acceptance requires an interactive terminal for human review"
+  [[ -t 1 ]] || fail "local Ollama acceptance requires interactive stdout to display review authority"
+fi
+
+if [[ ! -f "$repo_root/$fixture_relative_path" ]]; then
+  fail "required fixture file is missing: $fixture_relative_path"
+fi
 
 run_git() {
   GIT_CONFIG_NOSYSTEM=1 \
@@ -55,6 +109,10 @@ cleanup() {
   fi
   if [[ -n "$active_eval_pid" ]]; then
     kill_process_group "$active_eval_pid"
+  fi
+  if [[ -n "$evidence_temp" ]]; then
+    rm -f -- "$evidence_temp" || exit_code=1
+    evidence_temp=""
   fi
 
   if [[ -n "$temp_root" && -d "$temp_root" && -n "$source_before_snapshot" ]]; then
@@ -89,6 +147,38 @@ file_size_bytes() {
   else
     stat -c '%s' "$path"
   fi
+}
+
+report_local_failure() {
+  local stderr="$1"
+
+  node - "$stderr" <<'NODE'
+const fs = require('node:fs');
+const bytes = fs.readFileSync(process.argv[2]);
+if (bytes.length > 64 * 1024) {
+  process.stderr.write('local Ollama failure category: stderr exceeded the diagnostic bound; raw content omitted\n');
+  process.exit(0);
+}
+const text = bytes.toString('utf8');
+const categories = [
+  [/failed to parse ([A-Za-z]+) provider response/i, (match) => `role-schema failure at ${match[1]}`],
+  [/provider repair request failed for ([A-Za-z]+)/i, (match) => `structured repair failure at ${match[1]}`],
+  [/provider request failed for ([A-Za-z]+)/i, (match) => `provider request failure at ${match[1]}`],
+  [/request timed out/i, () => 'bounded local provider timeout'],
+  [/policy[^\n]*rejected/i, () => 'candidate policy rejection'],
+  [/request_changes|request changes/i, () => 'model reviewer requested changes'],
+  [/\breject(?:ed|ion)?\b/i, () => 'model reviewer rejected the candidate'],
+  [/\bblocked\b/i, () => 'model role reported a blocking outcome'],
+];
+for (const [pattern, label] of categories) {
+  const match = text.match(pattern);
+  if (match) {
+    process.stderr.write(`local Ollama failure category: ${label(match)}; raw content omitted\n`);
+    process.exit(0);
+  }
+}
+process.stderr.write('local Ollama failure category: unclassified before acceptance checkpoint; raw content omitted\n');
+NODE
 }
 
 snapshot_repository() {
@@ -237,13 +327,20 @@ run_in_repository() {
   local stderr="$output.stderr"
 
   if ! (cd "$repository" && "$seaf_binary" "$@") >"$output" 2>"$stderr"; then
-    echo "$label stderr:" >&2
-    sed 's/^/  /' "$stderr" >&2 || true
+    if [[ "$acceptance_mode" == "fake" ]]; then
+      echo "$label stderr:" >&2
+      sed 's/^/  /' "$stderr" >&2 || true
+    else
+      report_local_failure "$stderr"
+      echo "$label failed; provider stderr was retained only in ephemeral acceptance state" >&2
+    fi
     fail "$label command failed"
   fi
   if [[ -s "$stderr" ]]; then
-    echo "$label stderr:" >&2
-    sed 's/^/  /' "$stderr" >&2 || true
+    if [[ "$acceptance_mode" == "fake" ]]; then
+      echo "$label stderr:" >&2
+      sed 's/^/  /' "$stderr" >&2 || true
+    fi
     fail "$label wrote unexpected stderr"
   fi
 }
@@ -262,7 +359,9 @@ run_in_repository_fails_with() {
   set -e
   ((status != 0)) || fail "$label unexpectedly succeeded"
   grep -Fq -- "$expected" "$output.stderr" || {
-    sed 's/^/  /' "$output.stderr" >&2 || true
+    if [[ "$acceptance_mode" == "fake" ]]; then
+      sed 's/^/  /' "$output.stderr" >&2 || true
+    fi
     fail "$label did not report the expected failure"
   }
 }
@@ -275,8 +374,13 @@ run_in_repository_with_eval_cleanup_diagnostic() {
   local stderr="$output.stderr"
 
   if ! (cd "$repository" && "$seaf_binary" "$@") >"$output" 2>"$stderr"; then
-    echo "$label stderr:" >&2
-    sed 's/^/  /' "$stderr" >&2 || true
+    if [[ "$acceptance_mode" == "fake" ]]; then
+      echo "$label stderr:" >&2
+      sed 's/^/  /' "$stderr" >&2 || true
+    else
+      report_local_failure "$stderr"
+      echo "$label failed; provider stderr was retained only in ephemeral acceptance state" >&2
+    fi
     fail "$label command failed"
   fi
   node - "$stderr" <<'NODE'
@@ -323,18 +427,66 @@ assert_loop_report() {
   local command="$2"
   local run_id="$3"
   local status="$4"
+  local expected_provider="fake"
+  local expected_model="fake-local"
 
-  node - "$file" "$command" "$run_id" "$status" <<'NODE'
+  if [[ "$acceptance_mode" == "ollama" ]]; then
+    expected_provider="ollama"
+    expected_model="$model"
+  fi
+
+  node - "$file" "$command" "$run_id" "$status" "$expected_provider" "$expected_model" <<'NODE'
 const fs = require('node:fs');
-const [file, command, runId, status] = process.argv.slice(2);
+const [file, command, runId, status, expectedProvider, expectedModel] = process.argv.slice(2);
 const report = JSON.parse(fs.readFileSync(file, 'utf8'));
 if (report.command !== command || report.run_id !== runId || report.status !== status) {
   throw new Error(`unexpected loop report: ${JSON.stringify(report)}`);
 }
-if (report.provider !== undefined && (report.provider !== 'fake' || report.model !== 'fake-local')) {
-  throw new Error('loop report did not use exact fake-provider authority');
+if (report.provider !== undefined && (report.provider !== expectedProvider || report.model !== expectedModel)) {
+  throw new Error('loop report did not use exact provider authority');
 }
 NODE
+}
+
+require_live_review_checkpoint() {
+  local report_file="$1"
+  local run_directory="$2"
+  local label="$3"
+
+  if node - "$report_file" "$run_directory" "$label" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [reportPath, runDirectoryInput, label] = process.argv.slice(2);
+const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+if (report.status === 'awaiting_human_review') process.exit(0);
+const runDirectory = fs.realpathSync(runDirectoryInput);
+const run = JSON.parse(fs.readFileSync(path.join(runDirectory, 'run.json'), 'utf8'));
+const last = Array.isArray(run.provider_exchange_records)
+  ? run.provider_exchange_records.at(-1)
+  : undefined;
+let outcome = 'no_terminal_provider_exchange';
+let kind = 'none';
+if (last) {
+  kind = String(last.kind);
+  if (last.phase === 'response'
+    && typeof last.path === 'string'
+    && !path.posix.isAbsolute(last.path)
+    && !last.path.includes('\\')
+    && last.path.split('/').every((part) => part && part !== '.' && part !== '..')) {
+    const recordPath = path.resolve(runDirectory, last.path);
+    if (recordPath.startsWith(`${runDirectory}${path.sep}`)) {
+      const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+      outcome = String(record.outcome ?? outcome);
+    }
+  }
+}
+process.stderr.write(`local Ollama ${label} stopped at ${String(report.current_step)} with ${kind}/${outcome}; raw provider content omitted\n`);
+process.exit(1);
+NODE
+  then
+    return 0
+  fi
+  fail "$label did not reach the human review checkpoint"
 }
 
 assert_inspection() {
@@ -466,6 +618,84 @@ if (!Array.isArray(report.checks) || report.checks.length !== 8 || report.checks
 NODE
 }
 
+render_ollama_eval_config() {
+  local destination="$1"
+  local mode="$2"
+  local control_dir="$3"
+
+  [[ "$mode" == "pass" || "$mode" == "reject" ]] || fail "invalid Ollama fixture mode"
+  [[ "$control_dir" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "Ollama control directory is not template-safe"
+  sed \
+    -e "s|@SEAF_GOLDEN_PATH_MODE@|$mode|g" \
+    -e "s|@SEAF_GOLDEN_PATH_CONTROL_DIR@|$control_dir|g" \
+    "$ollama_fixture_root/seaf.evals.yaml.in" >"$destination"
+}
+
+materialize_ollama_repository() {
+  local repository="$1"
+  local control_dir="$2"
+  local mode="$3"
+  local label="$4"
+  local init_output="$temp_root/$label-init.json"
+  local ticket_output="$temp_root/$label-ticket.json"
+  local doctor_output="$temp_root/$label-doctor.json"
+
+  mkdir "$repository" "$control_dir"
+  chmod 0700 "$repository" "$control_dir"
+  install -m 0644 "$ollama_fixture_root/ollama-acceptance.txt" \
+    "$repository/ollama-acceptance.txt"
+  install -m 0755 "$ollama_fixture_root/ollama-native-check.sh" \
+    "$repository/ollama-native-check.sh"
+  run_git -C "$repository" init -q
+  run_git -C "$repository" config user.name "SEAF Ollama Golden Path"
+  run_git -C "$repository" config user.email "ollama-golden-path@seaf.invalid"
+
+  run_in_repository "$label generic init" "$repository" "$init_output" init --json
+  node - "$init_output" <<'NODE'
+const fs = require('node:fs');
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const expected = ['seaf.config.json', 'seaf.policy.json', 'seaf.evals.yaml', 'seaf.ticket.yaml', '.seaf/.gitignore'];
+if (report.path !== '.' || report.template !== 'generic' || JSON.stringify(report.created) !== JSON.stringify(expected)) {
+  throw new Error(`generic init output mismatch: ${JSON.stringify(report)}`);
+}
+NODE
+  install -m 0644 "$ollama_fixture_root/seaf.ticket.yaml" "$repository/seaf.ticket.yaml"
+  render_ollama_eval_config "$repository/seaf.evals.yaml" "$mode" "$control_dir"
+  run_in_repository "$label ticket validate" "$repository" "$ticket_output" \
+    ticket validate seaf.ticket.yaml --json
+  node - "$ticket_output" <<'NODE'
+const fs = require('node:fs');
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (report.valid !== true || report.kind !== 'ticket' || report.errors.length !== 0) {
+  throw new Error(`ticket validation mismatch: ${JSON.stringify(report)}`);
+}
+NODE
+
+  run_git -C "$repository" add \
+    .seaf/.gitignore ollama-acceptance.txt ollama-native-check.sh \
+    seaf.config.json seaf.evals.yaml seaf.policy.json seaf.ticket.yaml
+  run_git -C "$repository" commit -q -m "Initialize packaged Ollama fixture"
+  [[ -z "$(run_git -C "$repository" status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail "$label fixture was not clean after initialization"
+
+  run_in_repository "$label live Ollama doctor" "$repository" "$doctor_output" \
+    doctor --provider ollama --model "$model" --base-url "$ollama_base_url" \
+    --live-provider --timeout-ms 30000 --json
+  node - "$doctor_output" "$model" <<'NODE'
+const fs = require('node:fs');
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (report.schema_version !== 1
+  || report.ready !== true
+  || report.provider !== 'ollama'
+  || report.model !== process.argv[3]) {
+  throw new Error('live Ollama doctor authority mismatch');
+}
+if (!Array.isArray(report.checks) || report.checks.length !== 8 || report.checks.some((check) => check.status !== 'passed')) {
+  throw new Error('live Ollama doctor did not report exactly eight passing checks');
+}
+NODE
+}
+
 wait_for_file() {
   local path="$1"
   local label="$2"
@@ -490,6 +720,379 @@ if (!Array.isArray(run.provider_exchange_records) || run.provider_exchange_recor
   throw new Error('provider exchange ledger length changed');
 }
 NODE
+}
+
+assert_clean_live_provider_flow() {
+  local run_file="$1"
+  local inspect_file="$2"
+
+  node - "$run_file" "$inspect_file" <<'NODE'
+const fs = require('node:fs');
+const run = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const inspect = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const steps = ['research', 'analysis', 'spec_creation', 'spec_review', 'development', 'output_review'];
+const outcomes = ['passed', 'passed', 'passed', 'approve_spec', 'patch_proposed', 'approve_for_tests'];
+const records = run.provider_exchange_records;
+if (!Array.isArray(records) || records.length !== 12) {
+  throw new Error(`live provider ledger must contain exactly six request/response exchanges, got ${records?.length}`);
+}
+for (let index = 0; index < steps.length; index += 1) {
+  const request = records[index * 2];
+  const response = records[index * 2 + 1];
+  for (const record of [request, response]) {
+    if (record.step !== steps[index]
+      || record.step_attempt !== 1
+      || record.exchange_index !== 1
+      || record.kind !== 'initial'
+      || record.context_round !== undefined) {
+      throw new Error(`live provider exchange used retry, repair, expansion, or non-initial authority: ${JSON.stringify(record)}`);
+    }
+  }
+  if (request.phase !== 'request' || response.phase !== 'response') {
+    throw new Error(`live provider exchange phases are not one request and one response for ${steps[index]}`);
+  }
+}
+if (!Array.isArray(inspect.provider_attempts) || inspect.provider_attempts.length !== 6) {
+  throw new Error('inspection did not retain exactly six provider attempts');
+}
+for (let index = 0; index < inspect.provider_attempts.length; index += 1) {
+  const attempt = inspect.provider_attempts[index];
+  if (attempt.step !== steps[index] || attempt.attempt !== 1 || attempt.exchanges.length !== 2) {
+    throw new Error(`unexpected inspected provider attempt: ${JSON.stringify(attempt)}`);
+  }
+  const [request, response] = attempt.exchanges;
+  if (request.kind !== 'initial'
+    || response.kind !== 'initial'
+    || request.phase !== 'request'
+    || response.phase !== 'response'
+    || response.outcome !== outcomes[index]
+    || request.verification !== 'verified'
+    || response.verification !== 'verified') {
+    throw new Error(`provider attempt is not a clean terminal exchange: ${JSON.stringify(attempt)}`);
+  }
+}
+NODE
+}
+
+show_candidate_authority() {
+  local label="$1"
+  local status_file="$2"
+  local inspect_file="$3"
+  local run_directory="$4"
+  local status
+  local reviewed_diff
+
+  node - "$status_file" "$inspect_file" <<'NODE'
+const fs = require('node:fs');
+const [statusPath, inspectPath] = process.argv.slice(2);
+const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+const inspect = JSON.parse(fs.readFileSync(inspectPath, 'utf8'));
+if (inspect.integrity !== 'verified'
+  || inspect.candidate?.verification !== 'verified'
+  || inspect.run_id !== status.run_id
+  || inspect.status !== status.status) {
+  throw new Error('display authority is not bound to verified inspection');
+}
+NODE
+  status="$(json_value "$status_file" status)"
+  if [[ "$status" == "awaiting_human_review" ]]; then
+    local run_file="$run_directory/run.json"
+    assert_exact_ollama_candidate "$run_file" 'M  ollama-acceptance.txt'
+    local candidate_path
+    candidate_path="$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.candidate_workspace.path)' "$run_file")"
+    [[ -d "$candidate_path" && ! -L "$candidate_path" ]] || fail "$label candidate workspace is unsafe"
+    reviewed_diff="$(mktemp "$temp_root/reviewed-candidate-diff.XXXXXXXX")" ||
+      fail "$label could not create an ephemeral reviewed diff"
+    run_git -C "$candidate_path" diff \
+      --cached --binary --full-index --no-ext-diff --no-textconv HEAD -- \
+      >"$reviewed_diff"
+    local observed_digest
+    observed_digest="$(sha256_file "$reviewed_diff")"
+    [[ "$observed_digest" == "$(json_value "$status_file" candidate_diff_digest)" ]] ||
+      fail "$label regenerated candidate diff does not match displayed candidate authority"
+  else
+    local candidate_relative
+    candidate_relative="$(json_value "$status_file" candidate_diff_path)"
+    [[ "$candidate_relative" == artifacts/*
+      && "$candidate_relative" != *\\*
+      && "$candidate_relative" != */../*
+      && "$candidate_relative" != ../* ]] || fail "$label candidate diff path is unsafe"
+    reviewed_diff="$run_directory/$candidate_relative"
+    [[ -f "$reviewed_diff" && ! -L "$reviewed_diff" ]] || fail "$label candidate diff is missing"
+    [[ "$(sha256_file "$reviewed_diff")" == "$(json_value "$status_file" candidate_diff_digest)" ]] ||
+      fail "$label candidate diff artifact does not match displayed candidate authority"
+  fi
+  (("$(file_size_bytes "$reviewed_diff")" <= 32768)) || fail "$label candidate diff exceeds display bound"
+
+  node - "$label" "$status_file" "$inspect_file" <<'NODE'
+const fs = require('node:fs');
+const [label, statusPath, inspectPath] = process.argv.slice(2);
+const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+const inspect = JSON.parse(fs.readFileSync(inspectPath, 'utf8'));
+const shown = {
+  run: status.run_id,
+  status: status.status,
+  candidate_diff_digest: status.candidate_diff_digest,
+  eval_report_digest: status.eval_report_digest ?? null,
+  target_head: status.target_head,
+  integrity: inspect.integrity,
+};
+process.stdout.write(`==> ${label} authority\n${JSON.stringify(shown, null, 2)}\n`);
+NODE
+  echo "==> $label inspected candidate diff"
+  sed -n '1,400p' "$reviewed_diff"
+}
+
+require_typed_confirmation() {
+  local label="$1"
+  local expected="$2"
+  local entered
+
+  [[ -t 0 ]] || fail "$label requires an interactive terminal with human-entered input"
+  printf '%s: ' "$label" >&2
+  if ! IFS= read -r entered; then
+    fail "$label requires interactive typed input; received EOF"
+  fi
+  [[ "$entered" == "$expected" ]] || fail "$label did not exactly match the displayed authority"
+}
+
+assert_exact_ollama_candidate() {
+  local run_file="$1"
+  local expected_status="$2"
+
+  local candidate_path
+  candidate_path="$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.candidate_workspace.path)' "$run_file")"
+  [[ -d "$candidate_path" && ! -L "$candidate_path" ]] || fail "Ollama candidate workspace is unsafe"
+  [[ "$(run_git -C "$candidate_path" status --porcelain=v1 --untracked-files=all)" == "$expected_status" ]] ||
+    fail "Ollama candidate changed a path outside the one-file contract"
+  printf 'SEAF packaged Ollama acceptance passed.\n' |
+    cmp -s - "$candidate_path/ollama-acceptance.txt" ||
+    fail "Ollama candidate target bytes do not match the exact newline-terminated contract"
+}
+
+artifact_metrics() {
+  local directory="$1"
+  local output="$2"
+
+  node - "$directory" "$output" <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = fs.realpathSync(process.argv[2]);
+const entries = [];
+let totalBytes = 0;
+function walk(directory, relativeDirectory = '', depth = 0) {
+  if (depth > 8) throw new Error('evidence inventory exceeds depth bound');
+  for (const name of fs.readdirSync(directory).sort()) {
+    const relative = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+    const absolute = path.join(directory, name);
+    const stat = fs.lstatSync(absolute);
+    if (stat.isSymbolicLink()) throw new Error(`evidence inventory contains symlink: ${relative}`);
+    if (stat.isDirectory()) {
+      walk(absolute, relative, depth + 1);
+      continue;
+    }
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) throw new Error(`unsafe evidence inventory entry: ${relative}`);
+    const bytes = fs.readFileSync(absolute);
+    totalBytes += bytes.length;
+    if (totalBytes > 32 * 1024 * 1024) throw new Error('evidence inventory exceeds aggregate bound');
+    entries.push({ path: relative, mode: stat.mode & 0o7777, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') });
+    if (entries.length > 4096) throw new Error('evidence inventory exceeds file-count bound');
+  }
+}
+walk(root);
+const canonical = `${JSON.stringify(entries)}\n`;
+const report = {
+  file_count: entries.length,
+  total_bytes: totalBytes,
+  manifest_sha256: crypto.createHash('sha256').update(canonical).digest('hex'),
+};
+fs.writeFileSync(process.argv[3], `${JSON.stringify(report)}\n`, { flag: 'wx', mode: 0o600 });
+NODE
+}
+
+sha256_file() {
+  node -e 'const c=require("node:crypto"),f=require("node:fs");process.stdout.write(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$1"
+}
+
+fixture_manifest_sha256() {
+  node - "$ollama_fixture_root" <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = fs.realpathSync(process.argv[2]);
+const entries = fs.readdirSync(root).sort().map((name) => {
+  const absolute = path.join(root, name);
+  const stat = fs.lstatSync(absolute);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`unsafe Ollama fixture entry: ${name}`);
+  const bytes = fs.readFileSync(absolute);
+  return { name, mode: stat.mode & 0o7777, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
+});
+process.stdout.write(crypto.createHash('sha256').update(`${JSON.stringify(entries)}\n`).digest('hex'));
+NODE
+}
+
+validate_evidence_status_allowlist() {
+  local evidence_file="$1"
+
+  node - "$evidence_file" <<'NODE'
+const evidence = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+const allowed = new Set([
+  'pending',
+  'running',
+  'blocked',
+  'failed',
+  'awaiting_human_review',
+  'approved',
+  'eval_passed',
+  'promoted',
+]);
+for (const [label, transitions] of [
+  ['passing', evidence.passing?.status_transitions],
+  ['rejection', evidence.rejection?.status_transitions],
+]) {
+  if (!Array.isArray(transitions) || transitions.length === 0) {
+    throw new Error(`${label} status transitions are absent`);
+  }
+  for (const status of transitions) {
+    if (!allowed.has(status)) throw new Error(`${label} contains invented LoopStatus: ${status}`);
+  }
+}
+if (JSON.stringify(evidence.passing.status_transitions)
+    !== JSON.stringify(['awaiting_human_review', 'approved', 'eval_passed', 'promoted'])
+  || evidence.passing.interruption_observed !== true) {
+  throw new Error('passing status/interruption facts do not match executed authority');
+}
+if (JSON.stringify(evidence.rejection.status_transitions)
+    !== JSON.stringify(['awaiting_human_review', 'approved', 'failed'])
+  || evidence.rejection.candidate_lifecycle !== 'cleaned') {
+  throw new Error('rejection status/lifecycle facts do not match executed authority');
+}
+NODE
+}
+
+remove_owned_evidence_temp() {
+  [[ -z "$evidence_temp" ]] && return 0
+  rm -f -- "$evidence_temp" || return 1
+  evidence_temp=""
+}
+
+write_ollama_evidence() {
+  local passing_metrics="$1"
+  local rejection_metrics="$2"
+  local archive_sha256="$3"
+  local harness_sha256="$4"
+  local fixture_sha256="$5"
+  local candidate_digest="$6"
+  local eval_digest="$7"
+  local target_head="$8"
+  local rejection_candidate="$9"
+  shift 9
+  local rejection_eval_digest="$1"
+  local rejection_head="$2"
+
+  local evidence_parent
+  evidence_parent="$(dirname "$evidence_out")"
+  evidence_temp="$(mktemp "$evidence_parent/.seaf-m2-07-evidence.XXXXXXXX")" ||
+    fail "could not create secure evidence publication temporary file"
+  chmod 0600 "$evidence_temp"
+
+  if ! node - "$evidence_temp" "$passing_metrics" "$rejection_metrics" \
+    "$ollama_server_version" "$ollama_client_version" "$model" "$ollama_host" "$ollama_base_url" \
+    "$source_head" "$archive_sha256" "$harness_sha256" "$fixture_sha256" \
+    "$candidate_digest" "$eval_digest" "$target_head" "$rejection_candidate" \
+    "$rejection_eval_digest" "$rejection_head" "$(uname -s)" "$(uname -m)" <<'NODE'
+const fs = require('node:fs');
+const [
+  temporary, passingMetricsPath, rejectionMetricsPath, serverVersion, clientVersion,
+  model, host, apiBaseUrl, sourceCommit, archiveSha256, harnessSha256, fixtureSha256,
+  candidateDigest, evalDigest, targetHead, rejectionCandidate, rejectionEvalDigest,
+  rejectionHead, os, arch,
+] = process.argv.slice(2);
+const digest = /^[0-9a-f]{64}$/;
+const commit = /^[0-9a-f]{40,64}$/;
+for (const value of [archiveSha256, harnessSha256, fixtureSha256, candidateDigest, evalDigest, rejectionCandidate, rejectionEvalDigest]) {
+  if (!digest.test(value)) throw new Error('evidence contains invalid digest authority');
+}
+for (const value of [sourceCommit, targetHead, rejectionHead]) {
+  if (!commit.test(value)) throw new Error('evidence contains invalid Git authority');
+}
+const evidence = {
+  schema_version: 1,
+  milestone: 'M2-07',
+  generated_at: new Date().toISOString(),
+  platform: { os, arch },
+  ollama: { server_version: serverVersion, client_version: clientVersion, model, host, api_base_url: apiBaseUrl },
+  source_commit: sourceCommit,
+  packaged_archive_sha256: archiveSha256,
+  harness_sha256: harnessSha256,
+  fixture_manifest_sha256: fixtureSha256,
+  cli_identity: { version: 'seaf 0.1.0', info: 'Self-Evolving Application Framework' },
+  passing: {
+    status_transitions: ['awaiting_human_review', 'approved', 'eval_passed', 'promoted'],
+    interruption_observed: true,
+    evaluation_attempts: [1, 2],
+    provider_exchange_count: 6,
+    integrity: 'verified',
+    candidate_diff_digest: candidateDigest,
+    eval_report_digest: evalDigest,
+    target_head: targetHead,
+    source_unchanged_before_promotion: true,
+    approved_candidate_equals_promoted_source: true,
+    attempt_one_immutable: true,
+    artifacts: JSON.parse(fs.readFileSync(passingMetricsPath, 'utf8')),
+  },
+  rejection: {
+    status_transitions: ['awaiting_human_review', 'approved', 'failed'],
+    candidate_lifecycle: 'cleaned',
+    evaluation_attempts: [1],
+    provider_exchange_count: 6,
+    integrity: 'verified',
+    candidate_diff_digest: rejectionCandidate,
+    eval_report_digest: rejectionEvalDigest,
+    target_head: rejectionHead,
+    source_unchanged: true,
+    sentinels_unchanged: true,
+    artifacts: JSON.parse(fs.readFileSync(rejectionMetricsPath, 'utf8')),
+  },
+  omissions: {
+    raw_provider_bodies_omitted: true,
+    raw_prompts_omitted: true,
+    raw_responses_omitted: true,
+    provider_records_omitted: true,
+    provider_metadata_omitted: true,
+    absolute_paths_omitted: true,
+    command_output_omitted: true,
+  },
+};
+const bytes = Buffer.from(`${JSON.stringify(evidence, null, 2)}\n`, 'utf8');
+if (bytes.length > 32 * 1024) throw new Error('sanitized evidence exceeds 32 KiB');
+const descriptor = fs.openSync(temporary, 'r+');
+try {
+  fs.ftruncateSync(descriptor, 0);
+  fs.writeFileSync(descriptor, bytes);
+  fs.fsyncSync(descriptor);
+} finally {
+  fs.closeSync(descriptor);
+}
+NODE
+  then
+    remove_owned_evidence_temp || true
+    return 1
+  fi
+  if ! validate_evidence_status_allowlist "$evidence_temp"; then
+    remove_owned_evidence_temp || true
+    return 1
+  fi
+  if ! node - "$evidence_temp" "$evidence_out" <<'NODE'
+const fs = require('node:fs');
+fs.linkSync(process.argv[2], process.argv[3]);
+NODE
+  then
+    remove_owned_evidence_temp || true
+    return 1
+  fi
+  remove_owned_evidence_temp || fail "could not remove evidence publication temporary file"
 }
 
 validate_run_artifacts() {
@@ -614,15 +1217,359 @@ if (references.size === 0) throw new Error(`${label}: no artifact references wer
 NODE
 }
 
+run_ollama_acceptance() {
+  local passing_repo="$temp_root/ollama-passing-repo"
+  local passing_control="$temp_root/ollama-passing-control"
+  local passing_runs="$temp_root/ollama-passing-runs"
+  local rejection_repo="$temp_root/ollama-rejection-repo"
+  local rejection_control="$temp_root/ollama-rejection-control"
+  local rejection_runs="$temp_root/ollama-rejection-runs"
+
+  echo "==> Materialize live Ollama passing project"
+  materialize_ollama_repository "$passing_repo" "$passing_control" pass ollama-passing
+  local passing_source_before="$temp_root/ollama-passing-source-before.json"
+  snapshot_repository "$passing_repo" "$passing_source_before"
+
+  local passing_run_output="$temp_root/ollama-passing-run.json"
+  run_in_repository "live Ollama passing loop run" "$passing_repo" "$passing_run_output" \
+    loop run --ticket seaf.ticket.yaml --provider ollama --model "$model" \
+    --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" \
+    --runs-root "$passing_runs" --run-id "$ollama_passing_run_id" --json
+  require_live_review_checkpoint "$passing_run_output" \
+    "$passing_runs/$ollama_passing_run_id" "passing run"
+  assert_loop_report "$passing_run_output" run "$ollama_passing_run_id" awaiting_human_review
+  local candidate_digest
+  candidate_digest="$(json_value "$passing_run_output" candidate_diff_digest)"
+  local target_head
+  target_head="$(json_value "$passing_run_output" target_head)"
+  [[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]] || fail "Ollama passing candidate digest is invalid"
+  [[ "$target_head" =~ ^[0-9a-f]{40,64}$ ]] || fail "Ollama passing target HEAD is invalid"
+  local passing_run_dir="$passing_runs/$ollama_passing_run_id"
+  local passing_run_file="$passing_run_dir/run.json"
+  local provider_count
+  provider_count="$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.provider_exchange_records.length))' "$passing_run_file")"
+  [[ "$provider_count" == "12" ]] || fail "Ollama passing run did not contain exactly six provider exchanges"
+
+  local passing_awaiting_inspect="$temp_root/ollama-passing-awaiting-inspect.json"
+  inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" awaiting_human_review \
+    "$passing_awaiting_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_awaiting_inspect"
+  assert_exact_ollama_candidate "$passing_run_file" 'M  ollama-acceptance.txt'
+  snapshot_repository "$passing_repo" "$temp_root/ollama-passing-before-approval-source.json"
+  assert_same_snapshot "Ollama source before human approval" "$passing_source_before" \
+    "$temp_root/ollama-passing-before-approval-source.json"
+
+  local passing_status_before="$temp_root/ollama-passing-status-before-approval.json"
+  run_in_repository "Ollama passing approval status" "$passing_repo" "$passing_status_before" \
+    loop status --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" --json
+  assert_loop_report "$passing_status_before" status "$ollama_passing_run_id" awaiting_human_review
+  show_candidate_authority "Ollama passing approval" "$passing_status_before" \
+    "$passing_awaiting_inspect" "$passing_run_dir"
+  require_typed_confirmation "Type the passing candidate digest" "$candidate_digest"
+  require_typed_confirmation "Type the passing target HEAD" "$target_head"
+
+  local passing_approve_output="$temp_root/ollama-passing-approve.json"
+  run_in_repository "exact Ollama passing approval" "$passing_repo" "$passing_approve_output" \
+    loop approve --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
+    --reviewer "$reviewer" --confirm-candidate-diff "$candidate_digest" \
+    --confirm-target-head "$target_head" --json
+  assert_loop_report "$passing_approve_output" approve "$ollama_passing_run_id" approved
+  [[ "$(json_value "$passing_approve_output" testing_ran)" == "false" ]] ||
+    fail "Ollama approval unexpectedly ran Testing"
+  inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" approved \
+    "$temp_root/ollama-passing-approved-inspect.json"
+
+  echo "==> Interrupt packaged Ollama evaluation and recover with attempt 2"
+  local passing_resume_output="$temp_root/ollama-passing-resume-interrupted.json"
+  (
+    cd "$passing_repo"
+    exec "$seaf_binary" loop resume --run-id "$ollama_passing_run_id" \
+      --runs-root "$passing_runs" --base-url "$ollama_base_url" \
+      --timeout-ms "$role_timeout_ms" --json
+  ) >"$passing_resume_output" 2>"$passing_resume_output.stderr" &
+  active_resume_pid=$!
+  wait_for_file "$passing_control/started" "Ollama fixture evaluation start marker"
+  wait_for_file "$passing_control/eval.pid" "Ollama fixture evaluation PID marker"
+  active_eval_pid="$(tr -d '\r\n' <"$passing_control/eval.pid")"
+  [[ "$active_eval_pid" =~ ^[1-9][0-9]*$ ]] || fail "Ollama fixture evaluation PID is invalid"
+  [[ -f "$passing_run_dir/artifacts/07-testing.attempt-001.execution-intent.json" ]] ||
+    fail "Ollama evaluation started without durable attempt-1 intent"
+  /bin/kill -KILL "$active_resume_pid" || fail "could not interrupt packaged Ollama CLI"
+  kill_process_group "$active_eval_pid"
+  set +e
+  wait "$active_resume_pid"
+  local resume_status=$?
+  set -e
+  active_resume_pid=""
+  active_eval_pid=""
+  ((resume_status != 0)) || fail "interrupted packaged Ollama CLI unexpectedly succeeded"
+  snapshot_repository "$passing_repo" "$temp_root/ollama-passing-after-interruption-source.json"
+  assert_same_snapshot "Ollama source after real interruption" "$passing_source_before" \
+    "$temp_root/ollama-passing-after-interruption-source.json"
+  snapshot_directory "$passing_run_dir" "$temp_root/ollama-attempt-one-before-recovery.json" \
+    "artifacts/07-testing.attempt-001"
+  inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" approved \
+    "$temp_root/ollama-passing-interrupted-inspect.json" true
+
+  snapshot_directory "$passing_run_dir" "$temp_root/ollama-before-ordinary-resume.json"
+  run_in_repository_fails_with \
+    "ordinary incomplete Ollama evaluation resume" "$passing_repo" \
+    "$temp_root/ollama-ordinary-resume.stdout" \
+    "an incomplete Approved evaluation attempt exists; audited recovery is required" \
+    loop resume --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
+    --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" --json
+  snapshot_directory "$passing_run_dir" "$temp_root/ollama-after-ordinary-resume.json"
+  assert_same_snapshot "Ollama run authority after rejected ordinary resume" \
+    "$temp_root/ollama-before-ordinary-resume.json" "$temp_root/ollama-after-ordinary-resume.json"
+
+  local passing_revise_output="$temp_root/ollama-passing-revise.json"
+  run_in_repository "invalidate incomplete Ollama evaluation" "$passing_repo" "$passing_revise_output" \
+    loop revise --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
+    --from-step testing --eval-recovery invalidate --actor "$operator" \
+    --reason "recover packaged Ollama acceptance interruption" --json
+  node - "$passing_revise_output" <<'NODE'
+const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+if (report.command !== 'revise' || report.recovery_id !== 1 || report.invalidated_attempt !== 1 || report.next_evaluation_attempt !== 2) {
+  throw new Error('Ollama evaluation invalidation authority mismatch');
+}
+NODE
+  snapshot_directory "$passing_run_dir" "$temp_root/ollama-attempt-one-after-revise.json" \
+    "artifacts/07-testing.attempt-001"
+  assert_same_snapshot "Ollama evaluation attempt 1 after revise" \
+    "$temp_root/ollama-attempt-one-before-recovery.json" "$temp_root/ollama-attempt-one-after-revise.json"
+  assert_provider_count "$passing_run_file" "$provider_count"
+
+  : >"$passing_control/release"
+  local passing_rerun_output="$temp_root/ollama-passing-rerun.json"
+  run_in_repository_with_eval_cleanup_diagnostic \
+    "rerun invalidated Ollama evaluation" "$passing_repo" "$passing_rerun_output" \
+    loop rerun --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
+    --recovery 1 --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" --json
+  assert_loop_report "$passing_rerun_output" rerun "$ollama_passing_run_id" eval_passed
+  assert_provider_count "$passing_run_file" "$provider_count"
+  snapshot_directory "$passing_run_dir" "$temp_root/ollama-attempt-one-after-rerun.json" \
+    "artifacts/07-testing.attempt-001"
+  assert_same_snapshot "Ollama evaluation attempt 1 after rerun" \
+    "$temp_root/ollama-attempt-one-before-recovery.json" "$temp_root/ollama-attempt-one-after-rerun.json"
+  printf 'packaged Ollama native check passed\n' |
+    cmp -s - "$passing_run_dir/artifacts/07-testing.attempt-002.check-001.stdout.log" ||
+    fail "recovered Ollama native check stdout mismatch"
+  [[ ! -s "$passing_run_dir/artifacts/07-testing.attempt-002.check-001.stderr.log" ]] ||
+    fail "recovered Ollama native check wrote stderr"
+  snapshot_repository "$passing_repo" "$temp_root/ollama-passing-after-rerun-source.json"
+  assert_same_snapshot "Ollama source after evaluation recovery" "$passing_source_before" \
+    "$temp_root/ollama-passing-after-rerun-source.json"
+  local passing_eval_inspect="$temp_root/ollama-passing-eval-passed-inspect.json"
+  inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" eval_passed \
+    "$passing_eval_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_eval_inspect"
+
+  local passing_status_output="$temp_root/ollama-passing-promotion-status.json"
+  run_in_repository "Ollama passing promotion status" "$passing_repo" "$passing_status_output" \
+    loop status --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" --json
+  assert_loop_report "$passing_status_output" status "$ollama_passing_run_id" eval_passed
+  local promotion_candidate
+  promotion_candidate="$(json_value "$passing_status_output" candidate_diff_digest)"
+  local promotion_eval
+  promotion_eval="$(json_value "$passing_status_output" eval_report_digest)"
+  local promotion_head
+  promotion_head="$(json_value "$passing_status_output" target_head)"
+  [[ "$promotion_candidate" == "$candidate_digest" ]] || fail "Ollama promotion candidate drifted"
+  [[ "$promotion_eval" =~ ^[0-9a-f]{64}$ ]] || fail "Ollama promotion EvalReport digest is invalid"
+  [[ "$promotion_head" == "$target_head" ]] || fail "Ollama promotion target HEAD drifted"
+  show_candidate_authority "Ollama passing promotion" "$passing_status_output" \
+    "$passing_eval_inspect" "$passing_run_dir"
+  require_typed_confirmation "Type the promotion candidate digest" "$promotion_candidate"
+  require_typed_confirmation "Type the promotion EvalReport digest" "$promotion_eval"
+  require_typed_confirmation "Type the promotion target HEAD" "$promotion_head"
+
+  local passing_promote_output="$temp_root/ollama-passing-promote.json"
+  run_in_repository "exact Ollama passing promotion" "$passing_repo" "$passing_promote_output" \
+    loop promote --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
+    --reviewer "$reviewer" --confirm-candidate-diff "$promotion_candidate" \
+    --confirm-eval-report "$promotion_eval" --confirm-target-head "$promotion_head" --json
+  assert_loop_report "$passing_promote_output" promote "$ollama_passing_run_id" promoted
+  [[ "$(run_git -C "$passing_repo" rev-parse HEAD)" == "$target_head" ]] || fail "Ollama promotion changed target HEAD"
+  [[ "$(run_git -C "$passing_repo" write-tree)" == "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).indexTree)' "$passing_source_before")" ]] ||
+    fail "Ollama promotion changed target index"
+  [[ "$(run_git -C "$passing_repo" status --porcelain=v1 --untracked-files=all)" == ' M ollama-acceptance.txt' ]] ||
+    fail "Ollama promotion left changes outside the one permitted target"
+  printf 'SEAF packaged Ollama acceptance passed.\n' |
+    cmp -s - "$passing_repo/ollama-acceptance.txt" || fail "promoted Ollama source bytes mismatch"
+  assert_exact_ollama_candidate "$passing_run_file" 'M  ollama-acceptance.txt'
+  local candidate_path
+  candidate_path="$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.candidate_workspace.path)' "$passing_run_file")"
+  cmp -s "$passing_repo/ollama-acceptance.txt" "$candidate_path/ollama-acceptance.txt" ||
+    fail "promoted Ollama source differs from frozen candidate"
+  local candidate_diff_path
+  candidate_diff_path="$(json_value "$passing_status_output" candidate_diff_path)"
+  run_git -C "$candidate_path" diff --cached --binary --full-index --no-ext-diff --no-textconv HEAD -- \
+    >"$temp_root/ollama-frozen-candidate.diff"
+  cmp -s "$passing_run_dir/$candidate_diff_path" "$temp_root/ollama-frozen-candidate.diff" ||
+    fail "frozen Ollama candidate diff does not match approved artifact"
+  local passing_promoted_inspect="$temp_root/ollama-passing-promoted-inspect.json"
+  inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" promoted \
+    "$passing_promoted_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_promoted_inspect"
+  validate_run_artifacts "$passing_run_dir" "promoted Ollama passing run"
+
+  echo "==> Materialize live Ollama rejection project"
+  materialize_ollama_repository "$rejection_repo" "$rejection_control" reject ollama-rejection
+  local rejection_source_before="$temp_root/ollama-rejection-source-before.json"
+  snapshot_repository "$rejection_repo" "$rejection_source_before"
+  local rejection_run_output="$temp_root/ollama-rejection-run.json"
+  run_in_repository "live Ollama rejection loop run" "$rejection_repo" "$rejection_run_output" \
+    loop run --ticket seaf.ticket.yaml --provider ollama --model "$model" \
+    --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" \
+    --runs-root "$rejection_runs" --run-id "$ollama_rejection_run_id" --json
+  require_live_review_checkpoint "$rejection_run_output" \
+    "$rejection_runs/$ollama_rejection_run_id" "rejection run"
+  assert_loop_report "$rejection_run_output" run "$ollama_rejection_run_id" awaiting_human_review
+  local rejection_candidate
+  rejection_candidate="$(json_value "$rejection_run_output" candidate_diff_digest)"
+  local rejection_head
+  rejection_head="$(json_value "$rejection_run_output" target_head)"
+  local rejection_run_dir="$rejection_runs/$ollama_rejection_run_id"
+  local rejection_run_file="$rejection_run_dir/run.json"
+  local rejection_awaiting_inspect="$temp_root/ollama-rejection-awaiting-inspect.json"
+  inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" awaiting_human_review \
+    "$rejection_awaiting_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_awaiting_inspect"
+  assert_exact_ollama_candidate "$rejection_run_file" 'M  ollama-acceptance.txt'
+  local rejection_status="$temp_root/ollama-rejection-status.json"
+  run_in_repository "Ollama rejection approval status" "$rejection_repo" "$rejection_status" \
+    loop status --run-id "$ollama_rejection_run_id" --runs-root "$rejection_runs" --json
+  assert_loop_report "$rejection_status" status "$ollama_rejection_run_id" awaiting_human_review
+  show_candidate_authority "Ollama rejection approval" "$rejection_status" \
+    "$rejection_awaiting_inspect" "$rejection_run_dir"
+  require_typed_confirmation "Type the rejection candidate digest" "$rejection_candidate"
+  require_typed_confirmation "Type the rejection target HEAD" "$rejection_head"
+
+  local rejection_approve_output="$temp_root/ollama-rejection-approve.json"
+  run_in_repository "exact Ollama rejection approval" "$rejection_repo" "$rejection_approve_output" \
+    loop approve --run-id "$ollama_rejection_run_id" --runs-root "$rejection_runs" \
+    --reviewer "$reviewer" --confirm-candidate-diff "$rejection_candidate" \
+    --confirm-target-head "$rejection_head" --json
+  assert_loop_report "$rejection_approve_output" approve "$ollama_rejection_run_id" approved
+  snapshot_repository "$rejection_repo" "$temp_root/ollama-rejection-after-approval-clean.json"
+  assert_same_snapshot "Ollama rejection source after approval" "$rejection_source_before" \
+    "$temp_root/ollama-rejection-after-approval-clean.json"
+  printf 'packaged rejection preservation sentinel\n' >"$rejection_repo/rejection-untracked-sentinel.txt"
+  chmod 0640 "$rejection_repo/rejection-untracked-sentinel.txt"
+  (umask 000; ln -s rejection-untracked-sentinel.txt "$rejection_repo/rejection-untracked-sentinel.link")
+  local rejection_source_with_sentinels="$temp_root/ollama-rejection-source-with-sentinels.json"
+  snapshot_repository "$rejection_repo" "$rejection_source_with_sentinels"
+  assert_rejection_sentinels "$rejection_source_with_sentinels"
+
+  local rejection_resume_output="$temp_root/ollama-rejection-resume.json"
+  run_in_repository_with_eval_cleanup_diagnostic \
+    "deterministic Ollama rejecting evaluation" "$rejection_repo" "$rejection_resume_output" \
+    loop resume --run-id "$ollama_rejection_run_id" --runs-root "$rejection_runs" \
+    --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" --json
+  assert_loop_report "$rejection_resume_output" resume "$ollama_rejection_run_id" failed
+  local rejection_report="$rejection_run_dir/artifacts/08-eval-report.attempt-001.json"
+  node - "$rejection_report" "$rejection_run_dir" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const runDirectory = fs.realpathSync(process.argv[3]);
+if (report.passed !== false || report.decision !== 'reject' || report.checks?.length !== 1) {
+  throw new Error('rejecting Ollama EvalReport authority mismatch');
+}
+const check = report.checks[0];
+if (check.status !== 'failed' || check.name !== 'packaged_ollama_native_check' || check.summary !== 'command exited with code 24') {
+  throw new Error('rejecting Ollama native check summary mismatch');
+}
+function bytes(relative) {
+  if (typeof relative !== 'string' || path.posix.isAbsolute(relative) || relative.includes('\\') || relative.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error('unsafe rejecting Ollama log reference');
+  }
+  const absolute = path.resolve(runDirectory, relative);
+  if (fs.realpathSync(absolute) !== absolute || !absolute.startsWith(`${runDirectory}${path.sep}`)) throw new Error('rejecting Ollama log escaped run');
+  return fs.readFileSync(absolute);
+}
+if (bytes(check.stdout_path).length !== 0) throw new Error('rejecting Ollama native check wrote stdout');
+const expected = Buffer.from('ollama golden-path check: deterministic rejection requested\n', 'utf8');
+if (!bytes(check.stderr_path).equals(expected)) throw new Error('rejecting Ollama native check stderr mismatch');
+NODE
+  snapshot_repository "$rejection_repo" "$temp_root/ollama-rejection-after-failure.json"
+  assert_same_snapshot "Ollama rejection source after failure" "$rejection_source_with_sentinels" \
+    "$temp_root/ollama-rejection-after-failure.json"
+  local rejection_failed_inspect="$temp_root/ollama-rejection-failed-inspect.json"
+  inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" failed \
+    "$rejection_failed_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_failed_inspect"
+  validate_run_artifacts "$rejection_run_dir" "failed Ollama rejection run"
+
+  local rejection_cleanup_output="$temp_root/ollama-rejection-cleanup.json"
+  run_in_repository "Ollama rejection candidate cleanup" "$rejection_repo" "$rejection_cleanup_output" \
+    loop cleanup --run-id "$ollama_rejection_run_id" --runs-root "$rejection_runs" --json
+  node - "$rejection_cleanup_output" <<'NODE'
+const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+if (report.command !== 'cleanup' || report.status !== 'failed' || report.candidate_lifecycle !== 'cleaned') {
+  throw new Error('Ollama rejection cleanup authority mismatch');
+}
+NODE
+  snapshot_repository "$rejection_repo" "$temp_root/ollama-rejection-after-cleanup.json"
+  assert_same_snapshot "Ollama rejection source after cleanup" "$rejection_source_with_sentinels" \
+    "$temp_root/ollama-rejection-after-cleanup.json"
+  local rejection_cleaned_inspect="$temp_root/ollama-rejection-cleaned-inspect.json"
+  inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" failed \
+    "$rejection_cleaned_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_cleaned_inspect"
+  validate_run_artifacts "$rejection_run_dir" "cleaned Ollama rejection run"
+
+  [[ "$(run_git -C "$repo_root" rev-parse HEAD)" == "$source_head" ]] || fail "SEAF source HEAD changed during Ollama acceptance"
+  [[ "$(run_git -C "$repo_root" write-tree)" == "$source_index" ]] || fail "SEAF source index changed during Ollama acceptance"
+  snapshot_repository "$repo_root" "$temp_root/ollama-source-final.json"
+  assert_same_snapshot "SEAF source repository" "$source_before_snapshot" "$temp_root/ollama-source-final.json"
+
+  local passing_metrics="$temp_root/ollama-passing-metrics.json"
+  local rejection_metrics="$temp_root/ollama-rejection-metrics.json"
+  artifact_metrics "$passing_run_dir" "$passing_metrics"
+  artifact_metrics "$rejection_run_dir" "$rejection_metrics"
+  write_ollama_evidence "$passing_metrics" "$rejection_metrics" \
+    "$(sha256_file "$archive_path")" "$(sha256_file "$repo_root/scripts/test-packaged-external-golden-path.sh")" \
+    "$(fixture_manifest_sha256)" "$candidate_digest" "$promotion_eval" "$target_head" \
+    "$rejection_candidate" "$(sha256_file "$rejection_report")" "$rejection_head"
+  echo "Packaged local Ollama golden path passed; sanitized evidence published."
+}
+
 for command in cargo git gzip node sed tar; do
   require_command "$command"
 done
+if [[ "$acceptance_mode" == "ollama" ]]; then
+  for command in awk ollama; do
+    require_command "$command"
+  done
+  ollama_command="$(command -v ollama)"
+  [[ "$ollama_command" == /* && -x "$ollama_command" ]] || fail "Ollama command must resolve to an absolute executable"
+
+  evidence_parent="$(dirname "$evidence_out")"
+  [[ -d "$evidence_parent" ]] || fail "--evidence-out parent is missing"
+  evidence_parent="$(cd "$evidence_parent" && pwd -P)"
+  case "$evidence_parent/" in
+    "$repo_root/"*) fail "--evidence-out must be outside the SEAF source repository" ;;
+  esac
+  evidence_name="$(basename "$evidence_out")"
+  [[ -n "$evidence_name" && "$evidence_name" != "." && "$evidence_name" != ".." ]] ||
+    fail "--evidence-out filename is invalid"
+  evidence_out="$evidence_parent/$evidence_name"
+  [[ ! -e "$evidence_out" && ! -L "$evidence_out" ]] || fail "--evidence-out must not already exist"
+fi
 [[ -x "$build_release_script" ]] || fail "release artifact builder is missing or not executable"
 for relative in project.txt golden-path-check.sh seaf.ticket.yaml seaf.evals.yaml.in; do
   [[ -f "$fixture_root/$relative" && ! -L "$fixture_root/$relative" ]] ||
     fail "required fixture file is missing or unsafe: fixtures/packaged-external-golden-path/$relative"
 done
 [[ -x "$fixture_root/golden-path-check.sh" ]] || fail "fixture-native check is not executable"
+if [[ "$acceptance_mode" == "ollama" ]]; then
+  for relative in ollama-acceptance.txt ollama-native-check.sh seaf.ticket.yaml seaf.evals.yaml.in; do
+    [[ -f "$ollama_fixture_root/$relative" && ! -L "$ollama_fixture_root/$relative" ]] ||
+      fail "required Ollama fixture file is missing or unsafe: fixtures/packaged-external-golden-path/ollama/$relative"
+  done
+  [[ -x "$ollama_fixture_root/ollama-native-check.sh" ]] || fail "Ollama fixture-native check is not executable"
+fi
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) target="aarch64-apple-darwin" ;;
@@ -645,6 +1592,26 @@ source_before_snapshot="$temp_root/source-before.json"
 snapshot_repository "$repo_root" "$source_before_snapshot"
 source_head="$(run_git -C "$repo_root" rev-parse HEAD)"
 source_index="$(run_git -C "$repo_root" write-tree)"
+
+if [[ "$acceptance_mode" == "ollama" ]]; then
+  OLLAMA_HOST="$ollama_host" "$ollama_command" --version \
+    >"$temp_root/ollama-version.txt" 2>&1 || fail "Ollama version preflight failed"
+  read -r ollama_server_version ollama_client_version < <(
+    node - "$temp_root/ollama-version.txt" <<'NODE'
+const text = require('node:fs').readFileSync(process.argv[2], 'utf8');
+const server = text.match(/ollama version is ([0-9]+(?:\.[0-9]+)+)/i)?.[1];
+const client = text.match(/client version is ([0-9]+(?:\.[0-9]+)+)/i)?.[1] ?? server;
+if (!server || !client) process.exit(1);
+process.stdout.write(`${server} ${client}\n`);
+NODE
+  ) || fail "Ollama version preflight did not expose parseable client/server facts"
+  OLLAMA_HOST="$ollama_host" "$ollama_command" list \
+    >"$temp_root/ollama-list.txt" 2>"$temp_root/ollama-list.stderr" ||
+    fail "Ollama model inventory preflight failed"
+  [[ ! -s "$temp_root/ollama-list.stderr" ]] || fail "Ollama model inventory wrote unexpected stderr"
+  awk -v wanted="$model" 'NR > 1 && $1 == wanted { found += 1 } END { exit(found == 1 ? 0 : 1) }' \
+    "$temp_root/ollama-list.txt" || fail "exact Ollama model is not installed once: $model"
+fi
 
 build_root="$temp_root/build"
 archive_root="$temp_root/archive"
@@ -675,6 +1642,29 @@ printf 'seaf 0.1.0\n' | cmp -s - "$temp_root/version.stdout" || fail "packaged v
 printf 'Self-Evolving Application Framework\n' | cmp -s - "$temp_root/info.stdout" ||
   fail "packaged info output mismatch"
 [[ ! -s "$temp_root/info.stderr" ]] || fail "packaged info wrote stderr"
+
+if [[ "$acceptance_mode" == "ollama" ]]; then
+  model_check_output="$temp_root/ollama-model-check.json"
+  if ! "$seaf_binary" model check --provider ollama --model "$model" \
+    --base-url "$ollama_base_url" --timeout-ms 30000 --json \
+    >"$model_check_output" 2>"$model_check_output.stderr"; then
+    fail "packaged Ollama model check failed; stderr retained only in ephemeral acceptance state"
+  fi
+  [[ ! -s "$model_check_output.stderr" ]] || fail "packaged Ollama model check wrote unexpected stderr"
+  node - "$model_check_output" "$model" "$ollama_base_url" <<'NODE'
+const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+if (report.provider !== 'ollama'
+  || report.model !== process.argv[3]
+  || report.base_url !== process.argv[4]
+  || report.ok !== true
+  || report.status !== 'passed'
+  || report.error_kind !== null) {
+  throw new Error('packaged Ollama model check authority mismatch');
+}
+NODE
+  run_ollama_acceptance
+  exit 0
+fi
 
 adoption_started="$(date +%s)"
 passing_repo="$temp_root/passing-repo"
