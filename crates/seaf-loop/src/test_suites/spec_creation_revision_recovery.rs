@@ -224,6 +224,26 @@ fn spec_creation_revision_recovery_rejects_spec_review_status_mismatch() {
 }
 
 #[test]
+fn spec_creation_revision_recovery_rejects_non_completed_prior_spec() {
+    let fixture = blocked_spec_review_fixture("spec-revision-prior-status");
+    let reset = rewrite_recovery_source(&fixture, |source, _| {
+        source
+            .run
+            .steps
+            .iter_mut()
+            .find(|record| record.name == LoopStepName::SpecCreation)
+            .unwrap()
+            .status = LoopStepStatus::Blocked;
+    });
+
+    assert_revision_context_rejected_before_provider(
+        &fixture,
+        reset,
+        "source SpecCreation status must be Completed",
+    );
+}
+
+#[test]
 fn spec_creation_revision_recovery_rejects_non_request_changes_decision() {
     let fixture = blocked_spec_review_fixture("spec-revision-review-decision");
     let reset = rewrite_recovery_source(&fixture, |source, workspace| {
@@ -266,6 +286,112 @@ fn spec_creation_revision_recovery_rejects_non_request_changes_decision() {
         &fixture,
         reset,
         "source SpecReview decision must be RequestChanges",
+    );
+}
+
+#[test]
+fn spec_creation_revision_recovery_rejects_requested_attempt_mismatch_without_mutation() {
+    let fixture = blocked_spec_review_fixture("spec-revision-attempt-mismatch");
+    let revision = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::SpecCreation,
+        "operator@example.invalid",
+        "address authenticated Spec Review feedback",
+    )
+    .expect("create authenticated recovery");
+
+    assert_revision_context_rejected_before_provider_at_attempt(
+        &fixture,
+        revision.run,
+        3,
+        "provider attempt does not match exact latest recovery authorization",
+    );
+}
+
+#[test]
+fn spec_creation_revision_recovery_rejects_wrong_recovery_step_without_mutation() {
+    let fixture = blocked_spec_review_fixture("spec-revision-step-mismatch");
+    let revision = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::Analysis,
+        "operator@example.invalid",
+        "revise analysis instead of the requested spec",
+    )
+    .expect("create authenticated Analysis recovery");
+
+    assert_revision_context_rejected_before_provider_with_coordinates(
+        &fixture,
+        revision.run,
+        LoopStepName::Analysis,
+        LoopStepName::SpecCreation,
+        2,
+        "recovery attempt does not match the exact next runnable step",
+    );
+}
+
+#[test]
+fn ordinary_run_clears_stale_spec_creation_revision_context() {
+    let fixture = blocked_spec_review_fixture("spec-revision-stale-source");
+    let blocked = crate::state::load_run(&fixture.workspace).unwrap();
+    let prior_spec = load_role_artifact(
+        &fixture.workspace,
+        &blocked,
+        LoopStepName::SpecCreation,
+        Role::SpecWriter,
+    );
+    let reviewer_feedback = load_role_artifact(
+        &fixture.workspace,
+        &blocked,
+        LoopStepName::SpecReview,
+        Role::SpecReviewer,
+    );
+    let stale_context = SpecCreationRevisionContext {
+        prior_spec: RevisionRoleArtifact {
+            artifact_path: prior_spec.artifact_path,
+            artifact_digest: prior_spec.artifact_digest,
+            artifact: prior_spec.artifact,
+        },
+        reviewer_feedback: RevisionRoleArtifact {
+            artifact_path: reviewer_feedback.artifact_path,
+            artifact_digest: reviewer_feedback.artifact_digest,
+            artifact: reviewer_feedback.artifact,
+        },
+    };
+    let provider = FakeProvider::new(initial_provider_responses());
+    let mut step_runner =
+        ProviderStepRunner::new_legacy_unit_test_harness(&provider, "fake-model", 30_000)
+            .with_ticket(fixture.ticket.clone());
+    step_runner.spec_creation_revision_context = Some(stale_context);
+    let mut runner = LoopRunner::start(
+        LoopRunnerConfig::for_ticket(
+            &fixture.runs_root,
+            "ordinary-after-recovery",
+            &fixture.ticket,
+            "fake",
+            "fake-model",
+            LoopInputDigests {
+                ticket: canonical_sha256_digest(&fixture.ticket).unwrap(),
+                policy: "b".repeat(64),
+                config: "c".repeat(64),
+                repository: "d".repeat(64),
+                eval_config: None,
+            },
+        ),
+        &mut step_runner,
+    )
+    .expect("start ordinary run with reused provider runner");
+    runner.run_to_completion().expect("finish ordinary run");
+    drop(runner);
+    drop(step_runner);
+
+    let requests = provider.requests().unwrap();
+    let spec_creation: serde_json::Value =
+        serde_json::from_str(&requests[2].messages[0].content).unwrap();
+    assert!(spec_creation.get("revision_context").is_none());
+
+    git_ok(
+        &fixture.source,
+        &["worktree", "remove", "--force", fixture.candidate.to_str().unwrap()],
     );
 }
 
@@ -421,10 +547,37 @@ fn assert_revision_context_rejected_before_provider(
     reset: LoopRun,
     expected: &str,
 ) {
+    assert_revision_context_rejected_before_provider_at_attempt(fixture, reset, 2, expected);
+}
+
+fn assert_revision_context_rejected_before_provider_at_attempt(
+    fixture: &BlockedSpecReviewFixture,
+    reset: LoopRun,
+    attempt: u32,
+    expected: &str,
+) {
+    assert_revision_context_rejected_before_provider_with_coordinates(
+        fixture,
+        reset,
+        LoopStepName::SpecCreation,
+        LoopStepName::SpecCreation,
+        attempt,
+        expected,
+    );
+}
+
+fn assert_revision_context_rejected_before_provider_with_coordinates(
+    fixture: &BlockedSpecReviewFixture,
+    reset: LoopRun,
+    rerun_step: LoopStepName,
+    requested_step: LoopStepName,
+    attempt: u32,
+    expected: &str,
+) {
     let initialized = InitializedLoopRun::resume_isolated_for_rerun(
         &fixture.runs_root,
         reset,
-        LoopStepName::SpecCreation,
+        rerun_step,
     )
     .expect("resume isolated rerun authority");
     let prepared = initialized
@@ -446,27 +599,34 @@ fn assert_revision_context_rejected_before_provider(
             ),
             &mut patch_runner,
         )
-        .with_recovery_attempt(LoopStepName::SpecCreation, 2);
-    let mut runner = LoopRunner::resume_initialized(prepared, &mut step_runner)
-        .expect("resume rejected recovery fixture");
-    let run_before = fs::read(fixture.workspace.run_file()).unwrap();
+        .with_recovery_attempt(requested_step, attempt);
+    let run_directory_before = run_files(fixture.workspace.run_directory());
     let source_before = repository_authority(&fixture.source);
     let candidate_before = repository_authority(&fixture.candidate);
-
-    let error = runner
-        .run_next_step()
-        .expect_err("invalid revision context must fail closed");
+    let error = match LoopRunner::resume_initialized(prepared, &mut step_runner) {
+        Ok(mut runner) => {
+            let error = runner
+                .run_next_step()
+                .expect_err("invalid revision context must fail closed");
+            drop(runner);
+            error
+        }
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("SpecCreation revision context"),
         "{error}"
     );
     assert!(error.to_string().contains(expected), "{error}");
-    drop(runner);
     drop(step_runner);
 
     assert!(provider.requests().unwrap().is_empty());
     assert!(patch_runner.calls.is_empty());
-    assert_eq!(fs::read(fixture.workspace.run_file()).unwrap(), run_before);
+    assert_eq!(
+        run_files(fixture.workspace.run_directory()),
+        run_directory_before,
+        "invalid revision authority must not mutate any run-directory file"
+    );
     assert_eq!(repository_authority(&fixture.source), source_before);
     assert_eq!(repository_authority(&fixture.candidate), candidate_before);
 

@@ -383,10 +383,12 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
 
 impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     fn prepare_workspace(&mut self, workspace: &LoopWorkspace) -> Result<(), RunnerError> {
+        self.spec_creation_revision_context = None;
         self.prepare_provider_workspace(workspace, None)
     }
 
     fn prepare_run(&mut self, workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), RunnerError> {
+        self.spec_creation_revision_context = None;
         if self.model != run.model {
             return Err(RunnerError::Step(
                 "configured provider model does not match authoritative run model".to_string(),
@@ -549,6 +551,13 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 }
             }
         }
+        if let Some(attempt) = self
+            .recovered_step_attempt(LoopStepName::SpecCreation)
+            .filter(|attempt| *attempt > 1)
+        {
+            self.spec_creation_revision_context =
+                Some(self.load_spec_creation_revision_context(workspace, &reconciled, attempt)?);
+        }
         self.run = Some(reconciled.clone());
         self.prepare_provider_workspace(workspace, Some(&reconciled.run_id))
     }
@@ -619,10 +628,15 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         attempt: u32,
     ) -> Result<(), RunnerError> {
         self.step_attempt = Some(attempt);
-        self.spec_creation_revision_context = None;
         self.prepare_step(workspace, run, step)?;
         if step == LoopStepName::SpecCreation && attempt > 1 {
-            self.spec_creation_revision_context = Some(self.load_spec_creation_revision_context()?);
+            if self.spec_creation_revision_context.is_none() {
+                return Err(spec_creation_revision_error(
+                    "verified context was not prepared before resume",
+                ));
+            }
+        } else {
+            self.spec_creation_revision_context = None;
         }
         Ok(())
     }
@@ -2444,16 +2458,10 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
 
     fn load_spec_creation_revision_context(
         &self,
+        workspace: &LoopWorkspace,
+        run: &LoopRun,
+        attempt: u32,
     ) -> Result<SpecCreationRevisionContext, RunnerError> {
-        let workspace = self.exchange_workspace.as_ref().ok_or_else(|| {
-            spec_creation_revision_error("provider runner is missing its workspace")
-        })?;
-        let run = self.run.as_ref().ok_or_else(|| {
-            spec_creation_revision_error("provider runner is missing authoritative loop state")
-        })?;
-        let attempt = self.step_attempt.ok_or_else(|| {
-            spec_creation_revision_error("provider runner is missing the current step attempt")
-        })?;
         let (recovery, source) =
             crate::recovery::load_verified_latest_provider_recovery_source(workspace, run)
                 .map_err(|error| spec_creation_revision_error(error.to_string()))?;
@@ -2475,16 +2483,8 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             &source,
             LoopStepName::SpecCreation,
             Role::SpecWriter,
-            |status| {
-                matches!(
-                    status,
-                    LoopStepStatus::Completed
-                        | LoopStepStatus::Passed
-                        | LoopStepStatus::Blocked
-                        | LoopStepStatus::Failed
-                )
-            },
-            "source SpecCreation status must be terminal",
+            |status| status == LoopStepStatus::Completed,
+            "source SpecCreation status must be Completed",
         )?;
         let reviewer_feedback = load_spec_creation_revision_artifact(
             workspace,
@@ -2689,7 +2689,6 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         self.context_bundle = None;
         self.early_artifacts.clear();
         self.verified_candidate_patch = None;
-        self.spec_creation_revision_context = None;
         #[cfg(test)]
         {
             self.legacy_development_evidence = None;
