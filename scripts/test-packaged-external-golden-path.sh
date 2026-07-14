@@ -781,8 +781,8 @@ const path = require('node:path');
 const root = fs.realpathSync(process.argv[2]);
 const output = process.argv[3];
 const run = JSON.parse(fs.readFileSync(path.join(root, 'run.json'), 'utf8'));
-const MAX_IMMUTABLE_FILES = 128;
-const MAX_IMMUTABLE_BYTES = 32 * 1024 * 1024;
+const MAX_FILES = 128;
+const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 if (run.status !== 'blocked' || run.current_step !== 'spec_review') {
   throw new Error('reviewer recovery snapshot requires exact blocked Spec Review authority');
 }
@@ -796,9 +796,28 @@ function safeRelative(relative) {
     && !relative.includes('\\')
     && relative.split('/').every((part) => part && part !== '.' && part !== '..');
 }
-function readImmutable(relative, remainingBytes = Number.POSITIVE_INFINITY) {
+function normalizedSafeRelative(relative) {
   if (!safeRelative(relative)) throw new Error('unsafe immutable attempt-one path');
-  const absolute = path.resolve(root, relative);
+  const normalized = path.posix.normalize(relative);
+  if (normalized !== relative) throw new Error('noncanonical immutable attempt-one path');
+  return normalized;
+}
+const immutablePaths = new Set();
+const immutableCache = new Map();
+let totalBytes = 0;
+function addImmutablePath(relative) {
+  const normalized = normalizedSafeRelative(relative);
+  immutablePaths.add(normalized);
+  if (immutablePaths.size > MAX_FILES) {
+    throw new Error('immutable attempt-one inventory exceeds file-count bound');
+  }
+  return normalized;
+}
+function readImmutable(relative) {
+  const normalized = addImmutablePath(relative);
+  const cached = immutableCache.get(normalized);
+  if (cached) return cached;
+  const absolute = path.resolve(root, normalized);
   if (!absolute.startsWith(`${root}${path.sep}`)) throw new Error('immutable attempt-one path escaped run');
   const stat = fs.lstatSync(absolute);
   if (fs.realpathSync(absolute) !== absolute
@@ -807,16 +826,20 @@ function readImmutable(relative, remainingBytes = Number.POSITIVE_INFINITY) {
     || stat.size > 4 * 1024 * 1024) {
     throw new Error('unsafe immutable attempt-one file');
   }
-  if (stat.size > remainingBytes) {
+  if (totalBytes + stat.size > MAX_TOTAL_BYTES) {
     throw new Error('immutable attempt-one inventory exceeds aggregate bound');
   }
   const bytes = fs.readFileSync(absolute);
-  return {
-    path: relative,
+  if (bytes.length !== stat.size) throw new Error('immutable attempt-one file changed while reading');
+  totalBytes += bytes.length;
+  const entry = {
+    path: normalized,
     size: bytes.length,
     sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
     bytes,
   };
+  immutableCache.set(normalized, entry);
+  return entry;
 }
 const spec = run.steps?.find((step) => step.name === 'spec_creation');
 const review = run.steps?.find((step) => step.name === 'spec_review');
@@ -829,13 +852,6 @@ for (const [label, step, status] of [
   }
   if (readImmutable(step.artifact_path).sha256 !== step.artifact_digest) {
     throw new Error(`${label} artifact digest is not authenticated`);
-  }
-}
-const immutablePaths = new Set();
-function addImmutablePath(relative) {
-  immutablePaths.add(relative);
-  if (immutablePaths.size > MAX_IMMUTABLE_FILES) {
-    throw new Error('immutable attempt-one inventory exceeds file-count bound');
   }
 }
 for (const directory of ['prompts', 'responses']) {
@@ -857,15 +873,15 @@ for (const reference of run.provider_exchange_records) {
   if (record.response?.path) addImmutablePath(record.response.path);
   if (record.expansion?.path) addImmutablePath(record.expansion.path);
 }
-if (immutablePaths.size > MAX_IMMUTABLE_FILES) {
+if (immutablePaths.size > MAX_FILES) {
   throw new Error('immutable attempt-one inventory exceeds file-count bound');
 }
-const entries = [];
-let aggregateBytes = 0;
-for (const relative of [...immutablePaths].sort()) {
-  const { bytes: _, ...entry } = readImmutable(relative, MAX_IMMUTABLE_BYTES - aggregateBytes);
-  aggregateBytes += entry.size;
-  entries.push(entry);
+const entries = [...immutablePaths].sort().map((relative) => {
+  const { bytes: _, ...entry } = readImmutable(relative);
+  return entry;
+});
+if (entries.length > MAX_FILES || totalBytes > MAX_TOTAL_BYTES) {
+  throw new Error('immutable attempt-one inventory exceeds final bounds');
 }
 const snapshot = {
   provider_ledger_prefix: run.provider_exchange_records,
