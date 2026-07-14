@@ -60,11 +60,18 @@ impl OllamaProvider {
         let url = ollama_chat_url(&self.config.base_url)?;
         let temperature = self.effective_temperature(request)?;
         let mut messages = Vec::new();
+        let system = match &request.response_schema {
+            Some(schema) => format!(
+                "{}\n\nRespond with JSON matching this exact schema:\n{schema}",
+                request.system
+            ),
+            None => request.system.clone(),
+        };
 
-        if !request.system.trim().is_empty() {
+        if !system.trim().is_empty() {
             messages.push(json!({
                 "role": "system",
-                "content": request.system,
+                "content": system,
             }));
         }
 

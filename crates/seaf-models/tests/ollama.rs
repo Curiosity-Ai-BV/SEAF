@@ -25,6 +25,40 @@ fn ollama_request_builder_uses_chat_endpoint_stream_false_schema_format_and_low_
 }
 
 #[test]
+fn ollama_structured_request_keeps_exact_schema_and_grounds_the_system_message() {
+    let provider = OllamaProvider::default();
+    let request = structured_request(0.0);
+    let schema = request.response_schema.clone().expect("response schema");
+
+    let chat_request = provider
+        .build_chat_request(&request)
+        .expect("build structured request");
+
+    assert_eq!(chat_request.body()["format"], schema);
+    assert_eq!(
+        chat_request.body()["messages"][0]["content"],
+        format!(
+            "Return JSON only.\n\nRespond with JSON matching this exact schema:\n{}",
+            serde_json::to_string(&schema).expect("compact response schema")
+        )
+    );
+}
+
+#[test]
+fn ollama_unstructured_request_preserves_the_trusted_system_message() {
+    let provider = OllamaProvider::default();
+
+    let chat_request = provider
+        .build_chat_request(&unstructured_request(0.0))
+        .expect("build unstructured request");
+
+    assert_eq!(
+        chat_request.body()["messages"][0]["content"],
+        "Return JSON only."
+    );
+}
+
+#[test]
 fn ollama_request_builder_preserves_unstructured_and_already_low_temperatures() {
     let provider = OllamaProvider::default();
 
