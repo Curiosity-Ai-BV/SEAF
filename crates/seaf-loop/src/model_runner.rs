@@ -412,6 +412,22 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         let prospective = preflight_provider_exchange_reconciliation(workspace, run)
             .map_err(exchange_recovery_error)?;
         self.validate_provider_history_is_safe(workspace, &prospective)?;
+        let prevalidated_spec_creation_revision =
+            if crate::state::next_runnable_step(&prospective) == Some(LoopStepName::SpecCreation) {
+                let latest_recovery =
+                    crate::recovery::load_verified_latest_recovery(workspace, &prospective)
+                        .map_err(spec_creation_revision_error)?;
+                latest_recovery
+                    .filter(|recovery| recovery.step == LoopStepName::SpecCreation)
+                    .map(|recovery| {
+                        let attempt = recovery.next_step_attempt;
+                        self.load_spec_creation_revision_context(workspace, &prospective, attempt)
+                            .map(|context| (attempt, context))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
         let mut expected_output_review = None;
         if run.execution_mode == seaf_core::LoopExecutionMode::IsolatedCandidate {
             self.validate_isolated_candidate_authority(workspace, run)?;
@@ -452,6 +468,21 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             reconcile_provider_exchange_state_with_validator(workspace, run, |prospective| {
                 self.validate_provider_history_is_safe(workspace, prospective)
                     .map_err(|error| crate::ProviderExchangeError::Invalid(error.to_string()))?;
+                if let Some((attempt, expected_context)) =
+                    prevalidated_spec_creation_revision.as_ref()
+                {
+                    let current_context = self
+                        .load_spec_creation_revision_context(workspace, prospective, *attempt)
+                        .map_err(|error| {
+                            crate::ProviderExchangeError::Invalid(error.to_string())
+                        })?;
+                    if &current_context != expected_context {
+                        return Err(crate::ProviderExchangeError::Invalid(
+                            "SpecCreation revision context changed before provider exchange reconciliation"
+                                .to_string(),
+                        ));
+                    }
+                }
                 if run.execution_mode != seaf_core::LoopExecutionMode::IsolatedCandidate {
                     return Ok(());
                 }
@@ -555,19 +586,14 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 }
             }
         }
-        if let Some(attempt) = self
-            .recovered_step_attempt(LoopStepName::SpecCreation)
-            .filter(|attempt| *attempt > 1)
-        {
-            let latest_recovery =
-                crate::recovery::load_verified_latest_recovery(workspace, &reconciled)
-                    .map_err(spec_creation_revision_error)?;
-            if latest_recovery.is_some_and(|recovery| recovery.step == LoopStepName::SpecCreation) {
-                self.spec_creation_revision_attempt = Some(attempt);
-                self.spec_creation_revision_context = Some(
-                    self.load_spec_creation_revision_context(workspace, &reconciled, attempt)?,
-                );
+        if let Some((attempt, context)) = prevalidated_spec_creation_revision {
+            if self.recovered_step_attempt(LoopStepName::SpecCreation) != Some(attempt) {
+                return Err(spec_creation_revision_error(
+                    "verified context does not match the recovered SpecCreation attempt",
+                ));
             }
+            self.spec_creation_revision_attempt = Some(attempt);
+            self.spec_creation_revision_context = Some(context);
         }
         self.run = Some(reconciled.clone());
         self.prepare_provider_workspace(workspace, Some(&reconciled.run_id))
@@ -1570,6 +1596,23 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             return Err(RunnerError::Step(
                 "loop state changed before provider call commitment reauthentication".to_string(),
             ));
+        }
+        if let Some(attempt) = self.spec_creation_revision_attempt {
+            let expected_context =
+                self.spec_creation_revision_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        spec_creation_revision_error(
+                            "verified context was not prepared before provider call",
+                        )
+                    })?;
+            let current_context =
+                self.load_spec_creation_revision_context(workspace, &current, attempt)?;
+            if &current_context != expected_context {
+                return Err(spec_creation_revision_error(
+                    "verified context changed before provider call",
+                ));
+            }
         }
         let head = current.provider_exchange_records.last().ok_or_else(|| {
             RunnerError::Step("provider call has no authoritative request tail".to_string())

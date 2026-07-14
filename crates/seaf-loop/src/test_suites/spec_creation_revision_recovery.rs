@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
@@ -643,6 +644,268 @@ fn ordinary_resume_reconstructs_direct_spec_creation_revision_context() {
     git_ok(
         &fixture.source,
         &["worktree", "remove", "--force", fixture.candidate.to_str().unwrap()],
+    );
+}
+
+#[test]
+fn provider_call_reauthenticates_direct_revision_context_after_request_commit() {
+    let fixture = blocked_spec_review_fixture("direct-spec-recovery-reauth-race");
+    let blocked = crate::state::load_run(&fixture.workspace).expect("blocked run");
+    let revision_artifact_path = blocked
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::SpecCreation)
+        .and_then(|record| record.artifact_path.clone())
+        .expect("prior Spec Creation artifact path");
+    let revision = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::SpecCreation,
+        "operator@example.invalid",
+        "address authenticated Spec Review feedback",
+    )
+    .expect("create authenticated Spec Creation recovery");
+    let original_provider_record_count = revision.run.provider_exchange_records.len();
+    let initialized = InitializedLoopRun::resume_isolated_for_rerun(
+        &fixture.runs_root,
+        revision.run,
+        LoopStepName::SpecCreation,
+    )
+    .expect("resume isolated Spec Creation rerun");
+    let prepared = initialized
+        .scaffold()
+        .expect("resume scaffold")
+        .publish_authoritative_inputs(fixture.snapshots.clone())
+        .expect("resume authoritative inputs");
+    let provider = FakeProvider::new(revised_provider_responses());
+    let observer = |workspace: &LoopWorkspace,
+                    _run: &LoopRun,
+                    coordinates: &ProviderExchangeCoordinates,
+                    _request: &ArtifactReference| {
+        assert_eq!(coordinates.step, LoopStepName::SpecCreation);
+        assert_eq!(coordinates.step_attempt, 2);
+        fs::write(
+            workspace.run_directory().join(&revision_artifact_path),
+            b"{}",
+        )
+        .expect("tamper revision artifact at provider-call race boundary");
+    };
+    let source_before = repository_authority(&fixture.source);
+    let candidate_before = repository_authority(&fixture.candidate);
+    let mut patch_runner = RecordingGitCommandRunner::default();
+    let mut step_runner = ProviderStepRunner::new(&provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut patch_runner,
+        )
+        .with_recovery_attempt(LoopStepName::SpecCreation, 2)
+        .with_before_provider_reauthentication_observer(&observer);
+    let mut runner = LoopRunner::resume_initialized(prepared, &mut step_runner)
+        .expect("resume authenticated direct recovery");
+    let error = runner
+        .run_next_step()
+        .expect_err("tampered revision context must stop before provider invocation");
+    assert!(
+        error.to_string().contains("SpecCreation revision context"),
+        "{error}"
+    );
+    drop(runner);
+    drop(step_runner);
+
+    assert!(provider.requests().unwrap().is_empty());
+    assert!(patch_runner.calls.is_empty());
+    let current = crate::state::load_run(&fixture.workspace).expect("request-only run");
+    assert_eq!(
+        current.provider_exchange_records.len(),
+        original_provider_record_count + 1
+    );
+    let tail = current
+        .provider_exchange_records
+        .last()
+        .expect("durable request tail");
+    assert_eq!(tail.step, LoopStepName::SpecCreation);
+    assert_eq!(tail.step_attempt, 2);
+    assert_eq!(tail.phase, ProviderExchangePhase::Request);
+    assert_eq!(repository_authority(&fixture.source), source_before);
+    assert_eq!(repository_authority(&fixture.candidate), candidate_before);
+
+    git_ok(
+        &fixture.source,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            fixture.candidate.to_str().unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn invalid_direct_revision_source_cannot_adopt_staged_request_on_ordinary_resume() {
+    let fixture = blocked_spec_review_fixture("direct-spec-staged-request-invalid-source");
+    let blocked = crate::state::load_run(&fixture.workspace).expect("blocked run");
+    let revision_artifact_path = blocked
+        .steps
+        .iter()
+        .find(|record| record.name == LoopStepName::SpecCreation)
+        .and_then(|record| record.artifact_path.clone())
+        .expect("prior Spec Creation artifact path");
+    let revision = revise_provider_step(
+        &fixture.workspace,
+        LoopStepName::SpecCreation,
+        "operator@example.invalid",
+        "address authenticated Spec Review feedback",
+    )
+    .expect("create authenticated Spec Creation recovery");
+    let initialized = InitializedLoopRun::resume_isolated_for_rerun(
+        &fixture.runs_root,
+        revision.run,
+        LoopStepName::SpecCreation,
+    )
+    .expect("resume isolated Spec Creation rerun");
+    let prepared = initialized
+        .scaffold()
+        .expect("resume scaffold")
+        .publish_authoritative_inputs(fixture.snapshots.clone())
+        .expect("resume authoritative inputs");
+    let first_provider = FakeProvider::new(revised_provider_responses());
+    let staged_reference = RefCell::new(None);
+    let observer = |workspace: &LoopWorkspace,
+                    run: &LoopRun,
+                    coordinates: &ProviderExchangeCoordinates,
+                    _request: &ArtifactReference| {
+        assert_eq!(coordinates.step, LoopStepName::SpecCreation);
+        assert_eq!(coordinates.step_attempt, 2);
+        let mut running_authority = run.clone();
+        let staged = running_authority
+            .provider_exchange_records
+            .pop()
+            .expect("staged request reference");
+        assert_eq!(staged.phase, ProviderExchangePhase::Request);
+        *staged_reference.borrow_mut() = Some(staged);
+        fs::write(
+            workspace.run_file(),
+            crate::state::run_file_bytes(&running_authority).expect("running authority bytes"),
+        )
+        .expect("restore pre-adoption run authority");
+        panic!("interrupt with staged direct Spec Creation request");
+    };
+    let mut first_patch_runner = RecordingGitCommandRunner::default();
+    let mut first_step_runner = ProviderStepRunner::new(&first_provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut first_patch_runner,
+        )
+        .with_recovery_attempt(LoopStepName::SpecCreation, 2)
+        .with_before_provider_reauthentication_observer(&observer);
+    let mut first_runner = LoopRunner::resume_initialized(prepared, &mut first_step_runner)
+        .expect("resume direct recovery");
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = first_runner.run_next_step();
+    }));
+    assert!(interrupted.is_err());
+    drop(first_runner);
+    drop(first_step_runner);
+    assert!(first_provider.requests().unwrap().is_empty());
+    assert!(first_patch_runner.calls.is_empty());
+
+    let interrupted = crate::state::load_run(&fixture.workspace).expect("interrupted run");
+    let staged_reference = staged_reference
+        .into_inner()
+        .expect("captured staged request reference");
+    let staged_record = load_provider_exchange_record(
+        fixture.workspace.run_directory(),
+        &staged_reference,
+    )
+    .expect("staged request record");
+    let staged_record_path = fixture
+        .workspace
+        .run_directory()
+        .join(&staged_reference.path);
+    let staged_request_path = fixture
+        .workspace
+        .run_directory()
+        .join(&staged_record.request.path);
+    let staged_record_bytes = fs::read(&staged_record_path).expect("staged record bytes");
+    let staged_request_bytes = fs::read(&staged_request_path).expect("staged request bytes");
+    fs::remove_file(&staged_record_path).expect("temporarily remove staged record");
+    fs::remove_file(&staged_request_path).expect("temporarily remove staged request");
+    let ordinary_prepared = InitializedLoopRun::resume_isolated(
+        &fixture.runs_root,
+        interrupted,
+    )
+    .expect("prepare ordinary isolated resume before restoring staged request")
+    .scaffold()
+    .expect("ordinary resume scaffold")
+    .publish_authoritative_inputs(fixture.snapshots.clone())
+    .expect("ordinary resume authoritative inputs");
+    crate::artifact_safety::write_private_fixture(&staged_request_path, &staged_request_bytes)
+        .expect("restore staged request");
+    crate::artifact_safety::write_private_fixture(&staged_record_path, &staged_record_bytes)
+        .expect("restore staged record");
+    fs::write(
+        fixture
+            .workspace
+            .run_directory()
+            .join(&revision_artifact_path),
+        b"{}",
+    )
+    .expect("invalidate direct revision source");
+    let run_before = fs::read(fixture.workspace.run_file()).expect("run bytes before resume");
+    let source_before = repository_authority(&fixture.source);
+    let candidate_before = repository_authority(&fixture.candidate);
+    let resumed_provider = FakeProvider::new(revised_provider_responses());
+    let mut resumed_patch_runner = RecordingGitCommandRunner::default();
+    let mut resumed_step_runner = ProviderStepRunner::new(&resumed_provider, "fake-model", 30_000)
+        .with_ticket(fixture.ticket.clone())
+        .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+        .with_patch_gate(
+            ProviderPatchGateConfig::for_ticket(
+                &fixture.candidate,
+                &fixture.ticket,
+                fixture.policy.clone(),
+                true,
+            ),
+            &mut resumed_patch_runner,
+        );
+    let error = LoopRunner::resume_initialized(ordinary_prepared, &mut resumed_step_runner)
+        .expect_err("invalid revision source must reject before staged request adoption");
+    assert!(
+        error.to_string().contains("SpecCreation revision context"),
+        "{error}"
+    );
+    drop(resumed_step_runner);
+
+    assert!(resumed_provider.requests().unwrap().is_empty());
+    assert!(resumed_patch_runner.calls.is_empty());
+    assert_eq!(
+        fs::read(fixture.workspace.run_file()).expect("run bytes after rejected resume"),
+        run_before
+    );
+    assert_eq!(repository_authority(&fixture.source), source_before);
+    assert_eq!(repository_authority(&fixture.candidate), candidate_before);
+
+    git_ok(
+        &fixture.source,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            fixture.candidate.to_str().unwrap(),
+        ],
     );
 }
 
