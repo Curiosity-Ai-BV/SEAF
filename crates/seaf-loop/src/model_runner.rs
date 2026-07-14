@@ -60,6 +60,9 @@ type AfterResponsePersistObserver<'a> =
 type BeforeProviderReauthenticationObserver<'a> =
     dyn Fn(&LoopWorkspace, &LoopRun, &ProviderExchangeCoordinates, &ArtifactReference) + 'a;
 
+#[cfg(test)]
+type BeforeProviderReconciliationObserver<'a> = dyn Fn(&LoopWorkspace, &LoopRun) + 'a;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditedRepositoryContext {
@@ -146,6 +149,8 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     after_response_persist: Option<&'a AfterResponsePersistObserver<'a>>,
     #[cfg(test)]
     before_provider_reauthentication: Option<&'a BeforeProviderReauthenticationObserver<'a>>,
+    #[cfg(test)]
+    before_provider_reconciliation: Option<&'a BeforeProviderReconciliationObserver<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +247,8 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             after_response_persist: None,
             #[cfg(test)]
             before_provider_reauthentication: None,
+            #[cfg(test)]
+            before_provider_reconciliation: None,
         }
     }
 
@@ -295,6 +302,15 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
         observer: &'a BeforeProviderReauthenticationObserver<'a>,
     ) -> Self {
         self.before_provider_reauthentication = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_provider_reconciliation_observer(
+        mut self,
+        observer: &'a BeforeProviderReconciliationObserver<'a>,
+    ) -> Self {
+        self.before_provider_reconciliation = Some(observer);
         self
     }
 
@@ -463,6 +479,10 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 "legacy provider run cannot execute or resume; start a new isolated run"
                     .to_string(),
             ));
+        }
+        #[cfg(test)]
+        if let Some(observer) = self.before_provider_reconciliation {
+            observer(workspace, &prospective);
         }
         let reconciled = if workspace.run_file().exists() {
             reconcile_provider_exchange_state_with_validator(workspace, run, |prospective| {

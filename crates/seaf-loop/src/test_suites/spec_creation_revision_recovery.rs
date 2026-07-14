@@ -856,17 +856,16 @@ fn invalid_direct_revision_source_cannot_adopt_staged_request_on_ordinary_resume
         .expect("restore staged request");
     crate::artifact_safety::write_private_fixture(&staged_record_path, &staged_record_bytes)
         .expect("restore staged record");
-    fs::write(
-        fixture
-            .workspace
-            .run_directory()
-            .join(&revision_artifact_path),
-        b"{}",
-    )
-    .expect("invalidate direct revision source");
     let run_before = fs::read(fixture.workspace.run_file()).expect("run bytes before resume");
     let source_before = repository_authority(&fixture.source);
     let candidate_before = repository_authority(&fixture.candidate);
+    let reconciliation_observer = |workspace: &LoopWorkspace, _run: &LoopRun| {
+        fs::write(
+            workspace.run_directory().join(&revision_artifact_path),
+            b"{}",
+        )
+        .expect("invalidate direct revision source before locked reconciliation");
+    };
     let resumed_provider = FakeProvider::new(revised_provider_responses());
     let mut resumed_patch_runner = RecordingGitCommandRunner::default();
     let mut resumed_step_runner = ProviderStepRunner::new(&resumed_provider, "fake-model", 30_000)
@@ -880,7 +879,8 @@ fn invalid_direct_revision_source_cannot_adopt_staged_request_on_ordinary_resume
                 true,
             ),
             &mut resumed_patch_runner,
-        );
+        )
+        .with_before_provider_reconciliation_observer(&reconciliation_observer);
     let error = LoopRunner::resume_initialized(ordinary_prepared, &mut resumed_step_runner)
         .expect_err("invalid revision source must reject before staged request adoption");
     assert!(
