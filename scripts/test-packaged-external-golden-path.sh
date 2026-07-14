@@ -781,6 +781,8 @@ const path = require('node:path');
 const root = fs.realpathSync(process.argv[2]);
 const output = process.argv[3];
 const run = JSON.parse(fs.readFileSync(path.join(root, 'run.json'), 'utf8'));
+const MAX_IMMUTABLE_FILES = 128;
+const MAX_IMMUTABLE_BYTES = 32 * 1024 * 1024;
 if (run.status !== 'blocked' || run.current_step !== 'spec_review') {
   throw new Error('reviewer recovery snapshot requires exact blocked Spec Review authority');
 }
@@ -794,7 +796,7 @@ function safeRelative(relative) {
     && !relative.includes('\\')
     && relative.split('/').every((part) => part && part !== '.' && part !== '..');
 }
-function readImmutable(relative) {
+function readImmutable(relative, remainingBytes = Number.POSITIVE_INFINITY) {
   if (!safeRelative(relative)) throw new Error('unsafe immutable attempt-one path');
   const absolute = path.resolve(root, relative);
   if (!absolute.startsWith(`${root}${path.sep}`)) throw new Error('immutable attempt-one path escaped run');
@@ -804,6 +806,9 @@ function readImmutable(relative) {
     || stat.isSymbolicLink()
     || stat.size > 4 * 1024 * 1024) {
     throw new Error('unsafe immutable attempt-one file');
+  }
+  if (stat.size > remainingBytes) {
+    throw new Error('immutable attempt-one inventory exceeds aggregate bound');
   }
   const bytes = fs.readFileSync(absolute);
   return {
@@ -827,31 +832,40 @@ for (const [label, step, status] of [
   }
 }
 const immutablePaths = new Set();
+function addImmutablePath(relative) {
+  immutablePaths.add(relative);
+  if (immutablePaths.size > MAX_IMMUTABLE_FILES) {
+    throw new Error('immutable attempt-one inventory exceeds file-count bound');
+  }
+}
 for (const directory of ['prompts', 'responses']) {
   const absoluteDirectory = path.join(root, directory);
   for (const name of fs.readdirSync(absoluteDirectory)) {
     if (!name || name.includes('/') || name.includes('\\')) throw new Error('unsafe immutable entry name');
-    immutablePaths.add(`${directory}/${name}`);
+    addImmutablePath(`${directory}/${name}`);
   }
 }
 for (const step of run.steps ?? []) {
-  if (step.artifact_path) immutablePaths.add(step.artifact_path);
+  if (step.artifact_path) addImmutablePath(step.artifact_path);
 }
 for (const reference of run.provider_exchange_records) {
-  immutablePaths.add(reference.path);
+  addImmutablePath(reference.path);
   const recordEntry = readImmutable(reference.path);
   if (recordEntry.sha256 !== reference.digest) throw new Error('provider ledger reference digest mismatch');
   const record = JSON.parse(recordEntry.bytes.toString('utf8'));
-  immutablePaths.add(record.request?.path);
-  if (record.response?.path) immutablePaths.add(record.response.path);
-  if (record.expansion?.path) immutablePaths.add(record.expansion.path);
+  addImmutablePath(record.request?.path);
+  if (record.response?.path) addImmutablePath(record.response.path);
+  if (record.expansion?.path) addImmutablePath(record.expansion.path);
 }
-const entries = [...immutablePaths].sort().map((relative) => {
-  const { bytes: _, ...entry } = readImmutable(relative);
-  return entry;
-});
-if (entries.length > 128 || entries.reduce((sum, entry) => sum + entry.size, 0) > 32 * 1024 * 1024) {
-  throw new Error('immutable attempt-one inventory exceeds bounds');
+if (immutablePaths.size > MAX_IMMUTABLE_FILES) {
+  throw new Error('immutable attempt-one inventory exceeds file-count bound');
+}
+const entries = [];
+let aggregateBytes = 0;
+for (const relative of [...immutablePaths].sort()) {
+  const { bytes: _, ...entry } = readImmutable(relative, MAX_IMMUTABLE_BYTES - aggregateBytes);
+  aggregateBytes += entry.size;
+  entries.push(entry);
 }
 const snapshot = {
   provider_ledger_prefix: run.provider_exchange_records,
@@ -1213,6 +1227,8 @@ if (JSON.stringify(evidence.passing.status_transitions)
   || evidence.passing.reviewer_recovery?.revised_attempt !== 2
   || !Number.isSafeInteger(evidence.passing.reviewer_recovery?.recovery_id)
   || evidence.passing.reviewer_recovery.recovery_id < 1
+  || !Number.isSafeInteger(evidence.passing.evaluation_recovery_id)
+  || evidence.passing.evaluation_recovery_id !== evidence.passing.reviewer_recovery.recovery_id + 1
   || !digest.test(evidence.passing.reviewer_recovery?.prior_spec_artifact_digest)
   || !digest.test(evidence.passing.reviewer_recovery?.reviewer_artifact_digest)
   || evidence.passing.reviewer_recovery?.attempt_one_immutable !== true
@@ -1274,9 +1290,10 @@ write_ollama_evidence() {
   local rejection_head="$2"
   local passing_recovery_snapshot="$3"
   local provider_recovery_id="$4"
-  local rejection_recovered="$5"
-  local rejection_provider_attempt_count="$6"
-  local rejection_provider_ledger_record_count="$7"
+  local evaluation_recovery_id="$5"
+  local rejection_recovered="$6"
+  local rejection_provider_attempt_count="$7"
+  local rejection_provider_ledger_record_count="$8"
 
   local evidence_parent
   evidence_parent="$(dirname "$evidence_out")"
@@ -1289,15 +1306,16 @@ write_ollama_evidence() {
     "$source_head" "$archive_sha256" "$harness_sha256" "$fixture_sha256" \
     "$candidate_digest" "$eval_digest" "$target_head" "$rejection_candidate" \
     "$rejection_eval_digest" "$rejection_head" "$passing_recovery_snapshot" \
-    "$provider_recovery_id" "$rejection_recovered" "$rejection_provider_attempt_count" \
-    "$rejection_provider_ledger_record_count" "$(uname -s)" "$(uname -m)" <<'NODE'
+    "$provider_recovery_id" "$evaluation_recovery_id" "$rejection_recovered" \
+    "$rejection_provider_attempt_count" "$rejection_provider_ledger_record_count" \
+    "$(uname -s)" "$(uname -m)" <<'NODE'
 const fs = require('node:fs');
 const [
   temporary, passingMetricsPath, rejectionMetricsPath, serverVersion, clientVersion,
   model, host, apiBaseUrl, sourceCommit, archiveSha256, harnessSha256, fixtureSha256,
   candidateDigest, evalDigest, targetHead, rejectionCandidate, rejectionEvalDigest,
-  rejectionHead, passingRecoverySnapshotPath, providerRecoveryId, rejectionRecovered,
-  rejectionProviderAttemptCount, rejectionProviderLedgerRecordCount, os, arch,
+  rejectionHead, passingRecoverySnapshotPath, providerRecoveryId, evaluationRecoveryId,
+  rejectionRecovered, rejectionProviderAttemptCount, rejectionProviderLedgerRecordCount, os, arch,
 ] = process.argv.slice(2);
 const digest = /^[0-9a-f]{64}$/;
 const commit = /^[0-9a-f]{40,64}$/;
@@ -1308,10 +1326,15 @@ for (const value of [sourceCommit, targetHead, rejectionHead]) {
   if (!commit.test(value)) throw new Error('evidence contains invalid Git authority');
 }
 const reviewerAuthority = JSON.parse(fs.readFileSync(passingRecoverySnapshotPath, 'utf8'));
+const providerRecovery = Number(providerRecoveryId);
+const evaluationRecovery = Number(evaluationRecoveryId);
 if (!digest.test(reviewerAuthority.prior_spec_artifact_digest)
   || !digest.test(reviewerAuthority.reviewer_artifact_digest)
-  || !Number.isSafeInteger(Number(providerRecoveryId))
-  || Number(providerRecoveryId) < 1) {
+  || !Number.isSafeInteger(providerRecovery)
+  || providerRecovery < 1
+  || !Number.isSafeInteger(evaluationRecovery)
+  || evaluationRecovery < 1
+  || evaluationRecovery !== providerRecovery + 1) {
   throw new Error('reviewer recovery evidence authority mismatch');
 }
 const rejectionWasRecovered = rejectionRecovered === 'true';
@@ -1333,10 +1356,11 @@ const evidence = {
     status_transitions: ['blocked', 'pending', 'awaiting_human_review', 'approved', 'eval_passed', 'promoted'],
     interruption_observed: true,
     evaluation_attempts: [1, 2],
+    evaluation_recovery_id: evaluationRecovery,
     provider_attempt_count: 8,
     provider_ledger_record_count: 16,
     reviewer_recovery: {
-      recovery_id: Number(providerRecoveryId),
+      recovery_id: providerRecovery,
       source_step: 'spec_creation',
       blocked_step: 'spec_review',
       source_attempt: 1,
@@ -1883,8 +1907,9 @@ NODE
     "$(sha256_file "$archive_path")" "$(sha256_file "$repo_root/scripts/test-packaged-external-golden-path.sh")" \
     "$(fixture_manifest_sha256)" "$candidate_digest" "$promotion_eval" "$target_head" \
     "$rejection_candidate" "$(sha256_file "$rejection_report")" "$rejection_head" \
-    "$passing_recovery_snapshot" "$provider_recovery_id" "$rejection_recovered" \
-    "$rejection_provider_attempt_count" "$rejection_provider_ledger_record_count"
+    "$passing_recovery_snapshot" "$provider_recovery_id" "$evaluation_recovery_id" \
+    "$rejection_recovered" "$rejection_provider_attempt_count" \
+    "$rejection_provider_ledger_record_count"
   echo "Packaged local Ollama golden path passed; sanitized evidence published."
 }
 
