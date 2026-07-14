@@ -440,6 +440,7 @@ mutate_archive_metadata() {
   local source_archive="$2"
   local output_archive="$3"
   local fixture tar_path member_header=512 member_size padding_offset
+  local header_offset=0 member_index
 
   fixture_archive_index=$((fixture_archive_index + 1))
   fixture="$temp_root/metadata-mutation-$fixture_archive_index"
@@ -463,6 +464,15 @@ mutate_archive_metadata() {
   tar_path="$fixture/archive.tar"
   gzip -dc "$source_archive" >"$tar_path"
   case "$kind" in
+    gnu-tar-null-device-fields)
+      for ((member_index = 0; member_index < 5; member_index++)); do
+        dd if=/dev/zero of="$tar_path" bs=1 \
+          seek="$((header_offset + 329))" count=16 conv=notrunc 2>/dev/null
+        rewrite_fixture_header_checksum "$tar_path" "$header_offset"
+        member_size="$(read_fixture_octal "$tar_path" "$((header_offset + 124))" 12)"
+        header_offset=$((header_offset + 512 + ((member_size + 511) / 512) * 512))
+      done
+      ;;
     checksum-form)
       printf ' \000' |
         dd of="$tar_path" bs=1 seek="$((member_header + 154))" conv=notrunc 2>/dev/null
@@ -478,6 +488,11 @@ mutate_archive_metadata() {
       ;;
     device-major)
       printf '1' |
+        dd of="$tar_path" bs=1 seek="$((member_header + 329))" conv=notrunc 2>/dev/null
+      rewrite_fixture_header_checksum "$tar_path" "$member_header"
+      ;;
+    device-major-embedded-null)
+      printf '\060\060\000\060\060\060\060\060' |
         dd of="$tar_path" bs=1 seek="$((member_header + 329))" conv=notrunc 2>/dev/null
       rewrite_fixture_header_checksum "$tar_path" "$member_header"
       ;;
@@ -728,6 +743,25 @@ run_review_regressions() {
     expect_review_rejection "metadata mutation $mutation" "archive" \
       "$build_script" verify-structure "$target" "$mutation_archive" || true
   done
+
+  echo "==> Review regression: accept GNU tar zero-byte device fields for non-device USTAR entries"
+  mutation="gnu-tar-null-device-fields"
+  mutation_directory="$review_root/mutation-$mutation"
+  mutation_archive="$mutation_directory/$(basename "$archive")"
+  mutate_archive_metadata "$mutation" "$archive" "$mutation_archive"
+  if ! output="$("$build_script" verify-structure "$target" "$mutation_archive" 2>&1)"; then
+    record_review_failure \
+      "GNU tar uses zero-byte device fields for non-device USTAR entries; verifier output: $output"
+  fi
+
+  echo "==> Review regression: reject embedded NUL in device-major metadata"
+  mutation="device-major-embedded-null"
+  mutation_directory="$review_root/mutation-$mutation"
+  mutation_archive="$mutation_directory/$(basename "$archive")"
+  mutate_archive_metadata "$mutation" "$archive" "$mutation_archive"
+  expect_review_rejection "embedded-NUL device-major metadata" \
+    "malformed device-major metadata" \
+    "$build_script" verify-structure "$target" "$mutation_archive" || true
 
   if ((review_failure_count > 0)); then
     fail "$review_failure_count review regression assertions failed"

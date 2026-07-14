@@ -187,6 +187,25 @@ read_tar_octal() {
   printf '%s\n' "$((8#$value))"
 }
 
+read_tar_device_number() {
+  local tar_path="$1"
+  local offset="$2"
+  local value raw_hex
+
+  raw_hex="$(od -An -t x1 -j "$offset" -N 8 "$tar_path" | tr -d ' \n')"
+  if [[ "$raw_hex" == "0000000000000000" ]]; then
+    printf '0\n'
+    return
+  fi
+  if [[ "$raw_hex" =~ ^3[0-7]3[0-7]3[0-7]3[0-7]3[0-7]3[0-7]2000$ ]] ||
+    [[ "$raw_hex" =~ ^3[0-7]3[0-7]3[0-7]3[0-7]3[0-7]3[0-7]3[0-7]00$ ]]; then
+    value="$(read_tar_field "$tar_path" "$offset" 8 | tr -d ' ')"
+    printf '%s\n' "$((8#$value))"
+    return
+  fi
+  return 1
+}
+
 validate_ustar_header() {
   local tar_path="$1"
   local offset="$2"
@@ -225,9 +244,9 @@ validate_ustar_header() {
   version="$(read_tar_field "$tar_path" "$((offset + 263))" 2)"
   uname="$(read_tar_field "$tar_path" "$((offset + 265))" 32)"
   gname="$(read_tar_field "$tar_path" "$((offset + 297))" 32)"
-  device_major="$(read_tar_octal "$tar_path" "$((offset + 329))" 8)" ||
+  device_major="$(read_tar_device_number "$tar_path" "$((offset + 329))")" ||
     fail "archive inventory has malformed device-major metadata for $expected_name"
-  device_minor="$(read_tar_octal "$tar_path" "$((offset + 337))" 8)" ||
+  device_minor="$(read_tar_device_number "$tar_path" "$((offset + 337))")" ||
     fail "archive inventory has malformed device-minor metadata for $expected_name"
   prefix_bytes="$(dd if="$tar_path" bs=1 skip="$((offset + 345))" count=155 2>/dev/null |
     LC_ALL=C tr -d '\000' | wc -c | tr -d ' ')"
