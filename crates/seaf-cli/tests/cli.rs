@@ -7629,6 +7629,205 @@ fn loop_revise_testing_invalidate_and_rerun_use_no_provider_configuration() {
     );
 }
 
+fn prepare_recovered_evaluation_for_inspection(temp: &Path, run_id: &str) -> (PathBuf, PathBuf) {
+    let repo = temp.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: retry_probe\n      command: printf recovered\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Configure recovered inspection probe");
+    let runs_root = temp.join("runs");
+    let ticket = write_provider_loop_ticket(temp, true);
+    run_and_approve_provider_loop(&repo, &ticket, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    let approved_bytes = fs::read(run_dir.join("run.json")).unwrap();
+
+    let evaluation = seaf_in(&repo)
+        .args([
+            "loop",
+            "resume",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(evaluation.status.success(), "{evaluation:?}");
+    fs::write(run_dir.join("run.json"), approved_bytes).unwrap();
+    for path in [
+        "artifacts/07-testing.attempt-001.check-001.stderr.log",
+        "artifacts/07-testing.attempt-001.json",
+        "artifacts/08-eval-report.attempt-001.json",
+    ] {
+        fs::remove_file(run_dir.join(path)).unwrap();
+    }
+
+    let invalidated = seaf_in(&repo)
+        .args([
+            "loop",
+            "revise",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--from-step",
+            "testing",
+            "--eval-recovery",
+            "invalidate",
+            "--actor",
+            "operator@example.invalid",
+            "--reason",
+            "prove recovered inspection authority",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(invalidated.status.success(), "{invalidated:?}");
+    let rerun = seaf_in(&repo)
+        .args([
+            "loop",
+            "rerun",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--recovery",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(rerun.status.success(), "{rerun:?}");
+
+    (repo, runs_root)
+}
+
+fn write_evaluation_prompt_attempts(run_dir: &Path, through_attempt: u32) {
+    for stem in ["07-testing", "08-eval-report"] {
+        for attempt in 1..=through_attempt {
+            let name = if attempt == 1 {
+                format!("{stem}.prompt.md")
+            } else {
+                format!("{stem}.attempt-{attempt:03}.prompt.md")
+            };
+            let path = run_dir.join("prompts").join(name);
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options.open(&path).expect("create regular orphan prompt");
+            writeln!(file, "orphan evaluation prompt attempt {attempt}")
+                .expect("write regular orphan prompt");
+        }
+    }
+}
+
+fn inspect_loop_json(repo: &Path, runs_root: &Path, run_id: &str) -> serde_json::Value {
+    let inspected = seaf_in(repo)
+        .args([
+            "loop",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(inspected.status.success(), "{inspected:?}");
+    serde_json::from_slice(&inspected.stdout).unwrap()
+}
+
+fn assert_recovered_evaluation_attempt_two_is_current(report: &serde_json::Value) {
+    assert_eq!(
+        report["integrity"], "verified",
+        "a valid recovered evaluation must retain authenticated attempt-2 authority: {report}"
+    );
+    assert_eq!(report["ambiguity_messages"], serde_json::json!([]));
+    for step_index in [6, 7] {
+        assert_eq!(
+            report["steps"][step_index]["artifact_history"][0]["attempt"],
+            2
+        );
+        assert_eq!(
+            report["steps"][step_index]["artifact_history"][0]["classification"],
+            "current"
+        );
+    }
+}
+
+#[test]
+fn loop_inspect_treats_recovered_evaluation_attempt_two_as_current_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = "inspect-recovered-evaluation";
+    let (repo, runs_root) = prepare_recovered_evaluation_for_inspection(temp.path(), run_id);
+
+    let report = inspect_loop_json(&repo, &runs_root, run_id);
+    assert_recovered_evaluation_attempt_two_is_current(&report);
+}
+
+#[test]
+fn loop_inspect_ignores_orphan_future_prompts_after_verified_final_evaluation() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = "inspect-future-evaluation-prompt";
+    let (repo, runs_root) = prepare_recovered_evaluation_for_inspection(temp.path(), run_id);
+    write_evaluation_prompt_attempts(&runs_root.join(run_id), 3);
+
+    let report = inspect_loop_json(&repo, &runs_root, run_id);
+    assert_recovered_evaluation_attempt_two_is_current(&report);
+}
+
+#[test]
+fn loop_inspect_never_classifies_invalid_final_evaluation_authority_as_current() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = "inspect-invalid-final-evaluation";
+    let (repo, runs_root) = prepare_recovered_evaluation_for_inspection(temp.path(), run_id);
+    let run_dir = runs_root.join(run_id);
+    write_evaluation_prompt_attempts(&run_dir, 2);
+    fs::write(
+        run_dir.join("artifacts/07-testing.attempt-002.execution-intent.json"),
+        b"{}\n",
+    )
+    .unwrap();
+
+    let report = inspect_loop_json(&repo, &runs_root, run_id);
+    assert_eq!(report["integrity"], "degraded");
+    assert!(report["integrity_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message == "final evaluation authority is invalid"));
+    for step_index in [6, 7] {
+        let selected_path = report["steps"][step_index]["artifact_path"]
+            .as_str()
+            .unwrap();
+        let selected = report["steps"][step_index]["artifact_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["path"] == selected_path)
+            .unwrap();
+        assert_ne!(
+            selected["classification"], "current",
+            "invalid final evaluation authority must not authenticate {selected_path}: {report}"
+        );
+        let evaluation_prefix = report["evaluation_prefix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["path"] == selected_path)
+            .unwrap();
+        assert_eq!(
+            evaluation_prefix["classification"], "ambiguous",
+            "invalid final evaluation authority must be classified consistently for {selected_path}: {report}"
+        );
+    }
+}
+
 #[test]
 fn loop_revise_is_provider_free_and_exact_rerun_consumes_one_recovery_request() {
     let temp = tempfile::tempdir().unwrap();

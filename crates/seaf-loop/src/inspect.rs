@@ -167,6 +167,13 @@ pub struct InspectionBounds {
     pub ambiguity_messages_truncated: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalEvaluationAuthority {
+    NotRequired,
+    Verified { attempt: u32 },
+    Invalid,
+}
+
 pub fn inspect_loop_run(runs_root: &Path, run_id: &str) -> Result<LoopInspection, InspectError> {
     validate_run_id(run_id)?;
     let workspace = LoopWorkspace::open_minimal(runs_root, run_id)?;
@@ -201,17 +208,39 @@ pub fn inspect_loop_run(runs_root: &Path, run_id: &str) -> Result<LoopInspection
         exchanges_total: provider_exchanges_total,
         maxima: provider_maxima,
     } = provider_inventory;
+    let final_evaluation_authority = if matches!(
+        run.status,
+        LoopStatus::EvalPassed | LoopStatus::Promoted | LoopStatus::Failed
+    ) && run.human_approval.is_some()
+    {
+        match crate::load_verified_final_evaluation_authority(&workspace, &run) {
+            Ok(authority) => FinalEvaluationAuthority::Verified {
+                attempt: authority.execution_intent().attempt(),
+            },
+            Err(_) => {
+                integrity_messages.push("final evaluation authority is invalid".to_string());
+                FinalEvaluationAuthority::Invalid
+            }
+        }
+    } else {
+        FinalEvaluationAuthority::NotRequired
+    };
     let prompt_maxima = inspect_prompt_attempts(&workspace)?;
     let (steps, artifact_history_total) = inspect_steps(
         &workspace,
         &run,
         &provider_maxima,
         &prompt_maxima,
+        final_evaluation_authority,
         &mut integrity_messages,
         &mut ambiguity_messages,
     )?;
-    let (evaluation_prefix, evaluation_prefix_total) =
-        inspect_evaluation_prefix(&workspace, &run, &mut integrity_messages)?;
+    let (evaluation_prefix, evaluation_prefix_total) = inspect_evaluation_prefix(
+        &workspace,
+        &run,
+        final_evaluation_authority,
+        &mut integrity_messages,
+    )?;
     let retained_provider_exchanges = provider_attempts
         .iter()
         .map(|attempt| attempt.exchanges.len())
@@ -628,6 +657,7 @@ fn inspect_steps(
     run: &LoopRun,
     provider_maxima: &[Option<u32>; 8],
     prompt_maxima: &[Option<u32>; 8],
+    final_evaluation_authority: FinalEvaluationAuthority,
     messages: &mut Vec<String>,
     ambiguities: &mut Vec<String>,
 ) -> Result<(Vec<StepInspection>, usize), InspectError> {
@@ -648,11 +678,21 @@ fn inspect_steps(
         )?;
         total_history += total;
         let index = step_index(record.name);
-        let durable_attempt = provider_maxima[index]
-            .into_iter()
-            .chain(prompt_maxima[index])
-            .max()
-            .unwrap_or(1);
+        let is_evaluation_step = matches!(
+            record.name,
+            LoopStepName::Testing | LoopStepName::EvalReport
+        );
+        let invalid_final_authority =
+            is_evaluation_step && final_evaluation_authority == FinalEvaluationAuthority::Invalid;
+        let durable_attempt = match (is_evaluation_step, final_evaluation_authority) {
+            (true, FinalEvaluationAuthority::Verified { attempt }) => Some(attempt),
+            (true, FinalEvaluationAuthority::Invalid) => None,
+            _ => provider_maxima[index]
+                .into_iter()
+                .chain(prompt_maxima[index])
+                .max()
+                .or(Some(1)),
+        };
         let mut history = Vec::new();
         for path in &artifacts {
             let (attempt, extension) =
@@ -668,7 +708,17 @@ fn inspect_steps(
             if classification == EvidenceClassification::Verified {
                 classification = EvidenceClassification::Current;
             }
-            if record.artifact_path.as_deref() == Some(path) && attempt != durable_attempt {
+            if classification == EvidenceClassification::Current && invalid_final_authority {
+                ambiguities.push(format!(
+                    "{:?} selected artifact cannot be current because final evaluation authority is invalid",
+                    record.name
+                ));
+                classification = EvidenceClassification::Ambiguous;
+            }
+            if record.artifact_path.as_deref() == Some(path)
+                && durable_attempt.is_some_and(|durable_attempt| attempt != durable_attempt)
+            {
+                let durable_attempt = durable_attempt.expect("checked durable attempt");
                 let message = if attempt == 1 && durable_attempt >= 2 {
                     format!(
                         "{:?} durable attempt {durable_attempt} still selects the historical fixed-name artifact",
@@ -717,7 +767,7 @@ fn inspect_steps(
                         (identity, _) => (
                             identity
                                 .as_ref()
-                                .map_or(durable_attempt, |(attempt, _)| *attempt),
+                                .map_or(durable_attempt.unwrap_or(1), |(attempt, _)| *attempt),
                             identity.map(|(_, extension)| extension).unwrap_or_else(|| {
                                 Path::new(path)
                                     .extension()
@@ -728,7 +778,17 @@ fn inspect_steps(
                             EvidenceClassification::Tampered,
                         ),
                     };
-                if selected_attempt != durable_attempt {
+                if classification == EvidenceClassification::Current && invalid_final_authority {
+                    ambiguities.push(format!(
+                        "{:?} selected artifact cannot be current because final evaluation authority is invalid",
+                        record.name
+                    ));
+                    classification = EvidenceClassification::Ambiguous;
+                }
+                if durable_attempt
+                    .is_some_and(|durable_attempt| selected_attempt != durable_attempt)
+                {
+                    let durable_attempt = durable_attempt.expect("checked durable attempt");
                     ambiguities.push(format!(
                         "{:?} selects artifact attempt {selected_attempt} but durable authority proves attempt {durable_attempt}",
                         record.name
@@ -865,6 +925,7 @@ fn step_index(step: LoopStepName) -> usize {
 fn inspect_evaluation_prefix(
     workspace: &LoopWorkspace,
     run: &LoopRun,
+    final_evaluation_authority: FinalEvaluationAuthority,
     messages: &mut Vec<String>,
 ) -> Result<(Vec<EvaluationPrefixInspection>, usize), InspectError> {
     let is_evaluation_prefix = |path: &str| {
@@ -903,6 +964,11 @@ fn inspect_evaluation_prefix(
                 path,
                 record.artifact_digest.as_deref().unwrap_or_default(),
             )? {
+                EvidenceClassification::Verified
+                    if final_evaluation_authority == FinalEvaluationAuthority::Invalid =>
+                {
+                    EvidenceClassification::Ambiguous
+                }
                 EvidenceClassification::Verified => EvidenceClassification::Current,
                 other => {
                     messages.push(format!("evaluation prefix {path} is {other:?}").to_lowercase());
@@ -1177,6 +1243,7 @@ mod tests {
             &run,
             &provider_maxima,
             &prompt_maxima,
+            FinalEvaluationAuthority::NotRequired,
             &mut messages,
             &mut ambiguities,
         )
@@ -1250,6 +1317,7 @@ mod tests {
             &run,
             &provider_maxima,
             &prompt_maxima,
+            FinalEvaluationAuthority::NotRequired,
             &mut messages,
             &mut ambiguities,
         )
@@ -1354,6 +1422,7 @@ mod tests {
             &run,
             &[None; 8],
             &prompt_maxima,
+            FinalEvaluationAuthority::NotRequired,
             &mut Vec::new(),
             &mut Vec::new(),
         )
