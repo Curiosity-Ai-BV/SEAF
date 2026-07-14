@@ -2808,3 +2808,42 @@ remains the documented ordinary Ubuntu CI evidence.
 No tag, GitHub Release, registry publication, signing, notarization, golden
 path, or Ollama action was taken. M2-04 is accepted; M2-05 awaits explicit user
 authorization.
+
+## 2026-07-14 M2-05 preflight stopped; fresh exact-SHA authorization required
+
+The user authorized use of the current GitHub credential to configure tag
+protection, enable immutable releases with automatic attestation, and create
+lightweight tag `v0.1.0` plus a prerelease only at exact commit
+`29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Preflight found `origin/main` had
+independently advanced to that commit, so no branch push was performed.
+
+Exact-old-SHA ordinary-CI run
+[`29312976772`](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29312976772)
+failed in Rust `Release artifact readiness`: GNU tar rejected all-NUL ordinary
+USTAR device fields. TypeScript passed; Rust steps after the release-artifact
+step were skipped. No tag, release, release asset, or release-workflow run was
+created, and the failed ordinary-CI run was not rerun.
+
+Protective repository settings are live and verified. Tag ruleset
+[`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424) is ID
+`18918424`, targets tags, is active, includes exactly `refs/tags/v0.1.0`,
+contains update and deletion rules, has no creation rule or bypass actors, and
+reports `current_user_can_bypass` `never`. Immutable-releases `PUT` returned
+204, and current state is `{"enabled":true,"enforced_by_owner":false}`;
+publication will automatically attest.
+
+TDD correction `7b895b5` accepts GNU tar's ordinary USTAR device fields after
+independent specification and quality approval. A stronger full `linux/amd64`
+Rust 1.97/GNU tar 1.34 suite then exposed checksum lines ordered by digest
+instead of archive name. TDD correction `f4d7c28` fixes that ordering after
+independent specification and quality approval. The controller passed the
+focused and full macOS release-artifact gates and the full exact Linux suite at
+final clean commit `f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`.
+
+`v0.1.0` remains absent and the release count remains zero. Authorization for
+the old commit does not transfer. M2-05 remains pending fresh explicit
+authorization naming `f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`; M2-06 and
+M2-07 remain dependency-blocked. If authorized, the next operation may push
+only lightweight `v0.1.0` directly at that commit with no branch push, run and
+verify the initial tag workflow, then publish only the already verified two
+archives and `SHA256SUMS` under the existing M2-05 acceptance boundary.

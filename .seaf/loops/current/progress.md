@@ -54,7 +54,7 @@
 - [x] M2-02: Project doctor.
 - [x] M2-03: Package metadata and version identity.
 - [x] M2-04: Release artifact workflow.
-- [ ] M2-05: Human-authorized tagged prerelease (awaiting explicit user authorization).
+- [ ] M2-05: Human-authorized tagged prerelease (awaiting fresh exact-SHA authorization).
 - [ ] M2-06: Packaged external golden path.
 - [ ] M2-07: Executed Ollama acceptance.
 
@@ -71,12 +71,28 @@
 
 Milestone 1, including M1-12 interruption recovery acceptance, is complete.
 M2-01 generic project initialization, M2-02 project doctor, M2-03 package
-identity, and M2-04 release artifact workflow are accepted. M2-05 is awaiting
-explicit user authorization for external tag and prerelease state. The accepted
-package gate proves exact version/private metadata, four pristine local package
-archives, warning-free MIT notices, external extracted-CLI install, and exact
-version/info/init/commit/fake-doctor smoke. Its tracked-input, archive inventory,
-size/type, Git, Cargo-config, and wrapper boundaries pass their negative guards.
+identity, and M2-04 release artifact workflow are accepted. M2-05 is pending
+fresh explicit authorization naming exact clean commit
+`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`; the prior authorization named
+only `29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Ordinary-CI run
+[`29312976772`](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29312976772)
+failed at the old SHA in Rust `Release artifact readiness` because GNU tar
+rejected all-NUL ordinary USTAR device fields. TypeScript passed, later Rust
+steps were skipped, and no tag, release, release asset, or release-workflow run
+was created. The failed ordinary-CI run was not rerun. Corrections `7b895b5`
+and `f4d7c28` passed independent
+specification and quality review plus final focused/full macOS and exact
+`linux/amd64` Rust 1.97/GNU tar 1.34 release-artifact gates. Tag ruleset
+[`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424) is
+active with update/deletion protection and no bypass; immutable releases are
+enabled and will automatically attest. `v0.1.0` remains absent and the release
+count remains zero. M2-06 and M2-07 remain dependency-blocked.
+
+The accepted package gate proves exact version/private metadata, four pristine
+local package archives, warning-free MIT notices, external extracted-CLI
+install, and exact version/info/init/commit/fake-doctor smoke. Its tracked-input,
+archive inventory, size/type, Git, Cargo-config, and wrapper boundaries pass
+their negative guards.
 The accepted doctor slice covers the absolute/capped local Ollama transport,
 diagnostic-only candidate planning, loop-compatible ticket/config/policy
 authority, fake-option and model-check compatibility, and complete report/no-
@@ -235,7 +251,7 @@ claim. Independent specification and quality re-reviews approve M1-12 with no
 open findings. The controller's final gate passed all 14 exact acceptance
 tests, workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-M2-01 through M2-04 are accepted; M2-05 awaits explicit user authorization.
+M2-01 through M2-04 are accepted; M2-05 awaits fresh exact-SHA authorization.
 Compatibility handoff is recorded in
 `docs/preview-compatibility-handoff.md` for M2-03 and M3-05.
 The documented complete promotion path requires a clean checkout/worktree. The
@@ -255,7 +271,7 @@ SDK gates, and the complete locked serial Rust workspace suite. M2-02 then
 passed independent specification and quality review plus its complete focused
 and full controller gates. M2-03 passed its package-readiness gate, independent
 specification and quality reviews, and the complete controller matrix. M2-04 is
-accepted; M2-05 awaits explicit user authorization.
+accepted; M2-05 awaits fresh exact-SHA authorization.
 M2-04's required missing-script and missing-workflow REDs were witnessed before
 wiring; a follow-up probe also proved the missing non-executing aggregate
 verifier. The final local release-artifact gate passes deterministic double
@@ -264,7 +280,7 @@ refusal, external install and identity smoke, exact static workflow authority,
 and source-status preservation. Focused/full formatting, stable strict Clippy,
 package readiness, all SDK gates, and diff hygiene pass. GNU tar execution
 remains ordinary Ubuntu CI evidence; local macOS directly proves bsdtar. M2-04
-is accepted, and M2-05 awaits explicit user authorization.
+is accepted, and M2-05 awaits fresh exact-SHA authorization.
 
 M2-04 quality review rejected the first implementation on 2026-07-14. The
 correction's focused RED reported 17 failures covering process status/stderr,
@@ -275,5 +291,5 @@ helper with its four calls in one shell. Fresh independent specification and
 quality/security re-reviews approved the corrected slice with no findings. The
 controller's corrected artifact gate, complete Rust workspace suite, stable
 strict Clippy, package gate, formatting, SDK lint/typecheck/8-test/build suite,
-and diff hygiene pass. M2-04 is accepted; M2-05 awaits explicit user
+and diff hygiene pass. M2-04 is accepted; M2-05 awaits fresh exact-SHA
 authorization.

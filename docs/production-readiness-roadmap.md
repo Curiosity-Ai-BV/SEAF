@@ -413,7 +413,7 @@ Milestone 1 and M2-01 through M2-04 are complete. Package identity is private,
 exact, warning-free, and proven through pristine archives plus an external
 installed-CLI smoke. Independent specification and quality reviews approved the
 corrected package and release-artifact boundaries, and the full controller gates
-passed. M2-05 awaits explicit user authorization for the tagged prerelease.
+passed. M2-05 awaits fresh exact-SHA authorization for the tagged prerelease.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -463,7 +463,7 @@ validation, external installed-binary identity, static read-only workflow
 authority, and Git-status preservation. Formatting, stable strict Clippy,
 package readiness, SDK, and diff gates pass. That first implementation evidence
 was not acceptance or tagged publication; final acceptance follows the
-correction and reviews below. M2-05 awaits explicit user authorization.
+correction and reviews below. M2-05 awaits fresh exact-SHA authorization.
 
 Quality review rejected M2-04 on 2026-07-14 for incomplete process identity,
 incorrect Bash 3.2 file-limit units, nontransactional failed outputs, and
@@ -475,7 +475,20 @@ rollback, full normalized metadata mutations, and same-step workflow helper
 authority. Fresh independent specification and quality/security reviews
 approved the correction with no findings, and the complete controller gate
 passed. M2-04 is accepted. No M2-05 external authority or acceptance is claimed;
-the tagged prerelease awaits explicit user authorization.
+the tagged prerelease awaits fresh exact-SHA authorization.
+
+M2-05 preflight on 2026-07-14 used prior authorization limited to exact commit
+`29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Ordinary-CI run
+[`29312976772`](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29312976772)
+failed its Rust release-artifact gate on GNU tar USTAR device fields before any
+tag or release existed. Corrections `7b895b5` and `f4d7c28` passed independent
+reviews and final macOS plus exact `linux/amd64` Rust 1.97/GNU tar 1.34 gates.
+The active
+[`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424)
+tag ruleset and immutable releases with automatic attestation are live;
+`v0.1.0` and all releases remain absent. M2-05 and U7 remain pending fresh
+explicit authorization naming final clean commit
+`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`; Milestone 2 is not accepted.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario

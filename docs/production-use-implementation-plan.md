@@ -2158,7 +2158,7 @@ remaining integration and doc-test suite.
 ### M2-02 - Project Doctor
 
 Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 and M2-04
-are accepted; M2-05 awaits explicit user authorization.
+are accepted; M2-05 awaits fresh exact-SHA authorization.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2230,12 +2230,12 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 and M2-04 are accepted; M2-05 awaits explicit user authorization.
+M2-03 and M2-04 are accepted; M2-05 awaits fresh exact-SHA authorization.
 
 ### M2-03 - Package Metadata And Version Identity
 
 Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 is
-accepted; M2-05 awaits explicit user authorization.
+accepted; M2-05 awaits fresh exact-SHA authorization.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2292,7 +2292,7 @@ suite, and doc tests.
 ### M2-04 - Release Artifact Workflow
 
 Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is
-awaiting explicit user authorization.
+awaiting fresh exact-SHA authorization.
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2359,11 +2359,12 @@ specification and quality/security reviews approved the correction with no
 findings. The controller's corrected artifact gate, complete Rust workspace
 suite, stable strict Clippy, package readiness, formatting, SDK
 lint/typecheck/8-test/build suite, and diff hygiene pass. M2-04 is accepted;
-M2-05 awaits explicit user authorization.
+M2-05 awaits fresh exact-SHA authorization.
 
 ### M2-05 - Human-Authorized Tagged Prerelease
 
-Status: awaiting explicit user authorization on 2026-07-14. Dependencies:
+Status: awaiting fresh exact-SHA authorization naming
+`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a` on 2026-07-14. Dependencies:
 M2-04 (accepted).
 
 Roadmap: U7. Dependencies: M2-04.
@@ -2372,17 +2373,30 @@ Objective: prove the actual tagged, checksummed distribution path.
 
 Acceptance criteria:
 
-- With explicit user authorization, a preview tag produces downloadable
-  macOS/Linux artifacts and checksums.
+- With fresh explicit authorization naming the exact final commit, lightweight
+  tag `v0.1.0` is pushed directly to that commit without a branch push and
+  produces downloadable macOS/Linux artifacts and checksums.
 - Downloaded artifacts install and pass `--version`, `info`, and doctor smoke.
 - Evidence and URLs are recorded; without authorization this slice stays
   pending and Milestone 2 cannot complete.
 
 Likely seams: external GitHub release state and release evidence docs.
 
-Evidence: successful tagged workflow and downloaded-artifact smoke.
+Current evidence: prior authorization named only
+`29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Ordinary-CI run
+[`29312976772`](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29312976772)
+failed the old-SHA Rust release-artifact gate on GNU tar USTAR device fields;
+TypeScript passed and later Rust steps were skipped. Corrections `7b895b5` and
+`f4d7c28` passed independent reviews and final focused/full macOS plus exact
+`linux/amd64` Rust 1.97/GNU tar 1.34 release-artifact gates. Tag ruleset
+[`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424) and
+immutable releases with automatic attestation are live. No tag, release, asset,
+or release-workflow run exists.
 
-Verification: checksums, install smoke, clean repo status, and workflow result.
+Pending verification after fresh authorization: initial tag-workflow result,
+both native jobs and checksum assembly, downloaded checksum/inventory proof,
+external native install smoke, clean repository status, and prerelease assets
+identical to the verified workflow outputs.
 
 Docs/tracker: release evidence and M2-05 status.
 
