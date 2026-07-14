@@ -127,6 +127,12 @@ seaf loop rerun --run-id milestone-one-demo \
   --policy examples/adaptive-notes/seaf.policy.json --json
 ```
 
+The `--reason` value is sanitized audit evidence for the recovery record; it is
+never model guidance. When an authenticated Spec Review returns
+`request_changes`, revising from `spec` automatically supplies the prior Spec
+Creation artifact and the reviewer artifact to the revised Spec Creation
+request. Other provider-step and evaluation recoveries are unchanged.
+
 Only `loop rerun --recovery <id>` may consume a pending revision before its
 first durable provider request. After that request exists, ordinary `loop
 resume` continues the exact attempt. The former `loop resume --rerun-from`

@@ -452,41 +452,88 @@ require_live_review_checkpoint() {
   local report_file="$1"
   local run_directory="$2"
   local label="$3"
+  local result_variable="$4"
+  local classification
 
-  if node - "$report_file" "$run_directory" "$label" <<'NODE'
+  if ! classification="$(node - "$report_file" "$run_directory" "$label" <<'NODE'
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const [reportPath, runDirectoryInput, label] = process.argv.slice(2);
-const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-if (report.status === 'awaiting_human_review') process.exit(0);
-const runDirectory = fs.realpathSync(runDirectoryInput);
-const run = JSON.parse(fs.readFileSync(path.join(runDirectory, 'run.json'), 'utf8'));
-const last = Array.isArray(run.provider_exchange_records)
-  ? run.provider_exchange_records.at(-1)
-  : undefined;
-let outcome = 'no_terminal_provider_exchange';
+let currentStep = 'unknown';
 let kind = 'none';
-if (last) {
-  kind = String(last.kind);
-  if (last.phase === 'response'
-    && typeof last.path === 'string'
-    && !path.posix.isAbsolute(last.path)
-    && !last.path.includes('\\')
-    && last.path.split('/').every((part) => part && part !== '.' && part !== '..')) {
-    const recordPath = path.resolve(runDirectory, last.path);
-    if (recordPath.startsWith(`${runDirectory}${path.sep}`)) {
-      const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
-      outcome = String(record.outcome ?? outcome);
+let outcome = 'no_terminal_provider_exchange';
+let classification;
+try {
+  const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  currentStep = String(report.current_step ?? currentStep);
+  if (report.status === 'awaiting_human_review') {
+    classification = 'awaiting_human_review';
+  } else {
+    const runDirectory = fs.realpathSync(runDirectoryInput);
+    const run = JSON.parse(fs.readFileSync(path.join(runDirectory, 'run.json'), 'utf8'));
+    const last = Array.isArray(run.provider_exchange_records)
+      ? run.provider_exchange_records.at(-1)
+      : undefined;
+    if (last) {
+      kind = String(last.kind);
+      const safePath = typeof last.path === 'string'
+        && !path.posix.isAbsolute(last.path)
+        && !last.path.includes('\\')
+        && last.path.split('/').every((part) => part && part !== '.' && part !== '..');
+      if (safePath && /^[0-9a-f]{64}$/.test(last.digest)) {
+        const recordPath = path.resolve(runDirectory, last.path);
+        const stat = fs.lstatSync(recordPath);
+        if (recordPath.startsWith(`${runDirectory}${path.sep}`)
+          && fs.realpathSync(recordPath) === recordPath
+          && stat.isFile()
+          && !stat.isSymbolicLink()
+          && stat.size <= 4 * 1024 * 1024) {
+          const bytes = fs.readFileSync(recordPath);
+          const observed = crypto.createHash('sha256').update(bytes).digest('hex');
+          const record = JSON.parse(bytes.toString('utf8'));
+          outcome = String(record.outcome ?? outcome);
+          const verified = observed === last.digest
+            && record.run_id === last.run_id
+            && record.step === last.step
+            && record.role === last.role
+            && record.step_attempt === last.step_attempt
+            && record.exchange_index === last.exchange_index
+            && record.kind === last.kind
+            && record.context_round === last.context_round
+            && record.phase === last.phase;
+          if (report.status === 'blocked'
+            && currentStep === 'spec_review'
+            && run.status === 'blocked'
+            && run.current_step === 'spec_review'
+            && verified
+            && last.step === 'spec_review'
+            && last.step_attempt === 1
+            && last.exchange_index === 1
+            && last.kind === 'initial'
+            && last.context_round === undefined
+            && last.phase === 'response'
+            && outcome === 'request_changes') {
+            classification = 'recoverable_spec_review';
+          }
+        }
+      }
     }
   }
+} catch (_) {
+  // The caller receives only the bounded classification below.
 }
-process.stderr.write(`local Ollama ${label} stopped at ${String(report.current_step)} with ${kind}/${outcome}; raw provider content omitted\n`);
+if (classification) {
+  process.stdout.write(classification);
+  process.exit(0);
+}
+process.stderr.write(`local Ollama ${label} stopped at ${currentStep} with ${kind}/${outcome}; raw provider content omitted\n`);
 process.exit(1);
 NODE
-  then
-    return 0
+  )"; then
+    fail "$label did not reach a supported review checkpoint"
   fi
-  fail "$label did not reach the human review checkpoint"
+  printf -v "$result_variable" '%s' "$classification"
 }
 
 assert_inspection() {
@@ -722,26 +769,216 @@ if (!Array.isArray(run.provider_exchange_records) || run.provider_exchange_recor
 NODE
 }
 
+snapshot_reviewer_recovery_authority() {
+  local run_directory="$1"
+  local output="$2"
+
+  node - "$run_directory" "$output" <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = fs.realpathSync(process.argv[2]);
+const output = process.argv[3];
+const run = JSON.parse(fs.readFileSync(path.join(root, 'run.json'), 'utf8'));
+if (run.status !== 'blocked' || run.current_step !== 'spec_review') {
+  throw new Error('reviewer recovery snapshot requires exact blocked Spec Review authority');
+}
+if (!Array.isArray(run.provider_exchange_records) || run.provider_exchange_records.length !== 8) {
+  throw new Error('reviewer recovery snapshot requires exactly four initial provider attempts');
+}
+const digestPattern = /^[0-9a-f]{64}$/;
+function safeRelative(relative) {
+  return typeof relative === 'string'
+    && !path.posix.isAbsolute(relative)
+    && !relative.includes('\\')
+    && relative.split('/').every((part) => part && part !== '.' && part !== '..');
+}
+function readImmutable(relative) {
+  if (!safeRelative(relative)) throw new Error('unsafe immutable attempt-one path');
+  const absolute = path.resolve(root, relative);
+  if (!absolute.startsWith(`${root}${path.sep}`)) throw new Error('immutable attempt-one path escaped run');
+  const stat = fs.lstatSync(absolute);
+  if (fs.realpathSync(absolute) !== absolute
+    || !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.size > 4 * 1024 * 1024) {
+    throw new Error('unsafe immutable attempt-one file');
+  }
+  const bytes = fs.readFileSync(absolute);
+  return {
+    path: relative,
+    size: bytes.length,
+    sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    bytes,
+  };
+}
+const spec = run.steps?.find((step) => step.name === 'spec_creation');
+const review = run.steps?.find((step) => step.name === 'spec_review');
+for (const [label, step, status] of [
+  ['prior spec', spec, 'completed'],
+  ['reviewer artifact', review, 'blocked'],
+]) {
+  if (!step || step.status !== status || !safeRelative(step.artifact_path) || !digestPattern.test(step.artifact_digest)) {
+    throw new Error(`${label} authority is absent`);
+  }
+  if (readImmutable(step.artifact_path).sha256 !== step.artifact_digest) {
+    throw new Error(`${label} artifact digest is not authenticated`);
+  }
+}
+const immutablePaths = new Set();
+for (const directory of ['prompts', 'responses']) {
+  const absoluteDirectory = path.join(root, directory);
+  for (const name of fs.readdirSync(absoluteDirectory)) {
+    if (!name || name.includes('/') || name.includes('\\')) throw new Error('unsafe immutable entry name');
+    immutablePaths.add(`${directory}/${name}`);
+  }
+}
+for (const step of run.steps ?? []) {
+  if (step.artifact_path) immutablePaths.add(step.artifact_path);
+}
+for (const reference of run.provider_exchange_records) {
+  immutablePaths.add(reference.path);
+  const recordEntry = readImmutable(reference.path);
+  if (recordEntry.sha256 !== reference.digest) throw new Error('provider ledger reference digest mismatch');
+  const record = JSON.parse(recordEntry.bytes.toString('utf8'));
+  immutablePaths.add(record.request?.path);
+  if (record.response?.path) immutablePaths.add(record.response.path);
+  if (record.expansion?.path) immutablePaths.add(record.expansion.path);
+}
+const entries = [...immutablePaths].sort().map((relative) => {
+  const { bytes: _, ...entry } = readImmutable(relative);
+  return entry;
+});
+if (entries.length > 128 || entries.reduce((sum, entry) => sum + entry.size, 0) > 32 * 1024 * 1024) {
+  throw new Error('immutable attempt-one inventory exceeds bounds');
+}
+const snapshot = {
+  provider_ledger_prefix: run.provider_exchange_records,
+  prior_spec_artifact_digest: spec.artifact_digest,
+  reviewer_artifact_digest: review.artifact_digest,
+  immutable_attempt_one: entries,
+};
+fs.writeFileSync(output, `${JSON.stringify(snapshot)}\n`, { flag: 'wx', mode: 0o600 });
+NODE
+}
+
+assert_reviewer_recovery_preserved() {
+  local run_directory="$1"
+  local snapshot="$2"
+
+  node - "$run_directory" "$snapshot" <<'NODE'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = fs.realpathSync(process.argv[2]);
+const expected = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const run = JSON.parse(fs.readFileSync(path.join(root, 'run.json'), 'utf8'));
+const prefix = run.provider_exchange_records?.slice(0, expected.provider_ledger_prefix.length);
+if (JSON.stringify(prefix) !== JSON.stringify(expected.provider_ledger_prefix)) {
+  throw new Error('original provider ledger is not an unchanged prefix');
+}
+for (const entry of expected.immutable_attempt_one) {
+  const absolute = path.resolve(root, entry.path);
+  if (!absolute.startsWith(`${root}${path.sep}`)) throw new Error('immutable attempt-one path escaped run');
+  const stat = fs.lstatSync(absolute);
+  if (fs.realpathSync(absolute) !== absolute
+    || !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.size !== entry.size) {
+    throw new Error(`immutable attempt-one file changed: ${entry.path}`);
+  }
+  const observed = crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex');
+  if (observed !== entry.sha256) throw new Error(`immutable attempt-one bytes changed: ${entry.path}`);
+}
+NODE
+}
+
+recover_live_spec_review() {
+  local repository="$1"
+  local runs_root="$2"
+  local run_id="$3"
+  local label="$4"
+  local snapshot="$5"
+  local result_output="$6"
+  local recovery_variable="$7"
+  local run_directory="$runs_root/$run_id"
+  local revise_output="$temp_root/$label-spec-revise.json"
+  local rerun_output="$result_output"
+  local recovery_id
+  local rerun_checkpoint
+
+  snapshot_reviewer_recovery_authority "$run_directory" "$snapshot"
+  run_in_repository "revise $label from authenticated Spec Review" "$repository" "$revise_output" \
+    loop revise --run-id "$run_id" --runs-root "$runs_root" --from-step spec \
+    --actor "$operator" --reason "address authenticated packaged Spec Review feedback" --json
+  node - "$revise_output" <<'NODE'
+const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+if (report.command !== 'revise'
+  || report.status !== 'pending'
+  || report.current_step !== 'spec_creation'
+  || report.source_step_attempt !== 1
+  || report.next_step_attempt !== 2
+  || !Number.isSafeInteger(report.recovery_id)
+  || report.recovery_id < 1) {
+  throw new Error('Spec Creation revision authority mismatch');
+}
+NODE
+  recovery_id="$(json_value "$revise_output" recovery_id)"
+  run_in_repository "rerun $label from authenticated Spec Review" "$repository" "$rerun_output" \
+    loop rerun --run-id "$run_id" --runs-root "$runs_root" --recovery "$recovery_id" \
+    --ticket seaf.ticket.yaml --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" --json
+  require_live_review_checkpoint "$rerun_output" "$run_directory" "$label revised run" rerun_checkpoint
+  [[ "$rerun_checkpoint" == "awaiting_human_review" ]] ||
+    fail "$label revised run stopped before the human review checkpoint"
+  assert_loop_report "$rerun_output" rerun "$run_id" awaiting_human_review
+  assert_reviewer_recovery_preserved "$run_directory" "$snapshot"
+  printf -v "$recovery_variable" '%s' "$recovery_id"
+}
+
 assert_clean_live_provider_flow() {
   local run_file="$1"
   local inspect_file="$2"
+  local flow="$3"
 
-  node - "$run_file" "$inspect_file" <<'NODE'
+  node - "$run_file" "$inspect_file" "$flow" <<'NODE'
 const fs = require('node:fs');
 const run = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const inspect = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
-const steps = ['research', 'analysis', 'spec_creation', 'spec_review', 'development', 'output_review'];
-const outcomes = ['passed', 'passed', 'passed', 'approve_spec', 'patch_proposed', 'approve_for_tests'];
+const flow = process.argv[4];
+const clean = [
+  ['research', 1, 'passed'],
+  ['analysis', 1, 'passed'],
+  ['spec_creation', 1, 'passed'],
+  ['spec_review', 1, 'approve_spec'],
+  ['development', 1, 'patch_proposed'],
+  ['output_review', 1, 'approve_for_tests'],
+];
+const recovered = [
+  ['research', 1, 'passed'],
+  ['analysis', 1, 'passed'],
+  ['spec_creation', 1, 'passed'],
+  ['spec_review', 1, 'request_changes'],
+  ['spec_creation', 2, 'passed'],
+  ['spec_review', 2, 'approve_spec'],
+  ['development', 1, 'patch_proposed'],
+  ['output_review', 1, 'approve_for_tests'],
+];
+const expected = flow === 'rejection_clean'
+  ? clean
+  : (flow === 'passing_recovered' || flow === 'rejection_recovered' ? recovered : undefined);
+if (!expected) throw new Error(`unsupported live provider flow: ${flow}`);
 const records = run.provider_exchange_records;
-if (!Array.isArray(records) || records.length !== 12) {
-  throw new Error(`live provider ledger must contain exactly six request/response exchanges, got ${records?.length}`);
+if (!Array.isArray(records) || records.length !== expected.length * 2) {
+  throw new Error(`live provider ledger has an unexpected exact record count: ${records?.length}`);
 }
-for (let index = 0; index < steps.length; index += 1) {
+for (let index = 0; index < expected.length; index += 1) {
+  const [step, attempt] = expected[index];
   const request = records[index * 2];
   const response = records[index * 2 + 1];
   for (const record of [request, response]) {
-    if (record.step !== steps[index]
-      || record.step_attempt !== 1
+    if (record.step !== step
+      || record.step_attempt !== attempt
       || record.exchange_index !== 1
       || record.kind !== 'initial'
       || record.context_round !== undefined) {
@@ -749,15 +986,16 @@ for (let index = 0; index < steps.length; index += 1) {
     }
   }
   if (request.phase !== 'request' || response.phase !== 'response') {
-    throw new Error(`live provider exchange phases are not one request and one response for ${steps[index]}`);
+    throw new Error(`live provider exchange phases are not one request and one response for ${step}/${attempt}`);
   }
 }
-if (!Array.isArray(inspect.provider_attempts) || inspect.provider_attempts.length !== 6) {
-  throw new Error('inspection did not retain exactly six provider attempts');
+if (!Array.isArray(inspect.provider_attempts) || inspect.provider_attempts.length !== expected.length) {
+  throw new Error('inspection did not retain the exact provider attempt count');
 }
 for (let index = 0; index < inspect.provider_attempts.length; index += 1) {
   const attempt = inspect.provider_attempts[index];
-  if (attempt.step !== steps[index] || attempt.attempt !== 1 || attempt.exchanges.length !== 2) {
+  const [step, stepAttempt, outcome] = expected[index];
+  if (attempt.step !== step || attempt.attempt !== stepAttempt || attempt.exchanges.length !== 2) {
     throw new Error(`unexpected inspected provider attempt: ${JSON.stringify(attempt)}`);
   }
   const [request, response] = attempt.exchanges;
@@ -765,7 +1003,11 @@ for (let index = 0; index < inspect.provider_attempts.length; index += 1) {
     || response.kind !== 'initial'
     || request.phase !== 'request'
     || response.phase !== 'response'
-    || response.outcome !== outcomes[index]
+    || request.exchange_index !== 1
+    || response.exchange_index !== 1
+    || request.context_round !== undefined
+    || response.context_round !== undefined
+    || response.outcome !== outcome
     || request.verification !== 'verified'
     || response.verification !== 'verified') {
     throw new Error(`provider attempt is not a clean terminal exchange: ${JSON.stringify(attempt)}`);
@@ -937,6 +1179,8 @@ validate_evidence_status_allowlist() {
 
   node - "$evidence_file" <<'NODE'
 const evidence = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+if (evidence.schema_version !== 2) throw new Error('evidence schema version mismatch');
+const digest = /^[0-9a-f]{64}$/;
 const allowed = new Set([
   'pending',
   'running',
@@ -959,14 +1203,52 @@ for (const [label, transitions] of [
   }
 }
 if (JSON.stringify(evidence.passing.status_transitions)
-    !== JSON.stringify(['awaiting_human_review', 'approved', 'eval_passed', 'promoted'])
-  || evidence.passing.interruption_observed !== true) {
+    !== JSON.stringify(['blocked', 'pending', 'awaiting_human_review', 'approved', 'eval_passed', 'promoted'])
+  || evidence.passing.interruption_observed !== true
+  || evidence.passing.provider_attempt_count !== 8
+  || evidence.passing.provider_ledger_record_count !== 16
+  || evidence.passing.reviewer_recovery?.source_step !== 'spec_creation'
+  || evidence.passing.reviewer_recovery?.blocked_step !== 'spec_review'
+  || evidence.passing.reviewer_recovery?.source_attempt !== 1
+  || evidence.passing.reviewer_recovery?.revised_attempt !== 2
+  || !Number.isSafeInteger(evidence.passing.reviewer_recovery?.recovery_id)
+  || evidence.passing.reviewer_recovery.recovery_id < 1
+  || !digest.test(evidence.passing.reviewer_recovery?.prior_spec_artifact_digest)
+  || !digest.test(evidence.passing.reviewer_recovery?.reviewer_artifact_digest)
+  || evidence.passing.reviewer_recovery?.attempt_one_immutable !== true
+  || evidence.passing.reviewer_recovery?.ledger_prefix_preserved !== true
+  || JSON.stringify(evidence.passing.evaluation_attempts) !== JSON.stringify([1, 2])
+  || evidence.passing.source_unchanged_before_promotion !== true
+  || evidence.passing.approved_candidate_equals_promoted_source !== true
+  || evidence.passing.attempt_one_immutable !== true) {
   throw new Error('passing status/interruption facts do not match executed authority');
 }
-if (JSON.stringify(evidence.rejection.status_transitions)
-    !== JSON.stringify(['awaiting_human_review', 'approved', 'failed'])
-  || evidence.rejection.candidate_lifecycle !== 'cleaned') {
+const cleanRejection = JSON.stringify(['awaiting_human_review', 'approved', 'failed']);
+const recoveredRejection = JSON.stringify(['blocked', 'pending', 'awaiting_human_review', 'approved', 'failed']);
+const rejectionTransitions = JSON.stringify(evidence.rejection.status_transitions);
+const rejectionCountsMatch = rejectionTransitions === cleanRejection
+  ? evidence.rejection.provider_attempt_count === 6 && evidence.rejection.provider_ledger_record_count === 12
+  : rejectionTransitions === recoveredRejection
+    && evidence.rejection.provider_attempt_count === 8
+    && evidence.rejection.provider_ledger_record_count === 16;
+if (!rejectionCountsMatch
+  || evidence.rejection.candidate_lifecycle !== 'cleaned'
+  || JSON.stringify(evidence.rejection.evaluation_attempts) !== JSON.stringify([1])
+  || evidence.rejection.source_unchanged !== true
+  || evidence.rejection.sentinels_unchanged !== true) {
   throw new Error('rejection status/lifecycle facts do not match executed authority');
+}
+const omissions = evidence.omissions ?? {};
+if (Object.values({
+  raw_provider_bodies_omitted: omissions.raw_provider_bodies_omitted,
+  raw_prompts_omitted: omissions.raw_prompts_omitted,
+  raw_responses_omitted: omissions.raw_responses_omitted,
+  provider_records_omitted: omissions.provider_records_omitted,
+  provider_metadata_omitted: omissions.provider_metadata_omitted,
+  absolute_paths_omitted: omissions.absolute_paths_omitted,
+  command_output_omitted: omissions.command_output_omitted,
+}).some((value) => value !== true)) {
+  throw new Error('evidence omission contract mismatch');
 }
 NODE
 }
@@ -990,6 +1272,11 @@ write_ollama_evidence() {
   shift 9
   local rejection_eval_digest="$1"
   local rejection_head="$2"
+  local passing_recovery_snapshot="$3"
+  local provider_recovery_id="$4"
+  local rejection_recovered="$5"
+  local rejection_provider_attempt_count="$6"
+  local rejection_provider_ledger_record_count="$7"
 
   local evidence_parent
   evidence_parent="$(dirname "$evidence_out")"
@@ -1001,13 +1288,16 @@ write_ollama_evidence() {
     "$ollama_server_version" "$ollama_client_version" "$model" "$ollama_host" "$ollama_base_url" \
     "$source_head" "$archive_sha256" "$harness_sha256" "$fixture_sha256" \
     "$candidate_digest" "$eval_digest" "$target_head" "$rejection_candidate" \
-    "$rejection_eval_digest" "$rejection_head" "$(uname -s)" "$(uname -m)" <<'NODE'
+    "$rejection_eval_digest" "$rejection_head" "$passing_recovery_snapshot" \
+    "$provider_recovery_id" "$rejection_recovered" "$rejection_provider_attempt_count" \
+    "$rejection_provider_ledger_record_count" "$(uname -s)" "$(uname -m)" <<'NODE'
 const fs = require('node:fs');
 const [
   temporary, passingMetricsPath, rejectionMetricsPath, serverVersion, clientVersion,
   model, host, apiBaseUrl, sourceCommit, archiveSha256, harnessSha256, fixtureSha256,
   candidateDigest, evalDigest, targetHead, rejectionCandidate, rejectionEvalDigest,
-  rejectionHead, os, arch,
+  rejectionHead, passingRecoverySnapshotPath, providerRecoveryId, rejectionRecovered,
+  rejectionProviderAttemptCount, rejectionProviderLedgerRecordCount, os, arch,
 ] = process.argv.slice(2);
 const digest = /^[0-9a-f]{64}$/;
 const commit = /^[0-9a-f]{40,64}$/;
@@ -1017,8 +1307,19 @@ for (const value of [archiveSha256, harnessSha256, fixtureSha256, candidateDiges
 for (const value of [sourceCommit, targetHead, rejectionHead]) {
   if (!commit.test(value)) throw new Error('evidence contains invalid Git authority');
 }
+const reviewerAuthority = JSON.parse(fs.readFileSync(passingRecoverySnapshotPath, 'utf8'));
+if (!digest.test(reviewerAuthority.prior_spec_artifact_digest)
+  || !digest.test(reviewerAuthority.reviewer_artifact_digest)
+  || !Number.isSafeInteger(Number(providerRecoveryId))
+  || Number(providerRecoveryId) < 1) {
+  throw new Error('reviewer recovery evidence authority mismatch');
+}
+const rejectionWasRecovered = rejectionRecovered === 'true';
+const rejectionTransitions = rejectionWasRecovered
+  ? ['blocked', 'pending', 'awaiting_human_review', 'approved', 'failed']
+  : ['awaiting_human_review', 'approved', 'failed'];
 const evidence = {
-  schema_version: 1,
+  schema_version: 2,
   milestone: 'M2-07',
   generated_at: new Date().toISOString(),
   platform: { os, arch },
@@ -1029,10 +1330,22 @@ const evidence = {
   fixture_manifest_sha256: fixtureSha256,
   cli_identity: { version: 'seaf 0.1.0', info: 'Self-Evolving Application Framework' },
   passing: {
-    status_transitions: ['awaiting_human_review', 'approved', 'eval_passed', 'promoted'],
+    status_transitions: ['blocked', 'pending', 'awaiting_human_review', 'approved', 'eval_passed', 'promoted'],
     interruption_observed: true,
     evaluation_attempts: [1, 2],
-    provider_exchange_count: 6,
+    provider_attempt_count: 8,
+    provider_ledger_record_count: 16,
+    reviewer_recovery: {
+      recovery_id: Number(providerRecoveryId),
+      source_step: 'spec_creation',
+      blocked_step: 'spec_review',
+      source_attempt: 1,
+      revised_attempt: 2,
+      prior_spec_artifact_digest: reviewerAuthority.prior_spec_artifact_digest,
+      reviewer_artifact_digest: reviewerAuthority.reviewer_artifact_digest,
+      attempt_one_immutable: true,
+      ledger_prefix_preserved: true,
+    },
     integrity: 'verified',
     candidate_diff_digest: candidateDigest,
     eval_report_digest: evalDigest,
@@ -1043,10 +1356,11 @@ const evidence = {
     artifacts: JSON.parse(fs.readFileSync(passingMetricsPath, 'utf8')),
   },
   rejection: {
-    status_transitions: ['awaiting_human_review', 'approved', 'failed'],
+    status_transitions: rejectionTransitions,
     candidate_lifecycle: 'cleaned',
     evaluation_attempts: [1],
-    provider_exchange_count: 6,
+    provider_attempt_count: Number(rejectionProviderAttemptCount),
+    provider_ledger_record_count: Number(rejectionProviderLedgerRecordCount),
     integrity: 'verified',
     candidate_diff_digest: rejectionCandidate,
     eval_report_digest: rejectionEvalDigest,
@@ -1235,25 +1549,34 @@ run_ollama_acceptance() {
     loop run --ticket seaf.ticket.yaml --provider ollama --model "$model" \
     --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" \
     --runs-root "$passing_runs" --run-id "$ollama_passing_run_id" --json
+  local passing_run_dir="$passing_runs/$ollama_passing_run_id"
+  local passing_run_file="$passing_run_dir/run.json"
+  local passing_checkpoint
   require_live_review_checkpoint "$passing_run_output" \
-    "$passing_runs/$ollama_passing_run_id" "passing run"
-  assert_loop_report "$passing_run_output" run "$ollama_passing_run_id" awaiting_human_review
+    "$passing_run_dir" "passing run" passing_checkpoint
+  [[ "$passing_checkpoint" == "recoverable_spec_review" ]] ||
+    fail "passing run reached first-pass human review without exercising reviewer recovery"
+  local passing_recovery_snapshot="$temp_root/ollama-passing-reviewer-recovery.json"
+  local passing_recovered_output="$temp_root/ollama-passing-recovered.json"
+  local provider_recovery_id
+  recover_live_spec_review "$passing_repo" "$passing_runs" "$ollama_passing_run_id" \
+    "Ollama passing" "$passing_recovery_snapshot" "$passing_recovered_output" \
+    provider_recovery_id
+  passing_run_output="$passing_recovered_output"
   local candidate_digest
   candidate_digest="$(json_value "$passing_run_output" candidate_diff_digest)"
   local target_head
   target_head="$(json_value "$passing_run_output" target_head)"
   [[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]] || fail "Ollama passing candidate digest is invalid"
   [[ "$target_head" =~ ^[0-9a-f]{40,64}$ ]] || fail "Ollama passing target HEAD is invalid"
-  local passing_run_dir="$passing_runs/$ollama_passing_run_id"
-  local passing_run_file="$passing_run_dir/run.json"
   local provider_count
   provider_count="$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.provider_exchange_records.length))' "$passing_run_file")"
-  [[ "$provider_count" == "12" ]] || fail "Ollama passing run did not contain exactly six provider exchanges"
+  [[ "$provider_count" == "16" ]] || fail "Ollama passing run did not contain exactly eight provider attempts"
 
   local passing_awaiting_inspect="$temp_root/ollama-passing-awaiting-inspect.json"
   inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" awaiting_human_review \
     "$passing_awaiting_inspect"
-  assert_clean_live_provider_flow "$passing_run_file" "$passing_awaiting_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_awaiting_inspect" passing_recovered
   assert_exact_ollama_candidate "$passing_run_file" 'M  ollama-acceptance.txt'
   snapshot_repository "$passing_repo" "$temp_root/ollama-passing-before-approval-source.json"
   assert_same_snapshot "Ollama source before human approval" "$passing_source_before" \
@@ -1327,12 +1650,15 @@ run_ollama_acceptance() {
     loop revise --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
     --from-step testing --eval-recovery invalidate --actor "$operator" \
     --reason "recover packaged Ollama acceptance interruption" --json
-  node - "$passing_revise_output" <<'NODE'
+  node - "$passing_revise_output" "$provider_recovery_id" <<'NODE'
 const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
-if (report.command !== 'revise' || report.recovery_id !== 1 || report.invalidated_attempt !== 1 || report.next_evaluation_attempt !== 2) {
+const expected = Number(process.argv[3]) + 1;
+if (report.command !== 'revise' || report.recovery_id !== expected || report.invalidated_attempt !== 1 || report.next_evaluation_attempt !== 2) {
   throw new Error('Ollama evaluation invalidation authority mismatch');
 }
 NODE
+  local evaluation_recovery_id
+  evaluation_recovery_id="$(json_value "$passing_revise_output" recovery_id)"
   snapshot_directory "$passing_run_dir" "$temp_root/ollama-attempt-one-after-revise.json" \
     "artifacts/07-testing.attempt-001"
   assert_same_snapshot "Ollama evaluation attempt 1 after revise" \
@@ -1344,7 +1670,8 @@ NODE
   run_in_repository_with_eval_cleanup_diagnostic \
     "rerun invalidated Ollama evaluation" "$passing_repo" "$passing_rerun_output" \
     loop rerun --run-id "$ollama_passing_run_id" --runs-root "$passing_runs" \
-    --recovery 1 --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" --json
+    --recovery "$evaluation_recovery_id" --base-url "$ollama_base_url" \
+    --timeout-ms "$role_timeout_ms" --json
   assert_loop_report "$passing_rerun_output" rerun "$ollama_passing_run_id" eval_passed
   assert_provider_count "$passing_run_file" "$provider_count"
   snapshot_directory "$passing_run_dir" "$temp_root/ollama-attempt-one-after-rerun.json" \
@@ -1362,7 +1689,7 @@ NODE
   local passing_eval_inspect="$temp_root/ollama-passing-eval-passed-inspect.json"
   inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" eval_passed \
     "$passing_eval_inspect"
-  assert_clean_live_provider_flow "$passing_run_file" "$passing_eval_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_eval_inspect" passing_recovered
 
   local passing_status_output="$temp_root/ollama-passing-promotion-status.json"
   run_in_repository "Ollama passing promotion status" "$passing_repo" "$passing_status_output" \
@@ -1410,7 +1737,7 @@ NODE
   local passing_promoted_inspect="$temp_root/ollama-passing-promoted-inspect.json"
   inspect_run "$passing_repo" "$passing_runs" "$ollama_passing_run_id" promoted \
     "$passing_promoted_inspect"
-  assert_clean_live_provider_flow "$passing_run_file" "$passing_promoted_inspect"
+  assert_clean_live_provider_flow "$passing_run_file" "$passing_promoted_inspect" passing_recovered
   validate_run_artifacts "$passing_run_dir" "promoted Ollama passing run"
 
   echo "==> Materialize live Ollama rejection project"
@@ -1422,19 +1749,43 @@ NODE
     loop run --ticket seaf.ticket.yaml --provider ollama --model "$model" \
     --base-url "$ollama_base_url" --timeout-ms "$role_timeout_ms" \
     --runs-root "$rejection_runs" --run-id "$ollama_rejection_run_id" --json
+  local rejection_run_dir="$rejection_runs/$ollama_rejection_run_id"
+  local rejection_run_file="$rejection_run_dir/run.json"
+  local rejection_checkpoint
+  local rejection_recovered=false
+  local rejection_flow=rejection_clean
   require_live_review_checkpoint "$rejection_run_output" \
-    "$rejection_runs/$ollama_rejection_run_id" "rejection run"
-  assert_loop_report "$rejection_run_output" run "$ollama_rejection_run_id" awaiting_human_review
+    "$rejection_run_dir" "rejection run" rejection_checkpoint
+  if [[ "$rejection_checkpoint" == "recoverable_spec_review" ]]; then
+    local rejection_recovery_snapshot="$temp_root/ollama-rejection-reviewer-recovery.json"
+    local rejection_recovered_output="$temp_root/ollama-rejection-recovered.json"
+    local rejection_provider_recovery_id
+    recover_live_spec_review "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" \
+      "Ollama rejection" "$rejection_recovery_snapshot" "$rejection_recovered_output" \
+      rejection_provider_recovery_id
+    rejection_run_output="$rejection_recovered_output"
+    rejection_recovered=true
+    rejection_flow=rejection_recovered
+  else
+    [[ "$rejection_checkpoint" == "awaiting_human_review" ]] ||
+      fail "rejection run reached an unsupported review checkpoint"
+    assert_loop_report "$rejection_run_output" run "$ollama_rejection_run_id" awaiting_human_review
+  fi
   local rejection_candidate
   rejection_candidate="$(json_value "$rejection_run_output" candidate_diff_digest)"
   local rejection_head
   rejection_head="$(json_value "$rejection_run_output" target_head)"
-  local rejection_run_dir="$rejection_runs/$ollama_rejection_run_id"
-  local rejection_run_file="$rejection_run_dir/run.json"
+  local rejection_provider_attempt_count=6
+  local rejection_provider_ledger_record_count=12
+  if [[ "$rejection_recovered" == "true" ]]; then
+    rejection_provider_attempt_count=8
+    rejection_provider_ledger_record_count=16
+  fi
+  assert_provider_count "$rejection_run_file" "$rejection_provider_ledger_record_count"
   local rejection_awaiting_inspect="$temp_root/ollama-rejection-awaiting-inspect.json"
   inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" awaiting_human_review \
     "$rejection_awaiting_inspect"
-  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_awaiting_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_awaiting_inspect" "$rejection_flow"
   assert_exact_ollama_candidate "$rejection_run_file" 'M  ollama-acceptance.txt'
   local rejection_status="$temp_root/ollama-rejection-status.json"
   run_in_repository "Ollama rejection approval status" "$rejection_repo" "$rejection_status" \
@@ -1498,7 +1849,7 @@ NODE
   local rejection_failed_inspect="$temp_root/ollama-rejection-failed-inspect.json"
   inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" failed \
     "$rejection_failed_inspect"
-  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_failed_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_failed_inspect" "$rejection_flow"
   validate_run_artifacts "$rejection_run_dir" "failed Ollama rejection run"
 
   local rejection_cleanup_output="$temp_root/ollama-rejection-cleanup.json"
@@ -1516,7 +1867,7 @@ NODE
   local rejection_cleaned_inspect="$temp_root/ollama-rejection-cleaned-inspect.json"
   inspect_run "$rejection_repo" "$rejection_runs" "$ollama_rejection_run_id" failed \
     "$rejection_cleaned_inspect"
-  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_cleaned_inspect"
+  assert_clean_live_provider_flow "$rejection_run_file" "$rejection_cleaned_inspect" "$rejection_flow"
   validate_run_artifacts "$rejection_run_dir" "cleaned Ollama rejection run"
 
   [[ "$(run_git -C "$repo_root" rev-parse HEAD)" == "$source_head" ]] || fail "SEAF source HEAD changed during Ollama acceptance"
@@ -1531,7 +1882,9 @@ NODE
   write_ollama_evidence "$passing_metrics" "$rejection_metrics" \
     "$(sha256_file "$archive_path")" "$(sha256_file "$repo_root/scripts/test-packaged-external-golden-path.sh")" \
     "$(fixture_manifest_sha256)" "$candidate_digest" "$promotion_eval" "$target_head" \
-    "$rejection_candidate" "$(sha256_file "$rejection_report")" "$rejection_head"
+    "$rejection_candidate" "$(sha256_file "$rejection_report")" "$rejection_head" \
+    "$passing_recovery_snapshot" "$provider_recovery_id" "$rejection_recovered" \
+    "$rejection_provider_attempt_count" "$rejection_provider_ledger_record_count"
   echo "Packaged local Ollama golden path passed; sanitized evidence published."
 }
 
