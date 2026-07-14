@@ -119,8 +119,18 @@ fn role_response_roles_have_short_prompts_and_schemas() {
 
         assert!(prompt.contains("Return only structured JSON"));
         assert!(prompt.contains("untrusted context"));
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["properties"]["role"]["enum"][0], role.as_str());
+        let object_schema = match role {
+            Role::Researcher | Role::Analyzer | Role::SpecWriter => {
+                status_branch(&schema, "passed")
+            }
+            Role::Developer => status_branch(&schema, "patch_proposed"),
+            Role::SpecReviewer | Role::OutputReviewer => &schema,
+        };
+        assert_eq!(object_schema["type"], "object");
+        assert_eq!(
+            object_schema["properties"]["role"]["enum"][0],
+            role.as_str()
+        );
     }
 }
 
@@ -313,6 +323,78 @@ fn context_request_schema_and_runtime_forbid_requests_on_other_statuses() {
 }
 
 #[test]
+fn agent_status_schemas_use_closed_branches_that_match_runtime() {
+    for role in [Role::Researcher, Role::Analyzer, Role::SpecWriter] {
+        let schema = role.response_schema();
+        assert_closed_status_union(&schema);
+
+        for status in ["passed", "blocked", "needs_context"] {
+            let branch = status_branch(&schema, status);
+            let mut expected_properties = vec![
+                "findings",
+                "next_step_recommendation",
+                "risks",
+                "role",
+                "status",
+                "summary",
+            ];
+            let mut expected_required = expected_properties.clone();
+            if status == "needs_context" {
+                expected_properties.push("context_request");
+                expected_required.push("context_request");
+            }
+
+            assert_closed_branch(role, branch, &expected_properties, &expected_required);
+            assert_runtime(
+                role,
+                response_for_status(role, status),
+                status != "needs_context",
+            );
+        }
+    }
+}
+
+#[test]
+fn developer_status_schema_uses_closed_branches_that_match_runtime() {
+    let role = Role::Developer;
+    let schema = role.response_schema();
+    assert_closed_status_union(&schema);
+
+    for status in ["patch_proposed", "blocked", "needs_context"] {
+        let branch = status_branch(&schema, status);
+        let mut expected_properties = vec![
+            "changed_files",
+            "patch",
+            "requires_human_review",
+            "role",
+            "status",
+            "summary",
+        ];
+        let mut expected_required = vec![
+            "changed_files",
+            "requires_human_review",
+            "role",
+            "status",
+            "summary",
+        ];
+        if status == "patch_proposed" {
+            expected_required.push("patch");
+        }
+        if status == "needs_context" {
+            expected_properties.push("context_request");
+            expected_required.push("context_request");
+        }
+
+        assert_closed_branch(role, branch, &expected_properties, &expected_required);
+        assert_runtime(
+            role,
+            response_for_status(role, status),
+            status != "needs_context",
+        );
+    }
+}
+
+#[test]
 fn context_request_schema_errors_are_not_repairable() {
     let mut repairs = 0;
     let invalid = needs_context_response(
@@ -340,7 +422,7 @@ fn assert_runtime(role: Role, response: serde_json::Value, expected_valid: bool)
 
 fn assert_context_request_schema_contract(role: Role) {
     let schema = role.response_schema();
-    let request = &schema["properties"]["context_request"];
+    let request = &status_branch(&schema, "needs_context")["properties"]["context_request"];
     assert_eq!(request["type"], "object");
     assert_eq!(request["additionalProperties"], false);
     assert_eq!(request["required"], serde_json::json!(["paths", "reason"]));
@@ -360,17 +442,60 @@ fn assert_context_request_schema_contract(role: Role) {
         request["properties"]["reason"]["pattern"],
         r"^(?=.*\S)[^\u0000-\u001F\u007F-\u009F]*$"
     );
+    assert!(schema.get("allOf").is_none());
+}
+
+fn status_branch<'a>(schema: &'a serde_json::Value, status: &str) -> &'a serde_json::Value {
+    schema["oneOf"]
+        .as_array()
+        .expect("status-dependent schema must use oneOf")
+        .iter()
+        .find(|branch| branch["properties"]["status"]["enum"] == serde_json::json!([status]))
+        .unwrap_or_else(|| panic!("missing schema branch for status {status}"))
+}
+
+fn assert_closed_status_union(schema: &serde_json::Value) {
+    let object = schema
+        .as_object()
+        .expect("status-dependent schema must be an object");
+    assert_eq!(object.len(), 1);
+    assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(3));
+}
+
+fn assert_closed_branch(
+    role: Role,
+    branch: &serde_json::Value,
+    expected_properties: &[&str],
+    expected_required: &[&str],
+) {
+    assert_eq!(branch["type"], "object");
+    assert_eq!(branch["additionalProperties"], false);
     assert_eq!(
-        schema["allOf"],
-        serde_json::json!([{
-            "if": {
-                "properties": { "status": { "const": "needs_context" } },
-                "required": ["status"]
-            },
-            "then": { "required": ["context_request"] },
-            "else": { "not": { "required": ["context_request"] } }
-        }])
+        branch["properties"]["role"]["enum"],
+        serde_json::json!([role.as_str()])
     );
+
+    let mut actual_properties = branch["properties"]
+        .as_object()
+        .expect("closed branch properties must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual_properties.sort_unstable();
+    let mut expected_properties = expected_properties.to_vec();
+    expected_properties.sort_unstable();
+    assert_eq!(actual_properties, expected_properties);
+
+    let mut actual_required = branch["required"]
+        .as_array()
+        .expect("closed branch required fields must be an array")
+        .iter()
+        .map(|field| field.as_str().expect("required field must be a string"))
+        .collect::<Vec<_>>();
+    actual_required.sort_unstable();
+    let mut expected_required = expected_required.to_vec();
+    expected_required.sort_unstable();
+    assert_eq!(actual_required, expected_required);
 }
 
 fn needs_context_response(

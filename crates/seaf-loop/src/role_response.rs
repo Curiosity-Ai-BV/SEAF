@@ -434,6 +434,26 @@ pub(crate) fn repair_prompt(role: Role, raw: &str, error: &RoleResponseError) ->
 
 fn common_agent_schema(role: Role) -> Value {
     json!({
+        "oneOf": [
+            common_agent_status_schema(role, "passed", false),
+            common_agent_status_schema(role, "blocked", false),
+            common_agent_status_schema(role, "needs_context", true)
+        ]
+    })
+}
+
+fn developer_schema(role: Role) -> Value {
+    json!({
+        "oneOf": [
+            developer_status_schema(role, "patch_proposed", true, false),
+            developer_status_schema(role, "blocked", false, false),
+            developer_status_schema(role, "needs_context", false, true)
+        ]
+    })
+}
+
+fn common_agent_status_schema(role: Role, status: &str, needs_context: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -446,10 +466,7 @@ fn common_agent_schema(role: Role) -> Value {
         ],
         "properties": {
             "role": { "type": "string", "enum": [role.as_str()] },
-            "status": {
-                "type": "string",
-                "enum": ["passed", "blocked", "needs_context"]
-            },
+            "status": { "type": "string", "enum": [status] },
             "summary": { "type": "string" },
             "findings": {
                 "type": "array",
@@ -459,15 +476,26 @@ fn common_agent_schema(role: Role) -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "next_step_recommendation": { "type": "string" },
-            "context_request": context_request_schema()
-        },
-        "allOf": [context_request_presence_schema()]
-    })
+            "next_step_recommendation": { "type": "string" }
+        }
+    });
+    if needs_context {
+        schema["required"]
+            .as_array_mut()
+            .expect("agent schema required fields must be an array")
+            .push(json!("context_request"));
+        schema["properties"]["context_request"] = context_request_schema();
+    }
+    schema
 }
 
-fn developer_schema(role: Role) -> Value {
-    json!({
+fn developer_status_schema(
+    role: Role,
+    status: &str,
+    patch_required: bool,
+    needs_context: bool,
+) -> Value {
+    let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -479,21 +507,30 @@ fn developer_schema(role: Role) -> Value {
         ],
         "properties": {
             "role": { "type": "string", "enum": [role.as_str()] },
-            "status": {
-                "type": "string",
-                "enum": ["patch_proposed", "blocked", "needs_context"]
-            },
+            "status": { "type": "string", "enum": [status] },
             "summary": { "type": "string" },
             "changed_files": {
                 "type": "array",
                 "items": { "type": "string" }
             },
             "requires_human_review": { "type": "boolean" },
-            "patch": { "type": "string" },
-            "context_request": context_request_schema()
-        },
-        "allOf": [context_request_presence_schema()]
-    })
+            "patch": { "type": "string" }
+        }
+    });
+    if patch_required {
+        schema["required"]
+            .as_array_mut()
+            .expect("developer schema required fields must be an array")
+            .push(json!("patch"));
+    }
+    if needs_context {
+        schema["required"]
+            .as_array_mut()
+            .expect("developer schema required fields must be an array")
+            .push(json!("context_request"));
+        schema["properties"]["context_request"] = context_request_schema();
+    }
+    schema
 }
 
 fn reviewer_schema(role: Role) -> Value {
@@ -554,17 +591,6 @@ fn context_request_schema() -> Value {
                 "pattern": r"^(?=.*\S)[^\u0000-\u001F\u007F-\u009F]*$"
             }
         }
-    })
-}
-
-fn context_request_presence_schema() -> Value {
-    json!({
-        "if": {
-            "properties": { "status": { "const": "needs_context" } },
-            "required": ["status"]
-        },
-        "then": { "required": ["context_request"] },
-        "else": { "not": { "required": ["context_request"] } }
     })
 }
 
