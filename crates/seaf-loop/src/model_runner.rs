@@ -629,7 +629,9 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     ) -> Result<(), RunnerError> {
         self.step_attempt = Some(attempt);
         self.prepare_step(workspace, run, step)?;
-        if step == LoopStepName::SpecCreation && attempt > 1 {
+        if step == LoopStepName::SpecCreation
+            && self.recovered_step_attempt(LoopStepName::SpecCreation) == Some(attempt)
+        {
             if self.spec_creation_revision_context.is_none() {
                 return Err(spec_creation_revision_error(
                     "verified context was not prepared before resume",
@@ -2432,24 +2434,20 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
             "repository_context_authority": self.audited_repository_context(),
         });
-        if step == LoopStepName::SpecCreation
-            && self.step_attempt.is_some_and(|attempt| attempt > 1)
-        {
-            let revision_context = self
-                .spec_creation_revision_context
-                .as_ref()
-                .ok_or_else(|| spec_creation_revision_error("verified context was not prepared"))?;
-            prompt
-                .as_object_mut()
-                .expect("structured role prompt is an object")
-                .insert(
-                    "revision_context".to_string(),
-                    serde_json::to_value(revision_context).map_err(|error| {
-                        RunnerError::Step(format!(
-                            "SpecCreation revision context failed to serialize: {error}"
-                        ))
-                    })?,
-                );
+        if step == LoopStepName::SpecCreation {
+            if let Some(revision_context) = self.spec_creation_revision_context.as_ref() {
+                prompt
+                    .as_object_mut()
+                    .expect("structured role prompt is an object")
+                    .insert(
+                        "revision_context".to_string(),
+                        serde_json::to_value(revision_context).map_err(|error| {
+                            RunnerError::Step(format!(
+                                "SpecCreation revision context failed to serialize: {error}"
+                            ))
+                        })?,
+                    );
+            }
         }
         serde_json::to_string(&prompt).map(Some).map_err(|error| {
             RunnerError::Step(format!("failed to serialize {step:?} role input: {error}"))
