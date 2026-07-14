@@ -2157,8 +2157,8 @@ remaining integration and doc-test suite.
 
 ### M2-02 - Project Doctor
 
-Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 and M2-04
-are accepted; M2-05 awaits fresh exact-SHA authorization.
+Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 through
+M2-05 are accepted; M2-06 is dependency-ready.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2230,12 +2230,12 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 and M2-04 are accepted; M2-05 awaits fresh exact-SHA authorization.
+M2-03 through M2-05 are accepted; M2-06 is dependency-ready.
 
 ### M2-03 - Package Metadata And Version Identity
 
 Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 is
-accepted; M2-05 awaits fresh exact-SHA authorization.
+accepted. M2-05 is also accepted; M2-06 is dependency-ready.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2291,8 +2291,8 @@ suite, and doc tests.
 
 ### M2-04 - Release Artifact Workflow
 
-Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is
-awaiting fresh exact-SHA authorization.
+Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is also
+accepted; M2-06 is dependency-ready.
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2359,13 +2359,11 @@ specification and quality/security reviews approved the correction with no
 findings. The controller's corrected artifact gate, complete Rust workspace
 suite, stable strict Clippy, package readiness, formatting, SDK
 lint/typecheck/8-test/build suite, and diff hygiene pass. M2-04 is accepted;
-M2-05 awaits fresh exact-SHA authorization.
+at that boundary, M2-05 still awaited fresh exact-SHA authorization.
 
 ### M2-05 - Human-Authorized Tagged Prerelease
 
-Status: awaiting fresh exact-SHA authorization naming
-`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a` on 2026-07-14. Dependencies:
-M2-04 (accepted).
+Status: accepted on 2026-07-14. Dependencies: M2-04 (accepted).
 
 Roadmap: U7. Dependencies: M2-04.
 
@@ -2382,7 +2380,7 @@ Acceptance criteria:
 
 Likely seams: external GitHub release state and release evidence docs.
 
-Current evidence: prior authorization named only
+Preflight evidence: prior authorization named only
 `29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Ordinary-CI run
 [`29312976772`](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29312976772)
 failed the old-SHA Rust release-artifact gate on GNU tar USTAR device fields;
@@ -2391,18 +2389,36 @@ TypeScript passed and later Rust steps were skipped. Corrections `7b895b5` and
 `linux/amd64` Rust 1.97/GNU tar 1.34 release-artifact gates. Tag ruleset
 [`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424) and
 immutable releases with automatic attestation are live. No tag, release, asset,
-or release-workflow run exists.
+or release-workflow run existed when that preflight stopped.
 
-Pending verification after fresh authorization: initial tag-workflow result,
-both native jobs and checksum assembly, downloaded checksum/inventory proof,
-external native install smoke, clean repository status, and prerelease assets
-identical to the verified workflow outputs.
+Acceptance evidence: fresh authorization named exact commit
+`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`, and only lightweight tag
+`v0.1.0` was pushed directly to that SHA with no branch push. Exactly one
+initial [release workflow run](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29318734239)
+completed successfully on attempt 1 with both native jobs and checksum assembly
+successful. Final artifact `seaf-release-assets-1` (ID `8305020242`) had wrapper
+SHA-256 `07f24fc5091eb871b2b65180ce76d0f468da388693f333041dc5ca57dad5be68`;
+its safe inventory was exactly the two native archives and `SHA256SUMS`, and
+aggregate verification passed. The packaged macOS arm64 CLI passed exact
+version/info, generic init, commit, and eight-check fake-provider doctor smoke
+in a clean external repository. Linux execution evidence is the successful
+Ubuntu workflow job.
+
+The exact verified assets were byte-checked while draft and after publication
+in the [immutable `v0.1.0` prerelease](https://github.com/Curiosity-Ai-BV/SEAF/releases/tag/v0.1.0).
+All three automatic GitHub release attestations passed
+`gh release verify-asset`. Automatic attestation authority came from immutable
+GitHub Release publication, not from workflow write/OIDC permissions. M2-05 and
+U7 are accepted. M2-06 is dependency-ready; M2-07 remains blocked on M2-06.
 
 Docs/tracker: release evidence and M2-05 status.
 
 Commit boundary: evidence/docs after the separately authorized external action.
 
 ### M2-06 - Packaged External Golden Path
+
+Status: dependency-ready; implementation not started. Dependencies: M2-05
+(accepted).
 
 Roadmap: U8. Dependencies: M2-05.
 
@@ -2429,6 +2445,8 @@ Docs/tracker: tested quickstart and M2-06 status.
 Commit boundary: external acceptance fixture, CI, and matching docs.
 
 ### M2-07 - Executed Ollama Acceptance
+
+Status: blocked on M2-06.
 
 Roadmap: U8 and Milestone 2 exit gate. Dependencies: M2-06.
 

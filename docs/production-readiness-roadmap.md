@@ -413,7 +413,8 @@ Milestone 1 and M2-01 through M2-04 are complete. Package identity is private,
 exact, warning-free, and proven through pristine archives plus an external
 installed-CLI smoke. Independent specification and quality reviews approved the
 corrected package and release-artifact boundaries, and the full controller gates
-passed. M2-05 awaits fresh exact-SHA authorization for the tagged prerelease.
+passed. M2-05 and U7 were accepted on 2026-07-14; M2-06 is the next
+dependency-ready slice.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -452,8 +453,8 @@ and complete snapshots prove project, Git, worktree, and candidate namespaces
 remain unchanged. The full Rust and SDK controller gates passed. M2-03 package
 identity is accepted after exact archive/install smoke, adversarial boundary
 guards, independent reviews, and the full controller matrix. M2-04 release
-artifact workflow is accepted; tagged publication and the external golden path
-are not claimed.
+artifact workflow and M2-05 tagged prerelease are accepted; the external golden
+path is not yet claimed.
 
 M2-04 implementation evidence on 2026-07-13 records the required missing-script
 and missing-workflow REDs plus a missing structure-only verifier RED. The final
@@ -463,7 +464,8 @@ validation, external installed-binary identity, static read-only workflow
 authority, and Git-status preservation. Formatting, stable strict Clippy,
 package readiness, SDK, and diff gates pass. That first implementation evidence
 was not acceptance or tagged publication; final acceptance follows the
-correction and reviews below. M2-05 awaits fresh exact-SHA authorization.
+correction and reviews below. At that boundary, M2-05 still awaited exact-SHA
+authorization.
 
 Quality review rejected M2-04 on 2026-07-14 for incomplete process identity,
 incorrect Bash 3.2 file-limit units, nontransactional failed outputs, and
@@ -474,8 +476,8 @@ scoped 64 MiB identity-output and 128 MiB decompression boundaries, exact output
 rollback, full normalized metadata mutations, and same-step workflow helper
 authority. Fresh independent specification and quality/security reviews
 approved the correction with no findings, and the complete controller gate
-passed. M2-04 is accepted. No M2-05 external authority or acceptance is claimed;
-the tagged prerelease awaits fresh exact-SHA authorization.
+passed. M2-04 was accepted without M2-05 external authority; at that review
+boundary, the tagged prerelease still awaited authorization.
 
 M2-05 preflight on 2026-07-14 used prior authorization limited to exact commit
 `29c2cba739bdbc75bf871220b498bf66d6d82c4d`. Ordinary-CI run
@@ -486,9 +488,26 @@ reviews and final macOS plus exact `linux/amd64` Rust 1.97/GNU tar 1.34 gates.
 The active
 [`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424)
 tag ruleset and immutable releases with automatic attestation are live;
-`v0.1.0` and all releases remain absent. M2-05 and U7 remain pending fresh
-explicit authorization naming final clean commit
-`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`; Milestone 2 is not accepted.
+the preflight stopped with `v0.1.0` and all releases absent.
+
+M2-05 and U7 were accepted on 2026-07-14 after fresh authorization named exact
+commit `f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`. Only lightweight tag
+`v0.1.0` was pushed directly to that commit; no branch was pushed. The single
+initial [release workflow run](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29318734239)
+completed successfully on attempt 1 with both native builds and checksum
+assembly successful. Its exact three nonexpired artifacts passed safe ZIP
+inventory and aggregate checksum verification. The packaged macOS arm64 binary
+then passed exact empty-stderr version/info, generic five-file init, and
+eight-check fake-provider doctor smoke in a clean external repository. Linux
+execution evidence is the successful Ubuntu workflow job, not the local smoke.
+
+The verified assets were byte-checked while draft and after publication in the
+[immutable `v0.1.0` prerelease](https://github.com/Curiosity-Ai-BV/SEAF/releases/tag/v0.1.0).
+`gh release verify-asset` verified all three automatic GitHub release
+attestations. Those attestations come from immutable GitHub Release publication;
+the build workflow retains read-only contents permission and no write, OIDC, or
+attestation authority. Milestone 2 remains active: M2-06 is dependency-ready,
+and M2-07 remains blocked on M2-06.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario

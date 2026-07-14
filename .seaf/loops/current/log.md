@@ -2847,3 +2847,54 @@ M2-07 remain dependency-blocked. If authorized, the next operation may push
 only lightweight `v0.1.0` directly at that commit with no branch push, run and
 verify the initial tag workflow, then publish only the already verified two
 archives and `SHA256SUMS` under the existing M2-05 acceptance boundary.
+
+## 2026-07-14 accepted | M2-05 human-authorized tagged prerelease
+
+Fresh user authorization named exact reviewed commit
+`f4d7c28d27c345a8b0d7f6cc48c8c833b48f248a`. Only lightweight tag `v0.1.0`
+was pushed directly to that SHA; no branch was pushed, and post-push
+`origin/main` remained `29c2cba739bdbc75bf871220b498bf66d6d82c4d`. The tag is a
+REST commit object at the exact SHA. Active ruleset
+[`Protect v0.1.0`](https://github.com/Curiosity-Ai-BV/SEAF/rules/18918424)
+(ID `18918424`) protects update and deletion with no bypass. Immutable releases
+remain enabled.
+
+Exactly one initial
+[release workflow run](https://github.com/Curiosity-Ai-BV/SEAF/actions/runs/29318734239)
+(ID `29318734239`) matched the tag, workflow path, push event, exact SHA, and
+attempt 1; it completed successfully. Its exact successful jobs were Linux
+build `87038668673`, macOS arm64 build `87038668711`, and checksum assembly
+`87038967177`. Exactly three nonexpired workflow artifacts existed. Final
+artifact `seaf-release-assets-1` (ID `8305020242`) was 5,869,157 bytes; its API
+and local wrapper SHA-256 both equaled
+`07f24fc5091eb871b2b65180ce76d0f468da388693f333041dc5ca57dad5be68`.
+Safe ZIP inspection found exactly the two native archives and `SHA256SUMS`, and
+the committed aggregate verifier passed.
+
+The macOS arm64 archive was 2,773,611 bytes with SHA-256
+`7d335ed243c0b4412a6c90f92c118247dd43613503b1b1de00c4e981593000a6`.
+The Linux archive was 3,094,848 bytes with SHA-256
+`37f52983df1736d149060878959a630d14d8625d9662298a5f1f9ea2e2183d3c`.
+`SHA256SUMS` was 216 bytes with SHA-256
+`e706d3e648d1d0ab6017e696df9538185b29c2b08da184a41fa69b70646784da`.
+The packaged macOS arm64 CLI then passed exact empty-stderr `seaf 0.1.0` and
+`Self-Evolving Application Framework` identity, generic init's exact five-file
+inventory, commit, and doctor JSON with schema 1, `ready: true`, fake provider/
+model, and exactly eight passed checks; the external repository remained clean.
+Linux execution evidence is the successful Ubuntu workflow job.
+
+Draft release `353663778` first held exactly the three verified assets. Server
+digests and sizes matched, and numeric-ID redownloads were byte-identical before
+that draft alone was published. The public
+[immutable prerelease](https://github.com/Curiosity-Ai-BV/SEAF/releases/tag/v0.1.0)
+was published at `2026-07-14T08:43:06Z`, targets the exact authorized SHA, and
+is not latest. Post-publication numeric-ID redownloads remained byte-identical,
+aggregate verification passed, and `gh release verify-asset` succeeded for all
+three automatic GitHub release attestations. Those attestations came from
+immutable GitHub Release publication, not workflow write/OIDC/attestation
+permissions.
+
+M2-05 and U7 are accepted. Milestone 2 remains active: M2-06 is now
+dependency-ready, and M2-07 remains blocked on M2-06. No registry publication,
+signing, notarization, external golden-path execution, or Ollama execution is
+claimed.
