@@ -137,6 +137,7 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
+    spec_creation_revision_context: Option<SpecCreationRevisionContext>,
     secret_redactor: crate::secret_redaction::SecretRedactor,
     #[cfg(test)]
     legacy_unit_test_harness: bool,
@@ -181,6 +182,19 @@ struct PersistedRoleArtifact {
     artifact: ValidatedRoleArtifact,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct RevisionRoleArtifact {
+    artifact_path: String,
+    artifact_digest: String,
+    artifact: ValidatedRoleArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SpecCreationRevisionContext {
+    prior_spec: RevisionRoleArtifact,
+    reviewer_feedback: RevisionRoleArtifact,
+}
+
 #[cfg(test)]
 struct PersistedDevelopmentEvidence {
     artifact_path: String,
@@ -218,6 +232,7 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             exchange_workspace: None,
             step_attempt: None,
             durable_provider_exchange_records: None,
+            spec_creation_revision_context: None,
             secret_redactor: crate::secret_redaction::SecretRedactor::empty(),
             #[cfg(test)]
             legacy_unit_test_harness: false,
@@ -452,9 +467,12 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         };
         if let Some((step, attempt)) = self.authorized_recovery_attempt {
             if crate::state::next_runnable_step(&reconciled) != Some(step) {
-                return Err(RunnerError::Step(
-                    "recovery attempt does not match the exact next runnable step".to_string(),
-                ));
+                let message = "recovery attempt does not match the exact next runnable step";
+                return Err(if step == LoopStepName::SpecCreation && attempt > 1 {
+                    spec_creation_revision_error(message)
+                } else {
+                    RunnerError::Step(message.to_string())
+                });
             }
             crate::recovery::verify_latest_recovery_authorization(
                 workspace,
@@ -462,13 +480,22 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 step,
                 attempt,
             )
-            .map_err(|error| RunnerError::Step(error.to_string()))?;
+            .map_err(|error| {
+                if step == LoopStepName::SpecCreation && attempt > 1 {
+                    spec_creation_revision_error(error)
+                } else {
+                    RunnerError::Step(error.to_string())
+                }
+            })?;
             let next_attempt = next_step_attempt(workspace, step)?;
             let latest_attempt = latest_step_attempt(workspace, step)?;
             if next_attempt != attempt && latest_attempt != Some(attempt) {
-                return Err(RunnerError::Step(
-                    "recovery attempt does not match prompt attempt authority".to_string(),
-                ));
+                let message = "recovery attempt does not match prompt attempt authority";
+                return Err(if step == LoopStepName::SpecCreation && attempt > 1 {
+                    spec_creation_revision_error(message)
+                } else {
+                    RunnerError::Step(message.to_string())
+                });
             }
             self.recovered_step_attempt = Some((step, attempt));
         }
@@ -592,7 +619,12 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         attempt: u32,
     ) -> Result<(), RunnerError> {
         self.step_attempt = Some(attempt);
-        self.prepare_step(workspace, run, step)
+        self.spec_creation_revision_context = None;
+        self.prepare_step(workspace, run, step)?;
+        if step == LoopStepName::SpecCreation && attempt > 1 {
+            self.spec_creation_revision_context = Some(self.load_spec_creation_revision_context()?);
+        }
+        Ok(())
     }
 
     fn recovered_step_attempt(&self, step: LoopStepName) -> Option<u32> {
@@ -2373,7 +2405,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             | LoopStepName::Testing
             | LoopStepName::EvalReport => unreachable!("non-early step returned above"),
         };
-        let prompt = serde_json::json!({
+        let mut prompt = serde_json::json!({
             "instructions": format!(
                 "Run the {step:?} loop step as the {}. Return only JSON matching the response schema.",
                 role.as_str()
@@ -2386,8 +2418,94 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
             "repository_context": self.context_bundle.as_ref().map(context_prompt),
             "repository_context_authority": self.audited_repository_context(),
         });
+        if step == LoopStepName::SpecCreation
+            && self.step_attempt.is_some_and(|attempt| attempt > 1)
+        {
+            let revision_context = self
+                .spec_creation_revision_context
+                .as_ref()
+                .ok_or_else(|| spec_creation_revision_error("verified context was not prepared"))?;
+            prompt
+                .as_object_mut()
+                .expect("structured role prompt is an object")
+                .insert(
+                    "revision_context".to_string(),
+                    serde_json::to_value(revision_context).map_err(|error| {
+                        RunnerError::Step(format!(
+                            "SpecCreation revision context failed to serialize: {error}"
+                        ))
+                    })?,
+                );
+        }
         serde_json::to_string(&prompt).map(Some).map_err(|error| {
             RunnerError::Step(format!("failed to serialize {step:?} role input: {error}"))
+        })
+    }
+
+    fn load_spec_creation_revision_context(
+        &self,
+    ) -> Result<SpecCreationRevisionContext, RunnerError> {
+        let workspace = self.exchange_workspace.as_ref().ok_or_else(|| {
+            spec_creation_revision_error("provider runner is missing its workspace")
+        })?;
+        let run = self.run.as_ref().ok_or_else(|| {
+            spec_creation_revision_error("provider runner is missing authoritative loop state")
+        })?;
+        let attempt = self.step_attempt.ok_or_else(|| {
+            spec_creation_revision_error("provider runner is missing the current step attempt")
+        })?;
+        let (recovery, source) =
+            crate::recovery::load_verified_latest_provider_recovery_source(workspace, run)
+                .map_err(|error| spec_creation_revision_error(error.to_string()))?;
+        if recovery.step != LoopStepName::SpecCreation || recovery.next_step_attempt != attempt {
+            return Err(spec_creation_revision_error(
+                "latest recovery does not authorize the current SpecCreation attempt",
+            ));
+        }
+        if source.status != seaf_core::LoopStatus::Blocked
+            || source.current_step != LoopStepName::SpecReview
+        {
+            return Err(spec_creation_revision_error(
+                "source run must be Blocked at SpecReview",
+            ));
+        }
+
+        let prior_spec = load_spec_creation_revision_artifact(
+            workspace,
+            &source,
+            LoopStepName::SpecCreation,
+            Role::SpecWriter,
+            |status| {
+                matches!(
+                    status,
+                    LoopStepStatus::Completed
+                        | LoopStepStatus::Passed
+                        | LoopStepStatus::Blocked
+                        | LoopStepStatus::Failed
+                )
+            },
+            "source SpecCreation status must be terminal",
+        )?;
+        let reviewer_feedback = load_spec_creation_revision_artifact(
+            workspace,
+            &source,
+            LoopStepName::SpecReview,
+            Role::SpecReviewer,
+            |status| status == LoopStepStatus::Blocked,
+            "source SpecReview status must be Blocked",
+        )?;
+        if !matches!(
+            &reviewer_feedback.artifact.response,
+            RoleResponse::Reviewer(response)
+                if response.decision == ReviewDecision::RequestChanges
+        ) {
+            return Err(spec_creation_revision_error(
+                "source SpecReview decision must be RequestChanges",
+            ));
+        }
+        Ok(SpecCreationRevisionContext {
+            prior_spec,
+            reviewer_feedback,
         })
     }
 
@@ -2571,6 +2689,7 @@ impl<P: ModelProvider + ?Sized> ProviderStepRunner<'_, P> {
         self.context_bundle = None;
         self.early_artifacts.clear();
         self.verified_candidate_patch = None;
+        self.spec_creation_revision_context = None;
         #[cfg(test)]
         {
             self.legacy_development_evidence = None;
@@ -3126,6 +3245,41 @@ fn persisted_artifact_prompt(
         })
 }
 
+fn load_spec_creation_revision_artifact(
+    workspace: &LoopWorkspace,
+    source: &LoopRun,
+    step: LoopStepName,
+    role: Role,
+    valid_status: impl FnOnce(LoopStepStatus) -> bool,
+    invalid_status: &str,
+) -> Result<RevisionRoleArtifact, RunnerError> {
+    let record = source
+        .steps
+        .iter()
+        .find(|record| record.name == step)
+        .ok_or_else(|| spec_creation_revision_error(format!("source run is missing {step:?}")))?;
+    if !valid_status(record.status) {
+        return Err(spec_creation_revision_error(invalid_status));
+    }
+    let (path, digest) = required_artifact_pair(record)
+        .map_err(|error| spec_creation_revision_error(error.to_string()))?;
+    let artifact = ValidatedRoleArtifact::load(workspace, path, digest, &source.run_id, step, role)
+        .map_err(|error| {
+            spec_creation_revision_error(format!(
+                "failed to verify source {step:?} artifact: {error}"
+            ))
+        })?;
+    Ok(RevisionRoleArtifact {
+        artifact_path: path.to_string(),
+        artifact_digest: digest.to_string(),
+        artifact,
+    })
+}
+
+fn spec_creation_revision_error(message: impl std::fmt::Display) -> RunnerError {
+    RunnerError::Step(format!("SpecCreation revision context: {message}"))
+}
+
 fn persisted_artifact_identity(persisted: &PersistedRoleArtifact) -> OutputReviewArtifactIdentity {
     OutputReviewArtifactIdentity {
         run_id: persisted.artifact.run_id.clone(),
@@ -3325,6 +3479,11 @@ mod provider_secret_recovery_tests {
 #[cfg(test)]
 mod output_review_response_recovery_tests {
     include!("test_suites/output_review_response_recovery.rs");
+}
+
+#[cfg(test)]
+mod spec_creation_revision_recovery_tests {
+    include!("test_suites/spec_creation_revision_recovery.rs");
 }
 
 fn status_for_response(response: &RoleResponse) -> LoopStepStatus {

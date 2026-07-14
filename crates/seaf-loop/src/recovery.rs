@@ -2765,6 +2765,16 @@ pub fn load_verified_latest_recovery(
         .transpose()
 }
 
+pub(crate) fn load_verified_latest_provider_recovery_source(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<(RecoveryAttemptV1, LoopRun), RecoveryError> {
+    let reference = run.latest_recovery.as_ref().ok_or_else(|| {
+        RecoveryError::invalid("provider attempt has no latest recovery authority")
+    })?;
+    load_verified_provider_recovery_source(workspace, run, reference)
+}
+
 pub fn ensure_no_pending_recovery(
     workspace: &LoopWorkspace,
     run: &LoopRun,
@@ -2988,10 +2998,18 @@ fn load_verified_recovery(
     run: &LoopRun,
     reference: &RecoveryReference,
 ) -> Result<RecoveryAttemptV1, RecoveryError> {
+    load_verified_provider_recovery_source(workspace, run, reference).map(|(recovery, _)| recovery)
+}
+
+fn load_verified_provider_recovery_source(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    reference: &RecoveryReference,
+) -> Result<(RecoveryAttemptV1, LoopRun), RecoveryError> {
     validate_operator_run_envelope(workspace, run)?;
     let (recovery, source, projection) = load_verified_recovery_lineage(workspace, reference)?;
     validate_current_descendant(workspace, run, reference, &source, &projection, &recovery)?;
-    Ok(recovery)
+    Ok((recovery, source))
 }
 
 fn load_verified_recovery_lineage(
