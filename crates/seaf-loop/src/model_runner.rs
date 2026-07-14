@@ -137,6 +137,7 @@ pub struct ProviderStepRunner<'a, P: ModelProvider + ?Sized> {
     exchange_workspace: Option<LoopWorkspace>,
     step_attempt: Option<u32>,
     durable_provider_exchange_records: Option<Vec<seaf_core::ProviderExchangeRecordReference>>,
+    spec_creation_revision_attempt: Option<u32>,
     spec_creation_revision_context: Option<SpecCreationRevisionContext>,
     secret_redactor: crate::secret_redaction::SecretRedactor,
     #[cfg(test)]
@@ -232,6 +233,7 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
             exchange_workspace: None,
             step_attempt: None,
             durable_provider_exchange_records: None,
+            spec_creation_revision_attempt: None,
             spec_creation_revision_context: None,
             secret_redactor: crate::secret_redaction::SecretRedactor::empty(),
             #[cfg(test)]
@@ -383,11 +385,13 @@ impl<'a, P: ModelProvider + ?Sized> ProviderStepRunner<'a, P> {
 
 impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
     fn prepare_workspace(&mut self, workspace: &LoopWorkspace) -> Result<(), RunnerError> {
+        self.spec_creation_revision_attempt = None;
         self.spec_creation_revision_context = None;
         self.prepare_provider_workspace(workspace, None)
     }
 
     fn prepare_run(&mut self, workspace: &LoopWorkspace, run: &LoopRun) -> Result<(), RunnerError> {
+        self.spec_creation_revision_attempt = None;
         self.spec_creation_revision_context = None;
         if self.model != run.model {
             return Err(RunnerError::Step(
@@ -555,8 +559,15 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
             .recovered_step_attempt(LoopStepName::SpecCreation)
             .filter(|attempt| *attempt > 1)
         {
-            self.spec_creation_revision_context =
-                Some(self.load_spec_creation_revision_context(workspace, &reconciled, attempt)?);
+            let latest_recovery =
+                crate::recovery::load_verified_latest_recovery(workspace, &reconciled)
+                    .map_err(spec_creation_revision_error)?;
+            if latest_recovery.is_some_and(|recovery| recovery.step == LoopStepName::SpecCreation) {
+                self.spec_creation_revision_attempt = Some(attempt);
+                self.spec_creation_revision_context = Some(
+                    self.load_spec_creation_revision_context(workspace, &reconciled, attempt)?,
+                );
+            }
         }
         self.run = Some(reconciled.clone());
         self.prepare_provider_workspace(workspace, Some(&reconciled.run_id))
@@ -630,7 +641,7 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
         self.step_attempt = Some(attempt);
         self.prepare_step(workspace, run, step)?;
         if step == LoopStepName::SpecCreation
-            && self.recovered_step_attempt(LoopStepName::SpecCreation) == Some(attempt)
+            && self.spec_creation_revision_attempt == Some(attempt)
         {
             if self.spec_creation_revision_context.is_none() {
                 return Err(spec_creation_revision_error(
@@ -638,6 +649,7 @@ impl<P: ModelProvider + ?Sized> StepRunner for ProviderStepRunner<'_, P> {
                 ));
             }
         } else {
+            self.spec_creation_revision_attempt = None;
             self.spec_creation_revision_context = None;
         }
         Ok(())

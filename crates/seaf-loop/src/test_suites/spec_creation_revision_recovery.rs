@@ -405,6 +405,144 @@ fn upstream_recovery_replays_spec_creation_without_revision_context() {
 }
 
 #[test]
+fn ordinary_resume_reuses_interrupted_upstream_spec_creation_request_without_revision_context() {
+    for (upstream, slug, calls_before_spec) in [
+        (
+            LoopStepName::Research,
+            "interrupted-research-recovery-spec-replay",
+            2,
+        ),
+        (
+            LoopStepName::Analysis,
+            "interrupted-analysis-recovery-spec-replay",
+            1,
+        ),
+    ] {
+        let fixture = blocked_spec_review_fixture(slug);
+        let revision = revise_provider_step(
+            &fixture.workspace,
+            upstream,
+            "operator@example.invalid",
+            "replay the complete provider chain",
+        )
+        .expect("create authenticated upstream recovery");
+        let initialized = InitializedLoopRun::resume_isolated_for_rerun(
+            &fixture.runs_root,
+            revision.run,
+            upstream,
+        )
+        .expect("resume isolated upstream rerun");
+        let prepared = initialized
+            .scaffold()
+            .expect("resume scaffold")
+            .publish_authoritative_inputs(fixture.snapshots.clone())
+            .expect("resume authoritative inputs");
+        let first_provider = FakeProvider::new(
+            initial_provider_responses()
+                .into_iter()
+                .skip(2 - calls_before_spec)
+                .collect(),
+        );
+        let observer = |_workspace: &LoopWorkspace,
+                        _run: &LoopRun,
+                        coordinates: &ProviderExchangeCoordinates,
+                        _request: &ArtifactReference| {
+            if coordinates.step == LoopStepName::SpecCreation
+                && coordinates.step_attempt == 2
+            {
+                panic!("interrupt after durable upstream Spec Creation request");
+            }
+        };
+        let mut first_patch_runner = RecordingGitCommandRunner::default();
+        let mut first_step_runner = ProviderStepRunner::new(&first_provider, "fake-model", 30_000)
+            .with_ticket(fixture.ticket.clone())
+            .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+            .with_patch_gate(
+                ProviderPatchGateConfig::for_ticket(
+                    &fixture.candidate,
+                    &fixture.ticket,
+                    fixture.policy.clone(),
+                    true,
+                ),
+                &mut first_patch_runner,
+            )
+            .with_recovery_attempt(upstream, 2)
+            .with_before_provider_reauthentication_observer(&observer);
+        let mut first_runner = LoopRunner::resume_initialized(prepared, &mut first_step_runner)
+            .expect("resume upstream recovery");
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = first_runner.run_to_completion();
+        }));
+        assert!(interrupted.is_err());
+        drop(first_runner);
+        drop(first_step_runner);
+        assert_eq!(first_provider.requests().unwrap().len(), calls_before_spec);
+        assert!(first_patch_runner.calls.is_empty());
+
+        let interrupted = crate::state::load_run(&fixture.workspace).expect("interrupted run");
+        let durable_request = initial_request_user_json(
+            &fixture.workspace,
+            &interrupted,
+            LoopStepName::SpecCreation,
+            2,
+        );
+        assert!(durable_request.get("revision_context").is_none());
+        let initialized = InitializedLoopRun::resume_isolated(&fixture.runs_root, interrupted)
+            .expect("ordinary isolated resume");
+        let prepared = initialized
+            .scaffold()
+            .expect("ordinary resume scaffold")
+            .publish_authoritative_inputs(fixture.snapshots.clone())
+            .expect("ordinary resume authoritative inputs");
+        let resumed_provider = FakeProvider::new(
+            initial_provider_responses()
+                .into_iter()
+                .skip(2)
+                .collect(),
+        );
+        let mut resumed_patch_runner = RecordingGitCommandRunner::default();
+        let mut resumed_step_runner =
+            ProviderStepRunner::new(&resumed_provider, "fake-model", 30_000)
+                .with_ticket(fixture.ticket.clone())
+                .with_context_pack_request(context_request(&fixture.candidate, &fixture.ticket))
+                .with_patch_gate(
+                    ProviderPatchGateConfig::for_ticket(
+                        &fixture.candidate,
+                        &fixture.ticket,
+                        fixture.policy.clone(),
+                        true,
+                    ),
+                    &mut resumed_patch_runner,
+                );
+        let mut resumed = LoopRunner::resume_initialized(prepared, &mut resumed_step_runner)
+            .expect("ordinary resume retains the upstream prompt contract");
+        resumed
+            .run_to_completion()
+            .expect("finish ordinary upstream recovery resume");
+        assert_eq!(resumed.run().status, LoopStatus::Blocked);
+        drop(resumed);
+        drop(resumed_step_runner);
+
+        let requests = resumed_provider.requests().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replayed_request: serde_json::Value =
+            serde_json::from_str(&requests[0].messages[0].content).unwrap();
+        assert_eq!(replayed_request, durable_request);
+        assert!(resumed_patch_runner.calls.is_empty());
+
+        git_ok(
+            &fixture.source,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                fixture.candidate.to_str().unwrap(),
+            ],
+        );
+    }
+}
+
+#[test]
 fn ordinary_resume_reconstructs_direct_spec_creation_revision_context() {
     let fixture = blocked_spec_review_fixture("direct-spec-recovery-request-resume");
     let revision = revise_provider_step(
