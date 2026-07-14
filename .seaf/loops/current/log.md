@@ -2898,3 +2898,54 @@ M2-05 and U7 are accepted. Milestone 2 remains active: M2-06 is now
 dependency-ready, and M2-07 remains blocked on M2-06. No registry publication,
 signing, notarization, external golden-path execution, or Ollama execution is
 claimed.
+
+## 2026-07-14 accepted | M2-06 packaged external golden path
+
+The witnessed RED began with the missing external fixture contract. The first
+complete harness then exposed recovered attempt-2 inspection ambiguity; the
+reviewed prerequisite `161406f` made authenticated final evaluation authority
+override prompt/provider filename maxima and kept invalid authority degraded.
+Independent review found the remaining canonical indexed attempt-1 mismatch on
+the deterministic rejection path; reviewed prerequisite `145129f` made only
+Testing/EvalReport history accept canonical `.attempt-001` role artifacts while
+provider roles retain fixed attempt 1 and indexed attempts starting at 2.
+
+The accepted harness builds the current native release binary with locked
+offline Cargo into an external target root, creates and fully verifies the
+deterministic archive before extraction, and uses only the installed binary
+afterward. Two fresh external Git repositories use external run and control
+roots. Exact empty-stderr version/info, generic init, ticket validation, clean
+fixture commit, and eight-check fake doctor pass. The passing repository rejects
+a wrong approval without mutation, records exact approval, kills a real
+in-progress CLI/eval, refuses ordinary replay, invalidates attempt 1, and runs
+recovery-bound attempt 2 without changing the provider ledger or any attempt-1
+byte. Verified inspection remains stable through exact promotion, and the
+promoted source diff equals the frozen approved candidate.
+
+The separate rejection repository produces one exact failed native check and a
+terminal rejecting EvalReport with exact exit-24 summary, empty referenced
+stdout, and exact referenced rejection stderr. Run and approval preserve the
+clean source snapshot before explicit nonempty untracked regular-file and
+symlink sentinels are created with exact bytes, modes, and target. Their complete
+inventory remains exact through failure and candidate cleanup. Bounded recursive
+inventory covers at most 4,096 files, eight directory levels, 4 MiB per file,
+and 32 MiB aggregate; recursive JSON reference discovery is separately depth/
+node/reference bounded and recomputes every discovered path/digest pair. The
+SEAF source checkout snapshot is compared on every harness exit. Three pre-
+review current-head local runs passed with post-install adoption times of 9
+seconds, 8 seconds, and 8 seconds.
+
+Real SIGKILL intentionally leaves the shell's `Killed: 9` job notification
+visible. A successful eval command may race process-group cleanup and emit a
+narrowly bounded family of platform-rendered variants: an optional `/bin/`
+prefix and optional parentheses around the same negative PID and
+`No such process` semantics. Successful eval cleanup caps total stderr at 4 KiB
+and permits no other stderr; this observation is not hidden or treated as
+general stderr permission.
+
+Ordinary CI now runs `Packaged external golden path` immediately after release-
+artifact readiness. README, the local-loop guide, and the agent-loop command
+chain use the installed `seaf` CLI. The roadmap, implementation plan, contract,
+and progress tracker mark M2-06 and U8 accepted. M2-07 is dependency-ready but
+not started, Milestone 2 remains active, and no network, Ollama, registry,
+release, tag, signing, or notarization action occurred in this slice.

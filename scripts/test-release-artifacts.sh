@@ -272,15 +272,13 @@ assert_static_release_contract() {
   assert_file_contains "$repo_root/docs/supported-platforms.md" "$LINUX_TARGET"
   assert_file_contains "$repo_root/docs/supported-platforms.md" "$MACOS_TARGET"
   assert_file_contains "$repo_root/docs/production-use-implementation-plan.md" \
-    'Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is'
+    'Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted).'
   assert_file_contains "$repo_root/docs/production-readiness-roadmap.md" \
     'Milestone 1 and M2-01 through M2-04 are complete.'
   assert_file_contains "$repo_root/.seaf/loops/current/progress.md" \
     '[x] M2-04: Release artifact workflow.'
   assert_file_contains "$repo_root/.seaf/loops/current/log.md" \
     '2026-07-14 accepted | M2-04 release artifact workflow'
-  assert_file_contains "$repo_root/.seaf/loops/current/contract.md" \
-    'Status: awaiting-explicit-user-authorization on 2026-07-14.'
 }
 
 make_bad_archive() {

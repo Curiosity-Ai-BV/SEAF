@@ -44,7 +44,7 @@ failed gate, a genuine authority decision, or an external blocker.
 
 ## Current Slice
 
-M2-06 - Packaged external golden path. Milestone 1 and M2-01 through M2-05 are
+M2-07 - Executed Ollama acceptance. Milestone 1 and M2-01 through M2-06 are
 accepted. Status: dependency-ready; implementation has not started.
 
 M2-05's exact handoff is the immutable public
@@ -59,13 +59,18 @@ release attestations verified. Linux execution evidence is the successful
 Ubuntu workflow job. The read-only workflow did not receive write, OIDC, or
 attestation authority.
 
-M2-06 must add a minimal external fixture and packaged-CLI acceptance path for
-generic init, candidate creation, exact human approval, controlled evaluation,
-rejection, interruption/resume, and verified promotion with the fake provider.
-CI must validate every referenced artifact and prove failed runs leave the
-source unchanged. README and loop documentation must match the executed
-commands.
+M2-06 and U8 are accepted. The ordinary-CI packaged gate fully verifies a
+current native archive before installing it outside the source tree, then uses
+only that binary in two fresh external repositories. It covers generic init,
+candidate creation, wrong and exact human approval, real interruption,
+audited attempt-2 evaluation recovery without provider replay, stable inspect,
+verified promotion, exact exit-24 rejection evidence, candidate cleanup,
+preservation of explicit nonempty untracked file and symlink sentinels, bounded
+recursive artifact/digest validation, and source preservation. The installed CLI
+command chain is reflected in README and both loop docs. The three pre-review
+post-install adoption runs completed in 9 seconds, 8 seconds, and 8 seconds.
 
 Do not publish another release or registry package, move or replace `v0.1.0`,
-weaken immutable-release or tag protection, execute Ollama acceptance, or claim
-Milestone 2 completion. M2-07 remains blocked on accepted M2-06.
+weaken immutable-release or tag protection, or claim Milestone 2 completion.
+M2-07 requires separately executed local Ollama evidence and remains not
+started; no Ollama command is authorized by the M2-06 acceptance.

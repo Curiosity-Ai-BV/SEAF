@@ -37,7 +37,18 @@ If the harness becomes heavier than the work, delete or simplify the harness fir
 ## Current Command Chain
 
 ```text
-seaf task brief -> agent patch -> seaf eval run -> seaf release prepare -> seaf release verify -> commit/merge role
+seaf init -> seaf doctor --provider fake -> seaf loop run --provider fake
+  -> seaf loop status/inspect -> seaf loop approve -> seaf loop resume
+  -> seaf loop status -> seaf loop promote -> commit/merge role
 ```
 
-The commit/merge role must verify the working tree, staged files, eval report, and release capsule before staging or committing.
+The chain uses the installed CLI. `loop approve` binds the exact candidate diff
+and target HEAD; `loop promote` separately binds that candidate, the final
+EvalReport, and a fresh target HEAD. Interrupted incomplete evaluation uses
+`loop revise --from-step testing --eval-recovery invalidate` followed by exact
+`loop rerun --recovery <id>` and never replays the partial attempt in place.
+
+The commit/merge role must verify the working tree, staged files, inspected run
+authority, and EvalReport before staging or committing. The packaged external
+gate additionally proves deterministic rejection and cleanup leave the source
+repository unchanged.

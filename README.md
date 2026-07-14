@@ -49,10 +49,10 @@ pnpm typecheck
 
 ## CLI MVP
 
-### Install the private CLI from a checkout
+### Install the CLI
 
-SEAF requires the latest stable Rust toolchain. From a SEAF checkout, install
-the private CLI package and verify its exact identity:
+SEAF requires the latest stable Rust toolchain. From a reviewed SEAF checkout,
+install the private CLI package and verify its exact identity:
 
 ```bash
 rustup update stable
@@ -63,9 +63,13 @@ seaf --version
 
 Do **not** run `cargo install seaf-cli`: the package with that name on crates.io
 is an unrelated project. All SEAF workspace packages have registry publication
-disabled. The deterministic native archive and checksum contract is documented
-in [docs/release-artifacts.md](docs/release-artifacts.md), but public tagged
-downloads are not available until a separately authorized prerelease.
+disabled. The immutable `v0.1.0` prerelease provides checksummed native archives
+for the supported prebuilt matrix. Download, attestation, checksum, archive,
+and installed-binary verification are documented in
+[docs/release-artifacts.md](docs/release-artifacts.md). CI builds the current
+checkout through that same deterministic archive boundary and installs the
+verified binary outside the SEAF source tree before exercising the external
+golden path.
 
 Current support is limited to macOS and Linux; see the
 [supported-platform policy](https://github.com/Curiosity-Ai-BV/SEAF/blob/main/docs/supported-platforms.md).
@@ -78,12 +82,12 @@ Run the installed CLI from the project you want SEAF to initialize:
 mkdir -p /tmp/seaf-demo
 git -C /tmp/seaf-demo init
 cd /tmp/seaf-demo
-seaf init
-seaf ticket validate seaf.ticket.yaml
+seaf init --json
+seaf ticket validate seaf.ticket.yaml --json
 git add seaf.config.json seaf.policy.json seaf.evals.yaml seaf.ticket.yaml .seaf/.gitignore
 git -c user.name="SEAF Demo" -c user.email="demo@seaf.invalid" \
   commit -m "Initialize SEAF"
-seaf doctor --provider fake
+seaf doctor --provider fake --json
 seaf loop run \
   --ticket seaf.ticket.yaml --provider fake --run-id first-seaf-run --json
 ```
@@ -189,17 +193,17 @@ then resume once to run the immutable ticket/eval checks locally in the
 candidate:
 
 ```bash
-cargo run -p seaf-cli -- loop run --ticket <ticket.yaml> --run-id <run-id> --json
-cargo run -p seaf-cli -- loop status --run-id <run-id> --json
-cargo run -p seaf-cli -- loop inspect --run-id <run-id> --json
-cargo run -p seaf-cli -- loop approve --run-id <run-id> \
+seaf loop run --ticket <ticket.yaml> --provider fake --run-id <run-id> --json
+seaf loop status --run-id <run-id> --json
+seaf loop inspect --run-id <run-id> --json
+seaf loop approve --run-id <run-id> \
   --reviewer <reviewer> \
   --confirm-candidate-diff <digest-from-status> \
   --confirm-target-head <head-from-status> \
   --json
-cargo run -p seaf-cli -- loop resume --run-id <run-id> --json
-cargo run -p seaf-cli -- loop status --run-id <run-id> --json
-cargo run -p seaf-cli -- loop promote --run-id <run-id> \
+seaf loop resume --run-id <run-id> --json
+seaf loop status --run-id <run-id> --json
+seaf loop promote --run-id <run-id> \
   --reviewer <reviewer> \
   --confirm-candidate-diff <digest-from-status> \
   --confirm-eval-report <eval-report-digest-from-status> \
@@ -212,9 +216,9 @@ records the operator, reason, exact source state, and next attempt without
 calling the provider; `rerun` consumes that exact authorization:
 
 ```bash
-cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+seaf loop revise --run-id <run-id> \
   --from-step <provider-step> --actor <operator> --reason <reason> --json
-cargo run -p seaf-cli -- loop rerun --run-id <run-id> \
+seaf loop rerun --run-id <run-id> \
   --recovery <recovery-id> --ticket <ticket.yaml> --json
 ```
 
@@ -230,7 +234,7 @@ a failed check becomes an approval-bound reported failure. A complete
 interrupted evaluation prefix is adopted without provider or command calls:
 
 ```bash
-cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+seaf loop revise --run-id <run-id> \
   --from-step testing --eval-recovery adopt \
   --actor <operator> --reason <reason> --json
 ```
@@ -239,10 +243,10 @@ An incomplete prefix is never replayed in place. Invalidate it, then run the
 new recovery-bound indexed attempt:
 
 ```bash
-cargo run -p seaf-cli -- loop revise --run-id <run-id> \
+seaf loop revise --run-id <run-id> \
   --from-step testing --eval-recovery invalidate \
   --actor <operator> --reason <reason> --json
-cargo run -p seaf-cli -- loop rerun --run-id <run-id> \
+seaf loop rerun --run-id <run-id> \
   --recovery <recovery-id> --json
 ```
 
@@ -255,10 +259,14 @@ checkout, and leaves it unstaged and uncommitted for review. Crash retry adopts
 only that exact patch; it does not delete the frozen candidate or contact a
 model provider.
 
-Milestone 1 verifies the complete loop when SEAF runs from this Cargo source
-workspace. The package-readiness gate separately verifies an extracted CLI
-package outside the source tree through version, information, initialization,
-and fake-provider doctor checks. The packaged external golden path remains
-Milestone 2 work. The supported loop platforms are macOS and Linux: CI executes
-on Ubuntu, and current local verification is on macOS. Windows and untested
-architectures are not claimed.
+`./scripts/test-packaged-external-golden-path.sh` is the installed-CLI acceptance
+gate. It verifies a current native archive before extraction, initializes two
+fresh external Git repositories, runs the fake-provider approval/evaluation
+flow, kills and invalidates one real evaluation attempt before rerunning attempt
+2 without provider replay, promotes only the exact approved candidate, and
+separately proves exact exit-24 rejection plus candidate cleanup while preserving
+explicit nonempty untracked file and symlink sentinels. Recursive bounded
+validation checks run-owned files and every
+discovered path/digest reference. The supported loop platforms are macOS and
+Linux: CI executes on Ubuntu, and current local verification is on macOS.
+Windows and untested architectures are not claimed.

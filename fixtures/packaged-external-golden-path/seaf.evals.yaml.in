@@ -1,0 +1,11 @@
+evals:
+  allow_commands:
+    - ./golden-path-check.sh
+  required:
+    - name: packaged_external_native_check
+      command: ./golden-path-check.sh
+      timeout_ms: 90000
+      max_output_bytes: 4096
+      env:
+        SEAF_GOLDEN_PATH_MODE: "@SEAF_GOLDEN_PATH_MODE@"
+        SEAF_GOLDEN_PATH_CONTROL_DIR: "@SEAF_GOLDEN_PATH_CONTROL_DIR@"

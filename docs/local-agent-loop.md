@@ -1,9 +1,9 @@
 # Local Agent Loop
 
-This page documents the current Milestone 1 loop implementation as exercised
-from the SEAF Cargo source workspace. CI uses fake-provider paths for repeatable
-automation; Ollama commands are local live smoke checks. Packaged installation,
-generic initialization, and external-project adoption remain Milestone 2 gates.
+This page documents the supervised loop through the installed `seaf` CLI. CI
+uses fake-provider paths for repeatable automation; Ollama commands remain local
+live smoke checks. The packaged external gate verifies and extracts a native
+archive outside the SEAF source tree before it creates any project or run state.
 
 The local loop is disk-backed and review-first. Model output is untrusted
 working material. Schema validation, the deterministic policy gate, configured
@@ -32,22 +32,24 @@ repository root. Confirm `git status --short` has no output before starting the
 complete approve/evaluate/promote path:
 
 ```bash
-cargo run -p seaf-cli -- ticket validate examples/local-loop/tickets/add-health-command.yaml
-cargo run -p seaf-cli -- loop run --ticket examples/local-loop/tickets/add-health-command.yaml --policy examples/adaptive-notes/seaf.policy.json --run-id milestone-one-demo --json
-cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
-cargo run -p seaf-cli -- loop inspect --run-id milestone-one-demo --json
-cargo run -p seaf-cli -- loop approve --run-id milestone-one-demo \
+seaf ticket validate examples/local-loop/tickets/add-health-command.yaml
+seaf loop run --ticket examples/local-loop/tickets/add-health-command.yaml \
+  --policy examples/adaptive-notes/seaf.policy.json \
+  --provider fake --run-id milestone-one-demo --json
+seaf loop status --run-id milestone-one-demo --json
+seaf loop inspect --run-id milestone-one-demo --json
+seaf loop approve --run-id milestone-one-demo \
   --reviewer reviewer@example.invalid \
   --confirm-candidate-diff <digest-from-status> \
   --confirm-target-head <head-from-status> --json
-cargo run -p seaf-cli -- loop resume --run-id milestone-one-demo --json
-cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
-cargo run -p seaf-cli -- loop promote --run-id milestone-one-demo \
+seaf loop resume --run-id milestone-one-demo --json
+seaf loop status --run-id milestone-one-demo --json
+seaf loop promote --run-id milestone-one-demo \
   --reviewer reviewer@example.invalid \
   --confirm-candidate-diff <digest-from-status> \
   --confirm-eval-report <eval-report-digest-from-status> \
   --confirm-target-head <head-from-status> --json
-cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
+seaf loop bench --provider fake --fixture examples/agent-bench-lite --json
 ```
 
 The complete path intentionally omits `--allow-dirty`: `loop run` refuses a
@@ -104,7 +106,7 @@ before the exact evaluated patch can reach the source checkout.
 First inspect persisted state:
 
 ```bash
-cargo run -p seaf-cli -- loop status --run-id milestone-one-demo --json
+seaf loop status --run-id milestone-one-demo --json
 ```
 
 Use the reported `run_directory` and `next_action` fields to decide what to
@@ -117,9 +119,9 @@ only after the blocker is understood. This records the operator and reason and
 performs no provider call:
 
 ```bash
-cargo run -p seaf-cli -- loop revise --run-id milestone-one-demo \
+seaf loop revise --run-id milestone-one-demo \
   --from-step <provider-step> --actor <operator> --reason <reason> --json
-cargo run -p seaf-cli -- loop rerun --run-id milestone-one-demo \
+seaf loop rerun --run-id milestone-one-demo \
   --recovery <recovery-id> \
   --ticket examples/local-loop/tickets/add-health-command.yaml \
   --policy examples/adaptive-notes/seaf.policy.json --json
@@ -157,13 +159,14 @@ Mac Ollama setup is documented in
 The CI-safe benchmark is:
 
 ```bash
-cargo run -p seaf-cli -- loop bench --provider fake --fixture examples/agent-bench-lite --json
+seaf loop bench --provider fake --fixture examples/agent-bench-lite --json
 ```
 
 The live local Ollama smoke is:
 
 ```bash
-cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --fixture examples/agent-bench-lite
+seaf loop bench --provider ollama --model gemma4:e4b-mlx \
+  --fixture examples/agent-bench-lite
 ```
 
 The Ollama smoke loads the AgentBench-lite fixture, sends one structured local
@@ -173,8 +176,9 @@ installed, the provider error includes an `ollama pull` hint.
 Verified locally on 2026-07-01 with `gemma4:e4b-mlx` installed:
 
 ```bash
-cargo run -p seaf-cli -- model check --provider ollama --model gemma4:e4b-mlx --json
-cargo run -p seaf-cli -- loop bench --provider ollama --model gemma4:e4b-mlx --fixture examples/agent-bench-lite --json
+seaf model check --provider ollama --model gemma4:e4b-mlx --json
+seaf loop bench --provider ollama --model gemma4:e4b-mlx \
+  --fixture examples/agent-bench-lite --json
 ```
 
 The model check passed through the local Ollama API, and the AgentBench-lite
@@ -190,7 +194,22 @@ OutputReview durable-response adoption, approval, separate zero-command
 evaluation adoption and crash-cut convergence, invalidation with immutable
 attempt history, rejecting reports, exact approved-patch promotion crash
 adoption, and persisted clean v1 Testing compatibility. It does not establish
-packaged or external-project readiness. This source-workspace gate is currently
-supported on macOS and Linux only: the workflow executes it on Ubuntu, while
-the current local verification evidence is from macOS. Windows and generic
-platform support are not claimed.
+packaged or external-project readiness.
+
+Run `./scripts/test-packaged-external-golden-path.sh` for installed-package and
+external-project acceptance. It builds and fully verifies the current native
+archive before extraction, checks exact empty-stderr version/info identity, and
+uses only that installed binary in two fresh external Git repositories with
+external run and control roots. The passing repository covers init, ticket,
+commit, eight-check fake doctor, wrong and exact approval, real interruption,
+audited evaluation invalidation/rerun without provider replay, stable inspect,
+and exact promotion. The rejection repository proves a terminal rejecting
+EvalReport with exact exit-24 summary and referenced log bytes, plus candidate
+cleanup. Bounded recursive inventory and digest traversal validates run
+artifacts; source HEAD, index, status, and explicit nonempty untracked regular-
+file and symlink sentinel bytes, modes, and target are preserved through failure
+and cleanup.
+
+Both gates are supported on macOS and Linux only. CI executes them on Ubuntu,
+while current local verification is on macOS. Windows and generic platform
+support are not claimed.

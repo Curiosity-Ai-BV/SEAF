@@ -55,7 +55,7 @@
 - [x] M2-03: Package metadata and version identity.
 - [x] M2-04: Release artifact workflow.
 - [x] M2-05: Human-authorized tagged prerelease.
-- [ ] M2-06: Packaged external golden path.
+- [x] M2-06: Packaged external golden path.
 - [ ] M2-07: Executed Ollama acceptance.
 
 ## Milestone 3 - Piloted Preview
@@ -84,8 +84,13 @@ Ubuntu workflow job. The public
 [prerelease](https://github.com/Curiosity-Ai-BV/SEAF/releases/tag/v0.1.0) is
 immutable, targets the exact authorized SHA, and is not latest. Its automatic
 attestations come from immutable GitHub Release publication, not workflow write/
-OIDC authority. M2-06 is now dependency-ready; M2-07 remains blocked on M2-06,
-so Milestone 2 is not accepted.
+OIDC authority. M2-06 and U8 are accepted. The packaged external gate verifies
+and installs the current native archive outside the source tree, completes the
+two-repository fake-provider acceptance under the 15-minute bound and recursively
+validates bounded artifact references, binds rejection to exact exit-24 report/log
+evidence, and preserves explicit nonempty untracked file and symlink sentinels
+through failure and cleanup. M2-07 is dependency-ready but has not started, so
+Milestone 2 is not accepted.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI
@@ -250,7 +255,8 @@ claim. Independent specification and quality re-reviews approve M1-12 with no
 open findings. The controller's final gate passed all 14 exact acceptance
 tests, workspace check, strict Clippy, Rust and Prettier formatting, every
 locked serial Rust workspace test, all pinned-pnpm SDK gates, and diff hygiene.
-M2-01 through M2-05 are accepted; M2-06 is dependency-ready.
+At the M1-12 handoff, M2-01 through M2-05 were accepted and M2-06 became
+dependency-ready; the current M2-06 acceptance is recorded above.
 Compatibility handoff is recorded in
 `docs/preview-compatibility-handoff.md` for M2-03 and M3-05.
 The documented complete promotion path requires a clean checkout/worktree. The
@@ -264,13 +270,14 @@ keeps provider selection on the CLI. Seven focused tests pass, including
 byte-exact late-conflict/retry and symlink refusal, and all four generated evals
 execute successfully. Core 52/52, CLI 148/148, workspace check, strict owning-
 crate Clippy, formatting, and diff hygiene pass. Release artifacts and external
-golden-path acceptance remain pending. The controller's full gate
+golden-path acceptance were still pending at that slice boundary. The
+controller's full gate
 passed workspace check, strict all-target/all-feature Clippy, all pinned-pnpm
 SDK gates, and the complete locked serial Rust workspace suite. M2-02 then
 passed independent specification and quality review plus its complete focused
 and full controller gates. M2-03 passed its package-readiness gate, independent
 specification and quality reviews, and the complete controller matrix. M2-04 is
-accepted. M2-05 is also accepted; M2-06 is dependency-ready.
+accepted. M2-05 and M2-06 were accepted in their later slices.
 M2-04's required missing-script and missing-workflow REDs were witnessed before
 wiring; a follow-up probe also proved the missing non-executing aggregate
 verifier. The final local release-artifact gate passes deterministic double
@@ -279,7 +286,7 @@ refusal, external install and identity smoke, exact static workflow authority,
 and source-status preservation. Focused/full formatting, stable strict Clippy,
 package readiness, all SDK gates, and diff hygiene pass. GNU tar execution
 remains ordinary Ubuntu CI evidence; local macOS directly proves bsdtar. M2-04
-and M2-05 are accepted; M2-06 is dependency-ready.
+and M2-05 were accepted at that handoff; M2-06 is now also accepted.
 
 M2-04 quality review rejected the first implementation on 2026-07-14. The
 correction's focused RED reported 17 failures covering process status/stderr,
@@ -291,5 +298,5 @@ quality/security re-reviews approved the corrected slice with no findings. The
 controller's corrected artifact gate, complete Rust workspace suite, stable
 strict Clippy, package gate, formatting, SDK lint/typecheck/8-test/build suite,
 and diff hygiene pass. M2-04 is accepted. At that historical review boundary,
-M2-05 awaited fresh exact-SHA authorization; it is now accepted, and M2-06 is
-dependency-ready.
+M2-05 awaited fresh exact-SHA authorization at that review boundary; M2-05 and
+M2-06 are now accepted.

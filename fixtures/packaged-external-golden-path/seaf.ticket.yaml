@@ -1,0 +1,24 @@
+ticket_id: packaged-external-golden-path
+goal_id: packaged-external-adoption
+title: Prove packaged SEAF adoption in a fresh external project
+status: ready
+priority: p2
+problem: Exercise the installed CLI through a controlled fake-provider change.
+research_questions:
+  - Does the packaged CLI preserve review, evaluation, recovery, and promotion authority?
+context:
+  relevant_files:
+    - project.txt
+    - golden-path-check.sh
+  forbidden_files:
+    - .git/**
+    - .seaf/**
+autonomy:
+  level: 1
+  apply_patch: true
+  allow_shell_commands:
+    - ./golden-path-check.sh
+acceptance_criteria:
+  - The exact fake-provider candidate passes the fixture-native check before promotion.
+eval:
+  config: seaf.evals.yaml

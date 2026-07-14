@@ -2158,7 +2158,7 @@ remaining integration and doc-test suite.
 ### M2-02 - Project Doctor
 
 Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 through
-M2-05 are accepted; M2-06 is dependency-ready.
+M2-06 are accepted; M2-07 is dependency-ready and has not started.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2230,12 +2230,12 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 through M2-05 are accepted; M2-06 is dependency-ready.
+M2-03 through M2-06 are accepted; M2-07 is dependency-ready and has not started.
 
 ### M2-03 - Package Metadata And Version Identity
 
-Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 is
-accepted. M2-05 is also accepted; M2-06 is dependency-ready.
+Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 through
+M2-06 are accepted; M2-07 is dependency-ready and has not started.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2291,8 +2291,8 @@ suite, and doc tests.
 
 ### M2-04 - Release Artifact Workflow
 
-Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 is also
-accepted; M2-06 is dependency-ready.
+Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 and M2-06
+are also accepted; M2-07 is dependency-ready and has not started.
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2409,7 +2409,8 @@ in the [immutable `v0.1.0` prerelease](https://github.com/Curiosity-Ai-BV/SEAF/r
 All three automatic GitHub release attestations passed
 `gh release verify-asset`. Automatic attestation authority came from immutable
 GitHub Release publication, not from workflow write/OIDC permissions. M2-05 and
-U7 are accepted. M2-06 is dependency-ready; M2-07 remains blocked on M2-06.
+U7 are accepted. M2-06 and U8 were accepted afterward; M2-07 is now
+dependency-ready and has not started.
 
 Docs/tracker: release evidence and M2-05 status.
 
@@ -2417,8 +2418,7 @@ Commit boundary: evidence/docs after the separately authorized external action.
 
 ### M2-06 - Packaged External Golden Path
 
-Status: dependency-ready; implementation not started. Dependencies: M2-05
-(accepted).
+Status: accepted on 2026-07-14. Dependencies: M2-05 (accepted).
 
 Roadmap: U8. Dependencies: M2-05.
 
@@ -2444,9 +2444,42 @@ Docs/tracker: tested quickstart and M2-06 status.
 
 Commit boundary: external acceptance fixture, CI, and matching docs.
 
+Acceptance evidence: the executable packaged gate builds the current native
+release binary with locked offline Cargo into an external target root, creates
+and fully verifies the deterministic release archive before extraction, and
+uses only that installed binary afterward. Exact empty-stderr version/info,
+generic init, ticket validation, a clean fixture commit, and the eight-check
+fake doctor pass in two fresh external Git repositories with external run and
+control roots.
+
+The passing repository rejects a wrong candidate digest without mutation,
+records exact approval, kills the real CLI/eval process, rejects ordinary
+resume of the incomplete attempt, and completes audited invalidate/rerun as
+attempt 2 without changing the provider ledger or any attempt-1 byte. Stable
+inspection remains verified before exact promotion, whose source patch equals
+the frozen approved candidate. A separate repository produces the exact failed
+native check and rejecting EvalReport with exact exit-24 summary, empty
+referenced stdout, and exact referenced rejection stderr. Run and approval first
+preserve a clean snapshot; explicit nonempty untracked regular-file and symlink
+sentinels are then created with exact bytes, modes, and target and retain their
+full inventory through terminal failure and cleanup. Bounded recursive run-tree
+inventory and path/digest traversal validates every discovered reference, and a
+source-repository snapshot is compared on every harness exit. The pre-review
+gate passed three times after the two reviewed inspection prerequisites, with
+measured post-install adoption of 9 seconds, 8 seconds, and 8 seconds. Real
+SIGKILL produces the expected shell job notification. Successful evaluation
+cleanup may emit only a narrowly bounded family of platform-rendered variants:
+an optional `/bin/` prefix and optional parentheses around the same negative PID
+and `No such process` semantics. Total stderr is capped at 4 KiB and no other
+stderr is permitted.
+
+Ordinary CI runs this gate immediately after release-artifact readiness.
+README and both loop docs now use the installed `seaf` command chain. U8 and
+M2-06 are accepted; M2-07 is dependency-ready and has not started.
+
 ### M2-07 - Executed Ollama Acceptance
 
-Status: blocked on M2-06.
+Status: dependency-ready; implementation not started.
 
 Roadmap: U8 and Milestone 2 exit gate. Dependencies: M2-06.
 

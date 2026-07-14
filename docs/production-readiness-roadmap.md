@@ -413,8 +413,8 @@ Milestone 1 and M2-01 through M2-04 are complete. Package identity is private,
 exact, warning-free, and proven through pristine archives plus an external
 installed-CLI smoke. Independent specification and quality reviews approved the
 corrected package and release-artifact boundaries, and the full controller gates
-passed. M2-05 and U7 were accepted on 2026-07-14; M2-06 is the next
-dependency-ready slice.
+passed. M2-05 and U7 were accepted on 2026-07-14. M2-06 and U8 are now also
+accepted; M2-07 is dependency-ready and has not started.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -453,8 +453,8 @@ and complete snapshots prove project, Git, worktree, and candidate namespaces
 remain unchanged. The full Rust and SDK controller gates passed. M2-03 package
 identity is accepted after exact archive/install smoke, adversarial boundary
 guards, independent reviews, and the full controller matrix. M2-04 release
-artifact workflow and M2-05 tagged prerelease are accepted; the external golden
-path is not yet claimed.
+artifact workflow and M2-05 tagged prerelease are accepted. At that historical
+M2-05 handoff, the external golden path had not yet been claimed.
 
 M2-04 implementation evidence on 2026-07-13 records the required missing-script
 and missing-workflow REDs plus a missing structure-only verifier RED. The final
@@ -506,8 +506,29 @@ The verified assets were byte-checked while draft and after publication in the
 `gh release verify-asset` verified all three automatic GitHub release
 attestations. Those attestations come from immutable GitHub Release publication;
 the build workflow retains read-only contents permission and no write, OIDC, or
-attestation authority. Milestone 2 remains active: M2-06 is dependency-ready,
-and M2-07 remains blocked on M2-06.
+attestation authority.
+
+M2-06 and U8 were accepted on 2026-07-14. Ordinary CI now builds the current
+native CLI with locked offline Cargo, constructs and fully verifies its release
+archive before extraction, and uses only the installed external binary in two
+fresh Git repositories with external run and control roots. The passing path
+proves exact identity, generic init, ticket/commit/doctor, wrong and exact human
+approval, real evaluation interruption, refusal of ordinary replay, audited
+attempt-2 invalidation/rerun without provider replay, stable inspection, and
+exact approved-candidate promotion. The separate rejection path proves a
+terminal rejecting EvalReport with exact exit-24 summary, empty referenced
+stdout, and exact referenced rejection stderr. Explicit nonempty untracked file
+and symlink sentinels retain their inventory, bytes, modes, and target through
+failure and candidate cleanup. Recursive bounded inventory and digest traversal
+validates the run artifact graph, while the harness compares the SEAF source
+checkout on every exit. Local post-install adoption completed in 9 seconds, 8
+seconds, and 8 seconds on the three pre-review runs. The expected SIGKILL shell
+notification remains visible; successful eval cleanup may emit only a narrowly
+bounded family of platform-rendered variants with an optional `/bin/` prefix and
+optional parentheses around the same negative PID and `No such process`
+semantics. Total stderr is capped at 4 KiB and no other stderr is permitted.
+M2-07 is dependency-ready and has not started, so Milestone 2 remains active and
+Ollama acceptance is not claimed.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario
