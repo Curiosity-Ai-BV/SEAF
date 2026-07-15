@@ -1789,8 +1789,8 @@ fn completed_development_is_applied_only_to_the_candidate_before_output_review()
     );
     assert_eq!(patch_runner.calls[0].1, PatchCommand::GitApplyCheck);
     let decision = &completed.policy_decisions[0];
-    assert_eq!(decision.get("apply_requested").unwrap(), true);
-    assert_eq!(decision.get("applied").unwrap(), false);
+    assert!(decision.apply_requested);
+    assert!(!decision.applied);
     assert_eq!(source_evidence(&fixture.source), source_before);
     let applied = completed
         .candidate_workspace
@@ -2108,10 +2108,7 @@ fn human_approval_binds_the_exact_reviewed_candidate_without_running_tests() {
         .run
         .policy_decisions
         .iter()
-        .find(|decision| {
-            decision.get("patch_id").and_then(serde_json::Value::as_str)
-                == Some(approved.run.run_id.as_str())
-        })
+        .find(|decision| decision.patch_id == approved.run.run_id)
         .unwrap();
     assert_eq!(
         approved.evidence.policy_decision_digest,
@@ -2203,8 +2200,7 @@ fn human_approval_rejects_stale_or_substituted_authority_without_further_mutatio
                 write_raw_run(&fixture.workspace, &waiting);
             }
             ApprovalMutation::UnrelatedPolicy => {
-                waiting.policy_decisions[0]
-                    .insert("patch_id".to_string(), serde_json::json!("another-run"));
+                waiting.policy_decisions[0].patch_id = "another-run".to_string();
                 write_raw_run(&fixture.workspace, &waiting);
             }
             ApprovalMutation::OutputReviewArtifact => {

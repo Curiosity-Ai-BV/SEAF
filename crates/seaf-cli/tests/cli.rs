@@ -12930,7 +12930,7 @@ fn write_passing_loop_run_file(path: &Path, run_id: &str) {
   "policy_decisions": [
     {{
       "patch_id": "{run_id}",
-      "patch_sha256": "sha256:abc123",
+      "patch_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "changed_paths": ["crates/seaf-cli/src/main.rs"],
       "decision": "allowed",
       "reasons": [],

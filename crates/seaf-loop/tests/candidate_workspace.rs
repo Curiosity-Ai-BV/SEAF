@@ -1782,9 +1782,9 @@ fn candidate_patch_application_persists_intent_before_mutating_only_the_candidat
     development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
     development.status = seaf_core::LoopStepStatus::Completed;
     authoritative.current_step = seaf_core::LoopStepName::OutputReview;
-    authoritative.policy_decisions.push(
-        serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
-    );
+    authoritative
+        .policy_decisions
+        .push(evidence.policy_decision.clone());
     bind_empty_eval_config_fixture(&workspace, &mut authoritative);
     persist_run_fixture(&workspace, &authoritative).expect("Development authority");
 
@@ -2525,9 +2525,9 @@ fn persist_development_authority(
     development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
     development.status = seaf_core::LoopStepStatus::Completed;
     authoritative.current_step = seaf_core::LoopStepName::OutputReview;
-    authoritative.policy_decisions.push(
-        serde_json::from_value(serde_json::to_value(&evidence.policy_decision).unwrap()).unwrap(),
-    );
+    authoritative
+        .policy_decisions
+        .push(evidence.policy_decision.clone());
     persist_run_fixture(workspace, &authoritative).expect("Development authority");
     evidence
 }

@@ -2949,3 +2949,39 @@ chain use the installed `seaf` CLI. The roadmap, implementation plan, contract,
 and progress tracker mark M2-06 and U8 accepted. M2-07 is dependency-ready but
 not started, Milestone 2 remains active, and no network, Ollama, registry,
 release, tag, signing, or notarization action occurred in this slice.
+
+## 2026-07-15 complete | M3-01 typed durable loop contracts
+
+The user explicitly authorized M3-01 ahead of the recorded M2-07 dependency.
+M2-07 remains unexecuted, no M2-07 evidence is claimed, and neither Milestone 2
+nor Milestone 3 is complete.
+
+The required RED was
+`cargo test -p seaf-core --test durable_schema_drift`. It failed before
+production edits because `seaf_core` did not export `PolicyDecision` or
+`PatchDecisionKind` and `specs/policy-decision.schema.json` did not exist. This
+proved that policy decisions had no shared Rust/schema owner.
+
+`seaf-core` now owns `PolicyDecision`, `PatchDecisionKind`, and
+`PolicyDecisionReason`; `seaf-loop` keeps compatible public re-exports.
+`LoopRun.policy_decisions` is `Vec<PolicyDecision>`, and policy, eval, candidate,
+recovery, runner, and CLI readers use typed fields rather than map reparsing.
+The standalone closed policy-decision schema retains the existing
+`sha256:<hex>` patch digest format, and `loop-run.schema.json` references it.
+Rust/schema drift tests cover Ticket, Policy, LoopRun, PolicyDecision, and
+EvalReport fields, required/default membership, and closed top-level objects;
+PolicyDecision coverage also locks its serialized enum variants and nested
+closed reason shape, including string, omitted, and explicit-null optional
+states.
+No artifact version, migration, retention, purge, or unrelated format change
+was added.
+
+Before quality review, the focused drift suite passed 5 tests. Quality review
+then rejected nested reason nullability and enum coverage. The focused correction
+RED proved that mismatch; GREEN passed all 6 drift tests and all 52 core unit
+tests, and quality re-review approved it with no findings. The controller's
+exact post-correction full gate passed Rust formatting, strict locked all-target/
+all-feature Clippy, all 168 CLI tests, 52 core unit tests, 6 drift tests, 301
+loop unit tests, every remaining Rust workspace and doc test, Prettier, SDK
+lint/typecheck, all 8 SDK tests, SDK build, and `git diff --check`. No test was
+skipped.

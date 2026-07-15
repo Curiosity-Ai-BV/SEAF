@@ -9,7 +9,6 @@ use seaf_core::{
     validate_loop_run, LoopExecutionMode, LoopInputDigests, LoopRun, LoopStatus, LoopStepName,
     LoopStepRecord, LoopStepStatus,
 };
-use serde_json::Value;
 
 use crate::{
     run_persistence::{self, RunMutationGuard},
@@ -61,7 +60,7 @@ pub fn create_run(config: NewLoopRun) -> LoopRun {
                 artifact_digest: None,
             })
             .collect(),
-        policy_decisions: Vec::<std::collections::BTreeMap<String, Value>>::new(),
+        policy_decisions: Vec::new(),
         provider_exchange_records: Vec::new(),
         candidate_workspace: None,
         human_approval: None,

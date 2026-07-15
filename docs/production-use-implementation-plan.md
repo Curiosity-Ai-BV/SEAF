@@ -2510,6 +2510,10 @@ Commit boundary: Ollama evidence and any docs only; defects get separate slices.
 
 Roadmap: U9. Dependencies: M2-07.
 
+Status: complete. The user explicitly authorized M3-01 ahead of the recorded
+M2-07 dependency. M2-07 remains unexecuted, Milestones 2 and 3 remain
+incomplete, and no M2-07 evidence is claimed.
+
 Objective: type the artifact set exposed by the supported loop.
 
 Acceptance criteria:
@@ -2530,6 +2534,17 @@ matrix.
 Docs/tracker: typed contract ownership and M3-01 status.
 
 Commit boundary: typed contracts and drift tests only.
+
+Completion: `seaf-core` owns `PolicyDecision`, `PatchDecisionKind`, and
+`PolicyDecisionReason`; `seaf-loop` preserves its existing public re-exports.
+`LoopRun.policy_decisions` is typed, its readers no longer reparse arbitrary
+maps, and Ticket, Policy, LoopRun, PolicyDecision, and EvalReport have
+Rust/schema field, required/default, and closed-object drift tests. The existing
+`sha256:<hex>` policy-decision digest representation is unchanged.
+PolicyDecision coverage also locks serialized decision variants and nested
+closed reason optionality; explicit null remains readable for optional reason
+strings while canonical Rust serialization omits absent values. Artifact
+versioning, migration, retention, and purge remain outside this slice.
 
 ### M3-02 - Artifact Format Versions And Migration
 

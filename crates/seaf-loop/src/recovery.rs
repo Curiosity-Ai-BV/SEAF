@@ -4474,9 +4474,9 @@ fn reset_run(
         <= step_index(LoopStepName::Development).map_err(RecoveryError::wrapped)?
     {
         let run_id = reset.run_id.clone();
-        reset.policy_decisions.retain(|decision| {
-            decision.get("patch_id").and_then(serde_json::Value::as_str) != Some(run_id.as_str())
-        });
+        reset
+            .policy_decisions
+            .retain(|decision| decision.patch_id != run_id);
     }
     if step == LoopStepName::OutputReview {
         reset.human_approval = None;

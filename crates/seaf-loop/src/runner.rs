@@ -1341,23 +1341,11 @@ fn append_policy_decisions(
 ) -> Result<(), RunnerError> {
     for decision in decisions {
         let patch_id = decision.patch_id.clone();
-        let value = serde_json::to_value(decision).map_err(|error| {
-            RunnerError::Step(format!("failed to serialize policy decision: {error}"))
-        })?;
-        let entry = serde_json::from_value(value).map_err(|error| {
-            RunnerError::Step(format!("failed to encode policy decision entry: {error}"))
-        })?;
         run.policy_decisions
-            .retain(|existing| policy_decision_patch_id(existing) != Some(patch_id.as_str()));
-        run.policy_decisions.push(entry);
+            .retain(|existing| existing.patch_id != patch_id);
+        run.policy_decisions.push(decision);
     }
     Ok(())
-}
-
-fn policy_decision_patch_id(
-    decision: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> Option<&str> {
-    decision.get("patch_id").and_then(serde_json::Value::as_str)
 }
 
 impl<R: StepRunner + ?Sized> fmt::Debug for LoopRunner<'_, R> {

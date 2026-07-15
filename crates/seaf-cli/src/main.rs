@@ -2837,12 +2837,9 @@ fn validate_resume_ticket_identity(run: &LoopRun, ticket: &TicketSpec) -> Result
 }
 
 fn persisted_apply_authority(run: &LoopRun) -> bool {
-    run.policy_decisions.iter().any(|entry| {
-        serde_json::to_value(entry)
-            .ok()
-            .and_then(|value| serde_json::from_value::<PolicyDecision>(value).ok())
-            .is_some_and(|decision| decision.patch_id == run.run_id && decision.apply_requested)
-    })
+    run.policy_decisions
+        .iter()
+        .any(|decision| decision.patch_id == run.run_id && decision.apply_requested)
 }
 
 fn next_pending_model_step(run: &LoopRun) -> Option<LoopStepName> {

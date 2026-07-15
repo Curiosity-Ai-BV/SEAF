@@ -4,8 +4,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, ProjectConfig, ProviderExchangeKind,
-    ProviderExchangeOutcome, ProviderExchangePhase, ProviderExchangeRecord,
+    CheckStatus, EvalReport, GoalSpec, LoopRun, Policy, PolicyDecision, ProjectConfig,
+    ProviderExchangeKind, ProviderExchangeOutcome, ProviderExchangePhase, ProviderExchangeRecord,
     ProviderExchangeRecordReference, ProviderRole, ReleaseCapsule, SeafEvent, TicketSpec,
 };
 
@@ -223,6 +223,24 @@ pub fn validate_policy(policy: &Policy) -> Vec<FieldError> {
         "must include low-risk change types or be intentionally omitted in a later schema",
     );
 
+    errors
+}
+
+pub fn validate_policy_decision(decision: &PolicyDecision) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    require_non_empty(&mut errors, "patch_id", &decision.patch_id);
+    validate_sha256_digest(&mut errors, "patch_sha256", &decision.patch_sha256);
+    for (index, path) in decision.changed_paths.iter().enumerate() {
+        require_non_empty(&mut errors, format!("changed_paths[{index}]"), path);
+    }
+    for (index, reason) in decision.reasons.iter().enumerate() {
+        require_non_empty(&mut errors, format!("reasons[{index}].code"), &reason.code);
+        require_non_empty(
+            &mut errors,
+            format!("reasons[{index}].message"),
+            &reason.message,
+        );
+    }
     errors
 }
 
@@ -589,10 +607,10 @@ pub fn validate_loop_run(run: &LoopRun) -> Vec<FieldError> {
     }
 
     for (index, decision) in run.policy_decisions.iter().enumerate() {
-        if decision.is_empty() {
+        for error in validate_policy_decision(decision) {
             errors.push(FieldError::new(
-                format!("policy_decisions[{index}]"),
-                "must include at least one policy decision field",
+                format!("policy_decisions[{index}].{}", error.field),
+                error.message,
             ));
         }
     }
@@ -1131,10 +1149,7 @@ fn validate_human_approval_evidence(errors: &mut Vec<FieldError>, run: &LoopRun)
     let authoritative = run
         .policy_decisions
         .iter()
-        .filter(|decision| {
-            decision.get("patch_id").and_then(serde_json::Value::as_str)
-                == Some(run.run_id.as_str())
-        })
+        .filter(|decision| decision.patch_id == run.run_id)
         .collect::<Vec<_>>();
     if authoritative.len() != 1
         || crate::canonical_sha256_digest(authoritative[0])
@@ -3352,12 +3367,16 @@ unexpected_escape: true
             digest: "2".repeat(64),
             ..request.clone()
         };
-        let policy: std::collections::BTreeMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::json!({
-                "patch_id": run_id,
-                "decision": "allowed"
-            }))
-            .unwrap();
+        let policy = crate::PolicyDecision {
+            patch_id: run_id.clone(),
+            patch_sha256: format!("sha256:{}", "0".repeat(64)),
+            changed_paths: vec!["src/lib.rs".to_string()],
+            decision: crate::PatchDecisionKind::Allowed,
+            reasons: Vec::new(),
+            requires_human_review: false,
+            apply_requested: false,
+            applied: false,
+        };
         let policy_digest = canonical_sha256_digest(&policy).unwrap();
         let steps = [
             crate::LoopStepName::Research,
@@ -3505,7 +3524,7 @@ unexpected_escape: true
     }
 
     #[test]
-    fn loop_run_rejects_empty_policy_decision_objects() {
+    fn loop_run_rejects_policy_decisions_missing_typed_contract_fields() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let run_path = temp_dir.path().join("loop-run.json");
         std::fs::write(
@@ -3538,7 +3557,7 @@ unexpected_escape: true
         assert!(report
             .errors
             .iter()
-            .any(|error| error.field == "policy_decisions[0]"));
+            .any(|error| error.field == "file" && error.message.contains("patch_id")));
     }
 
     #[test]

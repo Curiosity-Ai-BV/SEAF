@@ -543,6 +543,11 @@ Goal: turn observed usage failures into a small, supportable `0.x` contract.
   PolicyDecision, and EvalReport; version on-disk formats; and define compatible
   read/migration behavior. Enforce private state-directory permissions, storage
   budgets, and retention/purge controls.
+  **M3-01 is complete:** `seaf-core` owns the shared `PolicyDecision` contract,
+  `LoopRun` stores typed decisions, and the five named Rust contracts have
+  schema-drift coverage. The user authorized this slice ahead of the recorded
+  M2-07 dependency; M2-07 remains unexecuted, and neither U9 nor Milestone 3 is
+  complete. Format versioning/migration and retention remain M3-02 and M3-03.
 - **U10 - Dogfood two real repositories.** Complete at least five bounded
   tickets across two different stacks, including an approved patch, a policy
   rejection, an eval failure, and an interrupted/resumed run. Track setup time,

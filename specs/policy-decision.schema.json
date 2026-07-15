@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seaf.dev/specs/policy-decision.schema.json",
+  "title": "SEAF PolicyDecision",
+  "type": "object",
+  "required": [
+    "patch_id",
+    "patch_sha256",
+    "changed_paths",
+    "decision",
+    "reasons",
+    "requires_human_review",
+    "apply_requested",
+    "applied"
+  ],
+  "properties": {
+    "patch_id": { "type": "string", "minLength": 1 },
+    "patch_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "changed_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "decision": {
+      "enum": ["allowed", "requires_human_review", "rejected"]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "path": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }]
+          },
+          "pattern": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }]
+          },
+          "details": {
+            "anyOf": [{ "type": "string" }, { "type": "null" }]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "requires_human_review": { "type": "boolean" },
+    "apply_requested": { "type": "boolean" },
+    "applied": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

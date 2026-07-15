@@ -137,7 +137,7 @@
     },
     "policy_decisions": {
       "type": "array",
-      "items": { "type": "object", "minProperties": 1 }
+      "items": { "$ref": "policy-decision.schema.json" }
     },
     "provider_exchange_records": {
       "type": "array",

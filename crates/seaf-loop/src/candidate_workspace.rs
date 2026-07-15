@@ -1065,10 +1065,11 @@ fn authoritative_policy_decision(
     run: &seaf_core::LoopRun,
     evidence: &DevelopmentEvidence,
 ) -> Result<PolicyDecision, CandidateWorkspaceError> {
-    let mut matching = run.policy_decisions.iter().filter(|entry| {
-        entry.get("patch_id").and_then(serde_json::Value::as_str) == Some(run.run_id.as_str())
-    });
-    let entry = matching.next().ok_or_else(|| {
+    let mut matching = run
+        .policy_decisions
+        .iter()
+        .filter(|decision| decision.patch_id == run.run_id);
+    let decision = matching.next().ok_or_else(|| {
         CandidateWorkspaceError::State(
             "Development evidence is missing its authoritative policy decision".to_string(),
         )
@@ -1078,17 +1079,12 @@ fn authoritative_policy_decision(
             "Development evidence has multiple authoritative policy decisions".to_string(),
         ));
     }
-    let decision: PolicyDecision = serde_json::from_value(
-        serde_json::to_value(entry)
-            .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?,
-    )
-    .map_err(|error| CandidateWorkspaceError::State(error.to_string()))?;
-    if decision != evidence.policy_decision {
+    if decision != &evidence.policy_decision {
         return Err(CandidateWorkspaceError::Mismatch(
             "Development evidence policy decision differs from authoritative run state".to_string(),
         ));
     }
-    Ok(decision)
+    Ok(decision.clone())
 }
 
 fn plan_candidate_patch(
@@ -5235,8 +5231,7 @@ mod tests {
         development.artifact_digest = Some(evidence.artifact_digest().expect("evidence digest"));
         development.status = seaf_core::LoopStepStatus::Completed;
         run.current_step = LoopStepName::OutputReview;
-        run.policy_decisions
-            .push(serde_json::from_value(serde_json::to_value(decision).unwrap()).unwrap());
+        run.policy_decisions.push(decision.clone());
         crate::state::write_raw_canonical_run_fixture(&workspace.run_file(), &run).expect("run");
         ApplicationFixture {
             _temp: temp,

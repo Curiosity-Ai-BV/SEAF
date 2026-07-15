@@ -9,9 +9,7 @@ fn eval_report_uses_loop_identity_and_includes_loop_checks() {
     let ticket = ticket();
     let mut run = passing_run(&ticket);
     run.policy_decisions
-        .push(serialized_policy_decision(policy_decision(
-            PatchDecisionKind::Allowed,
-        )));
+        .push(policy_decision(PatchDecisionKind::Allowed));
     let command_checks = vec![passed_check("local_loop_smoke")];
 
     let report = build_loop_eval_report(&run, &ticket, command_checks);
@@ -42,9 +40,7 @@ fn eval_report_rejects_failed_patch_policy_gate() {
     let ticket = ticket();
     let mut run = passing_run(&ticket);
     run.policy_decisions
-        .push(serialized_policy_decision(policy_decision(
-            PatchDecisionKind::Rejected,
-        )));
+        .push(policy_decision(PatchDecisionKind::Rejected));
 
     let report = build_loop_eval_report(&run, &ticket, vec![passed_check("local_loop_smoke")]);
 
@@ -73,8 +69,7 @@ fn eval_report_rejects_policy_gate_for_different_patch_id() {
     let mut run = passing_run(&ticket);
     let mut decision = policy_decision(PatchDecisionKind::Allowed);
     decision.patch_id = "other_patch".to_string();
-    run.policy_decisions
-        .push(serialized_policy_decision(decision));
+    run.policy_decisions.push(decision);
 
     let report = build_loop_eval_report(&run, &ticket, vec![passed_check("local_loop_smoke")]);
 
@@ -118,16 +113,10 @@ fn passing_run(ticket: &TicketSpec) -> seaf_core::LoopRun {
     run
 }
 
-fn serialized_policy_decision(
-    decision: PolicyDecision,
-) -> std::collections::BTreeMap<String, serde_json::Value> {
-    serde_json::from_value(serde_json::to_value(decision).unwrap()).unwrap()
-}
-
 fn policy_decision(decision: PatchDecisionKind) -> PolicyDecision {
     PolicyDecision {
         patch_id: "loop_20260701_001".to_string(),
-        patch_sha256: "sha256:abc123".to_string(),
+        patch_sha256: format!("sha256:{}", "a".repeat(64)),
         changed_paths: vec!["crates/seaf-cli/src/main.rs".to_string()],
         decision,
         reasons: Vec::new(),

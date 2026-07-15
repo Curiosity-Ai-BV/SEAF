@@ -3431,9 +3431,10 @@ fn load_verified_development_evidence(
                 "failed to verify Development evidence artifact: {error}"
             ))
         })?;
-    let mut matching = run.policy_decisions.iter().filter(|decision| {
-        decision.get("patch_id").and_then(serde_json::Value::as_str) == Some(run.run_id.as_str())
-    });
+    let mut matching = run
+        .policy_decisions
+        .iter()
+        .filter(|decision| decision.patch_id == run.run_id);
     let persisted = matching.next().ok_or_else(|| {
         RunnerError::Step(
             "Development evidence is missing its persisted run policy decision".to_string(),
@@ -3444,16 +3445,7 @@ fn load_verified_development_evidence(
             "Development evidence has multiple persisted run policy decisions".to_string(),
         ));
     }
-    let persisted: PolicyDecision =
-        serde_json::from_value(serde_json::to_value(persisted).map_err(|error| {
-            RunnerError::Step(format!(
-                "failed to inspect persisted policy decision: {error}"
-            ))
-        })?)
-        .map_err(|error| {
-            RunnerError::Step(format!("invalid persisted policy decision: {error}"))
-        })?;
-    if persisted != evidence.policy_decision {
+    if persisted != &evidence.policy_decision {
         return Err(RunnerError::Step(
             "Development evidence policy decision does not exactly match run state".to_string(),
         ));

@@ -60,7 +60,7 @@
 
 ## Milestone 3 - Piloted Preview
 
-- [ ] M3-01: Typed durable loop contracts.
+- [x] M3-01: Typed durable loop contracts.
 - [ ] M3-02: Artifact format versions and migration.
 - [ ] M3-03: Retention and audited purge.
 - [ ] M3-04: Two-repository pilot evidence.
@@ -91,6 +91,13 @@ validates bounded artifact references, binds rejection to exact exit-24 report/l
 evidence, and preserves explicit nonempty untracked file and symlink sentinels
 through failure and cleanup. M2-07 is dependency-ready but has not started, so
 Milestone 2 is not accepted.
+
+The user explicitly authorized M3-01 ahead of the recorded M2-07 dependency.
+M3-01 is complete: `seaf-core` owns the shared policy-decision types,
+`LoopRun.policy_decisions` is typed, and Ticket, Policy, LoopRun,
+PolicyDecision, and EvalReport have Rust/schema drift coverage. M2-07 remains
+unexecuted, Milestone 2 remains active, and Milestone 3 remains incomplete.
+Artifact versioning/migration and retention/purge remain M3-02 and M3-03.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI

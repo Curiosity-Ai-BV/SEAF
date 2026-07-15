@@ -1,10 +1,8 @@
+use crate::PatchDecisionKind;
 use seaf_core::{
     validate_loop_run, validate_ticket_spec, CheckStatus, EvalCheck, EvalDecision, EvalReport,
     LoopRun, LoopStepName, LoopStepStatus, RiskLevel, TicketSpec,
 };
-use serde_json::Value;
-
-use crate::{PatchDecisionKind, PolicyDecision};
 
 pub fn build_loop_eval_report(
     run: &LoopRun,
@@ -89,28 +87,20 @@ fn patch_policy_gate_check(run: &LoopRun) -> EvalCheck {
     }
 
     let mut rejected = Vec::new();
-    let mut malformed = Vec::new();
     let mut mismatched = Vec::new();
-    for (index, entry) in run.policy_decisions.iter().enumerate() {
-        let value = Value::Object(entry.clone().into_iter().collect());
-        match serde_json::from_value::<PolicyDecision>(value) {
-            Ok(decision) if decision.patch_id != run.run_id => mismatched.push(format!(
+    for (index, decision) in run.policy_decisions.iter().enumerate() {
+        match decision {
+            decision if decision.patch_id != run.run_id => mismatched.push(format!(
                 "policy_decisions[{index}].patch_id {} does not match run_id {}",
                 decision.patch_id, run.run_id
             )),
-            Ok(decision) if decision.decision == PatchDecisionKind::Rejected => {
+            decision if decision.decision == PatchDecisionKind::Rejected => {
                 rejected.push(format!("policy_decisions[{index}] rejected patch"))
             }
-            Ok(_) => {}
-            Err(error) => {
-                malformed.push(format!("policy_decisions[{index}] is malformed: {error}"))
-            }
+            _ => {}
         }
     }
 
-    if !malformed.is_empty() {
-        return check("patch_policy_gate", false, malformed.join("; "));
-    }
     if !mismatched.is_empty() {
         return check("patch_policy_gate", false, mismatched.join("; "));
     }

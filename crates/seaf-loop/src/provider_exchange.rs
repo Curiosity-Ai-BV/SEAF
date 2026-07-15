@@ -3708,13 +3708,16 @@ mod tests {
             cleanup_started_at: None,
             cleaned_at: None,
         });
-        run.policy_decisions.push(
-            serde_json::from_value(serde_json::json!({
-                "patch_id": run.run_id.clone(),
-                "decision": "allowed"
-            }))
-            .unwrap(),
-        );
+        run.policy_decisions.push(seaf_core::PolicyDecision {
+            patch_id: run.run_id.clone(),
+            patch_sha256: format!("sha256:{}", "0".repeat(64)),
+            changed_paths: vec!["src/lib.rs".to_string()],
+            decision: seaf_core::PatchDecisionKind::Allowed,
+            reasons: Vec::new(),
+            requires_human_review: false,
+            apply_requested: false,
+            applied: false,
+        });
         run
     }
 

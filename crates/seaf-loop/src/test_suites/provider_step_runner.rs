@@ -2753,8 +2753,7 @@ fn single_policy_decision(run: &LoopRun) -> PolicyDecision {
         1,
         "expected exactly one persisted policy decision"
     );
-    serde_json::from_value(serde_json::to_value(&run.policy_decisions[0]).expect("decision value"))
-        .expect("typed policy decision")
+    run.policy_decisions[0].clone()
 }
 
 fn step_status(run: &LoopRun, step: LoopStepName) -> LoopStepStatus {
@@ -3114,17 +3113,13 @@ fn assert_downstream_artifact_rejected_without_mutation(
             artifact["changed_paths"] = json!(["docs/example.md"]);
             artifact["policy_decision"]["patch_sha256"] = artifact["patch_digest"].clone();
             artifact["policy_decision"]["changed_paths"] = artifact["changed_paths"].clone();
-            verified.policy_decisions[0]
-                .insert("patch_sha256".to_string(), artifact["patch_digest"].clone());
-            verified.policy_decisions[0].insert(
-                "changed_paths".to_string(),
-                artifact["changed_paths"].clone(),
-            );
+            verified.policy_decisions[0].patch_sha256 = digest;
+            verified.policy_decisions[0].changed_paths = vec!["docs/example.md".to_string()];
             rewrite_artifact_and_verified_digest(&absolute_artifact_path, &artifact, record);
         }
         DownstreamArtifactMutation::PolicyMismatch => {
             assert!(matches!(target, DownstreamArtifactTarget::Development));
-            verified.policy_decisions[0].insert("decision".to_string(), json!("rejected"));
+            verified.policy_decisions[0].decision = PatchDecisionKind::Rejected;
         }
     }
     persist_verified_resume_authority(&run_dir, &verified);

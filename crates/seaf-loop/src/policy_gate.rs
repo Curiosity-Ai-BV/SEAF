@@ -10,7 +10,7 @@ use std::{
 use std::fs;
 
 use seaf_core::Policy;
-use serde::{Deserialize, Serialize};
+pub use seaf_core::{PatchDecisionKind, PolicyDecision, PolicyDecisionReason};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -26,40 +26,6 @@ pub struct PatchGateRequest<'a> {
     pub patch: &'a str,
     pub policy: &'a Policy,
     pub apply_patch: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyDecision {
-    pub patch_id: String,
-    pub patch_sha256: String,
-    pub changed_paths: Vec<String>,
-    pub decision: PatchDecisionKind,
-    pub reasons: Vec<PolicyDecisionReason>,
-    pub requires_human_review: bool,
-    pub apply_requested: bool,
-    pub applied: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PatchDecisionKind {
-    Allowed,
-    RequiresHumanReview,
-    Rejected,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyDecisionReason {
-    pub code: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

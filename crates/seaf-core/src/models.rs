@@ -70,6 +70,40 @@ pub struct Policy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PolicyDecision {
+    pub patch_id: String,
+    pub patch_sha256: String,
+    pub changed_paths: Vec<String>,
+    pub decision: PatchDecisionKind,
+    pub reasons: Vec<PolicyDecisionReason>,
+    pub requires_human_review: bool,
+    pub apply_requested: bool,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchDecisionKind {
+    Allowed,
+    RequiresHumanReview,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDecisionReason {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub policy_path: String,
 }
@@ -388,7 +422,7 @@ pub struct LoopRun {
     pub started_at: String,
     pub updated_at: String,
     pub steps: Vec<LoopStepRecord>,
-    pub policy_decisions: Vec<BTreeMap<String, Value>>,
+    pub policy_decisions: Vec<PolicyDecision>,
     #[serde(default)]
     pub provider_exchange_records: Vec<ProviderExchangeRecordReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,7 +453,7 @@ struct LoopRunWire {
     started_at: String,
     updated_at: String,
     steps: Vec<LoopStepRecord>,
-    policy_decisions: Vec<BTreeMap<String, Value>>,
+    policy_decisions: Vec<PolicyDecision>,
     #[serde(default)]
     provider_exchange_records: Vec<ProviderExchangeRecordReference>,
     #[serde(default)]

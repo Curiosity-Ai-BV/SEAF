@@ -1292,7 +1292,7 @@ mod tests {
             development_evidence: reference.clone(),
             policy_decision: PolicyDecision {
                 patch_id: "run".to_string(),
-                patch_sha256: "b".repeat(64),
+                patch_sha256: format!("sha256:{}", "b".repeat(64)),
                 changed_paths: vec!["tracked.txt".to_string()],
                 decision: PatchDecisionKind::Allowed,
                 reasons: Vec::new(),
