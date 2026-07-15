@@ -1,3 +1,4 @@
+schema_version: 1
 ticket_id: T-LOCAL-001
 goal_id: local_agent_loop_mvp
 title: Add a health check command to the CLI

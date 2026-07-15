@@ -5,6 +5,7 @@ use seaf_core::{
     LoopStepName, PatchDecisionKind, Policy, PolicyDecision, PolicyDecisionReason, RiskLevel,
     TicketAutonomy, TicketContext, TicketPriority, TicketSpec, TicketStatus,
 };
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -37,6 +38,7 @@ fn ticket_rust_contract_and_schema_fields_cannot_drift() {
         &["eval"],
         &["eval", "research_questions"],
     );
+    assert_current_legacy_and_future_version_behavior(&ticket);
 }
 
 #[test]
@@ -55,11 +57,89 @@ fn policy_rust_contract_and_schema_fields_cannot_drift() {
         &[],
         &[],
     );
+    assert_current_legacy_and_future_version_behavior(&policy);
 }
 
 #[test]
 fn loop_run_rust_contract_and_schema_fields_cannot_drift() {
-    let run = LoopRun {
+    let run = minimal_loop_run();
+
+    let schema_text = include_str!("../../../specs/loop-run.schema.json");
+    assert_contract_schema_shape(
+        &run,
+        schema_text,
+        &[
+            "candidate_workspace",
+            "human_approval",
+            "eval_report_path",
+            "promotion",
+            "latest_recovery",
+        ],
+        &[
+            "execution_mode",
+            "provider_exchange_records",
+            "candidate_workspace",
+            "human_approval",
+            "eval_report_path",
+            "promotion",
+            "latest_recovery",
+        ],
+    );
+    assert_current_legacy_and_future_version_behavior(&run);
+
+    let schema: Value = serde_json::from_str(schema_text).expect("loop-run schema is JSON");
+    assert_eq!(
+        schema["properties"]["policy_decisions"]["items"]["$ref"],
+        json!("policy-decision.schema.json"),
+        "LoopRun policy decisions must use the shared PolicyDecision schema"
+    );
+}
+
+#[test]
+fn loop_run_v1_adds_only_schema_version_to_the_legacy_serialized_shape() {
+    let run = minimal_loop_run();
+    let current = serde_json::to_value(&run).expect("LoopRun serializes");
+    assert_eq!(
+        current,
+        json!({
+            "schema_version": 1,
+            "run_id": "run-1",
+            "ticket_id": "T-1",
+            "goal_id": "goal-1",
+            "provider": "fake",
+            "model": "fake-local",
+            "input_digests": {
+                "ticket": "a".repeat(64),
+                "policy": "b".repeat(64),
+                "config": "c".repeat(64),
+                "repository": "d".repeat(64)
+            },
+            "execution_mode": "legacy_proposal_only",
+            "status": "pending",
+            "current_step": "research",
+            "started_at": "2026-07-15T00:00:00Z",
+            "updated_at": "2026-07-15T00:00:00Z",
+            "steps": [],
+            "policy_decisions": [],
+            "provider_exchange_records": []
+        }),
+        "v1 must preserve the exact legacy LoopRun shape apart from schema_version"
+    );
+
+    let mut legacy = current;
+    legacy
+        .as_object_mut()
+        .expect("LoopRun serializes as an object")
+        .remove("schema_version");
+    assert_eq!(
+        serde_json::from_value::<LoopRun>(legacy).expect("legacy LoopRun reads"),
+        run,
+        "the preserved legacy shape must still deserialize"
+    );
+}
+
+fn minimal_loop_run() -> LoopRun {
+    LoopRun {
         run_id: "run-1".to_string(),
         ticket_id: "T-1".to_string(),
         goal_id: "goal-1".to_string(),
@@ -85,36 +165,7 @@ fn loop_run_rust_contract_and_schema_fields_cannot_drift() {
         eval_report_path: None,
         promotion: None,
         latest_recovery: None,
-    };
-
-    let schema_text = include_str!("../../../specs/loop-run.schema.json");
-    assert_contract_schema_shape(
-        &run,
-        schema_text,
-        &[
-            "candidate_workspace",
-            "human_approval",
-            "eval_report_path",
-            "promotion",
-            "latest_recovery",
-        ],
-        &[
-            "execution_mode",
-            "provider_exchange_records",
-            "candidate_workspace",
-            "human_approval",
-            "eval_report_path",
-            "promotion",
-            "latest_recovery",
-        ],
-    );
-
-    let schema: Value = serde_json::from_str(schema_text).expect("loop-run schema is JSON");
-    assert_eq!(
-        schema["properties"]["policy_decisions"]["items"]["$ref"],
-        json!("policy-decision.schema.json"),
-        "LoopRun policy decisions must use the shared PolicyDecision schema"
-    );
+    }
 }
 
 #[test]
@@ -136,6 +187,7 @@ fn policy_decision_rust_contract_and_schema_fields_cannot_drift() {
         &[],
         &[],
     );
+    assert_current_legacy_and_future_version_behavior(&decision);
 }
 
 #[test]
@@ -268,6 +320,58 @@ fn eval_report_rust_contract_and_schema_fields_cannot_drift() {
         &["score_delta_estimate", "loop_evidence"],
         &["score_delta_estimate", "loop_evidence"],
     );
+    assert_current_legacy_and_future_version_behavior(&report);
+}
+
+fn assert_current_legacy_and_future_version_behavior<T>(value: &T)
+where
+    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let current = serde_json::to_value(value).expect("durable contract serializes");
+    assert_eq!(
+        current["schema_version"],
+        json!(1),
+        "new durable artifacts must explicitly serialize the current version"
+    );
+    assert_eq!(
+        serde_json::from_value::<T>(current.clone()).expect("current v1 artifact reads"),
+        *value,
+    );
+
+    let mut legacy = current.clone();
+    legacy
+        .as_object_mut()
+        .expect("durable contract is an object")
+        .remove("schema_version");
+    assert_eq!(
+        serde_json::from_value::<T>(legacy).expect("legacy unversioned v0 artifact reads"),
+        *value,
+    );
+
+    for unsupported in [0, 2] {
+        let mut future = current.clone();
+        future
+            .as_object_mut()
+            .expect("durable contract is an object")
+            .insert("schema_version".to_string(), json!(unsupported));
+        let error = serde_json::from_value::<T>(future)
+            .expect_err("explicit unsupported versions must fail closed")
+            .to_string();
+        assert!(
+            error.contains("unsupported") && error.contains("schema_version"),
+            "version refusal must be actionable: {error}"
+        );
+    }
+
+    let mut unknown = current;
+    unknown
+        .as_object_mut()
+        .expect("durable contract is an object")
+        .insert("unexpected".to_string(), json!(true));
+    assert!(
+        serde_json::from_value::<T>(unknown).is_err(),
+        "durable contracts must remain closed to unknown fields"
+    );
 }
 
 fn assert_contract_schema_shape<T: Serialize>(
@@ -277,6 +381,11 @@ fn assert_contract_schema_shape<T: Serialize>(
     optional_or_default_fields: &[&str],
 ) {
     let schema: Value = serde_json::from_str(schema_text).expect("contract schema is JSON");
+    assert_eq!(
+        schema["properties"]["schema_version"]["const"],
+        json!(1),
+        "new durable artifact schemas must require exactly version 1"
+    );
     assert_object_schema_shape(
         value,
         &schema,

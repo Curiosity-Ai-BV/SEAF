@@ -547,7 +547,12 @@ Goal: turn observed usage failures into a small, supportable `0.x` contract.
   `LoopRun` stores typed decisions, and the five named Rust contracts have
   schema-drift coverage. The user authorized this slice ahead of the recorded
   M2-07 dependency; M2-07 remains unexecuted, and neither U9 nor Milestone 3 is
-  complete. Format versioning/migration and retention remain M3-02 and M3-03.
+  complete. **M3-02a is complete:** after independent specification and quality
+  approval plus the final controller gate, the five durable contracts emit
+  explicit schema version 1, read legacy unversioned v0 and current v1, and
+  reject explicit unsupported versions without mutating input files. Whole-run
+  migration remains M3-02b, so M3-02 is active rather than complete; retention
+  remains M3-03.
 - **U10 - Dogfood two real repositories.** Complete at least five bounded
   tickets across two different stacks, including an approved patch, a policy
   rejection, an eval failure, and an interrupted/resumed run. Track setup time,

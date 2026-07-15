@@ -1,3 +1,4 @@
+schema_version: 1
 ticket_id: packaged-external-golden-path
 goal_id: packaged-external-adoption
 title: Prove packaged SEAF adoption in a fresh external project

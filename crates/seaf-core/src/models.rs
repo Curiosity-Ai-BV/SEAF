@@ -3,6 +3,49 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const DURABLE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default)]
+enum DecodedSchemaVersion {
+    #[default]
+    Missing,
+    Present(u32),
+}
+
+impl Serialize for DecodedSchemaVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Present(version) => serializer.serialize_u32(*version),
+            Self::Missing => serializer.serialize_u32(DURABLE_ARTIFACT_SCHEMA_VERSION),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DecodedSchemaVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        u32::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+fn require_supported_schema_version(
+    version: DecodedSchemaVersion,
+    kind: &str,
+) -> Result<(), String> {
+    match version {
+        DecodedSchemaVersion::Missing
+        | DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION) => Ok(()),
+        DecodedSchemaVersion::Present(version) => Err(format!(
+            "unsupported {kind} schema_version {version}; expected {DURABLE_ARTIFACT_SCHEMA_VERSION}, or omit schema_version for a legacy v0 artifact"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
@@ -56,7 +99,7 @@ pub struct GoalSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PolicyWire", into = "PolicyWire")]
 pub struct Policy {
     pub policy_id: String,
     pub default_autonomy_level: u8,
@@ -68,8 +111,51 @@ pub struct Policy {
     pub allowed_without_review: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PolicyWire {
+    #[serde(default)]
+    schema_version: DecodedSchemaVersion,
+    policy_id: String,
+    default_autonomy_level: u8,
+    #[serde(default)]
+    forbidden_paths: Vec<String>,
+    #[serde(default)]
+    requires_human_review: Vec<String>,
+    #[serde(default)]
+    allowed_without_review: Vec<String>,
+}
+
+impl TryFrom<PolicyWire> for Policy {
+    type Error = String;
+
+    fn try_from(wire: PolicyWire) -> Result<Self, Self::Error> {
+        require_supported_schema_version(wire.schema_version, "Policy")?;
+        Ok(Self {
+            policy_id: wire.policy_id,
+            default_autonomy_level: wire.default_autonomy_level,
+            forbidden_paths: wire.forbidden_paths,
+            requires_human_review: wire.requires_human_review,
+            allowed_without_review: wire.allowed_without_review,
+        })
+    }
+}
+
+impl From<Policy> for PolicyWire {
+    fn from(policy: Policy) -> Self {
+        Self {
+            schema_version: DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION),
+            policy_id: policy.policy_id,
+            default_autonomy_level: policy.default_autonomy_level,
+            forbidden_paths: policy.forbidden_paths,
+            requires_human_review: policy.requires_human_review,
+            allowed_without_review: policy.allowed_without_review,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PolicyDecisionWire", into = "PolicyDecisionWire")]
 pub struct PolicyDecision {
     pub patch_id: String,
     pub patch_sha256: String,
@@ -79,6 +165,55 @@ pub struct PolicyDecision {
     pub requires_human_review: bool,
     pub apply_requested: bool,
     pub applied: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDecisionWire {
+    #[serde(default)]
+    schema_version: DecodedSchemaVersion,
+    patch_id: String,
+    patch_sha256: String,
+    changed_paths: Vec<String>,
+    decision: PatchDecisionKind,
+    reasons: Vec<PolicyDecisionReason>,
+    requires_human_review: bool,
+    apply_requested: bool,
+    applied: bool,
+}
+
+impl TryFrom<PolicyDecisionWire> for PolicyDecision {
+    type Error = String;
+
+    fn try_from(wire: PolicyDecisionWire) -> Result<Self, Self::Error> {
+        require_supported_schema_version(wire.schema_version, "PolicyDecision")?;
+        Ok(Self {
+            patch_id: wire.patch_id,
+            patch_sha256: wire.patch_sha256,
+            changed_paths: wire.changed_paths,
+            decision: wire.decision,
+            reasons: wire.reasons,
+            requires_human_review: wire.requires_human_review,
+            apply_requested: wire.apply_requested,
+            applied: wire.applied,
+        })
+    }
+}
+
+impl From<PolicyDecision> for PolicyDecisionWire {
+    fn from(decision: PolicyDecision) -> Self {
+        Self {
+            schema_version: DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION),
+            patch_id: decision.patch_id,
+            patch_sha256: decision.patch_sha256,
+            changed_paths: decision.changed_paths,
+            decision: decision.decision,
+            reasons: decision.reasons,
+            requires_human_review: decision.requires_human_review,
+            apply_requested: decision.apply_requested,
+            applied: decision.applied,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +322,7 @@ pub struct EvalLoopEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "EvalReportWire", into = "EvalReportWire")]
 pub struct EvalReport {
     pub eval_report_id: String,
     pub patch_id: String,
@@ -201,6 +336,63 @@ pub struct EvalReport {
     pub decision: EvalDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_evidence: Option<EvalLoopEvidence>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvalReportWire {
+    #[serde(default)]
+    schema_version: DecodedSchemaVersion,
+    eval_report_id: String,
+    patch_id: String,
+    goal_id: String,
+    passed: bool,
+    summary: String,
+    checks: Vec<EvalCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    score_delta_estimate: Option<f64>,
+    risk_level: RiskLevel,
+    decision: EvalDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loop_evidence: Option<EvalLoopEvidence>,
+}
+
+impl TryFrom<EvalReportWire> for EvalReport {
+    type Error = String;
+
+    fn try_from(wire: EvalReportWire) -> Result<Self, Self::Error> {
+        require_supported_schema_version(wire.schema_version, "EvalReport")?;
+        Ok(Self {
+            eval_report_id: wire.eval_report_id,
+            patch_id: wire.patch_id,
+            goal_id: wire.goal_id,
+            passed: wire.passed,
+            summary: wire.summary,
+            checks: wire.checks,
+            score_delta_estimate: wire.score_delta_estimate,
+            risk_level: wire.risk_level,
+            decision: wire.decision,
+            loop_evidence: wire.loop_evidence,
+        })
+    }
+}
+
+impl From<EvalReport> for EvalReportWire {
+    fn from(report: EvalReport) -> Self {
+        Self {
+            schema_version: DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION),
+            eval_report_id: report.eval_report_id,
+            patch_id: report.patch_id,
+            goal_id: report.goal_id,
+            passed: report.passed,
+            summary: report.summary,
+            checks: report.checks,
+            score_delta_estimate: report.score_delta_estimate,
+            risk_level: report.risk_level,
+            decision: report.decision,
+            loop_evidence: report.loop_evidence,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,7 +520,7 @@ pub enum TicketPriority {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "TicketSpecWire", into = "TicketSpecWire")]
 pub struct TicketSpec {
     pub ticket_id: String,
     pub goal_id: String,
@@ -343,6 +535,66 @@ pub struct TicketSpec {
     pub acceptance_criteria: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval: Option<TicketEval>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketSpecWire {
+    #[serde(default)]
+    schema_version: DecodedSchemaVersion,
+    ticket_id: String,
+    goal_id: String,
+    title: String,
+    status: TicketStatus,
+    priority: TicketPriority,
+    problem: String,
+    #[serde(default)]
+    research_questions: Vec<String>,
+    context: TicketContext,
+    autonomy: TicketAutonomy,
+    acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eval: Option<TicketEval>,
+}
+
+impl TryFrom<TicketSpecWire> for TicketSpec {
+    type Error = String;
+
+    fn try_from(wire: TicketSpecWire) -> Result<Self, Self::Error> {
+        require_supported_schema_version(wire.schema_version, "TicketSpec")?;
+        Ok(Self {
+            ticket_id: wire.ticket_id,
+            goal_id: wire.goal_id,
+            title: wire.title,
+            status: wire.status,
+            priority: wire.priority,
+            problem: wire.problem,
+            research_questions: wire.research_questions,
+            context: wire.context,
+            autonomy: wire.autonomy,
+            acceptance_criteria: wire.acceptance_criteria,
+            eval: wire.eval,
+        })
+    }
+}
+
+impl From<TicketSpec> for TicketSpecWire {
+    fn from(ticket: TicketSpec) -> Self {
+        Self {
+            schema_version: DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION),
+            ticket_id: ticket.ticket_id,
+            goal_id: ticket.goal_id,
+            title: ticket.title,
+            status: ticket.status,
+            priority: ticket.priority,
+            problem: ticket.problem,
+            research_questions: ticket.research_questions,
+            context: ticket.context,
+            autonomy: ticket.autonomy,
+            acceptance_criteria: ticket.acceptance_criteria,
+            eval: ticket.eval,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -406,8 +658,8 @@ pub enum LoopStepName {
     EvalReport,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "LoopRunWire", into = "LoopRunWire")]
 pub struct LoopRun {
     pub run_id: String,
     pub ticket_id: String,
@@ -437,9 +689,11 @@ pub struct LoopRun {
     pub latest_recovery: Option<RecoveryReference>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoopRunWire {
+    #[serde(default)]
+    schema_version: DecodedSchemaVersion,
     run_id: String,
     ticket_id: String,
     goal_id: String,
@@ -456,15 +710,15 @@ struct LoopRunWire {
     policy_decisions: Vec<PolicyDecision>,
     #[serde(default)]
     provider_exchange_records: Vec<ProviderExchangeRecordReference>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     candidate_workspace: Option<CandidateWorkspaceState>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     human_approval: Option<HumanApprovalEvidence>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     eval_report_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     promotion: Option<PromotionEvidence>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_recovery: Option<RecoveryReference>,
 }
 
@@ -484,12 +738,23 @@ impl<'de> Deserialize<'de> for DecodedExecutionMode {
     }
 }
 
-impl<'de> Deserialize<'de> for LoopRun {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl Serialize for DecodedExecutionMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        D: serde::Deserializer<'de>,
+        S: serde::Serializer,
     {
-        let wire = LoopRunWire::deserialize(deserializer)?;
+        match self {
+            Self::Present(mode) => mode.serialize(serializer),
+            Self::Missing => LoopExecutionMode::LegacyProposalOnly.serialize(serializer),
+        }
+    }
+}
+
+impl TryFrom<LoopRunWire> for LoopRun {
+    type Error = String;
+
+    fn try_from(wire: LoopRunWire) -> Result<Self, Self::Error> {
+        require_supported_schema_version(wire.schema_version, "LoopRun")?;
         let execution_mode = match wire.execution_mode {
             DecodedExecutionMode::Present(mode) => mode,
             DecodedExecutionMode::Missing
@@ -501,23 +766,25 @@ impl<'de> Deserialize<'de> for LoopRun {
                         | LoopStatus::Promoted
                 ) =>
             {
-                return Err(serde::de::Error::custom(
-                    "human review states require explicit isolated_candidate execution_mode",
-                ));
+                return Err(
+                    "human review states require explicit isolated_candidate execution_mode"
+                        .to_string(),
+                );
             }
             DecodedExecutionMode::Missing
                 if wire.status == LoopStatus::Failed && wire.human_approval.is_some() =>
             {
-                return Err(serde::de::Error::custom(
-                    "final integrated evaluation requires explicit isolated_candidate execution_mode",
-                ));
+                return Err(
+                    "final integrated evaluation requires explicit isolated_candidate execution_mode"
+                        .to_string(),
+                );
             }
             DecodedExecutionMode::Missing if wire.candidate_workspace.is_some() => {
                 LoopExecutionMode::IsolatedCandidate
             }
             DecodedExecutionMode::Missing => LoopExecutionMode::LegacyProposalOnly,
         };
-        Ok(Self {
+        Ok(LoopRun {
             run_id: wire.run_id,
             ticket_id: wire.ticket_id,
             goal_id: wire.goal_id,
@@ -538,6 +805,33 @@ impl<'de> Deserialize<'de> for LoopRun {
             promotion: wire.promotion,
             latest_recovery: wire.latest_recovery,
         })
+    }
+}
+
+impl From<LoopRun> for LoopRunWire {
+    fn from(run: LoopRun) -> Self {
+        Self {
+            schema_version: DecodedSchemaVersion::Present(DURABLE_ARTIFACT_SCHEMA_VERSION),
+            run_id: run.run_id,
+            ticket_id: run.ticket_id,
+            goal_id: run.goal_id,
+            provider: run.provider,
+            model: run.model,
+            input_digests: run.input_digests,
+            execution_mode: DecodedExecutionMode::Present(run.execution_mode),
+            status: run.status,
+            current_step: run.current_step,
+            started_at: run.started_at,
+            updated_at: run.updated_at,
+            steps: run.steps,
+            policy_decisions: run.policy_decisions,
+            provider_exchange_records: run.provider_exchange_records,
+            candidate_workspace: run.candidate_workspace,
+            human_approval: run.human_approval,
+            eval_report_path: run.eval_report_path,
+            promotion: run.promotion,
+            latest_recovery: run.latest_recovery,
+        }
     }
 }
 

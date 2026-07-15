@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "policy_id": "default-local-project-policy",
   "default_autonomy_level": 1,
   "forbidden_paths": [

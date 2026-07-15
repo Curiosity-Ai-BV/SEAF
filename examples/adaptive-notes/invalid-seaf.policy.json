@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "policy_id": "",
   "default_autonomy_level": 9,
   "forbidden_paths": [],

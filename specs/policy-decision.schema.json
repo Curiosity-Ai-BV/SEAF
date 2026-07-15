@@ -4,6 +4,7 @@
   "title": "SEAF PolicyDecision",
   "type": "object",
   "required": [
+    "schema_version",
     "patch_id",
     "patch_sha256",
     "changed_paths",
@@ -14,6 +15,7 @@
     "applied"
   ],
   "properties": {
+    "schema_version": { "const": 1 },
     "patch_id": { "type": "string", "minLength": 1 },
     "patch_sha256": {
       "type": "string",

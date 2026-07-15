@@ -2550,6 +2550,10 @@ versioning, migration, retention, and purge remain outside this slice.
 
 Roadmap: U9. Dependencies: M3-01.
 
+Status: active. The work is split so format compatibility can land independently
+of the larger whole-run migration transaction. M3-02a is complete; M3-02b
+remains open, so M3-02 and U9 are not complete.
+
 Objective: version durable files and define compatible upgrade behavior.
 
 Acceptance criteria:
@@ -2570,6 +2574,28 @@ matrix.
 Docs/tracker: compatibility/migration policy and M3-02 status.
 
 Commit boundary: artifact versioning and migration only.
+
+#### M3-02a - Artifact Format Versions And Read Compatibility
+
+Status: complete after independent specification and quality approval plus the
+final controller gate.
+
+`TicketSpec`, `Policy`, `LoopRun`, `PolicyDecision`, and `EvalReport` now
+serialize with an explicit top-level `schema_version: 1`. Their typed readers
+accept either the current explicit version or a legacy document with the field
+omitted. Explicit `schema_version: 0`, future versions, and unknown fields fail
+closed with an actionable parse error. Reading an unsupported file is
+non-mutating, and serializing a successfully read legacy value always emits the
+current version. The five public schemas require `schema_version` with
+`const: 1`; current templates and fixtures emit it. Existing versioned nested
+evidence keeps its own schema contract and was not changed.
+
+#### M3-02b - Whole-Run Artifact Migration
+
+Status: pending. Implement the recoverable run-wide v0-to-v1 migration,
+transitive digest/reference rewrites, byte-exact backup, audited result, crash
+recovery, and idempotent CLI retry. Per-file migration is not permitted because
+it would invalidate authenticated cross-artifact references.
 
 ### M3-03 - Retention And Audited Purge
 

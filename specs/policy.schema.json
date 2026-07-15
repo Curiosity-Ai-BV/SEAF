@@ -4,6 +4,7 @@
   "title": "SEAF Policy",
   "type": "object",
   "required": [
+    "schema_version",
     "policy_id",
     "default_autonomy_level",
     "forbidden_paths",
@@ -11,6 +12,7 @@
     "allowed_without_review"
   ],
   "properties": {
+    "schema_version": { "const": 1 },
     "policy_id": { "type": "string", "minLength": 1 },
     "default_autonomy_level": { "type": "integer", "minimum": 0, "maximum": 4 },
     "forbidden_paths": {

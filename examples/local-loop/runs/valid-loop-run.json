@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "run_id": "loop_20260701_001",
   "ticket_id": "T-LOCAL-001",
   "goal_id": "local_agent_loop_mvp",

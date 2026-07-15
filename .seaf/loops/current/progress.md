@@ -62,6 +62,8 @@
 
 - [x] M3-01: Typed durable loop contracts.
 - [ ] M3-02: Artifact format versions and migration.
+  - [x] M3-02a: Artifact format versions and read compatibility.
+  - [ ] M3-02b: Whole-run artifact migration.
 - [ ] M3-03: Retention and audited purge.
 - [ ] M3-04: Two-repository pilot evidence.
 - [ ] M3-05: Supported preview readiness.
@@ -97,7 +99,11 @@ M3-01 is complete: `seaf-core` owns the shared policy-decision types,
 `LoopRun.policy_decisions` is typed, and Ticket, Policy, LoopRun,
 PolicyDecision, and EvalReport have Rust/schema drift coverage. M2-07 remains
 unexecuted, Milestone 2 remains active, and Milestone 3 remains incomplete.
-Artifact versioning/migration and retention/purge remain M3-02 and M3-03.
+M3-02a is complete after specification and quality approval plus the final
+controller gate: the five durable contracts emit schema version 1, accept
+legacy unversioned v0 and current v1, and reject explicit unsupported versions
+without mutating source files. M3-02 remains active because the run-wide
+migration transaction is still M3-02b. Retention/purge remains M3-03.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI

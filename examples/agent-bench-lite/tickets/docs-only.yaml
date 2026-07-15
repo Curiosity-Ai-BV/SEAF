@@ -1,3 +1,4 @@
+schema_version: 1
 ticket_id: T-BENCH-003
 goal_id: agent_bench_lite
 title: Docs-only change

@@ -4,6 +4,7 @@
   "title": "SEAF TicketSpec",
   "type": "object",
   "required": [
+    "schema_version",
     "ticket_id",
     "goal_id",
     "title",
@@ -15,6 +16,7 @@
     "acceptance_criteria"
   ],
   "properties": {
+    "schema_version": { "const": 1 },
     "ticket_id": { "type": "string", "minLength": 1 },
     "goal_id": { "type": "string", "minLength": 1 },
     "title": { "type": "string", "minLength": 1 },

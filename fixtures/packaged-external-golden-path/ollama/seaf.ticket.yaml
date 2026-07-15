@@ -1,3 +1,4 @@
+schema_version: 1
 ticket_id: packaged-ollama-golden-path
 goal_id: packaged-ollama-adoption
 title: Make the one permitted Ollama acceptance edit

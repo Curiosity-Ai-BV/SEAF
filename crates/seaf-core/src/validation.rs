@@ -2733,6 +2733,87 @@ unexpected_escape: true
     }
 
     #[test]
+    fn unsupported_versions_fail_without_mutating_durable_input_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let policy_path = temp_dir.path().join("policy.json");
+        let policy_bytes = future_version_bytes(crate::templates::DEFAULT_POLICY_JSON);
+        std::fs::write(&policy_path, &policy_bytes).expect("write policy");
+        let policy_error = load_policy_file(&policy_path).expect_err("future policy must fail");
+        assert_version_error(&policy_error);
+        assert_eq!(std::fs::read(&policy_path).unwrap(), policy_bytes);
+
+        let ticket_path = temp_dir.path().join("ticket.json");
+        let ticket = load_ticket_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/local-loop/tickets/add-health-command.yaml"),
+        )
+        .expect("ticket fixture");
+        let ticket_bytes = future_version_value(&ticket);
+        std::fs::write(&ticket_path, &ticket_bytes).expect("write ticket");
+        let ticket_error = load_ticket_file(&ticket_path).expect_err("future ticket must fail");
+        assert_version_error(&ticket_error);
+        assert_eq!(std::fs::read(&ticket_path).unwrap(), ticket_bytes);
+
+        let run_path = temp_dir.path().join("run.json");
+        let run = load_loop_run_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/local-loop/runs/valid-loop-run.json"),
+        )
+        .expect("run fixture");
+        let run_bytes = future_version_value(&run);
+        std::fs::write(&run_path, &run_bytes).expect("write run");
+        let run_error = load_loop_run_file(&run_path).expect_err("future run must fail");
+        assert_version_error(&run_error);
+        assert_eq!(std::fs::read(&run_path).unwrap(), run_bytes);
+
+        let report_path = temp_dir.path().join("eval-report.json");
+        let report: EvalReport = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "eval_report_id": "eval-version-refusal",
+            "patch_id": "patch-version-refusal",
+            "goal_id": "goal-version-refusal",
+            "passed": false,
+            "summary": "Future versions must not mutate source bytes.",
+            "checks": [{"name": "version", "status": "failed"}],
+            "risk_level": "high",
+            "decision": "reject"
+        }))
+        .expect("current report");
+        let report_bytes = future_version_value(&report);
+        std::fs::write(&report_path, &report_bytes).expect("write report");
+        let report_error =
+            load_eval_report_file(&report_path).expect_err("future EvalReport must fail");
+        assert_version_error(&report_error);
+        assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
+    }
+
+    fn future_version_bytes(current: &str) -> Vec<u8> {
+        let value: serde_json::Value = serde_json::from_str(current).expect("current JSON");
+        future_version_json(value)
+    }
+
+    fn future_version_value<T: Serialize>(value: &T) -> Vec<u8> {
+        future_version_json(serde_json::to_value(value).expect("current artifact serializes"))
+    }
+
+    fn future_version_json(mut value: serde_json::Value) -> Vec<u8> {
+        value
+            .as_object_mut()
+            .expect("durable artifact is an object")
+            .insert("schema_version".to_string(), serde_json::json!(2));
+        serde_json::to_vec_pretty(&value).expect("future fixture serializes")
+    }
+
+    fn assert_version_error(report: &ValidationReport) {
+        assert!(report.errors.iter().any(|error| {
+            error.field == "file"
+                && error.message.contains("unsupported")
+                && error.message.contains("schema_version")
+        }));
+    }
+
+    #[test]
     fn loop_run_requires_effective_input_digests() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let run_path = temp_dir.path().join("loop-run.json");

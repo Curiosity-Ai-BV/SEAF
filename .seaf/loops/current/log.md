@@ -2985,3 +2985,91 @@ all-feature Clippy, all 168 CLI tests, 52 core unit tests, 6 drift tests, 301
 loop unit tests, every remaining Rust workspace and doc test, Prettier, SDK
 lint/typecheck, all 8 SDK tests, SDK build, and `git diff --check`. No test was
 skipped.
+
+## 2026-07-15 implemented, review pending | M3-02a artifact versions and read compatibility
+
+M3-02 was split at the authenticated cross-artifact boundary. M3-02a covers
+format versions and compatible reads; M3-02b remains the pending recoverable
+whole-run migration transaction. M3-02 and U9 remain active, not complete.
+
+The required RED was
+`cargo test -p seaf-core --test durable_schema_drift`. Five contract tests
+failed because TicketSpec, Policy, LoopRun, PolicyDecision, and EvalReport did
+not serialize `schema_version`. The shared typed compatibility layer now emits
+version 1, accepts a missing version as legacy v0, accepts explicit v1, and
+rejects explicit v0 or future versions with actionable errors. Current public
+schemas, templates, and fixtures require or emit version 1. Unsupported file
+reads are covered as non-mutating. Existing nested evidence with its own
+version field was not changed.
+
+The initial implementation gate passed 6 drift tests, 53 core unit tests, Rust
+formatting, strict locked all-target/all-feature Clippy, all 168 CLI tests, 301
+loop unit tests, every remaining Rust workspace and doc test, Prettier, SDK
+lint/typecheck, all 8 SDK tests, SDK build, and `git diff --check`, with no
+ignored tests. Specification review then returned `CHANGES_REQUIRED` for two P1
+findings: `LoopRun` v1 serialization emitted five absent optional fields as
+`null`, and this entry interrupted the existing M3-01 chronology.
+
+The correction RED was the exact LoopRun serialized-shape regression. It failed
+on precisely those five unexpected `null` fields. The minimal wire correction
+restores the original omission attributes; the exact regression proves that
+the only top-level legacy-to-current shape addition is `schema_version`. GREEN
+passed all 7 drift tests and all 53 core unit tests, and Rust formatting passed.
+Tracking-document Prettier and `git diff --check` also passed. Specification
+review remains rejected pending correction re-review. Quality review has not
+started, and no review approval is claimed. Per controller direction, the full
+workspace gate will be rerun only after final approval.
+
+## 2026-07-15 quality changes required | M3-02a independent mapping evidence
+
+Specification re-review approved the optional-field serialization and log
+chronology correction with no findings. Quality review then returned
+`CHANGES_REQUIRED`: current trackers claimed completion before quality approval
+and the final controller gate, and same-wire roundtrips did not independently
+prove every field mapping against authored documents.
+
+The quality correction started by reopening the M3-02a checklist and recording
+the status as implemented and specification-approved, with quality approval and
+the final controller gate pending. The mapping correction uses independently
+authored current and legacy JSON/YAML documents, separately constructed Rust
+values, and distinct field sentinels; it does not change a correct production
+mapping merely to manufacture a failure. Its witnessed RED was an explicit
+test-only sentinel probe: authored Ticket JSON decoded `goal-wire-sentinel`,
+while the deliberately mismatched expected value was `goal-probe-sentinel`.
+The focused test failed on that exact field, proving the independent comparison
+detects a same-typed mapping mismatch before the probe was removed.
+
+## 2026-07-15 quality correction implemented, re-review pending | M3-02a mapping coverage
+
+After removing only the deliberate probe, 6 focused mapping tests passed. They
+bind independently authored current and legacy documents to separately built
+Rust values for TicketSpec, Policy, PolicyDecision, EvalReport, and LoopRun in
+both read and write directions. Distinct sentinels cover every top-level field,
+populated and omitted PolicyDecisionReason options, populated EvalCheck and
+EvalLoopEvidence fields, and a nontrivial LoopRun with a step, nested policy
+decision, provider references, human approval, eval path, and recovery
+reference. Ticket and Policy YAML tests accept missing legacy versions and
+explicit v1, while explicit v0 and future v2 fail with actionable version
+errors. No production mapping changed.
+
+The focused gate passed all 7 schema-drift tests, all 53 core unit tests, the 6
+mapping tests, core doc tests, and Rust formatting, with no ignored tests. The
+M3-02a checklist remains open. Quality re-review and the final controller gate
+are pending; no quality approval or completion is claimed, and the full
+workspace gate was not rerun in this correction.
+
+## 2026-07-15 accepted | M3-02a artifact versions and read compatibility
+
+Quality re-review approved the independent mapping and truthful-tracking
+corrections with no findings. The controller's exact final gate passed Rust
+formatting, strict locked all-target/all-feature Clippy, all 168 CLI tests, 53
+core unit tests, 7 schema-drift tests, 6 independent wire/JSON/YAML tests, 301
+loop unit tests, every remaining Rust workspace and doc test, Prettier, SDK
+lint/typecheck, all 8 SDK tests, SDK build, and `git diff --check`. No test was
+ignored or skipped.
+
+M3-02a is accepted. M3-02 remains active because M3-02b still owns the
+recoverable whole-run v0-to-v1 migration, transitive authority rewrites,
+byte-exact backup, audited result, crash recovery, and idempotent CLI retry.
+M2-07 remains unexecuted; M3-02, U9, and both Milestones 2 and 3 remain
+incomplete.
