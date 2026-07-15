@@ -135,6 +135,21 @@ fn role_response_roles_have_short_prompts_and_schemas() {
 }
 
 #[test]
+fn developer_prompt_requires_a_complete_git_style_diff_without_prose_or_omitted_hunks() {
+    let prompt = Role::Developer.system_prompt();
+
+    for required_component in ["diff --git", "---", "+++", "@@"] {
+        assert!(
+            prompt.contains(required_component),
+            "Developer prompt must show the required {required_component:?} diff component"
+        );
+    }
+    assert!(prompt.contains("complete git-style unified diff"));
+    assert!(prompt.contains("Do not include prose"));
+    assert!(prompt.contains("do not omit hunk headers"));
+}
+
+#[test]
 fn role_response_common_roles_parse_valid_fixtures() {
     for (role, name) in [
         (Role::Researcher, "research.valid.json"),
