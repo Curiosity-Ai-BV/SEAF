@@ -9008,6 +9008,177 @@ fn loop_smoke_produces_json_artifacts_without_ollama() {
 }
 
 #[test]
+fn loop_purge_defaults_to_dry_run_and_requires_apply_for_deletion() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runs_root = temp_dir.path().join("runs");
+    let smoke = seaf()
+        .args([
+            "loop",
+            "smoke",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run smoke fixture");
+    assert!(smoke.status.success(), "{smoke:?}");
+    let smoke_report: serde_json::Value = serde_json::from_slice(&smoke.stdout).unwrap();
+    let run_id = smoke_report["run_id"].as_str().unwrap();
+
+    let dry_run = seaf()
+        .args([
+            "loop",
+            "purge",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--max-managed-bytes",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run purge dry-run");
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let dry_report: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_report["mode"], "dry_run");
+    assert_eq!(dry_report["decision"]["selected"][0]["run_id"], run_id);
+    assert!(runs_root.join(run_id).is_dir());
+    assert!(!runs_root.join(".retention-purge.intent.json").exists());
+    assert!(!runs_root.join(".retention-purge.result.json").exists());
+
+    let apply = seaf()
+        .args([
+            "loop",
+            "purge",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--max-managed-bytes",
+            "0",
+            "--apply",
+            "--json",
+        ])
+        .output()
+        .expect("apply purge");
+    assert!(apply.status.success(), "{apply:?}");
+    let apply_report: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_report["mode"], "apply");
+    assert_eq!(apply_report["deleted"][0]["run_id"], run_id);
+    assert!(!runs_root.join(run_id).exists());
+    assert!(runs_root.join(".retention-purge.result.json").is_file());
+}
+
+#[test]
+fn loop_purge_preserves_authenticated_eval_passed_and_promoted_live_authority() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: retention_gate\n      command: printf retention-ready\n",
+    )
+    .expect("passing eval config");
+    commit_all(&repo, "Configure retention eval");
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "cli-retention-final-authority";
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+
+    let dry_run = || {
+        let output = seaf_in(&repo)
+            .args([
+                "loop",
+                "purge",
+                "--runs-root",
+                runs_root.to_str().unwrap(),
+                "--max-managed-bytes",
+                "0",
+                "--json",
+            ])
+            .output()
+            .expect("retention dry-run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("purge report JSON")
+    };
+    let selected_run_ids = |report: &serde_json::Value| {
+        report["decision"]["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["run_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let protected_run_ids = |report: &serde_json::Value| {
+        report["decision"]["snapshot"]["protected_active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run_id| run_id.as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let eval_passed_report = dry_run();
+    assert!(selected_run_ids(&eval_passed_report).is_empty());
+    assert_eq!(protected_run_ids(&eval_passed_report), [run_id]);
+
+    let status = seaf_in(&repo)
+        .args([
+            "loop",
+            "status",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("promotion status");
+    assert!(status.status.success(), "{status:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let promoted = seaf_in(&repo)
+        .args([
+            "loop",
+            "promote",
+            "--run-id",
+            run_id,
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--reviewer",
+            "retention-reviewer@example.invalid",
+            "--confirm-candidate-diff",
+            status["candidate_diff_digest"].as_str().unwrap(),
+            "--confirm-eval-report",
+            status["eval_report_digest"].as_str().unwrap(),
+            "--confirm-target-head",
+            status["target_head"].as_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("promote retained run");
+    assert!(
+        promoted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+
+    let live_promoted_report = dry_run();
+    assert!(selected_run_ids(&live_promoted_report).is_empty());
+    assert_eq!(protected_run_ids(&live_promoted_report), [run_id]);
+    let run_file = runs_root.join(run_id).join("run.json");
+    let authenticated = seaf_core::load_loop_run_file(&run_file)
+        .expect("Promoted run must satisfy the typed durable contract");
+    assert_eq!(authenticated.status, seaf_core::LoopStatus::Promoted);
+    assert_eq!(
+        authenticated.candidate_workspace.unwrap().lifecycle,
+        seaf_core::CandidateWorkspaceLifecycle::Active,
+        "final passing authority remains actionable and therefore retention-protected"
+    );
+}
+
+#[test]
 fn loop_inspect_is_factual_and_byte_identical_in_json_and_human_modes() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");

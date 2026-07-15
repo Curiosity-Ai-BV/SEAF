@@ -245,6 +245,46 @@ pub fn migrate_loop_run(
     migrate_loop_run_with_fault(runs_root, run_id, PublicationPhase::None)
 }
 
+pub(crate) fn pending_migration_source_is_protected(
+    runs_root: &crate::artifact_safety::PinnedPrivateDirectory,
+    run_id: &str,
+) -> Result<bool, MigrationError> {
+    validate_run_id(run_id)?;
+    let paths = MigrationPaths::new(runs_root.path(), run_id);
+    let intent_name = paths.intent.file_name().expect("intent name");
+    if !pending_migration_entry_exists(runs_root, intent_name)? {
+        return Ok(false);
+    }
+    if pinned_entry_exists(runs_root, paths.backup.file_name().expect("backup name"))? {
+        return Err(MigrationError::new(
+            "pending migration source has a backup but no published migration result",
+        ));
+    }
+
+    let intent = load_bound_intent(runs_root, intent_name, run_id, &paths.source)?;
+    if pinned_entry_exists(runs_root, paths.staged.file_name().expect("staged name"))? {
+        authenticate_current_staged_run(&paths.staged, &paths.source, run_id, &intent)?;
+    }
+    Ok(true)
+}
+
+fn pending_migration_entry_exists(
+    runs_root: &crate::artifact_safety::PinnedPrivateDirectory,
+    name: &OsStr,
+) -> Result<bool, MigrationError> {
+    runs_root.validate_identity()?;
+    match runs_root.entry_kind(name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => Ok(false),
+        Err(error) => Err(MigrationError::context(
+            "could not inspect pending migration entry",
+            error,
+        )),
+    }
+}
+
 fn migrate_loop_run_with_fault(
     runs_root: &Path,
     run_id: &str,
@@ -3580,6 +3620,61 @@ mod tests {
             assert!(!runs_root
                 .join(format!(".{run_id}.migration-v0-v1.staged"))
                 .exists());
+        }
+    }
+
+    #[test]
+    fn retention_preserves_completed_source_during_pending_migration_publication() {
+        for phase in [PublicationPhase::AfterIntent, PublicationPhase::AfterStaged] {
+            let temp = tempfile::tempdir().unwrap();
+            let runs_root = temp.path().join("runs");
+            fs::create_dir(&runs_root).unwrap();
+            let run_id = format!("retention-{phase:?}").to_ascii_lowercase();
+            write_legacy_fixture(&runs_root, &run_id);
+            let run_path = runs_root.join(&run_id).join("run.json");
+            let mut run: Value = serde_json::from_slice(&fs::read(&run_path).unwrap()).unwrap();
+            run["status"] = json!("completed");
+            fs::write(&run_path, canonical_json_bytes(&run).unwrap()).unwrap();
+
+            let error = migrate_loop_run_with_fault(&runs_root, &run_id, phase)
+                .expect_err("fault must leave a real pending migration transaction");
+            assert!(error.interrupted, "{phase:?}: {error}");
+            assert!(runs_root
+                .join(format!(".{run_id}.migration-v0-v1.intent.json"))
+                .is_file());
+            assert_eq!(
+                runs_root
+                    .join(format!(".{run_id}.migration-v0-v1.staged"))
+                    .is_dir(),
+                phase == PublicationPhase::AfterStaged
+            );
+
+            let report = crate::retention::purge_loop_runs(
+                &runs_root,
+                crate::retention::RetentionPolicy {
+                    max_managed_bytes: 0,
+                },
+                crate::retention::PurgeMode::Apply,
+            )
+            .expect("retention must protect the authenticated migration source");
+
+            assert!(runs_root.join(&run_id).is_dir(), "{phase:?}");
+            assert_eq!(
+                report
+                    .decision
+                    .snapshot
+                    .protected_migration_evidence
+                    .as_slice(),
+                std::slice::from_ref(&run_id),
+                "{phase:?}"
+            );
+            let outcome = migrate_loop_run(&runs_root, &run_id)
+                .expect("ordinary migration retry must recover protected source");
+            assert!(matches!(
+                outcome.status,
+                MigrationStatus::Migrated | MigrationStatus::Recovered
+            ));
+            assert!(runs_root.join(&run_id).join(RESULT_FILE).is_file());
         }
     }
 

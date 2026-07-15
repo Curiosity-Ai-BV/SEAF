@@ -64,7 +64,25 @@
 - [x] M3-02: Artifact format versions and migration.
   - [x] M3-02a: Artifact format versions and read compatibility.
   - [x] M3-02b: Whole-run artifact migration.
-- [ ] M3-03: Retention and audited purge.
+- [x] M3-03: Retention and audited purge.
+  - A cross-slice review reopened acceptance after finding that real
+    `source + intent` and `source + staged + intent` migration crash states
+    could expose an unlocked Passed/Completed source to purge. The correction
+    protects only an intent-bound matching source, fails closed on malformed
+    matching controls, and retains ordinary eligibility despite unrelated dot
+    siblings. Independent cross-slice re-review approved the correction with no
+    remaining P0/P1/P2 findings, and the full controller gate passed.
+  - `docs/run-retention.md` records the exact managed budget,
+    Passed/Completed eligibility, EvalPassed/Promoted final-authority
+    protection, protected/excluded namespaces, recovery, and latest-audit
+    boundary.
+  - Initial specification review returned audit-snapshot, hard-link, and policy
+    matrix findings. A later quality review returned guard-lifetime,
+    partial-tombstone, timestamp-ordering, audit-relocation, atomic-replacement,
+    and control-cap findings. Re-review then found continuation-history,
+    operator/control boundary, long-run-ID tombstone, and final-batch stale
+    adoption defects. Those earlier corrections and the later cross-slice fix
+    passed their independent reviews and full repository gates.
 - [ ] M3-04: Two-repository pilot evidence.
 - [ ] M3-05: Supported preview readiness.
 - [ ] M3-06: Human-authorized preview publication.
@@ -103,8 +121,11 @@ M3-02a is complete after specification and quality approval plus the final
 controller gate: the five durable contracts emit schema version 1, accept
 legacy unversioned v0 and current v1, and reject explicit unsupported versions
 without mutating source files. M3-02 is complete after independent
-specification and quality approval plus the final controller gate. U9 remains
-active because retention/purge is still M3-03.
+specification and quality approval plus the final controller gate. M3-03 is
+complete after the pending-migration source correction passed independent
+cross-slice re-review and the repeated full controller gate. U9 is complete.
+M2-07 remains unexecuted, and Milestones 2 and 3 remain incomplete; M3-04 is
+next.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI

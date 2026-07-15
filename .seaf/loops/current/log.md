@@ -3492,3 +3492,187 @@ tests and the complete Rust workspace. No code or test timeout was changed.
 M3-02b and M3-02 are accepted. U9 remains incomplete because M3-03 retention
 and audited purge is still open. M2-07 remains unexecuted, and Milestones 2 and
 3 remain incomplete.
+
+## 2026-07-15 implemented/review-pending | M3-03 retention and audited purge
+
+The implementation adds an operator-supplied managed-byte budget and
+`seaf loop purge`, which is byte-inert unless `--apply` is present. Only
+authenticated `passed` or `completed` runs without a live candidate workspace
+or migration-result evidence are eligible. EvalPassed and Promoted remain
+protected final authority because their candidates must stay active and the
+supported workflow has no cleanup transition. Other active and busy-locked
+runs, migration backup/control state, purge control/audit state, and other
+dot-prefixed root entries remain protected or excluded.
+
+Apply retains exact existing run guards, revalidates selected tree manifests
+and typed authority before publishing a bounded canonical intent, then renames
+each directory through the pinned runs-root descriptor into an intent-owned
+tombstone. Interrupted retry accepts only the same directory identity and a
+subset of the intent-bound manifest; added files, substituted tombstones, and
+conflicting policies fail closed. The typed run authority and held lock are
+removed last. A bounded canonical latest result survives convergence and binds
+the intent, inventory, byte totals, selection, deletion, protections, and its
+own digest; tampering fails closed.
+
+Focused RED was the missing retention API/CLI. Focused GREEN covers dry-run
+inertia, deterministic oldest-first budget selection, active and busy-lock
+protection, successful audit verification, tamper rejection, exact retry,
+mid-delete recovery, conflicting-policy refusal, post-inventory mutation, and
+unbound/substituted tombstones. M3-03 and U9 remain unchecked pending independent
+specification and quality review plus the final controller gate. M2-07 and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 specification correction implemented/re-review pending | M3-03 audit truth and policy matrix
+
+Initial specification review returned two P1 findings and one P2 coverage
+finding. The surviving result used only the post-deletion protected/excluded
+snapshot, so it could not explain the original selection decision, and exact
+retry compared only the managed-run digest while silently returning stale root
+exclusions. Retention also inherited aggregate hard-link de-duplication rather
+than rejecting multi-link managed evidence. Finally, tests did not lock the
+complete status, candidate, ordering, migration-result, and dot-namespace
+policy matrix.
+
+The correction stores the complete decision-time inventory, bytes,
+protections, exclusions, control state, and selection immutably in the intent
+and result. A separate converged snapshot records the final managed state,
+protections, exclusions, and normalized control state: no intent or temporary,
+one result, and no tombstones. Interrupted retry tests add an active run and
+migration exclusion after the decision; only convergence records them, and an
+exact retry validates the complete current converged state. A later exclusion
+forces a fresh audit instead of returning stale bytes.
+
+Every managed regular file now requires one link during the bounded pinned
+manifest walk. Dry-run and apply reject an externally hard-linked file before
+intent creation and preserve both names and bytes. Focused policy tests lock
+`updated_at` then `run_id` ordering; Completed and Passed eligibility;
+EvalPassed/Promoted final-authority protection; live-candidate precedence;
+migration-result run protection; and dot-prefixed migration/control
+preservation. M3-03, U9, M2-07, and Milestones 2 and 3 remain unchecked pending
+specification re-review, quality review, and the controller gate.
+
+## 2026-07-15 quality correction implemented/re-review pending | M3-03 bounded recovery
+
+Quality review found six remaining retention boundaries. Partial-budget apply
+held observation guards for unselected eligible runs through convergence and
+misreported them as externally locked. Partial tombstone retry required
+provider records that the authorized deletion had already removed. Timestamp
+ordering compared decimal Unix seconds lexically. Audit paths persisted the
+old absolute root. Result replacement unlinked the old final before publishing
+the new one. Finally, aggregate complete manifests could exceed the 2 MiB
+intent cap for otherwise supported inventories.
+
+The correction releases unselected guards before convergence; validates a
+remaining partial `run.json` intrinsically plus against the intent-bound
+manifest/digest without following deleted provider records; and parses
+canonical decimal Unix seconds as `u64`. Audit paths serialize as a stable
+relative result identity and resolve against the current pinned root. Result
+replacement now uses descriptor-relative atomic rename-overwrite and a crash
+cut proves the verified old final survives until the verified new final is
+installed.
+
+Intent manifests use SHA-256 entry fingerprints over path, kind, size, and
+content digest. Apply executes one run per recoverable batch, links each batch
+to the prior audit digest, and carries exact cumulative deleted summaries until
+the policy converges. Worst-case synthetic coverage proves a 4,096-entry intent
+fits the unchanged 2 MiB cap and a 4,096-run cumulative audit with maximum names
+and protected snapshots fits the separate 8 MiB result cap. Focused retention
+and CLI suites pass; M3-03, U9, M2-07, and Milestones 2 and 3 remain unchecked
+pending re-review and the controller gate.
+
+## 2026-07-15 batching-boundary correction implemented/re-review pending | M3-03 continuation identity
+
+Quality re-review found three defects at the batch boundary. A verified
+continuation result was carried forward only when its converged snapshot still
+equaled the current root, so an unrelated arrival discarded exact deletion
+history. A crash after chained result rename but before intent unlink also
+required stale snapshot equality and could strand the completed batch after
+drift. Root traversal counted SEAF control files against the 4,096 operator
+entries, and raw run IDs expanded tombstone filenames past filesystem limits.
+
+Continuation results now remain authenticated cumulative history independent
+of current-root drift. Exact snapshot equality is used only to return a final
+result unchanged. A verified result naming the pending intent must match its
+policy, decision, projection, prior digest, unique cumulative suffix, and bound;
+retry adopts that completed batch before unlinking the intent and advancing
+from fresh root state. Arrival and post-chained-result-rename regressions retain
+every deleted ID exactly once.
+
+Inventory now counts at most 4,096 operator-managed/protected/excluded entries
+separately from an explicit four-entry SEAF allowance for intent, result,
+temporary, and one tombstone. Exactly 4,096 exclusions converge to a verified
+audit without stranding retry. Tombstones use a fixed-length domain-separated
+SHA-256 component derived from the selected run and directory identity; intent
+loading re-derives it before recovery. An authenticated 230-byte run ID now
+converges while the existing substitution and manifest-tamper refusals remain.
+M3-03, U9, M2-07, and Milestones 2 and 3 remain unchecked pending re-review and
+the controller gate.
+
+## 2026-07-15 final-batch adoption correction implemented/re-review pending | M3-03 fresh convergence
+
+The final batching re-review found that a verified final-batch result could be
+adopted after result rename and intent unlink without rechecking current state.
+If a new eligible run arrived during that cut, retry returned the old final
+success and left the new run above the requested budget.
+
+Adoption still authenticates the completed intent/result chain first. After
+intent unlink, it now compares the adopted convergence snapshot with fresh
+normalized inventory. Exact equality returns the result; drift carries that
+audit as authenticated prior history into a fresh same-policy decision. The
+regression interrupts final run A after result rename, creates completed run B,
+and proves retry purges B and publishes one truthful cumulative A/B audit with
+current zero-byte convergence. M3-03, U9, M2-07, and Milestones 2 and 3 remain
+unchecked pending re-review and the controller gate.
+
+## 2026-07-15 accepted | M3-03 retention and audited purge
+
+Independent specification and quality re-reviews approved the corrected M3-03
+transaction with no remaining P0/P1/P2 findings. The final quality correction
+proves that post-result-rename adoption rechecks fresh normalized inventory and
+continues the same-policy purge when a new eligible run arrives, while retaining
+authenticated cumulative deletion history exactly once.
+
+The controller's full gate passed unchanged: `cargo fmt --all -- --check`,
+locked all-target/all-feature Clippy with warnings denied, the complete locked
+Rust workspace tests, package formatting, package lint, TypeScript typecheck,
+SDK tests, SDK build, and `git diff --check`. M3-03 and U9 are accepted. M2-07
+remains unexecuted, Milestone 2 remains active, and Milestone 3 remains
+incomplete with M3-04 next.
+
+## 2026-07-15 cross-slice correction implemented/re-review pending | M3-03 pending migration ownership
+
+A final cross-slice review reopened M3-03 after finding that whole-run
+migration's real `AfterIntent` and `AfterStaged` crash states leave an unlocked
+Passed/Completed source beside durable migration controls. Retention excluded
+the dot-prefixed controls but still selected and deleted that source, orphaning
+the recoverable transaction. The focused RED used the real migration fault
+injector and failed because the `AfterIntent` source disappeared under an apply
+policy with a zero-byte budget.
+
+The surgical correction reuses migration's canonical intent, exact source
+run/tree digests, staged ownership, projected inventory, migrated authority,
+and result binding as a read-only retention protection boundary. Exact
+`source + intent` and `source + staged + intent` states protect the matching
+source. Malformed or mismatched matching controls fail purge closed, while an
+unrelated dot-prefixed migration-like sibling remains excluded and does not
+protect an ordinary eligible run. The real-cut regression is GREEN for both
+phases and proves ordinary migration retry still converges after retention.
+
+Focused migration, retention, and CLI verification plus strict owning checks
+are recorded in the correction handoff. M3-03 and U9 are reopened; M2-07 and
+Milestones 2 and 3 remain incomplete. Fresh independent re-review and the
+controller full gate are pending, so M3-04 must not start yet.
+
+## 2026-07-15 accepted after cross-slice correction | M3-03 migration-safe retention
+
+Independent cross-slice re-review approved the pending-migration correction
+with no remaining P0/P1/P2 findings. The real `AfterIntent` and `AfterStaged`
+cuts retain their authenticated source under purge and then converge through
+ordinary migration recovery. Malformed matching controls fail closed, while an
+unrelated migration-like sibling does not protect an otherwise eligible run.
+
+The repeated controller gate passed unchanged: Rust formatting, locked
+all-target/all-feature Clippy with warnings denied, the complete locked Rust
+workspace, package formatting/lint/typecheck/tests/build, and `git diff --check`.
+M3-03 and U9 are accepted. M2-07 remains unexecuted, Milestone 2 remains active,
+and Milestone 3 remains incomplete with M3-04 next.

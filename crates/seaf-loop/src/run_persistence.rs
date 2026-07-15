@@ -54,6 +54,18 @@ impl RunMutationGuard {
         )
     }
 
+    pub(crate) fn try_acquire_existing(run_directory: &Path) -> Result<Self, RunPersistenceError> {
+        Self::acquire_with_policy(
+            run_directory,
+            LockWaitPolicy {
+                max_attempts: 1,
+                retry_interval: Duration::ZERO,
+            },
+            false,
+            false,
+        )
+    }
+
     fn acquire_with_policy(
         run_directory: &Path,
         policy: LockWaitPolicy,
@@ -413,6 +425,33 @@ impl RunMutationGuard {
     }
 
     pub(crate) fn unlock(mut self) -> Result<(), RunPersistenceError> {
+        self.file.unlock()?;
+        self.locked = false;
+        Ok(())
+    }
+
+    pub(crate) fn remove_empty_locked_run_directory(
+        mut self,
+        parent: &artifact_safety::PinnedPrivateDirectory,
+        name: &OsStr,
+        relocated: &artifact_safety::PinnedPrivateDirectory,
+    ) -> Result<(), RunPersistenceError> {
+        self.validate_at_child(parent, name)?;
+        relocated.validate_identity()?;
+        if !artifact_safety::same_file_identity(&self.directory.metadata()?, &relocated.metadata()?)
+        {
+            return Err(RunPersistenceError::Invalid(
+                "relocated purge directory no longer matches the locked run".to_string(),
+            ));
+        }
+        let lock_name = OsStr::new(RUN_MUTATION_LOCK_FILE);
+        let lock_identity = self.file.metadata()?;
+        relocated.validate_single_link_file(lock_name, &lock_identity)?;
+        relocated.unlink_if_same(lock_name, &lock_identity)?;
+        relocated.sync_all()?;
+        parent.validate_child_directory(name, &relocated.metadata()?)?;
+        parent.remove_child_directory_if_same(name, relocated)?;
+        parent.sync_all()?;
         self.file.unlock()?;
         self.locked = false;
         Ok(())
