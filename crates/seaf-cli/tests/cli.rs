@@ -1996,6 +1996,196 @@ fn loop_run_fake_uses_provider_artifacts_and_real_policy_decision() {
 }
 
 #[test]
+fn loop_migrate_emits_deterministic_json_for_an_already_current_run() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: migration_final_authority\n      command: printf verified\n",
+    )
+    .expect("eval config");
+    commit_all(&repo, "Configure migration final authority fixture");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let runs_root = repo.join("runs");
+    let run_id = "current-migration-cli";
+    run_fake_provider(&repo, &ticket_path, &runs_root, run_id, &[]);
+    let before = read_tree_bytes(&runs_root.join(run_id));
+
+    let output = seaf()
+        .args([
+            "loop",
+            "migrate",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("run loop migrate");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["command"], "migrate");
+    assert_eq!(report["run_id"], run_id);
+    assert_eq!(report["status"], "already_current");
+    assert_eq!(report["from_schema_version"], 1);
+    assert_eq!(report["to_schema_version"], 1);
+    assert_eq!(read_tree_bytes(&runs_root.join(run_id)), before);
+}
+
+#[test]
+fn loop_migrate_rewrites_a_real_legacy_eval_passed_history_and_revalidates_final_authority() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("seaf.evals.yaml"),
+        "evals:\n  allow_commands: [printf]\n  required:\n    - name: migration_final_authority\n      command: printf verified\n",
+    )
+    .expect("eval config");
+    commit_all(&repo, "Configure migration final authority fixture");
+    let ticket_path = write_provider_loop_ticket(temp_dir.path(), true);
+    let runs_root = temp_dir.path().join("runs");
+    let run_id = "legacy-final-migration";
+    run_approve_and_evaluate_provider_loop(&repo, &ticket_path, &runs_root, run_id);
+    let run_dir = runs_root.join(run_id);
+    downgrade_managed_durable_graph_to_legacy(&run_dir);
+    let legacy = read_tree_bytes(&run_dir);
+
+    let tampered_runs_root = temp_dir.path().join("tampered-runs");
+    let tampered_run_dir = tampered_runs_root.join(run_id);
+    for (relative, bytes) in &legacy {
+        let path = tampered_run_dir.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, bytes).unwrap();
+    }
+    let mut tampered = read_run_json(&tampered_run_dir);
+    let digest = tampered["human_approval"]["policy_decision_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tampered["human_approval"]["policy_decision_digest"] = serde_json::json!(format!(
+        "{}{}",
+        &digest[..63],
+        if digest.ends_with('0') { "1" } else { "0" }
+    ));
+    fs::write(
+        tampered_run_dir.join("run.json"),
+        canonical_json_bytes(&tampered).unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    make_run_tree_private(&tampered_run_dir);
+    let tampered_before = read_tree_bytes(&tampered_run_dir);
+    let rejected = seaf()
+        .args([
+            "loop",
+            "migrate",
+            "--runs-root",
+            tampered_runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("reject near-match legacy digest");
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("must select the unique authoritative Development policy decision"),
+        "{rejected:?}"
+    );
+    assert_eq!(read_tree_bytes(&tampered_run_dir), tampered_before);
+    assert!(!tampered_runs_root
+        .join(format!(".{run_id}.migration-v0-v1.intent.json"))
+        .exists());
+
+    let output = seaf()
+        .args([
+            "loop",
+            "migrate",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("migrate legacy final run");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["status"], "migrated");
+    assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
+    assert!(run_dir.join("migration-v0-v1.result.json").is_file());
+    let backup = runs_root.join(format!(".{run_id}.migration-v0-v1.backup"));
+    assert_eq!(read_tree_bytes(&backup), legacy);
+
+    let inspect = seaf()
+        .args([
+            "loop",
+            "inspect",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("inspect migrated final run");
+    assert!(inspect.status.success(), "{inspect:?}");
+    let inspection: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspection["integrity"], "verified");
+}
+
+#[test]
+fn loop_migrate_refuses_a_real_legacy_recovered_terminal_history_before_transaction() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let run_id = "legacy-recovered-final";
+    let (_repo, runs_root) = prepare_recovered_evaluation_for_inspection(temp.path(), run_id);
+    let run_dir = runs_root.join(run_id);
+    assert_eq!(read_run_json(&run_dir)["status"], "eval_passed");
+    assert_eq!(read_run_json(&run_dir)["latest_recovery"]["recovery_id"], 1);
+    downgrade_managed_durable_graph_to_legacy(&run_dir);
+    let before = read_tree_bytes(&run_dir);
+
+    let rejected = seaf()
+        .args([
+            "loop",
+            "migrate",
+            "--runs-root",
+            runs_root.to_str().unwrap(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("reject recovered legacy migration");
+
+    assert!(!rejected.status.success(), "{rejected:?}");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("legacy terminal runs with evaluation recovery history are not supported"),
+        "{rejected:?}"
+    );
+    assert!(stderr.contains("preserve the run"), "{rejected:?}");
+    assert_eq!(read_tree_bytes(&run_dir), before);
+    for suffix in ["intent.json", "staged", "backup"] {
+        assert!(!runs_root
+            .join(format!(".{run_id}.migration-v0-v1.{suffix}"))
+            .exists());
+    }
+}
+
+#[test]
 fn loop_approve_requires_exact_confirmation_and_is_a_byte_identical_retry() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let repo = temp_dir.path().join("repo");
@@ -11897,6 +12087,238 @@ fn read_tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     visit(root, root, &mut files);
     files
+}
+
+#[cfg(unix)]
+fn make_run_tree_private(root: &Path) {
+    fn visit(path: &Path) {
+        if path.is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("private fixture directory");
+            for entry in fs::read_dir(path).expect("private fixture entries") {
+                visit(&entry.expect("private fixture entry").path());
+            }
+        } else {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("private fixture file");
+        }
+    }
+
+    visit(root);
+}
+
+fn downgrade_managed_durable_graph_to_legacy(run_dir: &Path) {
+    fn sha256(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn collect_json(
+        root: &Path,
+        current: &Path,
+        values: &mut BTreeMap<PathBuf, serde_json::Value>,
+        bytes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_json(root, &path, values, bytes);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let content = fs::read(&path).unwrap();
+                if let Ok(value) = serde_json::from_slice(&content) {
+                    values.insert(relative.clone(), value);
+                    bytes.insert(relative, content);
+                }
+            }
+        }
+    }
+
+    fn node_aliases(
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        aliases: &mut BTreeMap<String, String>,
+    ) {
+        let before_digest = sha256(&canonical_json_bytes(before).unwrap());
+        let after_digest = sha256(&canonical_json_bytes(after).unwrap());
+        if before_digest != after_digest {
+            aliases.insert(before_digest, after_digest);
+        }
+        match (before, after) {
+            (serde_json::Value::Object(before), serde_json::Value::Object(after)) => {
+                for (key, before) in before {
+                    if let Some(after) = after.get(key) {
+                        node_aliases(before, after, aliases);
+                    }
+                }
+            }
+            (serde_json::Value::Array(before), serde_json::Value::Array(after))
+                if before.len() == after.len() =>
+            {
+                for (before, after) in before.iter().zip(after) {
+                    node_aliases(before, after, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn replace_aliases(value: &mut serde_json::Value, aliases: &BTreeMap<String, String>) {
+        match value {
+            serde_json::Value::String(string) => {
+                let mut current = string.clone();
+                let mut seen = std::collections::BTreeSet::new();
+                while seen.insert(current.clone()) {
+                    let Some(next) = aliases.get(&current) else {
+                        break;
+                    };
+                    current = next.clone();
+                }
+                *string = current;
+            }
+            serde_json::Value::Object(object) => {
+                for child in object.values_mut() {
+                    replace_aliases(child, aliases);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    replace_aliases(child, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_embedded_policy_versions(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::Object(decision)) = object.get_mut("policy_decision")
+                {
+                    decision.remove("schema_version");
+                }
+                if let Some(serde_json::Value::Array(decisions)) =
+                    object.get_mut("policy_decisions")
+                {
+                    for decision in decisions {
+                        decision.as_object_mut().unwrap().remove("schema_version");
+                    }
+                }
+                for child in object.values_mut() {
+                    remove_embedded_policy_versions(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    remove_embedded_policy_versions(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn approved_value(final_run: &serde_json::Value) -> Option<serde_json::Value> {
+        if final_run["status"] != "eval_passed" || final_run["human_approval"].is_null() {
+            return None;
+        }
+        let mut approved = final_run.clone();
+        approved["status"] = serde_json::json!("approved");
+        approved["current_step"] = serde_json::json!("testing");
+        approved["updated_at"] = approved["human_approval"]["approved_at"].clone();
+        approved.as_object_mut().unwrap().remove("eval_report_path");
+        for step in approved["steps"].as_array_mut().unwrap() {
+            if matches!(step["name"].as_str(), Some("testing" | "eval_report")) {
+                step["status"] = serde_json::json!("pending");
+                step.as_object_mut().unwrap().remove("artifact_path");
+                step.as_object_mut().unwrap().remove("artifact_digest");
+            }
+        }
+        let candidate = approved["candidate_workspace"].as_object_mut().unwrap();
+        candidate.insert("lifecycle".to_string(), serde_json::json!("active"));
+        candidate.remove("cleanup_started_at");
+        candidate.remove("cleaned_at");
+        Some(approved)
+    }
+
+    fn add_approved_alias(
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        aliases: &mut BTreeMap<String, String>,
+    ) {
+        if let (Some(before), Some(after)) = (approved_value(before), approved_value(after)) {
+            let before = sha256(&canonical_json_bytes(&before).unwrap());
+            let after = sha256(&canonical_json_bytes(&after).unwrap());
+            if before != after {
+                aliases.insert(before, after);
+            }
+        }
+    }
+
+    let mut values = BTreeMap::new();
+    let mut current_bytes = BTreeMap::new();
+    collect_json(run_dir, run_dir, &mut values, &mut current_bytes);
+    let original_values = values.clone();
+    let before_versions = values.clone();
+    for (relative, value) in &mut values {
+        let name = relative.to_string_lossy();
+        let managed = matches!(
+            name.as_ref(),
+            "inputs/ticket.json" | "ticket.snapshot.json" | "inputs/policy.json" | "run.json"
+        ) || name.ends_with(".policy-decision.json")
+            || name.contains("08-eval-report") && name.ends_with(".json");
+        if managed {
+            value.as_object_mut().unwrap().remove("schema_version");
+        }
+        remove_embedded_policy_versions(value);
+    }
+
+    let mut aliases = BTreeMap::new();
+    for (path, before) in &before_versions {
+        let after = &values[path];
+        node_aliases(before, after, &mut aliases);
+        if before != after {
+            let next = canonical_json_bytes(after).unwrap();
+            aliases.insert(sha256(&current_bytes[path]), sha256(&next));
+            current_bytes.insert(path.clone(), next);
+        }
+    }
+    add_approved_alias(
+        &before_versions[Path::new("run.json")],
+        &values[Path::new("run.json")],
+        &mut aliases,
+    );
+
+    for _ in 0..values.len().saturating_mul(4).saturating_add(16) {
+        let before = values.clone();
+        for value in values.values_mut() {
+            replace_aliases(value, &aliases);
+        }
+        for (path, previous) in &before {
+            let next = &values[path];
+            node_aliases(previous, next, &mut aliases);
+            if previous != next {
+                let next_bytes = canonical_json_bytes(next).unwrap();
+                aliases.insert(sha256(&current_bytes[path]), sha256(&next_bytes));
+                current_bytes.insert(path.clone(), next_bytes);
+            }
+        }
+        add_approved_alias(
+            &before[Path::new("run.json")],
+            &values[Path::new("run.json")],
+            &mut aliases,
+        );
+        if before == values {
+            break;
+        }
+    }
+
+    for (relative, value) in &values {
+        if original_values.get(relative) != Some(value) {
+            fs::write(run_dir.join(relative), &current_bytes[relative]).unwrap();
+        }
+    }
 }
 
 fn immutable_run_history(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

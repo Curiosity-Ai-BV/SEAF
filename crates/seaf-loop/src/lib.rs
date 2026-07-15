@@ -14,6 +14,7 @@ mod evaluation_storage;
 pub mod final_evaluation_authority;
 mod immutable_artifact;
 pub mod inspect;
+mod migration;
 pub mod model_runner;
 mod operator_evidence;
 pub mod patch;
@@ -75,6 +76,7 @@ pub use inspect::{
     InspectionIntegrity, LoopInspection, ProviderAttemptInspection, ProviderExchangeInspection,
     StepInspection,
 };
+pub use migration::{migrate_loop_run, MigrationError, MigrationOutcome, MigrationStatus};
 pub use model_runner::{ProviderPatchGateConfig, ProviderStepRunner};
 pub use patch::{parse_unified_diff, ParsedPatch, PatchFile, PatchParseError};
 pub use policy_gate::{

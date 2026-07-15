@@ -103,6 +103,22 @@ impl LoopWorkspace {
         Ok(workspace)
     }
 
+    pub(crate) fn open_staged_migration(run_directory: &Path) -> Result<Self, WorkspaceError> {
+        let metadata = fs::symlink_metadata(run_directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkspaceError::UnsafeExistingLayout(
+                run_directory.to_path_buf(),
+                "staged migration run must be a real directory".to_string(),
+            ));
+        }
+        artifact_safety::validate_private_directory(run_directory)?;
+        let workspace = Self {
+            run_directory: run_directory.canonicalize()?,
+        };
+        validate_regular_file(&workspace.run_file())?;
+        Ok(workspace)
+    }
+
     pub fn run_directory(&self) -> &Path {
         &self.run_directory
     }

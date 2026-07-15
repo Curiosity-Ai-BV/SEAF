@@ -37,12 +37,28 @@ impl RunMutationGuard {
                 max_attempts: LOCK_MAX_ATTEMPTS,
                 retry_interval: LOCK_RETRY_INTERVAL,
             },
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn acquire_existing(run_directory: &Path) -> Result<Self, RunPersistenceError> {
+        Self::acquire_with_policy(
+            run_directory,
+            LockWaitPolicy {
+                max_attempts: LOCK_MAX_ATTEMPTS,
+                retry_interval: LOCK_RETRY_INTERVAL,
+            },
+            false,
+            false,
         )
     }
 
     fn acquire_with_policy(
         run_directory: &Path,
         policy: LockWaitPolicy,
+        create_if_missing: bool,
+        cleanup_orphans: bool,
     ) -> Result<Self, RunPersistenceError> {
         let directory = artifact_safety::PinnedPrivateDirectory::open(run_directory)?;
         let path = run_directory.join(RUN_MUTATION_LOCK_FILE);
@@ -50,7 +66,7 @@ impl RunMutationGuard {
         let lock_name = OsStr::new(RUN_MUTATION_LOCK_FILE);
         let file = match open_existing_lock_file(&directory) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
                 crate::artifact_storage::validate_entry_projection(&directory, 1)?;
                 match directory.create_file(lock_name) {
                     Ok(file) => {
@@ -96,9 +112,11 @@ impl RunMutationGuard {
             let _ = file.unlock();
             return Err(error.into());
         }
-        if let Err(error) = cleanup_orphaned_run_replacement_temps(&directory) {
-            let _ = file.unlock();
-            return Err(error.into());
+        if cleanup_orphans {
+            if let Err(error) = cleanup_orphaned_run_replacement_temps(&directory) {
+                let _ = file.unlock();
+                return Err(error.into());
+            }
         }
         Ok(Self {
             directory,
@@ -113,6 +131,19 @@ impl RunMutationGuard {
             OsStr::new(RUN_MUTATION_LOCK_FILE),
             &self.file.metadata()?,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_at_child(
+        &self,
+        parent: &artifact_safety::PinnedPrivateDirectory,
+        name: &OsStr,
+    ) -> Result<(), RunPersistenceError> {
+        self.directory.validate_single_link_file(
+            OsStr::new(RUN_MUTATION_LOCK_FILE),
+            &self.file.metadata()?,
+        )?;
+        parent.validate_child_directory(name, &self.directory.metadata()?)?;
         Ok(())
     }
 
@@ -1279,6 +1310,8 @@ mod tests {
                     max_attempts: 2,
                     retry_interval: Duration::ZERO,
                 },
+                true,
+                true,
             )
         });
         barrier.wait();

@@ -3073,3 +3073,422 @@ recoverable whole-run v0-to-v1 migration, transitive authority rewrites,
 byte-exact backup, audited result, crash recovery, and idempotent CLI retry.
 M2-07 remains unexecuted; M3-02, U9, and both Milestones 2 and 3 remain
 incomplete.
+
+## 2026-07-15 implemented, review pending | M3-02b whole-run artifact migration
+
+The honest RED was
+`cargo test -p seaf-loop --test run_migration --no-run`. It failed only because
+the wished-for `migrate_loop_run` and `MigrationStatus` API did not exist. The
+focused contract now covers authenticated legacy TicketSpec, Policy, LoopRun,
+embedded and standalone PolicyDecision, and integrated EvalReport migration as
+one run; exact digest/reference rewrites; a byte-exact sibling backup; an
+audited result; unrelated forensic-file preservation; current-v1 idempotence;
+and explicit-v0, future, malformed, and tampered nonmutation.
+
+`seaf loop migrate --runs-root <root> --run-id <id> [--json]` owns deterministic
+intent, staged, and backup siblings. A full no-follow staged copy is validated
+before source-to-backup and staged-to-source renames. Deterministic fault tests
+cover interruption after intent, after staged validation, between the two
+renames, and after selected-run publication before intent cleanup; ordinary
+retry converges without data loss and retains the original backup.
+
+The migration acquires the selected run's existing permanent mutation lock
+without creating a missing lock or cleaning replacement temporaries, then
+holds both the selected/backup inode lock and the copied staged inode lock
+through publication. This preserves the byte-exact backup promise while
+preventing concurrent run publishers from racing authentication or either
+rename.
+
+A real EvalPassed CLI fixture is downgraded to authentic v0 contract and hidden
+historical digests, migrated, and accepted by the unchanged final-evaluation
+authority loader plus verified `loop inspect`. A one-character near-match
+policy-decision digest is rejected before intent creation. Legacy terminal runs
+with evaluation-recovery history fail closed before intent because projecting
+their recovery-source lineage is not yet supported; all source bytes remain
+unchanged. M3-02b is implemented with specification review, quality review, and
+the final controller gate pending. M3-02, U9, and Milestones 2 and 3 remain
+incomplete.
+
+## 2026-07-15 specification changes required | M3-02b migration safety
+
+Independent specification review returned changes required. Managed and
+referenced paths could traverse a symlink ancestor during staged writes;
+recovery checked only the shape of an intent digest rather than binding it to
+the selected source or retained backup; generic recursive digest replacement
+could rewrite matching payload strings and arbitrary `policy_decision`
+objects; the surviving result did not cryptographically bind the retained
+backup; and the documented refusal of recovered terminal histories lacked a
+realistic regression.
+
+The focused pre-fix regressions reproduced each unsafe behavior. A symlinked
+authenticated `inputs/` tree migrated and was traversed. A foreign intent
+digest migrated, a substituted backup was adopted, matching payload strings
+and an arbitrary `policy_decision` object were rewritten, malformed managed
+Development evidence migrated, and a completed retry accepted backup tamper.
+The realistic recovered EvalPassed fixture was a truthful characterization
+GREEN rather than RED: existing production logic already refused it before a
+transaction, but the new test supplied the missing byte-inert evidence.
+
+## 2026-07-15 specification correction implemented, re-review pending | M3-02b migration safety
+
+Authenticated paths and managed artifact discovery now use pinned no-follow
+directory traversal. The canonical closed intent binds both the original
+`run.json` and a deterministic no-follow full-tree digest; recovery verifies
+those bindings against source before the first rename and backup after it. The
+canonical closed result carries the same original bindings and its migrated
+`run.json` digest. Completed no-intent retry re-authenticates the selected run
+and final authority, validates the result, and verifies the retained backup.
+
+Digest projection now changes only proven reference fields, an explicit set of
+typed digest holders, and the LoopRun input-digest map. Matching payload
+strings, arbitrary `*_digest` payload names, and arbitrary objects named
+`policy_decision` remain unchanged. Embedded decision migration is limited to
+LoopRun and validated typed Development evidence; malformed managed
+Development evidence fails before intent creation. Deterministic recovery
+tests cover substituted source, backup, and intent at the relevant publication
+cuts, plus retained backup/result tamper after intent deletion.
+
+The final focused correction gate passed all 6 migration integration tests, all
+5 migration unit tests, and all 3 CLI migration tests, with no ignored tests.
+Strict all-target/all-feature Clippy for `seaf-loop` and `seaf-cli`, Rust
+formatting, changed-document Prettier, and `git diff --check` passed. The full
+workspace gate was not run. M3-02b remains open for specification re-review,
+quality review, and the final controller gate. M3-02, U9, and Milestones 2 and
+3 remain incomplete.
+
+## 2026-07-15 specification re-review changes required | M3-02b typed authority and audit set
+
+Specification re-review confirmed every prior finding closed and returned two
+remaining P1 findings. Generic reachable JSON could still create graph
+authority from matching field names and receive unpaired historical digest
+rewrites. Separately, a canonical result could replace its
+`migrated_artifacts` list with another sorted portable list without detection
+after intent deletion.
+
+The focused REDs reproduced both defects. A generic authenticated payload's
+`ticket_digest` and `policy_decision_digest` strings were rewritten because
+their names matched typed holders. An incidental payload `path`/`digest` pair
+was followed into unrelated noncanonical forensic JSON. After a successful
+migration, replacing the canonical result list with `[]` was accepted as
+`AlreadyCurrent`. The extra-list case was encoded in the same deterministic
+audit loop and executed after the omitted-list correction.
+
+## 2026-07-15 second specification correction implemented, re-review pending | M3-02b typed authority and audit set
+
+Reference discovery is now seeded from typed LoopRun fields and continues only
+through declared references in exact typed owners: EvalReport,
+TestingEvidence, ApprovedEvaluationIntent, ProviderExchangeRecord, and
+validated Development evidence. Generic reachable JSON remains
+digest-authenticated and canonical but contributes no nested references and
+receives no alias projection. Typed alias projection still updates the exact
+terminal Ticket, policy-decision, Testing, evaluation-intent, EvalReport, and
+historical Approved bindings; the realistic EvalPassed migration and unchanged
+final-authority loader pass.
+
+The pinned no-follow audit walker now produces one deterministic tree inventory
+used for both source-tree hashing and changed-set comparison. Staged validation
+and completed no-intent retry require the result list to equal every and only
+the changed regular-file paths between retained original and migrated source,
+excluding the result itself. Missing/extra paths, file-set changes, entry-type
+changes, symlink-target changes, omitted entries, and false extra entries fail
+closed.
+
+The final focused correction gate passed all 7 migration integration tests,
+all 5 migration unit tests, and all 3 CLI migration tests, including the exact
+realistic EvalPassed regression, with no ignored tests. Strict all-target and
+all-feature Clippy for `seaf-loop` and `seaf-cli` passed with warnings denied.
+Rust formatting, changed-document Prettier, and `git diff --check` also passed.
+The full workspace gate was not run. M3-02b remains open for specification
+re-review, quality review, and the final controller gate; M3-02, U9, and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 second specification re-review approved | M3-02b typed authority and audit set
+
+Independent specification re-review approved the corrected typed-authority and
+changed-artifact audit boundary with no remaining findings. Generic reachable
+JSON is leaf-only, exact typed owners define graph traversal and digest
+projection, and the canonical result list is bound to the deterministic pinned
+source-versus-migrated inventory. Specification review is complete for M3-02b;
+quality review and the final controller gate remain open.
+
+## 2026-07-15 quality review changes required | M3-02b recovery, identity, and bounds
+
+Independent quality review returned three P1 findings and one tracking
+correction. A crash during recursive copy or an in-place staged rewrite left an
+invalid source-plus-intent-plus-staged topology that ordinary retry could not
+rebuild. Selected and staged mutation locks were retained but not rebound to
+their exact named child identities, and publication/recovery still used raw
+path renames. Migration also read and inventoried unbounded file bodies without
+reusing the existing semantic per-file, 32 MiB aggregate, 4,096-entry, and
+depth-eight limits.
+
+The focused REDs reproduced every missing boundary. Mid-copy retry failed while
+trying to acquire a lock that the partial copy did not yet contain. A selected
+directory rebound after lock acquisition was accepted and fully published.
+Exact per-file size passed, but per-file cap plus one, aggregate cap plus one,
+entry cap plus one, and depth cap plus one all migrated and created transient
+disk state instead of rejecting before intent creation. Deterministic
+mid-rewrite and staged-rebound cases were encoded in the same focused loops.
+
+## 2026-07-15 quality correction implemented, re-review pending | M3-02b recovery, identity, and bounds
+
+Before the first source-to-backup rename, invalid or incomplete staged output is
+now unpublished scratch: recovery verifies the bound original source, removes
+the scratch through pinned descriptors, syncs the runs root, removes the unused
+intent, and rebuilds in the same ordinary retry. A valid staged tree is still
+adopted. After the first rename, recovery never discards staged or backup
+authority. Mid-copy and mid-rewrite tests prove retry convergence, byte-exact
+backup retention, valid result/audit authority, and transient cleanup.
+
+The selected and staged guards now validate their locked directory metadata as
+the exact child of one pinned runs-root descriptor before and after
+authentication, copy, rewrite, and publication boundaries. Normal and recovery
+publication use descriptor-relative rename for both selected-to-backup and
+staged-to-selected moves, with child identity checked immediately before and
+after. Deterministic selected and staged rebound tests fail closed without
+authenticating or publishing the unlocked replacement. Recursive copy, sync,
+symlink handling, scratch removal, and tree inventory use pinned descriptors.
+
+Migration now enforces the existing M1-11b storage bounds before intent or
+staging and during staged/recovery validation. Metadata and semantic per-file
+caps precede bounded reads; aggregate bytes, entries, and directory depth are
+counted during pinned traversal. Inventories retain regular-file length and a
+streamed SHA-256 digest rather than entire file bodies. Exact per-file,
+aggregate, entry, and depth limits pass; each limit plus one fails before disk
+amplification.
+
+The final focused quality-correction gate passed all 7 migration integration
+tests, all 12 migration unit tests, and all 3 CLI migration tests, including
+the exact realistic EvalPassed migration and recovered-terminal refusal, with
+no ignored tests. Strict all-target and all-feature Clippy for `seaf-loop` and
+`seaf-cli` passed with warnings denied. Rust formatting, changed-document
+Prettier, and `git diff --check` passed. The full workspace gate was not run and
+no commit was created. M3-02b remains unchecked with quality re-review and the
+final controller gate pending; M3-02, U9, and Milestones 2 and 3 remain
+incomplete.
+
+## 2026-07-15 second quality re-review changes required | M3-02b bounded ownership
+
+The second independent quality re-review returned three P1 findings. Run-tree
+inventory, recursive copy, sync, and scratch cleanup collected and sorted every
+directory name before applying the 4,096-entry cap. Recovery and same-call
+cleanup treated the deterministic staged pathname as sufficient ownership and
+could delete or publish a substituted tree. Migration intent creation, reading,
+and removal still reopened the runs root through raw paths instead of the
+retained pinned descriptor.
+
+The focused REDs reproduced every boundary. An over-wide inventory visited all
+4,196 entries instead of stopping at cap plus one. Recovery adopted an unmarked
+replacement placed at the staged pathname, and a same-call staged rebound was
+deleted after its identity check failed. Rebinding the runs root immediately
+before intent creation wrote the intent into the replacement root; the paired
+before-remove case was encoded in the same deterministic loop.
+
+## 2026-07-15 second quality correction implemented, re-review pending | M3-02b bounded ownership
+
+The shared pinned-directory enumerator now stops when it observes entry 4,097,
+before retaining another name, and sorts at most 4,096 names. Inventory,
+recursive copy, sync, and scratch cleanup all use that bounded enumerator. The
+focused regression proves enumeration visits exactly cap plus one even when a
+directory contains another hundred entries.
+
+Each staged tree now receives a canonical create-only ownership marker bound to
+the migration ID, run ID, and a fresh token stored in the durable intent.
+Recovery authenticates the marker through the retained staged descriptor before
+adoption or cleanup. Cleanup removes only a marker-proven retained child;
+substituted and rebound staged trees are preserved. The transient marker is
+excluded from the changed-artifact audit and removed through the pinned child
+before successful completion.
+
+Intent creation, canonical reading, and identity-checked unlinking now operate
+through the retained pinned runs-root descriptor. Deterministic rebound tests
+prove neither create nor remove can target a replacement root. The complete
+migration unit suite passed all 16 tests, all 7 migration integrations passed,
+and all 3 CLI migration tests passed with no ignored tests. Strict lint,
+all-target and all-feature Clippy passed with warnings denied. Rust formatting,
+changed-document Prettier, and `git diff --check` passed. The full workspace
+gate was not run and no commit was created. M3-02b remains unchecked with
+quality re-review and the final controller gate pending; M3-02, U9, and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 third quality re-review changes required | M3-02b projected completion
+
+The third independent quality re-review confirmed every prior finding closed
+and returned three P1 findings. A crash after durable ownership-marker removal
+but before intent unlink left the completed source-plus-backup-plus-intent
+topology unable to recover because the completed branch still required the
+marker. Preflight admitted only the legacy source inventory and did not project
+the marker, permanent result, or exact rewrite byte deltas and entry effects.
+A legacy source containing the reserved ownership path was rejected only after
+intent creation.
+
+The focused REDs reproduced each boundary. The new post-marker-removal cut
+failed ordinary retry with `staged ownership marker is missing`. Exact staged
+byte and entry peaks succeeded, but one byte or one entry less headroom created
+intent and staged state before rejection. A reserved-marker legacy source also
+left an intent behind. Source digests remained unchanged in both preflight
+rejection cases. With the staged-inventory equality guard removed, an injected
+unprojected file reached the later generic changed-set rejection rather than
+the intended prepublication projection boundary.
+
+## 2026-07-15 third quality correction implemented, re-review pending | M3-02b projected completion
+
+Before intent publication, one immutable migration plan now derives the exact
+canonical bytes for every authenticated rewrite, the permanent result, and the
+transient ownership marker. Their semantic sizes, byte deltas, and two-entry
+staged peak are applied to the pinned source inventory and checked against the
+shared per-file, 32 MiB aggregate, 4,096-entry, and existing depth limits. The
+staged writer consumes those exact bytes and requires its full pinned inventory
+to equal the admitted projection before the first rename. Exact byte and entry
+peaks pass end to end; a one-byte or one-entry shortage fails before intent,
+staging, backup, or source mutation.
+
+The completed source-plus-backup-plus-intent recovery branch now accepts the
+ownership marker either present or already durably removed. If present it must
+match the retained intent. In both states recovery still validates current
+authority, the canonical result and migrated run digest, retained backup and
+source bindings, the exact changed-artifact set, and result-to-intent equality
+before marker or intent cleanup. Incomplete source/staged topologies retain
+their existing mandatory marker proof. Legacy source authentication rejects the
+reserved marker before intent publication and preserves the complete source
+tree byte-for-byte.
+
+The complete migration unit suite passed all 20 tests, all 7 migration
+integrations passed, and all 3 CLI migration tests passed with no ignored tests.
+Strict all-target and all-feature Clippy passed with warnings denied. Rust
+formatting, changed-document Prettier, and `git diff --check` passed. The full
+workspace gate was not run and no commit was created. M3-02b remains unchecked
+with quality re-review and the final controller gate pending; M3-02, U9, and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 fourth quality re-review changes required | M3-02b durable projection binding
+
+The fourth independent quality re-review confirmed all prior blockers closed
+and returned two P1 findings. Pre-intent projection was compared only against
+the in-memory plan during the original call; the closed durable intent did not
+bind that admitted inventory. Recovery therefore trusted the candidate's
+self-consistent result and changed-artifact list. A staged unrelated-file change
+could be paired with a canonical amended result and adopted after an
+`AfterStaged` interruption. Separately, the permanent result path had an early
+production collision guard but lacked its symmetric byte-inert regression.
+
+The focused REDs reproduced both gaps. After changing staged `forensic.txt` and
+canonically adding it to `migrated_artifacts`, ordinary retry returned
+`Recovered`, published the forged staged tree, and reported the forged path.
+After temporarily removing the untested result-path precheck, a legacy result
+collision reached late create-only failure with `File exists` instead of a
+pre-intent reserved-path refusal.
+
+## 2026-07-15 fourth quality correction implemented, re-review pending | M3-02b durable projection binding
+
+The closed canonical intent now carries the digest of the exact admitted staged
+inventory, including canonical rewrite, permanent result, and transient marker
+entries. This introduces no digest cycle: those bytes depend on the fixed source
+bindings, run identity, and ownership token, not the new projection field.
+Original publication and every intent-bearing staged recovery candidate compare
+their full pinned inventory to the intent-bound digest.
+
+Source-plus-staged recovery first performs the existing marker, current-schema,
+result, final-authority, source-binding, and exact changed-set validation.
+Incomplete unpublished scratch can still be removed and rebuilt. A fully
+self-consistent candidate that then differs from the durable projection is
+preserved and refused, so the coherent forged-extra-change regression leaves
+source, staged evidence, and intent in place with no backup or publication.
+Completed source-plus-backup-plus-intent recovery performs every existing
+validation and then compares to the same digest; if marker removal was already
+durable, it reconstructs only the exact canonical marker entry derived from the
+retained intent before comparison. The symmetric reserved-result regression now
+proves pre-intent refusal, no transaction siblings, and an unchanged source.
+
+The complete migration unit suite passed all 22 tests, all 7 migration
+integrations passed, and all 3 CLI migration tests passed with no ignored tests.
+Strict all-target and all-feature Clippy passed with warnings denied. Rust
+formatting, changed-document Prettier, and `git diff --check` passed. The full
+workspace gate was not run and no commit was created. M3-02b remains unchecked
+with quality re-review and the final controller gate pending; M3-02, U9, and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 fifth quality re-review changes required | M3-02b completed cleanup identity
+
+The fifth independent quality re-review confirmed every prior finding closed
+and returned one P1 identity-window finding. Completed
+source-plus-backup-plus-intent recovery retained selected and backup mutation
+guards and validated both near branch entry, but after the complete result,
+authority, backup/source, audit-set, intent, and projected-inventory checks it
+could unlink the marker or intent without revalidating either guarded child at
+the cleanup boundary.
+
+The focused RED used the marker-absent `AfterOwnershipRemoval` state, then
+rebound the selected child immediately after completed validation and before
+intent unlink. Recovery incorrectly returned `Recovered` and removed the intent
+while the guarded completed tree was parked and an unlocked replacement occupied
+the selected name.
+
+## 2026-07-15 fifth quality correction implemented, re-review pending | M3-02b completed cleanup identity
+
+After all completed and projection validation, recovery now revalidates both
+the selected and backup mutation guards against their exact named children of
+the retained pinned runs-root descriptor. These checks occur after the
+deterministic rebound cut and immediately before either marker cleanup or intent
+unlink. These are final for the marker-absent path; the marker-present path still
+performs durable marker removal before it reaches intent unlink.
+
+The regression now fails on selected identity and retains the intent, backup,
+parked locked completed tree, replacement selected tree, and both copies of the
+result evidence. The complete migration unit suite passed all 23 tests, all 7
+migration integrations passed, and all 3 CLI migration tests passed with no
+ignored tests. Strict all-target and all-feature Clippy passed with warnings
+denied. Rust formatting, changed-document Prettier, and `git diff --check`
+passed. The full workspace gate was not run and no commit was created. M3-02b
+remains unchecked with quality re-review and the final controller gate pending;
+M3-02, U9, and Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 sixth quality re-review changes required | M3-02b post-marker identity
+
+The sixth independent quality re-review confirmed the prior findings closed and
+returned one narrow P1. The fifth correction kept both selected and backup
+guard checks immediately before marker mutation, but the marker-present path
+then durably removed ownership evidence before unlinking the intent. A child
+rebound during that interval was not revalidated.
+
+The focused RED started from `AfterPublish`, proving the completed source still
+carried its marker. Recovery removed the marker, rebound the selected child, and
+incorrectly returned `Recovered` while unlinking the intent. The guarded source
+was parked and an unlocked marker-free replacement occupied the selected name.
+
+## 2026-07-15 sixth quality correction implemented, re-review pending | M3-02b post-marker identity
+
+The existing selected and backup exact-child checks remain before marker
+mutation. When the marker is present, recovery now revalidates both guarded
+children again after `remove_staged_ownership` returns and immediately before
+intent unlink. The marker-absent path retains its fifth-correction final checks
+without redundant mutation handling.
+
+The post-marker rebound regression now fails on selected identity and retains
+the intent, backup, parked locked source, replacement source, and result
+evidence in both trees; marker removal remains durably complete. The complete
+migration unit suite passed all 24 tests, all 7 migration integrations passed,
+and all 3 CLI migration tests passed with no ignored tests. Strict all-target
+and all-feature Clippy passed with warnings denied. Rust formatting,
+changed-document Prettier, and `git diff --check` passed. The full workspace
+gate was not run and no commit was created. M3-02b remains unchecked with
+quality re-review and the final controller gate pending; M3-02, U9, and
+Milestones 2 and 3 remain incomplete.
+
+## 2026-07-15 accepted | M3-02b whole-run artifact migration
+
+Independent quality re-review approved the sixth correction with no remaining
+P0, P1, or P2 findings. The final controller gate passed Rust formatting,
+locked all-target and all-feature Clippy with warnings denied, the exact locked
+workspace test command, repository formatting, package lint, typecheck, all 8
+SDK tests, package build, and `git diff --check`.
+
+The first cold locked workspace test attempt produced four concurrent nested
+eval-command timeouts at the exact 120-second limit while 167 sibling CLI tests
+passed. Each timed-out test passed alone, and the exact locked workspace test
+command then passed unchanged with warmed artifacts, including all 171 CLI
+tests and the complete Rust workspace. No code or test timeout was changed.
+
+M3-02b and M3-02 are accepted. U9 remains incomplete because M3-03 retention
+and audited purge is still open. M2-07 remains unexecuted, and Milestones 2 and
+3 remain incomplete.

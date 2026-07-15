@@ -2550,9 +2550,10 @@ versioning, migration, retention, and purge remain outside this slice.
 
 Roadmap: U9. Dependencies: M3-01.
 
-Status: active. The work is split so format compatibility can land independently
-of the larger whole-run migration transaction. M3-02a is complete; M3-02b
-remains open, so M3-02 and U9 are not complete.
+Status: complete after independent specification and quality approval plus the
+final controller gate. The work landed as separate M3-02a format-compatibility
+and M3-02b whole-run migration commits. U9 remains active until M3-03 retention
+and audited purge is complete.
 
 Objective: version durable files and define compatible upgrade behavior.
 
@@ -2592,10 +2593,71 @@ evidence keeps its own schema contract and was not changed.
 
 #### M3-02b - Whole-Run Artifact Migration
 
-Status: pending. Implement the recoverable run-wide v0-to-v1 migration,
-transitive digest/reference rewrites, byte-exact backup, audited result, crash
-recovery, and idempotent CLI retry. Per-file migration is not permitted because
-it would invalidate authenticated cross-artifact references.
+Status: complete after independent specification and quality approval plus the
+final controller gate.
+The implementation adds the
+recoverable run-wide v0-to-v1 migration, transitive authenticated
+digest/reference rewrites, byte-exact backup, audited result, deterministic
+crash recovery, and idempotent CLI retry. Per-file migration remains prohibited
+because it would invalidate authenticated cross-artifact references. M3-02 is
+complete; U9 remains active until M3-03 retention and audited purge is complete.
+
+The quality correction rebuilds invalid unpublished partial staging after
+deterministic mid-copy or mid-rewrite interruption, binds selected and staged
+locks to exact children of a pinned runs-root descriptor, and publishes both
+renames through that descriptor. Migration reuses the M1-11b artifact limits:
+semantic per-file caps, 32 MiB aggregate bytes, 4,096 entries, and depth eight.
+Bounded readers check metadata before allocation, and inventories retain file
+length plus streamed SHA-256 rather than full contents. Exact-limit and
+limit-plus-one migration regressions cover all four boundaries; over-limit
+sources fail before intent or staging.
+
+The second quality correction stops directory enumeration at the first
+over-limit entry before collecting or sorting more than 4,096 names. A
+canonical staged-ownership marker binds scratch cleanup and recovery adoption
+to the exact transaction intent, so substituted or rebound staged trees are
+preserved instead of deleted by name. Intent create, read, and unlink operations
+use the retained pinned runs-root descriptor and fail closed if the root is
+rebound.
+
+The third quality correction builds one deterministic migration plan before
+intent publication. Exact canonical rewrite, result, and ownership-marker bytes
+are projected onto the pinned source inventory, including their byte deltas and
+two-entry staged peak, and checked against the shared semantic and run-tree
+limits. The staged inventory must equal that projection before publication.
+Legacy sources containing either reserved migration path fail before intent.
+Recovery after selected publication accepts the ownership marker as present or
+already durably removed only in the completed source-plus-backup-plus-intent
+topology, after full result, authority, source/backup, audit-set, and intent
+validation.
+
+The fourth quality correction binds the canonical projected staged-inventory
+digest into the closed durable intent. Original publication and every
+intent-bearing recovery candidate compare their actual pinned inventory to this
+authority rather than trusting a coherently amended result list. Completed
+source-plus-backup-plus-intent recovery reconstructs only the exact canonical
+ownership-marker entry when marker removal was already durable. Fully
+self-consistent staged evidence that differs from the admitted digest is
+preserved and refused; only incomplete unpublished scratch retains the rebuild
+path. The reserved permanent result path now has symmetric byte-inert
+pre-transaction collision coverage.
+
+The fifth quality correction closes the completed-recovery cleanup window.
+After completed authority, result, backup/source, exact audit-set, intent, and
+projected-inventory validation, recovery revalidates both the selected and
+backup mutation guards as the exact children of the pinned runs root
+immediately before marker cleanup or intent unlink. Marker-present and
+marker-absent completion share these pre-cleanup checks, but only the
+marker-absent path proceeds directly to intent unlink. A deterministic selected
+rebound at the marker-absent boundary fails identity and preserves the intent,
+locked parked tree, replacement, backup, and result evidence.
+
+The sixth quality correction keeps those checks and adds a second selected and
+backup exact-child validation after marker removal returns on the marker-present
+path, immediately before intent unlink. A deterministic rebound in that later
+window fails identity while retaining the intent, backup, parked locked source,
+replacement source, and result evidence; the already-completed marker removal
+remains durable.
 
 ### M3-03 - Retention And Audited Purge
 

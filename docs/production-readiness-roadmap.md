@@ -551,8 +551,9 @@ Goal: turn observed usage failures into a small, supportable `0.x` contract.
   approval plus the final controller gate, the five durable contracts emit
   explicit schema version 1, read legacy unversioned v0 and current v1, and
   reject explicit unsupported versions without mutating input files. Whole-run
-  migration remains M3-02b, so M3-02 is active rather than complete; retention
-  remains M3-03.
+  migration M3-02b is complete after independent specification and quality
+  approval plus the final controller gate, so M3-02 is complete. U9 remains
+  active because retention is still M3-03.
 - **U10 - Dogfood two real repositories.** Complete at least five bounded
   tickets across two different stacks, including an approved patch, a policy
   rejection, an eval failure, and an interrupted/resumed run. Track setup time,

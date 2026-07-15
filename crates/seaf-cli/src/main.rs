@@ -28,14 +28,14 @@ use seaf_loop::{
     cleanup_candidate_workspace_outcome, ensure_no_pending_recovery, evaluate_zero_tolerance,
     execute_approved_evaluation, execute_eval_checks, inspect_loop_run,
     invalidate_approved_evaluation, load_agent_bench_fixture,
-    load_verified_recovery_authority_kind, plan_eval_checks, preflight_authoritative_run_inputs,
-    promote_evaluated_candidate, rerun_invalidated_evaluation, revise_provider_step,
-    validate_human_review_execution_barrier, validate_requested_recovery, AgentBenchSummary,
-    ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits,
-    ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner,
-    LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun,
-    ProviderPatchGateConfig, ProviderStepRunner, RecoveryAuthorityKind, RunnerError, StepOutput,
-    StepRunner,
+    load_verified_recovery_authority_kind, migrate_loop_run, plan_eval_checks,
+    preflight_authoritative_run_inputs, promote_evaluated_candidate, rerun_invalidated_evaluation,
+    revise_provider_step, validate_human_review_execution_barrier, validate_requested_recovery,
+    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
+    ContextLimits, ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun,
+    LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision,
+    PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RecoveryAuthorityKind,
+    RunnerError, StepOutput, StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -161,6 +161,8 @@ enum LoopCommand {
     Status(LoopStatusArgs),
     /// Inspect persisted loop authority without changing it.
     Inspect(LoopInspectArgs),
+    /// Migrate one authenticated legacy run to the current durable artifact schema.
+    Migrate(LoopMigrateArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
     /// Publish an audited provider-step revision without contacting a provider.
@@ -314,6 +316,19 @@ struct LoopStatusArgs {
 
 #[derive(Debug, Args)]
 struct LoopInspectArgs {
+    /// Run ID under --runs-root.
+    #[arg(long)]
+    run_id: String,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopMigrateArgs {
     /// Run ID under --runs-root.
     #[arg(long)]
     run_id: String,
@@ -675,6 +690,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Inspect(args),
         } => loop_inspect(args),
+        Command::Loop {
+            command: LoopCommand::Migrate(args),
+        } => loop_migrate(args),
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
@@ -1395,6 +1413,27 @@ fn loop_inspect(args: LoopInspectArgs) -> Result<(), CliFailure> {
     }
     println!("run directory: {}", report.run_directory);
     println!("run file: {}", report.run_file);
+    Ok(())
+}
+
+fn loop_migrate(args: LoopMigrateArgs) -> Result<(), CliFailure> {
+    validate_run_id(&args.run_id)?;
+    let report = migrate_loop_run(&args.runs_root, &args.run_id)
+        .map_err(|error| CliFailure::message(format!("loop migration failed: {error}")))?;
+    if args.json {
+        return print_json(&report);
+    }
+
+    println!(
+        "loop migrate {}: {:?} (schema {} -> {})",
+        report.run_id, report.status, report.from_schema_version, report.to_schema_version
+    );
+    if let Some(path) = report.backup_directory {
+        println!("byte-exact backup: {path}");
+    }
+    if let Some(path) = report.result_path {
+        println!("migration result: {path}");
+    }
     Ok(())
 }
 

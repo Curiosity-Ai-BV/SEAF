@@ -50,11 +50,27 @@ pub fn load_verified_final_evaluation_authority(
     workspace: &LoopWorkspace,
     run: &LoopRun,
 ) -> Result<VerifiedFinalEvaluationAuthority, FinalEvaluationAuthorityError> {
-    if workspace
-        .run_directory()
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some(run.run_id.as_str())
+    load_verified_final_evaluation_authority_with_binding(workspace, run, true)
+}
+
+pub(crate) fn load_verified_staged_final_evaluation_authority(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+) -> Result<VerifiedFinalEvaluationAuthority, FinalEvaluationAuthorityError> {
+    load_verified_final_evaluation_authority_with_binding(workspace, run, false)
+}
+
+fn load_verified_final_evaluation_authority_with_binding(
+    workspace: &LoopWorkspace,
+    run: &LoopRun,
+    require_selected_directory_name: bool,
+) -> Result<VerifiedFinalEvaluationAuthority, FinalEvaluationAuthorityError> {
+    if require_selected_directory_name
+        && workspace
+            .run_directory()
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(run.run_id.as_str())
     {
         return Err(FinalEvaluationAuthorityError::invalid(
             "final LoopRun run_id does not match the authoritative run directory",
@@ -303,6 +319,49 @@ fn reconstruct_approved_authority(
     workspace: &LoopWorkspace,
     final_run: &LoopRun,
 ) -> Result<LoopRun, FinalEvaluationAuthorityError> {
+    let mut approved = project_unrecovered_approved_authority(final_run)?;
+    let recovery_source =
+        crate::recovery::load_evaluation_recovery_source_for_final(workspace, final_run)
+            .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
+    if let Some(source) = recovery_source {
+        approved.latest_recovery = source.latest_recovery.clone();
+        approved.updated_at = source.updated_at.clone();
+        if approved != source {
+            return Err(FinalEvaluationAuthorityError::invalid(
+                "final LoopRun is not an allowed descendant of its evaluation recovery source",
+            ));
+        }
+        approved = source;
+    }
+    let errors = validate_loop_run(&approved);
+    if !errors.is_empty() {
+        return Err(FinalEvaluationAuthorityError::invalid(format!(
+            "could not reconstruct exact Approved authority: {}",
+            format_field_errors(errors)
+        )));
+    }
+    Ok(approved)
+}
+
+pub(crate) fn project_unrecovered_approved_authority(
+    final_run: &LoopRun,
+) -> Result<LoopRun, FinalEvaluationAuthorityError> {
+    let evaluation_run;
+    let final_run = if final_run.status == LoopStatus::Promoted {
+        let promotion = final_run.promotion.as_ref().ok_or_else(|| {
+            FinalEvaluationAuthorityError::invalid("Promoted authority lost promotion evidence")
+        })?;
+        evaluation_run = {
+            let mut predecessor = final_run.clone();
+            predecessor.status = LoopStatus::EvalPassed;
+            predecessor.updated_at = promotion.eval_passed_updated_at.clone();
+            predecessor.promotion = None;
+            predecessor
+        };
+        &evaluation_run
+    } else {
+        final_run
+    };
     let approval = final_run.human_approval.as_ref().ok_or_else(|| {
         FinalEvaluationAuthorityError::invalid(
             "final evaluation authority lost human approval evidence",
@@ -331,26 +390,6 @@ fn reconstruct_approved_authority(
         candidate.lifecycle = seaf_core::CandidateWorkspaceLifecycle::Active;
         candidate.cleanup_started_at = None;
         candidate.cleaned_at = None;
-    }
-    let recovery_source =
-        crate::recovery::load_evaluation_recovery_source_for_final(workspace, final_run)
-            .map_err(|error| FinalEvaluationAuthorityError::invalid(error.to_string()))?;
-    if let Some(source) = recovery_source {
-        approved.latest_recovery = source.latest_recovery.clone();
-        approved.updated_at = source.updated_at.clone();
-        if approved != source {
-            return Err(FinalEvaluationAuthorityError::invalid(
-                "final LoopRun is not an allowed descendant of its evaluation recovery source",
-            ));
-        }
-        approved = source;
-    }
-    let errors = validate_loop_run(&approved);
-    if !errors.is_empty() {
-        return Err(FinalEvaluationAuthorityError::invalid(format!(
-            "could not reconstruct exact Approved authority: {}",
-            format_field_errors(errors)
-        )));
     }
     Ok(approved)
 }

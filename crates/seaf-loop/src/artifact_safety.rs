@@ -39,13 +39,26 @@ pub(crate) fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> b
 pub(crate) struct PinnedPrivateDirectory {
     file: fs::File,
     path: PathBuf,
+    require_private_mode: bool,
 }
 
 impl PinnedPrivateDirectory {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_mode_policy(path, true)
+    }
+
+    pub(crate) fn open_parent(path: &Path) -> io::Result<Self> {
+        Self::open_with_mode_policy(path, false)
+    }
+
+    fn open_with_mode_policy(path: &Path, require_private_mode: bool) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            validate_private_directory(path)?;
+            if require_private_mode {
+                validate_private_directory(path)?;
+            } else {
+                validate_real_directory(path)?;
+            }
             let mut options = fs::OpenOptions::new();
             options
                 .read(true)
@@ -53,8 +66,8 @@ impl PinnedPrivateDirectory {
             let file = options.open(path)?;
             let opened = file.metadata()?;
             let current = fs::symlink_metadata(path)?;
-            validate_private_directory_mode(path, &opened)?;
-            validate_private_directory_mode(path, &current)?;
+            validate_directory_mode_policy(path, &opened, require_private_mode)?;
+            validate_directory_mode_policy(path, &current, require_private_mode)?;
             if opened.dev() != current.dev() || opened.ino() != current.ino() {
                 return Err(invalid(format!(
                     "private run directory identity changed: {}",
@@ -64,6 +77,7 @@ impl PinnedPrivateDirectory {
             Ok(Self {
                 file,
                 path: path.to_path_buf(),
+                require_private_mode,
             })
         }
         #[cfg(not(unix))]
@@ -86,8 +100,8 @@ impl PinnedPrivateDirectory {
         {
             let opened = self.file.metadata()?;
             let current = fs::symlink_metadata(&self.path)?;
-            validate_private_directory_mode(&self.path, &opened)?;
-            validate_private_directory_mode(&self.path, &current)?;
+            validate_directory_mode_policy(&self.path, &opened, self.require_private_mode)?;
+            validate_directory_mode_policy(&self.path, &current, self.require_private_mode)?;
             if opened.dev() != current.dev() || opened.ino() != current.ino() {
                 return Err(invalid(format!(
                     "private run directory identity changed: {}",
@@ -195,11 +209,74 @@ impl PinnedPrivateDirectory {
                     path.display()
                 )));
             }
-            Ok(Self { file, path })
+            Ok(Self {
+                file,
+                path,
+                require_private_mode: true,
+            })
         }
         #[cfg(not(unix))]
         {
             let _ = name;
+            Err(unsupported())
+        }
+    }
+
+    pub(crate) fn read_symlink(&self, name: &OsStr, max_bytes: usize) -> io::Result<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            let name = c_name(name)?;
+            let capacity = max_bytes
+                .checked_add(1)
+                .ok_or_else(|| invalid("symlink target bound overflowed".to_string()))?;
+            let mut bytes = vec![0_u8; capacity];
+            // SAFETY: the pinned directory descriptor, C name, and writable buffer are valid.
+            let read = unsafe {
+                libc::readlinkat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if read < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let read = usize::try_from(read)
+                .map_err(|_| invalid("symlink target length is not representable".to_string()))?;
+            if read > max_bytes {
+                return Err(invalid(format!(
+                    "symlink target exceeds its {max_bytes}-byte cap"
+                )));
+            }
+            bytes.truncate(read);
+            Ok(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, max_bytes);
+            Err(unsupported())
+        }
+    }
+
+    pub(crate) fn create_symlink(&self, target: &[u8], name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let target = CString::new(target)
+                .map_err(|_| invalid("symlink target contains a NUL byte".to_string()))?;
+            let name = c_name(name)?;
+            // SAFETY: target, name, and the pinned directory descriptor are valid.
+            let result =
+                unsafe { libc::symlinkat(target.as_ptr(), self.file.as_raw_fd(), name.as_ptr()) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, name);
             Err(unsupported())
         }
     }
@@ -758,6 +835,30 @@ fn validate_private_directory_mode(path: &Path, metadata: &fs::Metadata) -> io::
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_real_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_directory_mode_policy(path, &metadata, false)
+}
+
+#[cfg(unix)]
+fn validate_directory_mode_policy(
+    path: &Path,
+    metadata: &fs::Metadata,
+    require_private_mode: bool,
+) -> io::Result<()> {
+    if require_private_mode {
+        validate_private_directory_mode(path, metadata)
+    } else if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        Err(invalid(format!(
+            "directory authority must be a real directory: {}",
+            path.display()
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
