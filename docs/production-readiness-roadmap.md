@@ -552,8 +552,23 @@ Goal: turn observed usage failures into a small, supportable `0.x` contract.
   explicit schema version 1, read legacy unversioned v0 and current v1, and
   reject explicit unsupported versions without mutating input files. Whole-run
   migration M3-02b is complete after independent specification and quality
-  approval plus the final controller gate, so M3-02 is complete. U9 remains
-  active because retention is still M3-03.
+  approval plus the final controller gate, so M3-02 is complete. **M3-03 is
+  complete:** the explicit managed-byte policy, dry-run/apply CLI,
+  protected active/locked/migrated state, intent-owned tombstones, repeatable
+  interrupted purge, single-link refusal, immutable decision evidence,
+  separately normalized convergence evidence, and bounded verified latest
+  audit are present. Only Passed and Completed authority is purgeable;
+  EvalPassed and Promoted remain protected because their supported candidate
+  cleanup is unavailable. The review correction adds numeric timestamp
+  ordering, partial-deletion recovery, relocatable audit identity, atomic
+  result replacement, and compact one-run batches with proven 2 MiB intent and
+  8 MiB cumulative-audit bounds. The batching re-review correction preserves
+  continuation history across drift, separates the 4,096 operator-entry cap
+  from four bounded SEAF controls, and uses fixed-length intent-validated
+  tombstone digests. Independent specification and quality re-reviews approved
+  the corrected transaction with no remaining P0/P1/P2 findings, and the full
+  controller gate passed. U9 is complete. M2-07 remains unexecuted, and
+  Milestones 2 and 3 remain incomplete with M3-04 next.
 - **U10 - Dogfood two real repositories.** Complete at least five bounded
   tickets across two different stacks, including an approved patch, a policy
   rejection, an eval failure, and an interrupted/resumed run. Track setup time,

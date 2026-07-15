@@ -23,6 +23,7 @@ pub mod policy_gate;
 pub mod promotion;
 pub mod provider_exchange;
 pub mod recovery;
+mod retention;
 pub mod role_artifact;
 pub mod role_response;
 mod run_persistence;
@@ -100,6 +101,10 @@ pub use recovery::{
     EvaluationInvalidationSourceRunV3, RecoveryAction, RecoveryAttemptV1, RecoveryAuthorityKind,
     RecoveryError, RecoveryRevisionOutcome, RecoverySourceRunV1,
     EVALUATION_INVALIDATION_SCHEMA_VERSION, RECOVERY_SCHEMA_VERSION,
+};
+pub use retention::{
+    load_verified_purge_result, purge_loop_runs, PurgeControlState, PurgeDecisionEvidence,
+    PurgeMode, PurgeReport, PurgeRunSummary, PurgeStateSnapshot, RetentionError, RetentionPolicy,
 };
 pub use role_artifact::{RoleArtifactError, ValidatedRoleArtifact};
 pub use role_response::{

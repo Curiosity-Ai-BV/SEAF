@@ -29,13 +29,14 @@ use seaf_loop::{
     execute_approved_evaluation, execute_eval_checks, inspect_loop_run,
     invalidate_approved_evaluation, load_agent_bench_fixture,
     load_verified_recovery_authority_kind, migrate_loop_run, plan_eval_checks,
-    preflight_authoritative_run_inputs, promote_evaluated_candidate, rerun_invalidated_evaluation,
-    revise_provider_step, validate_human_review_execution_barrier, validate_requested_recovery,
-    AgentBenchSummary, ArtifactContent, AuthoritativeRunInputSnapshots, CandidateCleanupOutcome,
-    ContextLimits, ContextPackRequest, EvalCheckExecution, GitCommandRunner, InitializedLoopRun,
-    LoopRunner, LoopRunnerConfig, LoopWorkspace, PatchDecisionKind, PolicyDecision,
-    PreparedLoopRun, ProviderPatchGateConfig, ProviderStepRunner, RecoveryAuthorityKind,
-    RunnerError, StepOutput, StepRunner,
+    preflight_authoritative_run_inputs, promote_evaluated_candidate, purge_loop_runs,
+    rerun_invalidated_evaluation, revise_provider_step, validate_human_review_execution_barrier,
+    validate_requested_recovery, AgentBenchSummary, ArtifactContent,
+    AuthoritativeRunInputSnapshots, CandidateCleanupOutcome, ContextLimits, ContextPackRequest,
+    EvalCheckExecution, GitCommandRunner, InitializedLoopRun, LoopRunner, LoopRunnerConfig,
+    LoopWorkspace, PatchDecisionKind, PolicyDecision, PreparedLoopRun, ProviderPatchGateConfig,
+    ProviderStepRunner, PurgeMode, RecoveryAuthorityKind, RetentionPolicy, RunnerError, StepOutput,
+    StepRunner,
 };
 use seaf_models::{
     FakeProvider, ModelMessage, ModelMessageRole, ModelProvider, ModelRequest, ModelResponse,
@@ -163,6 +164,8 @@ enum LoopCommand {
     Inspect(LoopInspectArgs),
     /// Migrate one authenticated legacy run to the current durable artifact schema.
     Migrate(LoopMigrateArgs),
+    /// Plan or apply size-bounded retention for authenticated Passed/Completed runs.
+    Purge(LoopPurgeArgs),
     /// Resume a local-loop run.
     Resume(LoopResumeArgs),
     /// Publish an audited provider-step revision without contacting a provider.
@@ -335,6 +338,22 @@ struct LoopMigrateArgs {
     /// Directory containing loop run workspaces.
     #[arg(long, default_value = ".seaf/loops/runs")]
     runs_root: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoopPurgeArgs {
+    /// Maximum bytes retained across authenticated ordinary run directories.
+    #[arg(long)]
+    max_managed_bytes: u64,
+    /// Directory containing loop run workspaces.
+    #[arg(long, default_value = ".seaf/loops/runs")]
+    runs_root: PathBuf,
+    /// Apply the deletion plan. Omit for a byte-inert dry-run.
+    #[arg(long)]
+    apply: bool,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -693,6 +712,9 @@ fn run(cli: Cli) -> Result<(), CliFailure> {
         Command::Loop {
             command: LoopCommand::Migrate(args),
         } => loop_migrate(args),
+        Command::Loop {
+            command: LoopCommand::Purge(args),
+        } => loop_purge(args),
         Command::Loop {
             command: LoopCommand::Resume(args),
         } => resume_loop(args),
@@ -1433,6 +1455,61 @@ fn loop_migrate(args: LoopMigrateArgs) -> Result<(), CliFailure> {
     }
     if let Some(path) = report.result_path {
         println!("migration result: {path}");
+    }
+    Ok(())
+}
+
+fn loop_purge(args: LoopPurgeArgs) -> Result<(), CliFailure> {
+    let mode = if args.apply {
+        PurgeMode::Apply
+    } else {
+        PurgeMode::DryRun
+    };
+    let report = purge_loop_runs(
+        &args.runs_root,
+        RetentionPolicy {
+            max_managed_bytes: args.max_managed_bytes,
+        },
+        mode,
+    )
+    .map_err(|error| CliFailure::message(format!("loop purge failed: {error}")))?;
+    if args.json {
+        let bytes = canonical_json_bytes(&report).map_err(|error| {
+            CliFailure::message(format!("could not serialize canonical purge JSON: {error}"))
+        })?;
+        io::stdout()
+            .write_all(&bytes)
+            .and_then(|()| io::stdout().write_all(b"\n"))
+            .map_err(|error| {
+                CliFailure::message(format!("could not write canonical purge JSON: {error}"))
+            })?;
+        return Ok(());
+    }
+
+    println!(
+        "loop purge {:?}: {} managed bytes -> {} (budget {})",
+        report.mode,
+        report.decision.snapshot.managed_bytes,
+        report
+            .converged
+            .as_ref()
+            .map_or(report.projected_managed_bytes_after, |state| state
+                .managed_bytes),
+        report.policy.max_managed_bytes
+    );
+    println!("selected runs: {}", report.decision.selected.len());
+    println!("deleted runs: {}", report.deleted.len());
+    println!(
+        "decision-time protected active runs: {}",
+        report.decision.snapshot.protected_active.len()
+    );
+    println!(
+        "decision-time protected locked runs: {}",
+        report.decision.snapshot.protected_locked.len()
+    );
+    if let Some(path) = report.audit_path {
+        println!("purge audit: {}", path.display());
+        println!("audit digest: {}", report.audit_digest);
     }
     Ok(())
 }

@@ -2663,6 +2663,11 @@ remains durable.
 
 Roadmap: U9. Dependencies: M3-02.
 
+Status: complete. Independent specification and quality re-reviews approved the
+corrected transaction with no remaining P0/P1/P2 findings, and the full
+controller gate passed. U9 is complete. M2-07 and Milestones 2 and 3 remain
+incomplete.
+
 Objective: bound durable storage without deleting active evidence.
 
 Acceptance criteria:
@@ -2681,6 +2686,49 @@ Verification: workspace/CLI suites and Full repo gate from the matrix.
 Docs/tracker: retention/purge guide and M3-03 status.
 
 Commit boundary: retention and purge only.
+
+Implementation: `seaf loop purge --max-managed-bytes <bytes>` is a byte-inert
+dry-run; `--apply` is the sole destructive authority. Typed, bounded canonical
+intent/result files, exact retained run locks, descriptor-relative tombstones,
+complete intent-bound tree manifests, and subset-only retry make interruption
+repeatable while failing closed on policy conflict, substitution, or injected
+content. Only authenticated `passed` and `completed` runs without a live
+candidate workspace or migration-result evidence are eligible. `eval_passed`
+and `promoted` remain protected final authority because their candidates must
+stay active and supported cleanup is unavailable. Other active, busy-locked,
+migrated, unsafe, and dot-prefixed control/backup state is never selected. Full
+policy and support boundaries are documented in `docs/run-retention.md`.
+
+The specification correction separates immutable decision evidence in the
+intent/result from normalized converged evidence. Exact retry validates current
+managed, protected, excluded, and purge-control state instead of returning a
+stale exclusion snapshot. Managed files must be single-link before intent
+publication. Focused policy coverage locks updated-time/run-ID ordering, Passed
+and Completed eligibility, EvalPassed/Promoted final-authority protection,
+live-candidate precedence, and migration result/backup preservation.
+
+The quality correction releases unselected observation guards before
+convergence; permits partial tombstone retry after intent-authorized relational
+provider evidence deletion while retaining intrinsic typed and manifest/digest
+checks; and parses canonical decimal Unix seconds numerically. Audit paths are
+durably relative and resolved against the current pinned root. Result
+replacement is atomic rename-overwrite with an old-or-new verified crash cut.
+Compact manifest fingerprints and one-run recoverable batches keep every intent
+within 2 MiB; prior-audit chaining and exact cumulative deletion summaries keep
+the final audit truthful within a worst-case-proven 8 MiB cap. Independent
+re-review then found three batching boundaries. Continuation history is now
+carried across unrelated root drift, while exact snapshot equality is reserved
+for final-result reuse; a matching completed intent/result chain is adopted
+before current-state advancement after a result-rename cut. The 4,096-entry
+operator inventory and four SEAF retention controls are counted separately.
+Tombstones use a fixed-length domain-separated run/directory identity digest,
+which is re-derived when the intent loads. Final-batch adoption now also compares
+fresh normalized inventory after intent unlink; drift carries the adopted audit
+as prior history into a new same-policy decision instead of returning stale
+success. Independent quality re-review approved the final correction with no
+remaining P0/P1/P2 findings. The full locked Rust workspace, Rust formatting,
+Clippy with warnings denied, package formatting/lint/typecheck/tests/build, and
+diff checks passed.
 
 ### M3-04 - Two-Repository Pilot Evidence
 

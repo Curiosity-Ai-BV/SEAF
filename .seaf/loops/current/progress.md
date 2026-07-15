@@ -64,7 +64,19 @@
 - [x] M3-02: Artifact format versions and migration.
   - [x] M3-02a: Artifact format versions and read compatibility.
   - [x] M3-02b: Whole-run artifact migration.
-- [ ] M3-03: Retention and audited purge.
+- [x] M3-03: Retention and audited purge.
+  - Accepted after independent specification and quality review plus the full
+    controller gate. `docs/run-retention.md` records the exact managed budget,
+    Passed/Completed eligibility, EvalPassed/Promoted final-authority
+    protection, protected/excluded namespaces, recovery, and latest-audit
+    boundary.
+  - Initial specification review returned audit-snapshot, hard-link, and policy
+    matrix findings. A later quality review returned guard-lifetime,
+    partial-tombstone, timestamp-ordering, audit-relocation, atomic-replacement,
+    and control-cap findings. Re-review then found continuation-history,
+    operator/control boundary, long-run-ID tombstone, and final-batch stale
+    adoption defects. The corrected transaction passed both re-reviews and the
+    full repository gate with no remaining P0/P1/P2 findings.
 - [ ] M3-04: Two-repository pilot evidence.
 - [ ] M3-05: Supported preview readiness.
 - [ ] M3-06: Human-authorized preview publication.
@@ -103,8 +115,10 @@ M3-02a is complete after specification and quality approval plus the final
 controller gate: the five durable contracts emit schema version 1, accept
 legacy unversioned v0 and current v1, and reject explicit unsupported versions
 without mutating source files. M3-02 is complete after independent
-specification and quality approval plus the final controller gate. U9 remains
-active because retention/purge is still M3-03.
+specification and quality approval plus the final controller gate. M3-03 is
+also accepted after independent specification and quality approval plus the
+full controller gate, so U9 is complete. M2-07 remains unexecuted, Milestone 2
+remains active, and Milestone 3 remains incomplete with M3-04 next.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI
