@@ -7,6 +7,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 fixture_relative_path="fixtures/packaged-external-golden-path/project.txt"
 fixture_root="$repo_root/fixtures/packaged-external-golden-path"
 ollama_fixture_root="$fixture_root/ollama"
+ollama_fixture_validator="$ollama_fixture_root/validate-fixture.cjs"
+ollama_fixture_validator_test="$repo_root/scripts/test-packaged-ollama-fixture-preflight.cjs"
 build_release_script="$repo_root/scripts/build-release-artifact.sh"
 readonly version="0.1.0"
 readonly reviewer="golden-path-reviewer@example.invalid"
@@ -140,54 +142,9 @@ require_command() {
 }
 
 validate_ollama_review_fixture() {
-  node - \
-    "$ollama_fixture_root/seaf.ticket.yaml" \
-    "$ollama_fixture_root/ollama-acceptance.txt" \
-    "$ollama_fixture_root/ollama-native-check.sh" <<'NODE'
-const fs = require('node:fs');
-
-const [ticketPath, initialPath, checkPath] = process.argv.slice(2);
-function readBoundedRegularFile(path, maximumBytes) {
-  const stat = fs.lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new Error(`unsafe Ollama review fixture file: ${path}`);
-  }
-  if (stat.size > maximumBytes) {
-    throw new Error(`Ollama review fixture file exceeds bound: ${path}`);
-  }
-  return fs.readFileSync(path);
-}
-
-const ticketBytes = readBoundedRegularFile(ticketPath, 16 * 1024);
-const initialBytes = readBoundedRegularFile(initialPath, 64);
-const checkBytes = readBoundedRegularFile(checkPath, 16 * 1024);
-const ticket = ticketBytes.toString('utf8');
-if (!Buffer.from(ticket, 'utf8').equals(ticketBytes)) {
-  throw new Error('Ollama ticket is not valid UTF-8');
-}
-const normalizedTicket = ticket.replace(/\s+/g, ' ').trim();
-const initialInstruction = 'When a Spec Creation provider request has no revision_context, the specification must propose the exact final bytes SEAF packaged Ollama acceptance draft. followed by one newline.';
-const reviewInstruction = 'This proposed final text is intentionally wrong, so Spec Review must request changes.';
-const recoveredInstruction = 'When a Spec Creation provider request has revision_context, the specification must correct the proposed final bytes to SEAF packaged Ollama acceptance passed. followed by one newline.';
-const preservationInstruction = 'The recovered specification must preserve the permitted path, policy scope, command, and acceptance criteria.';
-for (const instruction of [initialInstruction, reviewInstruction, recoveredInstruction, preservationInstruction]) {
-  if (!normalizedTicket.includes(instruction)) {
-    throw new Error(`Ollama ticket is missing the trusted review protocol: ${instruction}`);
-  }
-}
-const finalCriterion = '  - After the change its exact bytes are SEAF packaged Ollama acceptance passed. followed by one newline.';
-if (!ticket.split('\n').includes(finalCriterion)) {
-  throw new Error('Ollama ticket final-byte acceptance criterion changed');
-}
-if (!initialBytes.equals(Buffer.from('PENDING\n', 'utf8'))) {
-  throw new Error('Ollama fixture initial bytes changed');
-}
-const check = checkBytes.toString('utf8');
-if (!check.includes('expected_content="SEAF packaged Ollama acceptance passed."')
-  || !check.includes('wc -l <"$candidate_file"')) {
-  throw new Error('Ollama fixture native check no longer enforces the exact final bytes and newline');
-}
-NODE
+  node --test "$ollama_fixture_validator_test" >/dev/null ||
+    fail "Ollama fixture preflight regressions failed"
+  node "$ollama_fixture_validator" "$ollama_fixture_root"
 }
 
 file_size_bytes() {
@@ -2003,6 +1960,10 @@ if [[ "$acceptance_mode" == "ollama" ]]; then
   [[ ! -e "$evidence_out" && ! -L "$evidence_out" ]] || fail "--evidence-out must not already exist"
 fi
 [[ -x "$build_release_script" ]] || fail "release artifact builder is missing or not executable"
+[[ -f "$ollama_fixture_validator" && ! -L "$ollama_fixture_validator" ]] ||
+  fail "Ollama fixture validator is missing or unsafe"
+[[ -f "$ollama_fixture_validator_test" && ! -L "$ollama_fixture_validator_test" ]] ||
+  fail "Ollama fixture preflight regression test is missing or unsafe"
 for relative in project.txt golden-path-check.sh seaf.ticket.yaml seaf.evals.yaml.in; do
   [[ -f "$fixture_root/$relative" && ! -L "$fixture_root/$relative" ]] ||
     fail "required fixture file is missing or unsafe: fixtures/packaged-external-golden-path/$relative"
