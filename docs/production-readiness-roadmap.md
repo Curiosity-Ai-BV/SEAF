@@ -414,7 +414,8 @@ exact, warning-free, and proven through pristine archives plus an external
 installed-CLI smoke. Independent specification and quality reviews approved the
 corrected package and release-artifact boundaries, and the full controller gates
 passed. M2-05 and U7 were accepted on 2026-07-14. M2-06 and U8 are now also
-accepted; M2-07 is dependency-ready and has not started.
+accepted. M2-07 implementation and its reviewed remediation chain are accepted;
+fresh sanitized live Ollama acceptance evidence remains pending.
 
 ### Milestone 2 - Make The Loop Consumable
 
@@ -527,8 +528,9 @@ notification remains visible; successful eval cleanup may emit only a narrowly
 bounded family of platform-rendered variants with an optional `/bin/` prefix and
 optional parentheses around the same negative PID and `No such process`
 semantics. Total stderr is capped at 4 KiB and no other stderr is permitted.
-M2-07 is dependency-ready and has not started, so Milestone 2 remains active and
-Ollama acceptance is not claimed.
+M2-07 implementation and its reviewed remediation chain are accepted, but no
+successful sanitized live Ollama evidence has been published. Milestone 2
+therefore remains active and Ollama acceptance is not claimed.
 
 Exit gate: a new developer can complete the fake-provider path from the public
 quickstart in under 15 minutes. The full production-use acceptance scenario
@@ -546,8 +548,9 @@ Goal: turn observed usage failures into a small, supportable `0.x` contract.
   **M3-01 is complete:** `seaf-core` owns the shared `PolicyDecision` contract,
   `LoopRun` stores typed decisions, and the five named Rust contracts have
   schema-drift coverage. The user authorized this slice ahead of the recorded
-  M2-07 dependency; M2-07 remains unexecuted, and neither U9 nor Milestone 3 is
-  complete. **M3-02a is complete:** after independent specification and quality
+  M2-07 dependency; M2-07 live acceptance remains unexecuted, and neither U9
+  nor Milestone 3 is complete. **M3-02a is complete:** after independent
+  specification and quality
   approval plus the final controller gate, the five durable contracts emit
   explicit schema version 1, read legacy unversioned v0 and current v1, and
   reject explicit unsupported versions without mutating input files. Whole-run

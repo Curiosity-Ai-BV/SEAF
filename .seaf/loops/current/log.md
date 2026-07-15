@@ -3676,3 +3676,18 @@ all-target/all-feature Clippy with warnings denied, the complete locked Rust
 workspace, package formatting/lint/typecheck/tests/build, and `git diff --check`.
 M3-03 and U9 are accepted. M2-07 remains unexecuted, Milestone 2 remains active,
 and Milestone 3 remains incomplete with M3-04 next.
+
+## 2026-07-15 tracking correction | M2-07 implementation versus live acceptance
+
+Repository history confirms that M2-07 is not missing implementation. Commit
+`7410f65` added the packaged live-Ollama harness, fixtures, and sanitized-
+evidence machinery, and the reviewed remediation chain through `c874440`,
+`0397fbb`, and `2f721cc` hardened response grammar, deterministic reviewer
+recovery, unified-diff grounding, and fixture trust boundaries. Those code
+changes and their gates are accepted.
+
+The M2-07 checklist remains open because its declared deliverable is executed
+Ollama acceptance, and no fresh successful sanitized live evidence artifact is
+present in repository history. The stale “implementation not started” wording
+is corrected to “implementation accepted; live acceptance pending.” Milestone 2
+is not marked complete.

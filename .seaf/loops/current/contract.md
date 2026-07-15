@@ -45,7 +45,8 @@ failed gate, a genuine authority decision, or an external blocker.
 ## Current Slice
 
 M2-07 - Executed Ollama acceptance. Milestone 1 and M2-01 through M2-06 are
-accepted. Status: dependency-ready; implementation has not started.
+accepted. Status: implementation and its reviewed remediation chain are
+complete; fresh sanitized live Ollama acceptance evidence is pending.
 
 M2-05's exact handoff is the immutable public
 [`v0.1.0` prerelease](https://github.com/Curiosity-Ai-BV/SEAF/releases/tag/v0.1.0)
@@ -72,5 +73,6 @@ post-install adoption runs completed in 9 seconds, 8 seconds, and 8 seconds.
 
 Do not publish another release or registry package, move or replace `v0.1.0`,
 weaken immutable-release or tag protection, or claim Milestone 2 completion.
-M2-07 requires separately executed local Ollama evidence and remains not
-started; no Ollama command is authorized by the M2-06 acceptance.
+M2-07 remains open because its separately executed local Ollama run has not
+published accepted sanitized evidence. Do not claim Milestone 2 completion from
+the accepted harness and remediation code alone.

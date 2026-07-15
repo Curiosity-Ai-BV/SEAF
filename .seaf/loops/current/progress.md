@@ -57,6 +57,9 @@
 - [x] M2-05: Human-authorized tagged prerelease.
 - [x] M2-06: Packaged external golden path.
 - [ ] M2-07: Executed Ollama acceptance.
+  - Implementation and the reviewed remediation chain are accepted. A fresh
+    successful live Ollama run and its validated sanitized evidence remain the
+    open exit gate.
 
 ## Milestone 3 - Piloted Preview
 
@@ -109,8 +112,9 @@ and installs the current native archive outside the source tree, completes the
 two-repository fake-provider acceptance under the 15-minute bound and recursively
 validates bounded artifact references, binds rejection to exact exit-24 report/log
 evidence, and preserves explicit nonempty untracked file and symlink sentinels
-through failure and cleanup. M2-07 is dependency-ready but has not started, so
-Milestone 2 is not accepted.
+through failure and cleanup. M2-07 implementation and its reviewed remediation
+chain are accepted, but no successful sanitized live Ollama evidence has been
+published, so Milestone 2 is not accepted.
 
 The user explicitly authorized M3-01 ahead of the recorded M2-07 dependency.
 M3-01 is complete: `seaf-core` owns the shared policy-decision types,
@@ -124,8 +128,8 @@ without mutating source files. M3-02 is complete after independent
 specification and quality approval plus the final controller gate. M3-03 is
 complete after the pending-migration source correction passed independent
 cross-slice re-review and the repeated full controller gate. U9 is complete.
-M2-07 remains unexecuted, and Milestones 2 and 3 remain incomplete; M3-04 is
-next.
+M2-07 live acceptance remains unexecuted, and Milestones 2 and 3 remain
+incomplete; M3-04 is next.
 
 The accepted package gate proves exact version/private metadata, four pristine
 local package archives, warning-free MIT notices, external extracted-CLI

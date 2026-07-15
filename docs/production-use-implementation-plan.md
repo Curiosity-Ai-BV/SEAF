@@ -2158,7 +2158,8 @@ remaining integration and doc-test suite.
 ### M2-02 - Project Doctor
 
 Status: accepted on 2026-07-13. Dependencies: M2-01 (accepted). M2-03 through
-M2-06 are accepted; M2-07 is dependency-ready and has not started.
+M2-06 are accepted. M2-07 implementation is accepted; fresh sanitized live
+Ollama evidence remains pending.
 
 Roadmap: U6. Dependencies: M2-01.
 
@@ -2230,12 +2231,14 @@ reviews approved the corrected slice without findings. The final controller
 gate passed 15/15 focused doctor tests, model-check compatibility, all Rust
 format/Clippy/workspace suites (including CLI 164/164, loop unit 286/286, and
 provider/candidate 75/75), every SDK lint/type/test/build gate, and diff hygiene.
-M2-03 through M2-06 are accepted; M2-07 is dependency-ready and has not started.
+M2-03 through M2-06 are accepted. M2-07 implementation is accepted; fresh
+sanitized live Ollama evidence remains pending.
 
 ### M2-03 - Package Metadata And Version Identity
 
 Status: accepted on 2026-07-13. Dependencies: M2-02 (accepted). M2-04 through
-M2-06 are accepted; M2-07 is dependency-ready and has not started.
+M2-06 are accepted. M2-07 implementation is accepted; fresh sanitized live
+Ollama evidence remains pending.
 
 Roadmap: U7. Dependencies: M2-02.
 
@@ -2292,7 +2295,8 @@ suite, and doc tests.
 ### M2-04 - Release Artifact Workflow
 
 Status: accepted on 2026-07-14. Dependencies: M2-03 (accepted). M2-05 and M2-06
-are also accepted; M2-07 is dependency-ready and has not started.
+are also accepted. M2-07 implementation is accepted; fresh sanitized live
+Ollama evidence remains pending.
 
 Roadmap: U7. Dependencies: M2-03.
 
@@ -2409,8 +2413,8 @@ in the [immutable `v0.1.0` prerelease](https://github.com/Curiosity-Ai-BV/SEAF/r
 All three automatic GitHub release attestations passed
 `gh release verify-asset`. Automatic attestation authority came from immutable
 GitHub Release publication, not from workflow write/OIDC permissions. M2-05 and
-U7 are accepted. M2-06 and U8 were accepted afterward; M2-07 is now
-dependency-ready and has not started.
+U7 are accepted. M2-06 and U8 were accepted afterward. M2-07 implementation is
+accepted; fresh sanitized live Ollama evidence remains pending.
 
 Docs/tracker: release evidence and M2-05 status.
 
@@ -2475,11 +2479,13 @@ stderr is permitted.
 
 Ordinary CI runs this gate immediately after release-artifact readiness.
 README and both loop docs now use the installed `seaf` command chain. U8 and
-M2-06 are accepted; M2-07 is dependency-ready and has not started.
+M2-06 are accepted. M2-07 implementation is accepted; fresh sanitized live
+Ollama evidence remains pending.
 
 ### M2-07 - Executed Ollama Acceptance
 
-Status: dependency-ready; implementation not started.
+Status: implementation and reviewed remediation chain accepted; live acceptance
+pending.
 
 Roadmap: U8 and Milestone 2 exit gate. Dependencies: M2-06.
 
@@ -2506,13 +2512,21 @@ Docs/tracker: executed evidence and Milestone 2 completion.
 
 Commit boundary: Ollama evidence and any docs only; defects get separate slices.
 
+Implementation: commit `7410f65` added the packaged live-Ollama harness,
+fixtures, and sanitized-evidence machinery. The reviewed remediation chain
+through `c874440`, `0397fbb`, and `2f721cc` hardened structured response grammar,
+deterministic reviewer recovery, unified-diff grounding, and the packaged
+fixture trust boundary. Its focused and repository gates passed. This accepted
+implementation does not satisfy the M2-07 exit gate by itself: a fresh live run
+must still complete and publish validated sanitized evidence.
+
 ### M3-01 - Typed Durable Loop Contracts
 
 Roadmap: U9. Dependencies: M2-07.
 
 Status: complete. The user explicitly authorized M3-01 ahead of the recorded
-M2-07 dependency. M2-07 remains unexecuted, Milestones 2 and 3 remain
-incomplete, and no M2-07 evidence is claimed.
+M2-07 dependency. M2-07 live acceptance remains unexecuted, Milestones 2 and 3
+remain incomplete, and no successful sanitized live evidence is claimed.
 
 Objective: type the artifact set exposed by the supported loop.
 
