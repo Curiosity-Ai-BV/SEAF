@@ -10,7 +10,7 @@ const test = require("node:test");
 
 const {
   validateOllamaReviewFixture,
-} = require("../fixtures/packaged-external-golden-path/ollama/validate-fixture.cjs");
+} = require("./validate-packaged-ollama-fixture.cjs");
 
 const sourceRoot = path.resolve(
   __dirname,

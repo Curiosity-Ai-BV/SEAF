@@ -7,8 +7,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 fixture_relative_path="fixtures/packaged-external-golden-path/project.txt"
 fixture_root="$repo_root/fixtures/packaged-external-golden-path"
 ollama_fixture_root="$fixture_root/ollama"
-ollama_fixture_validator="$ollama_fixture_root/validate-fixture.cjs"
+ollama_fixture_validator="$repo_root/scripts/validate-packaged-ollama-fixture.cjs"
 ollama_fixture_validator_test="$repo_root/scripts/test-packaged-ollama-fixture-preflight.cjs"
+ollama_fixture_boundary_test="$repo_root/scripts/test-packaged-ollama-fixture-trust-boundary.cjs"
 build_release_script="$repo_root/scripts/build-release-artifact.sh"
 readonly version="0.1.0"
 readonly reviewer="golden-path-reviewer@example.invalid"
@@ -144,6 +145,8 @@ require_command() {
 validate_ollama_review_fixture() {
   node --test "$ollama_fixture_validator_test" >/dev/null ||
     fail "Ollama fixture preflight regressions failed"
+  node --test "$ollama_fixture_boundary_test" >/dev/null ||
+    fail "Ollama fixture trust-boundary regression failed"
   node "$ollama_fixture_validator" "$ollama_fixture_root"
 }
 
@@ -1964,6 +1967,8 @@ fi
   fail "Ollama fixture validator is missing or unsafe"
 [[ -f "$ollama_fixture_validator_test" && ! -L "$ollama_fixture_validator_test" ]] ||
   fail "Ollama fixture preflight regression test is missing or unsafe"
+[[ -f "$ollama_fixture_boundary_test" && ! -L "$ollama_fixture_boundary_test" ]] ||
+  fail "Ollama fixture trust-boundary regression test is missing or unsafe"
 for relative in project.txt golden-path-check.sh seaf.ticket.yaml seaf.evals.yaml.in; do
   [[ -f "$fixture_root/$relative" && ! -L "$fixture_root/$relative" ]] ||
     fail "required fixture file is missing or unsafe: fixtures/packaged-external-golden-path/$relative"
