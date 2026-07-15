@@ -7,7 +7,14 @@ problem: >-
   Change only top-level ollama-acceptance.txt from the exact bytes PENDING plus
   one trailing newline to the exact bytes SEAF packaged Ollama acceptance
   passed. plus one trailing newline. Do not create, delete, rename, or modify
-  any other path.
+  any other path. When a Spec Creation provider request has no
+  revision_context, the specification must propose the exact final bytes SEAF
+  packaged Ollama acceptance draft. followed by one newline. This proposed
+  final text is intentionally wrong, so Spec Review must request changes. When
+  a Spec Creation provider request has revision_context, the specification must
+  correct the proposed final bytes to SEAF packaged Ollama acceptance passed.
+  followed by one newline. The recovered specification must preserve the
+  permitted path, policy scope, command, and acceptance criteria.
 research_questions:
   - Can the exact one-file, one-line, trailing-newline change be made without any other repository change?
 context:

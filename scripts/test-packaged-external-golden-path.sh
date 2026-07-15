@@ -139,6 +139,57 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
 }
 
+validate_ollama_review_fixture() {
+  node - \
+    "$ollama_fixture_root/seaf.ticket.yaml" \
+    "$ollama_fixture_root/ollama-acceptance.txt" \
+    "$ollama_fixture_root/ollama-native-check.sh" <<'NODE'
+const fs = require('node:fs');
+
+const [ticketPath, initialPath, checkPath] = process.argv.slice(2);
+function readBoundedRegularFile(path, maximumBytes) {
+  const stat = fs.lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`unsafe Ollama review fixture file: ${path}`);
+  }
+  if (stat.size > maximumBytes) {
+    throw new Error(`Ollama review fixture file exceeds bound: ${path}`);
+  }
+  return fs.readFileSync(path);
+}
+
+const ticketBytes = readBoundedRegularFile(ticketPath, 16 * 1024);
+const initialBytes = readBoundedRegularFile(initialPath, 64);
+const checkBytes = readBoundedRegularFile(checkPath, 16 * 1024);
+const ticket = ticketBytes.toString('utf8');
+if (!Buffer.from(ticket, 'utf8').equals(ticketBytes)) {
+  throw new Error('Ollama ticket is not valid UTF-8');
+}
+const normalizedTicket = ticket.replace(/\s+/g, ' ').trim();
+const initialInstruction = 'When a Spec Creation provider request has no revision_context, the specification must propose the exact final bytes SEAF packaged Ollama acceptance draft. followed by one newline.';
+const reviewInstruction = 'This proposed final text is intentionally wrong, so Spec Review must request changes.';
+const recoveredInstruction = 'When a Spec Creation provider request has revision_context, the specification must correct the proposed final bytes to SEAF packaged Ollama acceptance passed. followed by one newline.';
+const preservationInstruction = 'The recovered specification must preserve the permitted path, policy scope, command, and acceptance criteria.';
+for (const instruction of [initialInstruction, reviewInstruction, recoveredInstruction, preservationInstruction]) {
+  if (!normalizedTicket.includes(instruction)) {
+    throw new Error(`Ollama ticket is missing the trusted review protocol: ${instruction}`);
+  }
+}
+const finalCriterion = '  - After the change its exact bytes are SEAF packaged Ollama acceptance passed. followed by one newline.';
+if (!ticket.split('\n').includes(finalCriterion)) {
+  throw new Error('Ollama ticket final-byte acceptance criterion changed');
+}
+if (!initialBytes.equals(Buffer.from('PENDING\n', 'utf8'))) {
+  throw new Error('Ollama fixture initial bytes changed');
+}
+const check = checkBytes.toString('utf8');
+if (!check.includes('expected_content="SEAF packaged Ollama acceptance passed."')
+  || !check.includes('wc -l <"$candidate_file"')) {
+  throw new Error('Ollama fixture native check no longer enforces the exact final bytes and newline');
+}
+NODE
+}
+
 file_size_bytes() {
   local path="$1"
 
@@ -1964,6 +2015,7 @@ if [[ "$acceptance_mode" == "ollama" ]]; then
   done
   [[ -x "$ollama_fixture_root/ollama-native-check.sh" ]] || fail "Ollama fixture-native check is not executable"
 fi
+validate_ollama_review_fixture
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) target="aarch64-apple-darwin" ;;
